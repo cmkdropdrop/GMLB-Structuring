@@ -1,0 +1,105 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+
+# Test and coverage artefacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Packaging and build artefacts
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated model and analysis outputs
+/AGILE_Modelling_Engine/examples/output/
+/AGILE_Modelling_Engine/portfolio_simulations/output/
+/_review_work/runner_workaround_reproduction/
+
+# Research paper collections and derived paper code
+/Code based on Papers/
+/Papers on Pricing/
+
+# Runtime files
+*.log
+*.pid
+*.seed
+*.tmp
+*.temp
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Microsoft Office lock files
+~$*
+
+# Excel workbooks and templates
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+*.xlt
+*.xltx
+*.xltm
+*.xla
+*.xlam
+
+# Tabular data and bibliography files
+*.csv
+*.bib
+
+# Stylesheets and text files
+*.css
+*.txt
+
+# PDF documents
+*.pdf
+
+# HTML and Word documents
+*.html
+*.htm
+*.docx
+
+# Generated images
+*.png
+
+# PowerShell scripts
+*.ps1
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
