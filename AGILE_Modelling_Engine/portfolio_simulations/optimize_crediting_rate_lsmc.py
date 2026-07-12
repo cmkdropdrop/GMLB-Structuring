@@ -11,8 +11,13 @@ risk-neutral Heston-Hull-White.  Exploratory cap paths then drive the existing
 generic monthly contract projector.  A cross-fitted Fitted-Q backward pass
 estimates, for every anniversary and admissible cap,
 
-    E[PV(claims - collected product fees - collected LIP fees)
+    E[PV(collected fees + other insurer margins
+         - insurer-funded benefits - insurer costs)
       + optimal continuation value | information at the cap-setting time].
+
+The signed quantity is the repository's market-consistent insurer net value
+before Risk Margin and is used here as an approximate New Business CSM proxy.
+The optimisation selects the cap with the largest proxy value.
 
 The action grid is the explicit research convention requested for this study:
 ``{0.20%, 1%, 2%, ..., 20%}``.  It overrides the active case study's 0.25%
@@ -24,10 +29,11 @@ Important timing convention
 ---------------------------
 The management action is selected immediately after the anniversary state is
 known and applies to the following crediting year.  The optimisation therefore
-uses the administrative annual-crediting view (DVA and crediting-margin cash
-flows disabled).  This makes every regression state strictly pre-action and
-keeps the requested objective limited to guarantee claims less actually
-collected fees.  Dynamic income-phase lapse and withdrawal assumptions are
+uses the administrative annual-crediting view with DVA disabled.  This makes
+every regression state strictly pre-action.  Collected Product/LIP Fees,
+Crediting and retained margins, Guarantee Claims, operating expenses and
+hedge-execution costs enter the CSM proxy with their insurer cashflow signs.
+Dynamic income-phase lapse and withdrawal assumptions are
 re-evaluated after cap-dependent Account-Value changes for Single-Life,
 Lump-Sum-Spouse and Single-Life fallback branches.  Consistent with the active
 Engine, a Continue-Income Joint-Life branch uses state-independent CSV base
@@ -55,6 +61,7 @@ from typing import Iterator, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import ndtr
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +75,7 @@ from agile_engine import (  # noqa: E402
     DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY,
     DEFAULT_MODEL_PARAMETERS_PATH,
     DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
+    ExpenseAssumptions,
     FeeSpec,
     Index,
     IndexLinkedLifetimeIncomeProduct,
@@ -99,6 +107,7 @@ IntArray = NDArray[np.int64]
 STEPS_PER_YEAR = 12
 
 ACTION_CAPS = np.concatenate((np.array([0.002]), np.arange(0.01, 0.201, 0.01)))
+OTHER_INSURER_FUNDED_BENEFIT_KEYS: tuple[str, ...] = ()
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "crediting_cap_lsmc"
 )
@@ -192,19 +201,35 @@ class ProjectionBranch:
 
 @dataclass
 class PortfolioPathData:
-    """Time-zero discounted portfolio paths used by the backward induction."""
+    """Discounted insurer-margin paths used by the backward induction."""
 
-    claims: Array
+    guarantee_claims: Array
+    other_insurer_funded_benefits: Array
     fees_product: Array
     fees_lip: Array
+    crediting_margin: Array
+    mva_retained: Array
+    aps_retained: Array
+    expenses: Array
+    hedge_costs: Array
     terminal_closeout: Array
     raw_states: Array | None
     state_feature_names: tuple[str, ...]
     representative_initial_premium: float
 
     @property
-    def net(self) -> Array:
-        return self.claims - self.fees_product - self.fees_lip
+    def new_business_csm_proxy(self) -> Array:
+        return (
+            self.fees_product
+            + self.fees_lip
+            + self.crediting_margin
+            + self.mva_retained
+            + self.aps_retained
+            - self.guarantee_claims
+            - self.other_insurer_funded_benefits
+            - self.expenses
+            - self.hedge_costs
+        )
 
 
 @dataclass(frozen=True)
@@ -219,11 +244,17 @@ class RegressionPolicyYear:
 @dataclass
 class BackwardResult:
     first_year_cap: float
-    pv_net: float
-    pv_claims: float
+    pv_new_business_csm_proxy: float
+    pv_guarantee_claims: float
+    pv_other_insurer_funded_benefits: float
     pv_fees_product: float
     pv_fees_lip: float
-    standard_error_net: float
+    pv_crediting_margin: float
+    pv_mva_retained: float
+    pv_aps_retained: float
+    pv_expenses: float
+    pv_hedge_costs: float
+    standard_error_new_business_csm_proxy: float
     first_year_action_rows: list[dict[str, object]]
     policy_year_rows: list[dict[str, object]]
     regression_rows: list[dict[str, object]]
@@ -398,20 +429,101 @@ def _vector_credited_return(
     return float(out) if np.ndim(index_return) == 0 and np.ndim(cap) == 0 else out
 
 
+def _vector_bs_call(
+    x0: float | Array,
+    strike: float | Array,
+    tau: float,
+    rate: float | Array,
+    dividend_yield: float,
+    sigma: float | Array,
+) -> float | Array:
+    """Black-Scholes call supporting one pathwise strike per cap control."""
+    spot, strike_array, rate_array, sigma_array = np.broadcast_arrays(
+        np.asarray(x0, dtype=float),
+        np.asarray(strike, dtype=float),
+        np.asarray(rate, dtype=float),
+        np.asarray(sigma, dtype=float),
+    )
+    if np.any(np.isnan(strike_array)) or np.any(strike_array <= 0.0):
+        raise ValueError("Option strikes must be positive and not NaN.")
+    if tau <= 0.0:
+        result = np.maximum(spot - strike_array, 0.0)
+    else:
+        vol = np.maximum(sigma_array, 1.0e-8) * np.sqrt(float(tau))
+        forward = spot * np.exp((rate_array - dividend_yield) * tau)
+        finite = np.isfinite(strike_array)
+        safe_strike = np.where(finite, strike_array, 1.0)
+        d1 = np.log(np.maximum(forward, 1.0e-300) / safe_strike) / vol \
+            + 0.5 * vol
+        d2 = d1 - vol
+        result = np.exp(-rate_array * tau) * (
+            forward * ndtr(d1) - safe_strike * ndtr(d2)
+        )
+        result = np.where(finite, result, 0.0)
+    scalar = all(np.ndim(value) == 0 for value in (x0, strike, rate, sigma))
+    return float(result) if scalar else np.asarray(result, dtype=float)
+
+
+def _vector_crediting_package_value(
+    x0: float | Array,
+    protection: Protection,
+    cap: float | Array,
+    tau: float,
+    rate: float | Array,
+    dividend_yield: float,
+    sigma: float | Array,
+    buffer: float = 0.10,
+) -> float | Array:
+    """Vector-cap package value used by margin and hedge-cost cashflows."""
+    protection = Protection(protection)
+    caps = np.asarray(cap, dtype=float)
+    if np.any(np.isnan(caps)) or np.any(caps < 0.0):
+        raise ValueError("cap must be non-negative and not NaN.")
+    if not np.isfinite(buffer) or not 0.0 <= buffer < 1.0:
+        raise ValueError("buffer must be finite and in [0, 1).")
+    call_at_one = _vector_bs_call(
+        x0, 1.0, tau, rate, dividend_yield, sigma
+    )
+    call_at_cap = _vector_bs_call(
+        x0, 1.0 + caps, tau, rate, dividend_yield, sigma
+    )
+    call_spread = np.asarray(call_at_one) - np.asarray(call_at_cap)
+    if protection == Protection.TOTAL:
+        result = call_spread
+    else:
+        strike = 1.0 - buffer
+        call_at_buffer = np.asarray(_vector_bs_call(
+            x0, strike, tau, rate, dividend_yield, sigma
+        ))
+        spot = np.asarray(x0, dtype=float)
+        rate_array = np.asarray(rate, dtype=float)
+        put_at_buffer = (
+            call_at_buffer
+            - spot * np.exp(-dividend_yield * tau)
+            + strike * np.exp(-rate_array * tau)
+        )
+        result = call_spread - put_at_buffer
+    scalar = all(np.ndim(value) == 0 for value in (x0, cap, rate, sigma))
+    return float(result) if scalar else np.asarray(result, dtype=float)
+
+
 @contextmanager
 def _pathwise_cap_adapter() -> Iterator[None]:
-    """Temporarily vectorise only the projector's local crediting call.
+    """Temporarily vectorise projector calls reached by pathwise cap controls.
 
-    The adapter is process-local, restored in ``finally`` and used with DVA,
-    hedge cost and crediting margin disabled.  Consequently no other scalar-
-    cap pricing function is reached.
+    The adapter is process-local and restored in ``finally``. DVA remains
+    disabled, while the package pricer is vectorised so the CSM proxy can
+    include cap-dependent Crediting Margin and hedge-execution cost.
     """
-    original = projection_module.credited_return
+    original_return = projection_module.credited_return
+    original_package = projection_module.crediting_package_value
     projection_module.credited_return = _vector_credited_return
+    projection_module.crediting_package_value = _vector_crediting_package_value
     try:
         yield
     finally:
-        projection_module.credited_return = original
+        projection_module.credited_return = original_return
+        projection_module.crediting_package_value = original_package
 
 
 def _controlled_product(
@@ -741,10 +853,14 @@ def _annual_discounted_paths(
     cashflow: Array,
     discount: Array,
     n_years: int,
+    *,
+    include_time_zero_in_first_year: bool = False,
 ) -> Array:
     """Aggregate grid cashflows in ``(year, year+1]`` in time-zero units."""
     n_paths, n_columns = cashflow.shape
     out = np.zeros((n_paths, n_years))
+    if include_time_zero_in_first_year and n_years:
+        out[:, 0] = cashflow[:, 0] * discount[:, 0]
     last_step = n_columns - 1
     for year in range(n_years):
         lo = year * STEPS_PER_YEAR + 1
@@ -756,6 +872,32 @@ def _annual_discounted_paths(
     return out
 
 
+def _annual_start_discounted_paths(
+    cashflow: Array,
+    discount: Array,
+    n_years: int,
+) -> Array:
+    """Assign anniversary-start cashflows to the cap chosen at that time."""
+    n_paths, n_columns = cashflow.shape
+    out = np.zeros((n_paths, n_years))
+    for year in range(n_years):
+        step = year * STEPS_PER_YEAR
+        if step >= n_columns:
+            break
+        out[:, year] = cashflow[:, step] * discount[:, step]
+    total_discounted = np.sum(cashflow * discount, axis=1)
+    unassigned = total_discounted - np.sum(out, axis=1)
+    tolerance = 1.0e-10 * max(
+        1.0, float(np.max(np.abs(total_discounted)))
+    )
+    if np.any(np.abs(unassigned) > tolerance):
+        raise RuntimeError(
+            "Hedge-cost cashflows were found away from control-year starts; "
+            "the action-timing aggregation would omit a material amount."
+        )
+    return out
+
+
 def _aggregate_portfolio_paths(
     *,
     scenarios: ScenarioSet,
@@ -764,6 +906,7 @@ def _aggregate_portfolio_paths(
     model_points: PolicyholderModelPointSet,
     behaviour: BehaviourModel,
     mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
     projection_config: ProjectionConfig,
     collect_states: bool,
     progress_label: str,
@@ -786,10 +929,16 @@ def _aggregate_portfolio_paths(
         "%s | %d model points | %d market paths | %d policy years | states=%s",
         progress_label, point_count, scenarios.n_paths, n_years, collect_states,
     )
-    claims = np.zeros((scenarios.n_paths, n_years))
-    fees_product = np.zeros_like(claims)
-    fees_lip = np.zeros_like(claims)
-    terminal_closeout = np.zeros_like(claims)
+    guarantee_claims = np.zeros((scenarios.n_paths, n_years))
+    other_insurer_funded_benefits = np.zeros_like(guarantee_claims)
+    fees_product = np.zeros_like(guarantee_claims)
+    fees_lip = np.zeros_like(guarantee_claims)
+    crediting_margin = np.zeros_like(guarantee_claims)
+    mva_retained = np.zeros_like(guarantee_claims)
+    aps_retained = np.zeros_like(guarantee_claims)
+    projected_expenses = np.zeros_like(guarantee_claims)
+    hedge_costs = np.zeros_like(guarantee_claims)
+    terminal_closeout = np.zeros_like(guarantee_claims)
 
     representative_premium = float(sum(
         point.contract_weight * point.policy.initial_investment
@@ -881,20 +1030,44 @@ def _aggregate_portfolio_paths(
                     scenarios,
                     branch.behaviour,
                     mortality,
-                    expenses=None,
+                    expenses=expenses,
                     config=config,
                 )
                 branch_weight = float(point.contract_weight * branch_probability)
                 n_columns = len(result.times)
                 discount = scenarios.discount[:, :n_columns]
-                claims += branch_weight * _annual_discounted_paths(
+                guarantee_claims += branch_weight * _annual_discounted_paths(
                     result.cashflows["guarantee_claims"], discount, n_years
                 )
+                for key in OTHER_INSURER_FUNDED_BENEFIT_KEYS:
+                    other_insurer_funded_benefits += (
+                        branch_weight * _annual_discounted_paths(
+                            result.cashflows[key], discount, n_years
+                        )
+                    )
                 fees_product += branch_weight * _annual_discounted_paths(
                     result.cashflows["fees_product"], discount, n_years
                 )
                 fees_lip += branch_weight * _annual_discounted_paths(
                     result.cashflows["fees_lip"], discount, n_years
+                )
+                crediting_margin += branch_weight * _annual_discounted_paths(
+                    result.cashflows["crediting_margin"], discount, n_years
+                )
+                mva_retained += branch_weight * _annual_discounted_paths(
+                    result.cashflows["mva_retained"], discount, n_years
+                )
+                aps_retained += branch_weight * _annual_discounted_paths(
+                    result.cashflows["aps_retained"], discount, n_years
+                )
+                projected_expenses += branch_weight * _annual_discounted_paths(
+                    result.cashflows["expenses"],
+                    discount,
+                    n_years,
+                    include_time_zero_in_first_year=True,
+                )
+                hedge_costs += branch_weight * _annual_start_discounted_paths(
+                    result.cashflows["hedge_costs"], discount, n_years
                 )
                 terminal_closeout += branch_weight * _annual_discounted_paths(
                     result.cashflows["terminal_closeout"], discount, n_years
@@ -1053,9 +1226,15 @@ def _aggregate_portfolio_paths(
         )
 
     return PortfolioPathData(
-        claims=claims,
+        guarantee_claims=guarantee_claims,
+        other_insurer_funded_benefits=other_insurer_funded_benefits,
         fees_product=fees_product,
         fees_lip=fees_lip,
+        crediting_margin=crediting_margin,
+        mva_retained=mva_retained,
+        aps_retained=aps_retained,
+        expenses=projected_expenses,
+        hedge_costs=hedge_costs,
         terminal_closeout=terminal_closeout,
         raw_states=raw_states,
         state_feature_names=feature_names,
@@ -1303,10 +1482,16 @@ def _cross_fitted_action_values(
             "observed_path_count": int(np.sum(selected)),
             "basis_dimension": int(full_design.shape[1]),
             "ridge_multiplier": float(ridge),
-            "in_sample_rmse_net": float(np.sqrt(residual_variance)),
-            "in_sample_r_squared_net": float(r_squared),
-            "out_of_fold_rmse_net": float(np.sqrt(oof_residual_variance)),
-            "out_of_fold_r_squared_net": float(oof_r_squared),
+            "in_sample_rmse_new_business_csm_proxy": float(
+                np.sqrt(residual_variance)
+            ),
+            "in_sample_r_squared_new_business_csm_proxy": float(r_squared),
+            "out_of_fold_rmse_new_business_csm_proxy": float(
+                np.sqrt(oof_residual_variance)
+            ),
+            "out_of_fold_r_squared_new_business_csm_proxy": float(
+                oof_r_squared
+            ),
             "design_condition_number": _condition_number(full_design[selected]),
         })
 
@@ -1357,7 +1542,7 @@ def _backward_induction(
     """Cross-fitted Fitted-Q recursion for a repeated discrete control."""
     if data.raw_states is None:
         raise ValueError("Backward induction requires recorded state paths.")
-    n_paths, n_years = data.net.shape
+    n_paths, n_years = data.new_business_csm_proxy.shape
     if action_indices.shape != (n_paths, n_years):
         raise ValueError("Action indices and projected rewards are inconsistent.")
     LOGGER.info(
@@ -1366,15 +1551,17 @@ def _backward_induction(
     )
     rng = np.random.default_rng(seed)
     # Stratify complete-path folds by the first action so the cap-selection
-    # sample and the held-out first-year PV sample both contain every cap.
+    # sample and held-out first-year CSM sample both contain every cap.
     fold_ids = np.empty(n_paths, dtype=np.int64)
     for action in range(len(ACTION_CAPS)):
         rows = np.flatnonzero(action_indices[:, 0] == action)
         assigned = np.resize(np.arange(folds, dtype=np.int64), len(rows))
         fold_ids[rows] = rng.permutation(assigned)
 
-    # Columns: restricted net objective, claims, product fees, LIP fees.
-    continuation = np.zeros((n_paths, 4), dtype=float)
+    # Columns: CSM proxy, Product Fees, LIP Fees, Crediting Margin,
+    # MVA retained, APS retained, Guarantee Claims, other insurer-funded
+    # benefits, operating expenses and hedge-execution costs.
+    continuation = np.zeros((n_paths, 10), dtype=float)
     policy_years: list[RegressionPolicyYear] = []
     regression_rows: list[dict[str, object]] = []
     policy_year_rows: list[dict[str, object]] = []
@@ -1383,7 +1570,7 @@ def _backward_induction(
     inforce_index = data.state_feature_names.index("inforce_exposure")
 
     first_cap = float("nan")
-    first_outputs = np.zeros(4)
+    first_outputs = np.zeros(10)
     first_se = float("nan")
 
     for year in range(n_years - 1, -1, -1):
@@ -1395,10 +1582,18 @@ def _backward_induction(
         year_exposure = data.raw_states[:, year, inforce_index]
         if not np.any(year_exposure > 0.0):
             residual_magnitude = max(
-                float(np.max(np.abs(data.net[:, year]))),
-                float(np.max(np.abs(data.claims[:, year]))),
+                float(np.max(np.abs(data.new_business_csm_proxy[:, year]))),
+                float(np.max(np.abs(data.guarantee_claims[:, year]))),
+                float(np.max(np.abs(
+                    data.other_insurer_funded_benefits[:, year]
+                ))),
                 float(np.max(np.abs(data.fees_product[:, year]))),
                 float(np.max(np.abs(data.fees_lip[:, year]))),
+                float(np.max(np.abs(data.crediting_margin[:, year]))),
+                float(np.max(np.abs(data.mva_retained[:, year]))),
+                float(np.max(np.abs(data.aps_retained[:, year]))),
+                float(np.max(np.abs(data.expenses[:, year]))),
+                float(np.max(np.abs(data.hedge_costs[:, year]))),
                 float(np.max(np.abs(continuation))),
             )
             materiality = 1.0e-10 * data.representative_initial_premium
@@ -1417,21 +1612,27 @@ def _backward_induction(
             continue
         active_policy_years.append(year + 1)
         targets = np.column_stack((
-            data.net[:, year] + continuation[:, 0],
-            data.claims[:, year] + continuation[:, 1],
-            data.fees_product[:, year] + continuation[:, 2],
-            data.fees_lip[:, year] + continuation[:, 3],
+            data.new_business_csm_proxy[:, year] + continuation[:, 0],
+            data.fees_product[:, year] + continuation[:, 1],
+            data.fees_lip[:, year] + continuation[:, 2],
+            data.crediting_margin[:, year] + continuation[:, 3],
+            data.mva_retained[:, year] + continuation[:, 4],
+            data.aps_retained[:, year] + continuation[:, 5],
+            data.guarantee_claims[:, year] + continuation[:, 6],
+            data.other_insurer_funded_benefits[:, year] + continuation[:, 7],
+            data.expenses[:, year] + continuation[:, 8],
+            data.hedge_costs[:, year] + continuation[:, 9],
         ))
         observed = action_indices[:, year]
 
         if year == 0:
             # Fold zero is never used to select the first cap.  Its paths get
             # continuation estimates from regressions trained without fold
-            # zero and provide an honest holdout PV after the cap is frozen.
+            # zero and provide an honest holdout CSM after the cap is frozen.
             selection_paths = fold_ids != 0
             holdout_paths = fold_ids == 0
-            selection_values = np.zeros((len(ACTION_CAPS), 4), dtype=float)
-            holdout_values = np.zeros((len(ACTION_CAPS), 4), dtype=float)
+            selection_values = np.zeros((len(ACTION_CAPS), 10), dtype=float)
+            holdout_values = np.zeros((len(ACTION_CAPS), 10), dtype=float)
             selection_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
             holdout_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
             for action, cap in enumerate(ACTION_CAPS):
@@ -1449,13 +1650,13 @@ def _backward_induction(
                 holdout_standard_errors[action] = _standard_error(
                     targets[holdout, 0]
                 )
-            chosen_action = int(np.argmin(selection_values[:, 0]))
+            chosen_action = int(np.argmax(selection_values[:, 0]))
             first_cap = float(ACTION_CAPS[chosen_action])
             first_outputs = holdout_values[chosen_action]
             first_se = holdout_standard_errors[chosen_action]
             LOGGER.info(
                 "First-year decision (unscaled representative contract) | "
-                "cap %.2f%% | selection Q %.2f | holdout PV %.2f | "
+                "cap %.2f%% | selection Q-CSM %.2f | holdout CSM %.2f | "
                 "holdout SE %.2f",
                 100.0 * first_cap,
                 selection_values[chosen_action, 0],
@@ -1466,17 +1667,43 @@ def _backward_induction(
                 first_year_action_rows.append({
                     "cap": float(cap),
                     "cap_percent": 100.0 * float(cap),
-                    "selection_estimated_q_net": float(selection_values[action, 0]),
-                    "selection_standard_error_net": float(
+                    "selection_estimated_q_new_business_csm_proxy": float(
+                        selection_values[action, 0]
+                    ),
+                    "selection_standard_error_new_business_csm_proxy": float(
                         selection_standard_errors[action]
                     ),
-                    "holdout_estimated_q_net": float(holdout_values[action, 0]),
-                    "holdout_estimated_q_claims": float(holdout_values[action, 1]),
+                    "holdout_estimated_q_new_business_csm_proxy": float(
+                        holdout_values[action, 0]
+                    ),
                     "holdout_estimated_q_fees_product": float(
+                        holdout_values[action, 1]
+                    ),
+                    "holdout_estimated_q_fees_lip": float(
                         holdout_values[action, 2]
                     ),
-                    "holdout_estimated_q_fees_lip": float(holdout_values[action, 3]),
-                    "holdout_standard_error_net": float(
+                    "holdout_estimated_q_crediting_margin": float(
+                        holdout_values[action, 3]
+                    ),
+                    "holdout_estimated_q_mva_retained": float(
+                        holdout_values[action, 4]
+                    ),
+                    "holdout_estimated_q_aps_retained": float(
+                        holdout_values[action, 5]
+                    ),
+                    "holdout_estimated_q_guarantee_claims": float(
+                        holdout_values[action, 6]
+                    ),
+                    "holdout_estimated_q_other_insurer_funded_benefits": float(
+                        holdout_values[action, 7]
+                    ),
+                    "holdout_estimated_q_expenses": float(
+                        holdout_values[action, 8]
+                    ),
+                    "holdout_estimated_q_hedge_costs": float(
+                        holdout_values[action, 9]
+                    ),
+                    "holdout_standard_error_new_business_csm_proxy": float(
                         holdout_standard_errors[action]
                     ),
                     "selection_path_count": int(np.sum(
@@ -1520,13 +1747,13 @@ def _backward_induction(
             ridge=ridge,
             feature_names=data.state_feature_names,
         )
-        chosen = np.argmin(predictions[:, :, 0], axis=1)
+        chosen = np.argmax(predictions[:, :, 0], axis=1)
         rows = np.arange(n_paths)
         continuation = predictions[rows, chosen, :]
         selected_caps = ACTION_CAPS[chosen]
         LOGGER.debug(
             "Backward induction | year %d | mean selected cap %.3f%% | "
-            "minimum Q %.2f (unscaled representative contract)",
+            "maximum Q-CSM %.2f (unscaled representative contract)",
             year + 1,
             100.0 * float(np.mean(selected_caps)),
             float(np.mean(continuation[:, 0])),
@@ -1562,14 +1789,30 @@ def _backward_induction(
             "In-force exposure becomes positive after an inactive policy year; "
             "the economic policy horizon is not contiguous."
         )
-    component_net = first_outputs[1] - first_outputs[2] - first_outputs[3]
+    component_csm = (
+        first_outputs[1]
+        + first_outputs[2]
+        + first_outputs[3]
+        + first_outputs[4]
+        + first_outputs[5]
+        - first_outputs[6]
+        - first_outputs[7]
+        - first_outputs[8]
+        - first_outputs[9]
+    )
     return BackwardResult(
         first_year_cap=first_cap,
-        pv_net=float(first_outputs[0]),
-        pv_claims=float(first_outputs[1]),
-        pv_fees_product=float(first_outputs[2]),
-        pv_fees_lip=float(first_outputs[3]),
-        standard_error_net=float(first_se),
+        pv_new_business_csm_proxy=float(first_outputs[0]),
+        pv_fees_product=float(first_outputs[1]),
+        pv_fees_lip=float(first_outputs[2]),
+        pv_crediting_margin=float(first_outputs[3]),
+        pv_mva_retained=float(first_outputs[4]),
+        pv_aps_retained=float(first_outputs[5]),
+        pv_guarantee_claims=float(first_outputs[6]),
+        pv_other_insurer_funded_benefits=float(first_outputs[7]),
+        pv_expenses=float(first_outputs[8]),
+        pv_hedge_costs=float(first_outputs[9]),
+        standard_error_new_business_csm_proxy=float(first_se),
         first_year_action_rows=first_year_action_rows,
         policy_year_rows=sorted(
             policy_year_rows,
@@ -1580,7 +1823,7 @@ def _backward_induction(
             key=lambda row: (int(row["policy_year"]), float(row["cap"])),
         ),
         policy_years=policy_years,
-        reconciliation_gap=float(first_outputs[0] - component_net),
+        reconciliation_gap=float(first_outputs[0] - component_csm),
         economically_active_policy_years=tuple(active_policy_years),
         inactive_market_tail_year_count=n_years - len(active_policy_years),
     )
@@ -1615,6 +1858,110 @@ def _benchmark_cases() -> list[tuple[str, float, str]]:
     return cases
 
 
+def _summed_csm_components(
+    projected: PortfolioPathData,
+    rows: slice,
+) -> dict[str, Array]:
+    """Collapse annual discounted components to one PV per market path."""
+    names = (
+        "fees_product",
+        "fees_lip",
+        "crediting_margin",
+        "mva_retained",
+        "aps_retained",
+        "guarantee_claims",
+        "other_insurer_funded_benefits",
+        "expenses",
+        "hedge_costs",
+        "terminal_closeout",
+    )
+    return {
+        name: np.sum(np.asarray(getattr(projected, name))[rows], axis=1)
+        for name in names
+    }
+
+
+def _csm_benchmark_row(
+    *,
+    label: str,
+    cap: float | None,
+    definition: str,
+    components: Mapping[str, Array],
+    csm_paths: Array,
+    best_fixed_paths: Array,
+    portfolio_scale: float,
+    is_best_fixed: bool,
+) -> dict[str, object]:
+    """Create one auditable fixed/special-policy CSM result row."""
+    difference = portfolio_scale * (csm_paths - best_fixed_paths)
+
+    def mean_pv(name: str) -> float:
+        return portfolio_scale * float(np.mean(components[name]))
+
+    future_fees = components["fees_product"] + components["fees_lip"]
+    other_margins = (
+        components["crediting_margin"]
+        + components["mva_retained"]
+        + components["aps_retained"]
+    )
+    total_benefits = (
+        components["guarantee_claims"]
+        + components["other_insurer_funded_benefits"]
+    )
+    total_costs = components["expenses"] + components["hedge_costs"]
+    reconstructed_csm = future_fees + other_margins - total_benefits - total_costs
+    reconciliation = csm_paths - reconstructed_csm
+    return {
+        "case": label,
+        "cap": cap,
+        "cap_percent": None if cap is None else 100.0 * cap,
+        "definition": definition,
+        "pv_product_fees_aud": mean_pv("fees_product"),
+        "pv_lip_fees_aud": mean_pv("fees_lip"),
+        "pv_future_fees_aud": portfolio_scale * float(np.mean(future_fees)),
+        "pv_crediting_margin_aud": mean_pv("crediting_margin"),
+        "pv_mva_retained_aud": mean_pv("mva_retained"),
+        "pv_aps_retained_aud": mean_pv("aps_retained"),
+        "pv_other_insurer_margins_aud": portfolio_scale * float(
+            np.mean(other_margins)
+        ),
+        "pv_total_insurer_inflows_aud": portfolio_scale * float(np.mean(
+            future_fees + other_margins
+        )),
+        "pv_guarantee_claims_aud": mean_pv("guarantee_claims"),
+        "pv_other_insurer_funded_benefits_aud": mean_pv(
+            "other_insurer_funded_benefits"
+        ),
+        "pv_total_insurer_funded_benefits_aud": portfolio_scale * float(
+            np.mean(total_benefits)
+        ),
+        "pv_expenses_aud": mean_pv("expenses"),
+        "pv_hedge_costs_aud": mean_pv("hedge_costs"),
+        "pv_total_costs_aud": portfolio_scale * float(np.mean(total_costs)),
+        "estimated_new_business_csm_proxy_aud": portfolio_scale * float(
+            np.mean(csm_paths)
+        ),
+        "standard_error_new_business_csm_proxy_aud": (
+            portfolio_scale * _standard_error(csm_paths)
+        ),
+        "new_business_csm_component_reconciliation_gap_aud": (
+            portfolio_scale * float(np.mean(reconciliation))
+        ),
+        "new_business_csm_component_reconciliation_max_absolute_aud": (
+            portfolio_scale * float(np.max(np.abs(reconciliation)))
+        ),
+        "pv_terminal_closeout_excluded_aud": mean_pv("terminal_closeout"),
+        "new_business_csm_difference_vs_best_fixed_1_to_20_aud": float(
+            np.mean(difference)
+        ),
+        "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud": (
+            _standard_error(difference)
+        ),
+        "is_best_fixed_cap_1_to_20": is_best_fixed,
+        "n_common_random_number_paths": int(csm_paths.size),
+    }
+
+
 def _evaluate_fixed_benchmarks(
     *,
     base_scenarios: ScenarioSet,
@@ -1624,6 +1971,7 @@ def _evaluate_fixed_benchmarks(
     model_points: PolicyholderModelPointSet,
     behaviour: BehaviourModel,
     mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
     projection_config: ProjectionConfig,
     portfolio_scale: float,
     model_point_log_interval: int,
@@ -1631,7 +1979,7 @@ def _evaluate_fixed_benchmarks(
     """Direct fixed-policy projections with paired common market paths."""
     cases = _benchmark_cases()
     path_values: dict[str, Array] = {}
-    component_paths: dict[str, tuple[Array, Array, Array, Array]] = {}
+    component_paths: dict[str, dict[str, Array]] = {}
     batch_count = int(np.ceil(len(cases) / batch_size))
     LOGGER.info(
         "Fixed-cap benchmarks | %d cases | %d batches | %d CRN paths/case",
@@ -1659,6 +2007,7 @@ def _evaluate_fixed_benchmarks(
             model_points=model_points,
             behaviour=behaviour,
             mortality=mortality,
+            expenses=expenses,
             projection_config=projection_config,
             collect_states=False,
             progress_label=f"Benchmark batch {batch_number}/{batch_count}",
@@ -1667,67 +2016,54 @@ def _evaluate_fixed_benchmarks(
         for position, (label, _, _) in enumerate(batch):
             lo = position * base_scenarios.n_paths
             hi = (position + 1) * base_scenarios.n_paths
-            claims = np.sum(projected.claims[lo:hi], axis=1)
-            fees_product = np.sum(projected.fees_product[lo:hi], axis=1)
-            fees_lip = np.sum(projected.fees_lip[lo:hi], axis=1)
-            terminal_closeout = np.sum(
-                projected.terminal_closeout[lo:hi], axis=1
+            components = _summed_csm_components(projected, slice(lo, hi))
+            csm_paths = np.sum(
+                projected.new_business_csm_proxy[lo:hi], axis=1
             )
-            net = claims - fees_product - fees_lip
-            path_values[label] = net
-            component_paths[label] = (
-                claims, fees_product, fees_lip, terminal_closeout
-            )
+            path_values[label] = csm_paths
+            component_paths[label] = components
         LOGGER.info(
             "Benchmark batch %d/%d complete | elapsed %.1fs",
             batch_number, batch_count, time.perf_counter() - batch_started,
         )
 
     fixed_labels = [f"fixed_cap_{percent}pct" for percent in range(1, 21)]
-    best_label = min(fixed_labels, key=lambda label: float(np.mean(path_values[label])))
+    best_label = max(
+        fixed_labels,
+        key=lambda label: float(np.mean(path_values[label])),
+    )
     best_paths = path_values[best_label]
     LOGGER.info(
-        "Best fixed 1%%-20%% benchmark | %s | PV net %.2f",
+        "Best fixed 1%%-20%% benchmark | %s | New Business CSM proxy %.2f",
         best_label, portfolio_scale * float(np.mean(best_paths)),
     )
     rows: list[dict[str, object]] = []
     for label, cap, definition in cases:
-        net = path_values[label]
-        claims, fees_product, fees_lip, terminal_closeout = component_paths[label]
-        difference = (net - best_paths) * portfolio_scale
-        row = {
-            "case": label,
-            "cap": None if np.isposinf(cap) else float(cap),
-            "cap_percent": None if np.isposinf(cap) else 100.0 * float(cap),
-            "definition": definition,
-            "pv_guarantee_claims_aud": portfolio_scale * float(np.mean(claims)),
-            "pv_product_fees_aud": portfolio_scale * float(np.mean(fees_product)),
-            "pv_lip_fees_aud": portfolio_scale * float(np.mean(fees_lip)),
-            "pv_total_fees_aud": portfolio_scale * float(np.mean(
-                fees_product + fees_lip
-            )),
-            "pv_claims_minus_total_fees_aud": portfolio_scale * float(np.mean(net)),
-            "pv_terminal_closeout_excluded_aud": portfolio_scale * float(
-                np.mean(terminal_closeout)
-            ),
-            "standard_error_net_aud": portfolio_scale * _standard_error(net),
-            "difference_vs_best_fixed_1_to_20_aud": float(np.mean(difference)),
-            "paired_standard_error_vs_best_fixed_aud": _standard_error(difference),
-            "is_best_fixed_cap_1_to_20": label == best_label,
-            "n_common_random_number_paths": int(base_scenarios.n_paths),
-        }
+        csm_paths = path_values[label]
+        row = _csm_benchmark_row(
+            label=label,
+            cap=None if np.isposinf(cap) else float(cap),
+            definition=definition,
+            components=component_paths[label],
+            csm_paths=csm_paths,
+            best_fixed_paths=best_paths,
+            portfolio_scale=portfolio_scale,
+            is_best_fixed=label == best_label,
+        )
         rows.append(row)
         LOGGER.debug(
-            "Benchmark result | %s | claims=%.2f | product fees=%.2f | "
-            "LIP fees=%.2f | terminal closeout excluded=%.2f | "
-            "net=%.2f | SE=%.2f",
+            "Benchmark result | %s | future fees=%.2f | other margins=%.2f | "
+            "benefits=%.2f | expenses=%.2f | hedge costs=%.2f | "
+            "CSM proxy=%.2f | SE=%.2f | terminal closeout excluded=%.2f",
             label,
-            row["pv_guarantee_claims_aud"],
-            row["pv_product_fees_aud"],
-            row["pv_lip_fees_aud"],
+            row["pv_future_fees_aud"],
+            row["pv_other_insurer_margins_aud"],
+            row["pv_total_insurer_funded_benefits_aud"],
+            row["pv_expenses_aud"],
+            row["pv_hedge_costs_aud"],
+            row["estimated_new_business_csm_proxy_aud"],
+            row["standard_error_new_business_csm_proxy_aud"],
             row["pv_terminal_closeout_excluded_aud"],
-            row["pv_claims_minus_total_fees_aud"],
-            row["standard_error_net_aud"],
         )
     return rows, path_values
 
@@ -1742,6 +2078,7 @@ def _evaluate_explicit_schedule_benchmark(
     model_points: PolicyholderModelPointSet,
     behaviour: BehaviourModel,
     mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
     projection_config: ProjectionConfig,
     portfolio_scale: float,
     comparison_paths: Array,
@@ -1765,39 +2102,25 @@ def _evaluate_explicit_schedule_benchmark(
         model_points=model_points,
         behaviour=behaviour,
         mortality=mortality,
+        expenses=expenses,
         projection_config=projection_config,
         collect_states=False,
         progress_label=label,
         model_point_log_interval=model_point_log_interval,
     )
-    claims = np.sum(projected.claims, axis=1)
-    fees_product = np.sum(projected.fees_product, axis=1)
-    fees_lip = np.sum(projected.fees_lip, axis=1)
-    terminal_closeout = np.sum(projected.terminal_closeout, axis=1)
-    net = claims - fees_product - fees_lip
-    difference = portfolio_scale * (net - comparison)
-    row = {
-        "case": label,
-        "cap": None,
-        "cap_percent": None,
-        "definition": definition,
-        "pv_guarantee_claims_aud": portfolio_scale * float(np.mean(claims)),
-        "pv_product_fees_aud": portfolio_scale * float(np.mean(fees_product)),
-        "pv_lip_fees_aud": portfolio_scale * float(np.mean(fees_lip)),
-        "pv_total_fees_aud": portfolio_scale * float(np.mean(
-            fees_product + fees_lip
-        )),
-        "pv_claims_minus_total_fees_aud": portfolio_scale * float(np.mean(net)),
-        "pv_terminal_closeout_excluded_aud": portfolio_scale * float(
-            np.mean(terminal_closeout)
-        ),
-        "standard_error_net_aud": portfolio_scale * _standard_error(net),
-        "difference_vs_best_fixed_1_to_20_aud": float(np.mean(difference)),
-        "paired_standard_error_vs_best_fixed_aud": _standard_error(difference),
-        "is_best_fixed_cap_1_to_20": False,
-        "n_common_random_number_paths": int(scenarios.n_paths),
-    }
-    return row, net
+    components = _summed_csm_components(projected, slice(None))
+    csm_paths = np.sum(projected.new_business_csm_proxy, axis=1)
+    row = _csm_benchmark_row(
+        label=label,
+        cap=None,
+        definition=definition,
+        components=components,
+        csm_paths=csm_paths,
+        best_fixed_paths=comparison,
+        portfolio_scale=portfolio_scale,
+        is_best_fixed=False,
+    )
+    return row, csm_paths
 
 
 def _policy_payload(
@@ -1809,14 +2132,30 @@ def _policy_payload(
     return {
         "engine_version": ENGINE_VERSION,
         "method": "cross_fitted_control_randomisation_fitted_q",
+        "optimization_direction": "maximize",
         "projection_semantics": dict(projection_semantics),
         "objective_outputs": [
-            "claims_minus_product_fees_minus_lip_fees",
-            "guarantee_claims",
+            "new_business_csm_proxy",
             "product_fees",
             "lip_fees",
+            "crediting_margin",
+            "mva_retained",
+            "aps_retained",
+            "guarantee_claims",
+            "other_insurer_funded_benefits",
+            "expenses",
+            "hedge_costs",
         ],
-        "excluded_objective_cashflows": ["terminal_closeout"],
+        "other_insurer_funded_benefit_cashflow_keys": list(
+            OTHER_INSURER_FUNDED_BENEFIT_KEYS
+        ),
+        "excluded_objective_cashflows": [
+            "income_paid",
+            "death_benefits",
+            "surrender_benefits",
+            "partial_withdrawals",
+            "terminal_closeout",
+        ],
         "action_caps": ACTION_CAPS.tolist(),
         "raw_state_features": list(feature_names),
         "economically_active_policy_years": list(
@@ -1844,8 +2183,8 @@ def _policy_payload(
         "application_rule": (
             "At each economically active anniversary form only the listed "
             "pre-action state, apply that year's scaling and basis, predict "
-            "all action values, and select the cap with the smallest "
-            "net-objective prediction. No policy is fitted after all covered "
+            "all action values, and select the cap with the largest approximate "
+            "New Business CSM prediction. No policy is fitted after all covered "
             "lives have zero in-force exposure."
         ),
     }
@@ -1856,13 +2195,19 @@ def _scaled_first_year_rows(
     scale: float,
 ) -> list[dict[str, object]]:
     monetary = (
-        "selection_estimated_q_net",
-        "selection_standard_error_net",
-        "holdout_estimated_q_net",
-        "holdout_estimated_q_claims",
+        "selection_estimated_q_new_business_csm_proxy",
+        "selection_standard_error_new_business_csm_proxy",
+        "holdout_estimated_q_new_business_csm_proxy",
         "holdout_estimated_q_fees_product",
         "holdout_estimated_q_fees_lip",
-        "holdout_standard_error_net",
+        "holdout_estimated_q_crediting_margin",
+        "holdout_estimated_q_mva_retained",
+        "holdout_estimated_q_aps_retained",
+        "holdout_estimated_q_guarantee_claims",
+        "holdout_estimated_q_other_insurer_funded_benefits",
+        "holdout_estimated_q_expenses",
+        "holdout_estimated_q_hedge_costs",
+        "holdout_standard_error_new_business_csm_proxy",
     )
     output: list[dict[str, object]] = []
     for source in rows:
@@ -1931,16 +2276,20 @@ def _plot_first_year_choice(
     ordered = sorted(rows, key=lambda row: float(row["cap_percent"]))
     caps = np.asarray([float(row["cap_percent"]) for row in ordered])
     selection = np.asarray([
-        float(row["selection_estimated_q_net_aud"]) for row in ordered
+        float(row["selection_estimated_q_new_business_csm_proxy_aud"])
+        for row in ordered
     ])
     selection_se = np.asarray([
-        float(row["selection_standard_error_net_aud"]) for row in ordered
+        float(row["selection_standard_error_new_business_csm_proxy_aud"])
+        for row in ordered
     ])
     holdout = np.asarray([
-        float(row["holdout_estimated_q_net_aud"]) for row in ordered
+        float(row["holdout_estimated_q_new_business_csm_proxy_aud"])
+        for row in ordered
     ])
     holdout_se = np.asarray([
-        float(row["holdout_standard_error_net_aud"]) for row in ordered
+        float(row["holdout_standard_error_new_business_csm_proxy_aud"])
+        for row in ordered
     ])
     chosen = next(row for row in ordered if row["is_optimal_first_year_cap"])
     chosen_cap = float(chosen["cap_percent"])
@@ -1962,8 +2311,8 @@ def _plot_first_year_choice(
     )
     axis.axhline(0.0, color="grey", linewidth=0.8)
     axis.set_xlabel("First-year cap (%)")
-    axis.set_ylabel("PV claims minus total fees (AUD)")
-    axis.set_title("First-year cap decision: Fitted-Q action values")
+    axis.set_ylabel("Approximate New Business CSM (AUD; higher is better)")
+    axis.set_title("First-year cap decision: CSM-maximising Fitted-Q values")
     axis.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     axis.grid(alpha=0.25)
     axis.legend(loc="best")
@@ -1995,15 +2344,22 @@ def _plot_fixed_cap_checks(
         key=lambda row: float(row["cap_percent"]),
     )
     caps = np.asarray([float(row["cap_percent"]) for row in numeric])
-    net = np.asarray([
-        float(row["pv_claims_minus_total_fees_aud"]) for row in numeric
+    csm = np.asarray([
+        float(row["estimated_new_business_csm_proxy_aud"]) for row in numeric
     ])
-    se = np.asarray([float(row["standard_error_net_aud"]) for row in numeric])
+    se = np.asarray([
+        float(row["standard_error_new_business_csm_proxy_aud"])
+        for row in numeric
+    ])
     difference = np.asarray([
-        float(row["difference_vs_best_fixed_1_to_20_aud"]) for row in numeric
+        float(row[
+            "new_business_csm_difference_vs_best_fixed_1_to_20_aud"
+        ]) for row in numeric
     ])
     paired_se = np.asarray([
-        float(row["paired_standard_error_vs_best_fixed_aud"]) for row in numeric
+        float(row[
+            "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
+        ]) for row in numeric
     ])
     best = next(row for row in numeric if row["is_best_fixed_cap_1_to_20"])
     best_cap = float(best["cap_percent"])
@@ -2013,7 +2369,7 @@ def _plot_fixed_cap_checks(
         gridspec_kw={"height_ratios": (2.0, 1.0)},
     )
     top.errorbar(
-        caps, net, yerr=1.96 * se, marker="o", linewidth=1.5,
+        caps, csm, yerr=1.96 * se, marker="o", linewidth=1.5,
         markersize=4, capsize=2, label="Direct fixed-cap projection",
     )
     top.axvline(
@@ -2030,16 +2386,16 @@ def _plot_fixed_cap_checks(
         matching = [row for row in benchmark_rows if row["case"] == case]
         if matching:
             top.axhline(
-                float(matching[0]["pv_claims_minus_total_fees_aud"]),
+                float(matching[0]["estimated_new_business_csm_proxy_aud"]),
                 color=colour, linestyle=style, linewidth=1.2, label=label,
             )
     top.axhline(
-        float(summary["estimated_optimal_pv_claims_minus_total_fees_aud"]),
+        float(summary["estimated_optimal_new_business_csm_proxy_aud"]),
         color="tab:red", linestyle=":", linewidth=1.4,
         label="Held-out Bellman estimate (not direct rollout)",
     )
-    top.set_ylabel("PV claims minus total fees (AUD)")
-    top.set_title("Fixed-cap and special-policy sanity checks")
+    top.set_ylabel("Approximate New Business CSM (AUD)")
+    top.set_title("CSM-maximising fixed-cap and special-policy checks")
     top.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     top.grid(alpha=0.25)
     top.legend(loc="best", fontsize=8)
@@ -2051,13 +2407,13 @@ def _plot_fixed_cap_checks(
     )
     bottom.axhline(0.0, color="black", linewidth=0.9)
     bottom.set_xlabel("Constant annual cap (%)")
-    bottom.set_ylabel("Paired difference\nvs best fixed (AUD)")
+    bottom.set_ylabel("Paired Δ CSM\ncase − best fixed (AUD)")
     bottom.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     bottom.grid(alpha=0.25)
     figure.text(
         0.01, 0.01,
         "0% means zero crediting. 'No upper cap' means max(fund return, 0). "
-        "Paired intervals use common market paths.",
+        "Paired intervals use common market paths; positive Δ CSM is better.",
         fontsize=8,
     )
     figure.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
@@ -2081,30 +2437,66 @@ def _plot_fixed_cap_decomposition(
         key=lambda row: float(row["cap_percent"]),
     )
     caps = np.asarray([float(row["cap_percent"]) for row in numeric])
-    claims = np.asarray([float(row["pv_guarantee_claims_aud"]) for row in numeric])
-    product_fees = -np.asarray([float(row["pv_product_fees_aud"]) for row in numeric])
-    lip_fees = -np.asarray([float(row["pv_lip_fees_aud"]) for row in numeric])
-    net = np.asarray([
-        float(row["pv_claims_minus_total_fees_aud"]) for row in numeric
+    product_fees = np.asarray([
+        float(row["pv_product_fees_aud"]) for row in numeric
     ])
-    se = np.asarray([float(row["standard_error_net_aud"]) for row in numeric])
+    lip_fees = np.asarray([
+        float(row["pv_lip_fees_aud"]) for row in numeric
+    ])
+    other_margins = np.asarray([
+        float(row["pv_other_insurer_margins_aud"]) for row in numeric
+    ])
+    claims = -np.asarray([
+        float(row["pv_guarantee_claims_aud"]) for row in numeric
+    ])
+    other_benefits = -np.asarray([
+        float(row["pv_other_insurer_funded_benefits_aud"])
+        for row in numeric
+    ])
+    expenses = -np.asarray([
+        float(row["pv_expenses_aud"]) for row in numeric
+    ])
+    hedge_costs = -np.asarray([
+        float(row["pv_hedge_costs_aud"]) for row in numeric
+    ])
+    csm = np.asarray([
+        float(row["estimated_new_business_csm_proxy_aud"]) for row in numeric
+    ])
+    se = np.asarray([
+        float(row["standard_error_new_business_csm_proxy_aud"])
+        for row in numeric
+    ])
 
-    figure, axis = pyplot.subplots(figsize=(10.5, 6.3))
-    axis.plot(caps, claims, marker="o", label="Guarantee claims")
-    axis.plot(caps, product_fees, marker="s", label="− Product fees")
-    axis.plot(caps, lip_fees, marker="^", label="− LIP fees")
-    axis.plot(caps, net, color="black", linewidth=2.0, label="Net objective")
+    figure, axis = pyplot.subplots(figsize=(11.5, 7.0))
+    axis.plot(caps, product_fees, marker="s", label="+ Product fees")
+    axis.plot(caps, lip_fees, marker="^", label="+ LIP fees")
+    axis.plot(caps, other_margins, marker="D", label="+ Other insurer margins")
+    axis.plot(caps, claims, marker="o", label="− Guarantee claims")
+    if np.any(np.abs(other_benefits) > 0.0):
+        axis.plot(
+            caps, other_benefits, marker="v",
+            label="− Other insurer-funded benefits",
+        )
+    axis.plot(caps, expenses, marker="P", label="− Operating expenses")
+    axis.plot(caps, hedge_costs, marker="X", label="− Hedge execution costs")
+    axis.plot(
+        caps, csm, color="black", linewidth=2.0,
+        label="Approximate New Business CSM",
+    )
     axis.fill_between(
-        caps, net - 1.96 * se, net + 1.96 * se,
-        color="black", alpha=0.10, label="Net ±1.96 MC SE",
+        caps, csm - 1.96 * se, csm + 1.96 * se,
+        color="black", alpha=0.10, label="CSM ±1.96 MC SE",
     )
     axis.axhline(0.0, color="grey", linewidth=0.8)
     axis.set_xlabel("Constant annual cap (%)")
     axis.set_ylabel("Present value contribution (AUD)")
-    axis.set_title("Fixed-cap PV decomposition (terminal closeout excluded)")
+    axis.set_title(
+        "Fixed-cap New Business CSM proxy decomposition "
+        "(terminal closeout excluded)"
+    )
     axis.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     axis.grid(alpha=0.25)
-    axis.legend(loc="best")
+    axis.legend(loc="best", fontsize=8)
     figure.tight_layout()
     return _save_figure(
         figure=figure, pyplot=pyplot, directory=directory,
@@ -2170,7 +2562,7 @@ def _plot_dynamic_policy(
     ])
     heat.set_ylabel("Cap action")
     heat.set_title(
-        "Cross-fitted cap choices; grey tail has zero in-force exposure "
+        "CSM-maximising cross-fitted cap choices; grey tail has zero exposure "
         "(not an independent rollout)"
     )
     figure.colorbar(image, ax=heat, label="Selected path fraction", pad=0.01)
@@ -2233,7 +2625,9 @@ def _plot_regression_diagnostics(
     for row in rows:
         action = int(np.argmin(np.abs(ACTION_CAPS - float(row["cap"]))))
         column = year_index[int(row["policy_year"])]
-        r_squared[action, column] = float(row["out_of_fold_r_squared_net"])
+        r_squared[action, column] = float(
+            row["out_of_fold_r_squared_new_business_csm_proxy"]
+        )
         condition = max(float(row["design_condition_number"]), 1.0)
         log_condition[action, column] = min(np.log10(condition), 16.0)
         coverage[action, column] = (
@@ -2266,7 +2660,7 @@ def _plot_regression_diagnostics(
         figure.colorbar(image, ax=axis, pad=0.01)
     axes[-1].set_xlabel("Policy year (year 1 is a direct mean, not a regression)")
     figure.suptitle(
-        "Fitted-Q regression diagnostics (economically active years only)",
+        "New Business CSM Fitted-Q diagnostics (active years only)",
         y=1.01,
     )
     figure.tight_layout()
@@ -2520,6 +2914,21 @@ def main() -> None:
         ),
         "mortality_terminal_age": float(MORTALITY_TERMINAL_AGE),
         "scalar_behaviour_schedule_validation": "strict_engine_loader",
+        "new_business_csm_proxy_scope": (
+            "Product Fees + LIP Fees + Crediting Margin + MVA/APS retained "
+            "minus Guarantee Claims, other insurer-funded benefits, operating "
+            "expenses and hedge-execution costs"
+        ),
+        "other_insurer_funded_benefit_cashflow_keys": list(
+            OTHER_INSURER_FUNDED_BENEFIT_KEYS
+        ),
+        "account_value_funded_policyholder_benefits_in_csm_proxy": False,
+        "crediting_margin_in_csm_proxy": True,
+        "operating_expenses_in_csm_proxy": True,
+        "hedge_costs_in_csm_proxy": True,
+        "hedge_volatility_spread": float(costs.projection.hedge_vol_spread),
+        "time_zero_acquisition_cost_assignment": "first control year",
+        "anniversary_start_hedge_cost_assignment": "same control year",
         "terminal_closeout_in_objective": False,
         "terminal_closeout_validation": (
             "fail if material under the required full lifetime horizon"
@@ -2535,8 +2944,7 @@ def main() -> None:
     projection_config = replace(
         costs.projection,
         dva_enabled=False,
-        crediting_margin_enabled=False,
-        hedge_vol_spread=0.0,
+        crediting_margin_enabled=True,
         record_paths=True,
         max_age=120.0,
         heston_cos=False,
@@ -2585,6 +2993,16 @@ def main() -> None:
         "hard terminal age=%d | market path target age=120",
         MORTALITY_TERMINAL_AGE,
     )
+    LOGGER.info(
+        "Objective | MAX New Business CSM proxy | +Product/LIP Fees "
+        "+Crediting/MVA/APS margins -Guarantee/other insurer benefits "
+        "-Expenses -Hedge costs | hedge vol spread=%.6f",
+        projection_config.hedge_vol_spread,
+    )
+    LOGGER.info(
+        "Cost timing | time-zero acquisition cost -> first control year | "
+        "anniversary-start hedge cost -> cap chosen for that same year"
+    )
     LOGGER.debug("Cost inputs | %s", costs.source_metadata())
     LOGGER.debug("Behaviour inputs | %s", loaded_behaviour.source_metadata())
     LOGGER.debug("Model-point inputs | %s", model_points.source_metadata())
@@ -2629,14 +3047,15 @@ def main() -> None:
             model_points=model_points,
             behaviour=behaviour,
             mortality=mortality,
+            expenses=costs.expenses,
             projection_config=projection_config,
             collect_states=True,
             progress_label="Control-randomisation training projection",
             model_point_log_interval=args.model_point_log_interval,
         )
     LOGGER.debug(
-        "Training arrays | rewards=%s | states=%s | representative premium=%.2f",
-        training_data.net.shape,
+        "Training arrays | CSM rewards=%s | states=%s | representative premium=%.2f",
+        training_data.new_business_csm_proxy.shape,
         None if training_data.raw_states is None else training_data.raw_states.shape,
         training_data.representative_initial_premium,
     )
@@ -2673,14 +3092,26 @@ def main() -> None:
             seed=args.seed + 130_363,
         )
     LOGGER.info(
-        "Backward result | first-year cap=%.2f%% | held-out Bellman PV=%.2f | "
-        "claims=%.2f | product fees=%.2f | LIP fees=%.2f | MC SE=%.2f",
+        "Backward result | first-year cap=%.2f%% | held-out Bellman CSM=%.2f | "
+        "future fees=%.2f | other margins=%.2f | benefits=%.2f | "
+        "expenses=%.2f | hedge costs=%.2f | MC SE=%.2f",
         100.0 * backward.first_year_cap,
-        portfolio_scale * backward.pv_net,
-        portfolio_scale * backward.pv_claims,
-        portfolio_scale * backward.pv_fees_product,
-        portfolio_scale * backward.pv_fees_lip,
-        portfolio_scale * backward.standard_error_net,
+        portfolio_scale * backward.pv_new_business_csm_proxy,
+        portfolio_scale * (
+            backward.pv_fees_product + backward.pv_fees_lip
+        ),
+        portfolio_scale * (
+            backward.pv_crediting_margin
+            + backward.pv_mva_retained
+            + backward.pv_aps_retained
+        ),
+        portfolio_scale * (
+            backward.pv_guarantee_claims
+            + backward.pv_other_insurer_funded_benefits
+        ),
+        portfolio_scale * backward.pv_expenses,
+        portfolio_scale * backward.pv_hedge_costs,
+        portfolio_scale * backward.standard_error_new_business_csm_proxy,
     )
     LOGGER.info(
         "Economic cap-policy horizon | active policy years=1-%d | inactive "
@@ -2709,7 +3140,7 @@ def main() -> None:
         )
     if backward.regression_rows:
         oof_r2 = np.asarray([
-            float(row["out_of_fold_r_squared_net"])
+            float(row["out_of_fold_r_squared_new_business_csm_proxy"])
             for row in backward.regression_rows
         ])
         LOGGER.debug(
@@ -2744,6 +3175,7 @@ def main() -> None:
             model_points=model_points,
             behaviour=behaviour,
             mortality=mortality,
+            expenses=costs.expenses,
             projection_config=projection_config,
             portfolio_scale=portfolio_scale,
             model_point_log_interval=args.model_point_log_interval,
@@ -2773,6 +3205,7 @@ def main() -> None:
             model_points=model_points,
             behaviour=behaviour,
             mortality=mortality,
+            expenses=costs.expenses,
             projection_config=projection_config,
             portfolio_scale=portfolio_scale,
             comparison_paths=benchmark_path_values[str(best_fixed_row["case"])],
@@ -2797,31 +3230,46 @@ def main() -> None:
         benchmark_closeout_max_abs,
     )
     LOGGER.info(
-        "Direct fallback result | %s | PV net=%.2f | MC SE=%.2f",
+        "Direct fallback result | %s | New Business CSM proxy=%.2f | MC SE=%.2f",
         fallback_row["definition"],
-        fallback_row["pv_claims_minus_total_fees_aud"],
-        fallback_row["standard_error_net_aud"],
+        fallback_row["estimated_new_business_csm_proxy_aud"],
+        fallback_row["standard_error_new_business_csm_proxy_aud"],
     )
-    optimal_pv = portfolio_scale * backward.pv_net
-    optimal_se = portfolio_scale * backward.standard_error_net
-    best_fixed_pv = float(best_fixed_row["pv_claims_minus_total_fees_aud"])
-    best_fixed_se = float(best_fixed_row["standard_error_net_aud"])
+    optimal_csm = portfolio_scale * backward.pv_new_business_csm_proxy
+    optimal_se = (
+        portfolio_scale * backward.standard_error_new_business_csm_proxy
+    )
+    best_fixed_csm = float(
+        best_fixed_row["estimated_new_business_csm_proxy_aud"]
+    )
+    best_fixed_se = float(
+        best_fixed_row["standard_error_new_business_csm_proxy_aud"]
+    )
+    scaled_initial_premium = portfolio_scale * (
+        training_data.representative_initial_premium
+    )
 
     summary = {
         "status": "completed",
         "engine_version": ENGINE_VERSION,
         "valuation_label": (
-            "market-consistent counterfactual cap-management study under fixed "
-            "proxy product and behaviour assumptions"
+            "market-consistent approximate New Business CSM cap-management "
+            "study under fixed proxy product and behaviour assumptions"
         ),
         "method": "gas-storage-style control-randomisation Fitted-Q LSMC",
         "estimate_type": (
-            "first cap selected without fold zero; PV evaluated on held-out "
+            "first cap selected without fold zero; CSM proxy evaluated on held-out "
             "fold zero with complete-path cross-fitted continuation values"
         ),
+        "csm_measurement_label": (
+            "approximate market-consistent New Business CSM proxy; aligned "
+            "with insurer net value before Risk Margin, not reported IFRS 17 CSM"
+        ),
+        "objective_direction": "maximize",
         "objective": (
-            "minimise PV(guarantee claims) - PV(collected product fees) "
-            "- PV(collected lifetime income premiums)"
+            "maximise PV(collected Product and LIP Fees + Crediting Margin + "
+            "MVA/APS retained) - PV(Guarantee Claims + other insurer-funded "
+            "benefits + operating expenses + hedge-execution costs)"
         ),
         "terminal_closeout_in_objective": False,
         "training_exploration_terminal_closeout_mean_pv_aud": (
@@ -2835,9 +3283,17 @@ def main() -> None:
         ),
         "optimal_first_year_cap": backward.first_year_cap,
         "optimal_first_year_cap_percent": 100.0 * backward.first_year_cap,
-        "estimated_optimal_pv_claims_minus_total_fees_aud": optimal_pv,
+        "estimated_optimal_new_business_csm_proxy_aud": optimal_csm,
+        "estimated_optimal_recognised_csm_proxy_aud": max(optimal_csm, 0.0),
+        "estimated_optimal_loss_component_proxy_aud": max(-optimal_csm, 0.0),
+        "estimated_optimal_new_business_csm_proxy_to_initial_premium": (
+            optimal_csm / scaled_initial_premium
+        ),
         "estimated_optimal_pv_guarantee_claims_aud": (
-            portfolio_scale * backward.pv_claims
+            portfolio_scale * backward.pv_guarantee_claims
+        ),
+        "estimated_optimal_pv_other_insurer_funded_benefits_aud": (
+            portfolio_scale * backward.pv_other_insurer_funded_benefits
         ),
         "estimated_optimal_pv_product_fees_aud": (
             portfolio_scale * backward.pv_fees_product
@@ -2845,41 +3301,83 @@ def main() -> None:
         "estimated_optimal_pv_lip_fees_aud": (
             portfolio_scale * backward.pv_fees_lip
         ),
-        "estimated_optimal_pv_total_fees_aud": portfolio_scale * (
+        "estimated_optimal_pv_future_fees_aud": portfolio_scale * (
             backward.pv_fees_product + backward.pv_fees_lip
         ),
-        "estimated_optimal_pv_standard_error_aud": optimal_se,
-        "optimal_pv_evaluation_sample": "held-out cross-fit fold zero",
-        "conditional_holdout_mc_interval_95pct_lower_aud": (
-            optimal_pv - 1.96 * optimal_se
+        "estimated_optimal_pv_crediting_margin_aud": (
+            portfolio_scale * backward.pv_crediting_margin
         ),
-        "conditional_holdout_mc_interval_95pct_upper_aud": (
-            optimal_pv + 1.96 * optimal_se
+        "estimated_optimal_pv_mva_retained_aud": (
+            portfolio_scale * backward.pv_mva_retained
+        ),
+        "estimated_optimal_pv_aps_retained_aud": (
+            portfolio_scale * backward.pv_aps_retained
+        ),
+        "estimated_optimal_pv_other_insurer_margins_aud": portfolio_scale * (
+            backward.pv_crediting_margin
+            + backward.pv_mva_retained
+            + backward.pv_aps_retained
+        ),
+        "estimated_optimal_pv_total_insurer_inflows_aud": portfolio_scale * (
+            backward.pv_fees_product
+            + backward.pv_fees_lip
+            + backward.pv_crediting_margin
+            + backward.pv_mva_retained
+            + backward.pv_aps_retained
+        ),
+        "estimated_optimal_pv_total_insurer_funded_benefits_aud": (
+            portfolio_scale * (
+                backward.pv_guarantee_claims
+                + backward.pv_other_insurer_funded_benefits
+            )
+        ),
+        "estimated_optimal_pv_expenses_aud": (
+            portfolio_scale * backward.pv_expenses
+        ),
+        "estimated_optimal_pv_hedge_costs_aud": (
+            portfolio_scale * backward.pv_hedge_costs
+        ),
+        "estimated_optimal_pv_total_costs_aud": portfolio_scale * (
+            backward.pv_expenses + backward.pv_hedge_costs
+        ),
+        "estimated_optimal_new_business_csm_proxy_standard_error_aud": (
+            optimal_se
+        ),
+        "optimal_csm_evaluation_sample": "held-out cross-fit fold zero",
+        "conditional_holdout_csm_mc_interval_95pct_lower_aud": (
+            optimal_csm - 1.96 * optimal_se
+        ),
+        "conditional_holdout_csm_mc_interval_95pct_upper_aud": (
+            optimal_csm + 1.96 * optimal_se
         ),
         "conditional_holdout_mc_interval_scope": (
             "path dispersion conditional on fitted continuation models; excludes "
             "regression, model-selection and repeated-sample uncertainty"
         ),
-        "component_regression_reconciliation_gap_aud": (
+        "new_business_csm_component_reconciliation_gap_aud": (
             portfolio_scale * backward.reconciliation_gap
         ),
         "best_fixed_cap_1_to_20_case": best_fixed_row["case"],
         "best_fixed_cap_1_to_20_percent": best_fixed_row["cap_percent"],
-        "best_fixed_cap_pv_aud": best_fixed_pv,
-        "best_fixed_cap_standard_error_aud": best_fixed_se,
-        "direct_first_year_cap_then_best_fixed_pv_aud": fallback_row[
-            "pv_claims_minus_total_fees_aud"
-        ],
-        "direct_first_year_cap_then_best_fixed_standard_error_aud": fallback_row[
-            "standard_error_net_aud"
+        "best_fixed_cap_new_business_csm_proxy_aud": best_fixed_csm,
+        "best_fixed_cap_new_business_csm_proxy_standard_error_aud": (
+            best_fixed_se
+        ),
+        "direct_first_year_cap_then_best_fixed_new_business_csm_proxy_aud": (
+            fallback_row["estimated_new_business_csm_proxy_aud"]
+        ),
+        "direct_first_year_cap_then_best_fixed_csm_standard_error_aud": fallback_row[
+            "standard_error_new_business_csm_proxy_aud"
         ],
         "direct_first_year_cap_then_best_fixed_definition": fallback_row[
             "definition"
         ],
-        "estimated_optimal_minus_best_fixed_pv_aud": optimal_pv - best_fixed_pv,
-        "approximate_unpaired_standard_error_of_difference_aud": float(np.sqrt(
-            optimal_se ** 2 + best_fixed_se ** 2
-        )),
+        "estimated_optimal_minus_best_fixed_new_business_csm_proxy_aud": (
+            optimal_csm - best_fixed_csm
+        ),
+        "approximate_unpaired_csm_standard_error_of_difference_aud": float(
+            np.sqrt(optimal_se ** 2 + best_fixed_se ** 2)
+        ),
         "action_caps": ACTION_CAPS.tolist(),
         "cap_grid_convention": "0.20%, followed by integer 1% caps through 20%",
         "cap_floor_override": (
@@ -2909,9 +3407,13 @@ def main() -> None:
         "cross_fit_folds": args.cross_fit_folds,
         "ridge_multiplier": args.ridge,
         "dva_enabled": False,
-        "crediting_margin_in_objective": False,
-        "hedge_costs_in_objective": False,
-        "expenses_in_objective": False,
+        "crediting_margin_in_objective": True,
+        "mva_and_aps_retained_in_objective": True,
+        "hedge_costs_in_objective": True,
+        "expenses_in_objective": True,
+        "other_insurer_funded_benefit_cashflow_keys": list(
+            OTHER_INSURER_FUNDED_BENEFIT_KEYS
+        ),
         "base_policy_behaviour_regime": behaviour.regime,
         "behaviour_treatment_by_branch": behaviour_treatment_by_branch,
         "source_income_take_up_mode": loaded_behaviour.behaviour.take_up.mode,
@@ -2934,9 +3436,7 @@ def main() -> None:
         "representative_initial_premium_aud": (
             training_data.representative_initial_premium
         ),
-        "scaled_initial_premium_aud": portfolio_scale * (
-            training_data.representative_initial_premium
-        ),
+        "scaled_initial_premium_aud": scaled_initial_premium,
     }
 
     policy_payload = _policy_payload(
@@ -2990,13 +3490,39 @@ def main() -> None:
         "heston_substeps": args.heston_substeps,
         "exploration": exploration_metadata,
         "objective_scope": {
-            "included_outflow": ["guarantee_claims"],
-            "included_inflows": ["fees_product", "fees_lip"],
-            "excluded": [
-                "crediting_margin", "option_or_hedge_cost", "expenses",
-                "capital", "risk_margin", "death_benefits",
-                "account-value-funded income", "terminal_closeout",
+            "measurement": (
+                "approximate market-consistent New Business CSM proxy aligned "
+                "with insurer net value before Risk Margin; not IFRS 17 CSM"
+            ),
+            "optimization_direction": "maximize",
+            "included_fee_inflows": ["fees_product", "fees_lip"],
+            "included_other_insurer_margins": [
+                "crediting_margin", "mva_retained", "aps_retained",
             ],
+            "included_insurer_funded_benefits": [
+                "guarantee_claims",
+                *OTHER_INSURER_FUNDED_BENEFIT_KEYS,
+            ],
+            "included_costs": ["expenses", "hedge_costs"],
+            "expense_timing": (
+                "time-zero acquisition/commission expense is assigned to the "
+                "first control year; maintenance expense follows payment time"
+            ),
+            "hedge_cost_timing": (
+                "anniversary-start hedge cost is assigned to the cap chosen "
+                "for that control year"
+            ),
+            "excluded": [
+                "premium", "income_paid", "death_benefits",
+                "surrender_benefits", "partial_withdrawals",
+                "terminal_closeout", "capital", "risk_margin", "tax",
+                "cost_of_capital",
+            ],
+            "account_value_funded_benefit_treatment": (
+                "Income, death, surrender and withdrawal benefits funded from "
+                "Policyholder Account Value are excluded from insurer outgo; "
+                "only separately recorded insurer-funded top-ups are deducted"
+            ),
             "terminal_closeout_diagnostic": (
                 "reported separately and expected to be zero for the full "
                 "lifetime horizon"
@@ -3016,16 +3542,17 @@ def main() -> None:
             "future_discount_factor_in_state": False,
             "fold_unit": "complete market/control path",
             "first_cap_selection_folds": "all folds except fold zero",
-            "first_cap_pv_evaluation_fold": "fold zero only",
+            "first_cap_csm_evaluation_fold": "fold zero only",
             "evaluation_fold_used_in_any_regression_fit": False,
             "dva_disabled_for_pre_action_state": True,
         },
         "limitations": [
-            "The optimal-policy PV is cross-fitted but is not a second, fully "
+            "The optimal-policy CSM proxy is cross-fitted but is not a second, fully "
             "independent forward simulation of the learned state-feedback policy.",
             "The annual administrative Account-Value view disables intra-year DVA; "
             "cap effects on dynamic Behaviour branches enter through realised "
-            "annual crediting.",
+            "annual crediting. Crediting Margin and hedge cost use the engine's "
+            "annual option-package proxy, not a full ALM replication.",
             f"The regression state compresses {len(model_points.model_points)} "
             "model points into portfolio, age, "
             "premium, age/sex/Single-vs-Joint and, when heterogeneous, effective-"
@@ -3048,8 +3575,12 @@ def main() -> None:
             f"{costs.product.automatic_income_start_age:g} is reached, "
             f"subject to the {float(costs.product.min_years_before_income):g}-year product "
             "minimum waiting period.",
-            "The objective excludes cap-package cost and crediting margin, so it is "
-            "not a complete commercial-profit or capital objective.",
+            "The New Business CSM measure is a signed market-consistent proxy aligned "
+            "with insurer net value before Risk Margin. It is not reported IFRS 17 "
+            "CSM and excludes Risk Adjustment, capital, tax and reinsurance.",
+            "Account-Value-funded Income, death, surrender and withdrawal payments "
+            "are investment-component cashflows and are not deducted again; only "
+            "Guarantee Claims and separately named insurer-funded benefits are outgo.",
             "Dynamic Behaviour inputs remain uncalibrated proxy assumptions; scalar "
             "Behaviour schedules are subject to the Engine loader's strict validation.",
             "The mortality basis is the illustrative repository Gompertz-Makeham "
@@ -3065,8 +3596,9 @@ def main() -> None:
             "The 0.20% minimum is a requested counterfactual and is below the "
             "active case-study product's documented 0.25% guaranteed minimum.",
             "The best fixed 1%-to-20% benchmark is selected on the same finite "
-            "benchmark sample used to report it and is therefore subject to a "
-            "small winner's-curse bias; paired path differences are also reported.",
+            "benchmark sample used to report it and its reported maximum CSM proxy "
+            "is therefore subject to a small upward winner's-curse bias; paired "
+            "path differences are also reported.",
         ],
     }
 
@@ -3169,12 +3701,12 @@ def main() -> None:
     total_elapsed = time.perf_counter() - run_started
     LOGGER.info(
         "RUN COMPLETE | elapsed %.1fs | first-year cap %.2f%% | "
-        "held-out Bellman PV %.2f | best fixed cap %.0f%% / PV %.2f",
+        "held-out Bellman CSM %.2f | best fixed cap %.0f%% / CSM %.2f",
         total_elapsed,
         100.0 * backward.first_year_cap,
-        optimal_pv,
+        optimal_csm,
         100.0 * best_fixed_cap,
-        best_fixed_pv,
+        best_fixed_csm,
     )
     LOGGER.info(
         "Outputs | %d CSV | %d JSON | %d plot files | log=%s | directory=%s",
