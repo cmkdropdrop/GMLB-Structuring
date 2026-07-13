@@ -341,32 +341,51 @@ dynamic Election state transition.
 ### 9.1 Combined optimal-behaviour policy
 
 The separate research LSMC entry point projects the same contract from issue
-and solves one phase-dependent Policyholder problem:
+and solves an ordered two-stage Multiple-Stopping problem:
 
 ```text
-Growth: WAIT | START_INCOME_NOW
-Income: CONTINUE | PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL
+Growth: WAIT_FOR_ONE_YEAR | START_INCOME_NOW
+Income: CONTINUE_FOR_ONE_YEAR | FULL_WITHDRAWAL_NOW
+Terminated: no action
 ```
 
-`START_INCOME_NOW` fixes annual income from the current post-credit,
-post-fee and post-mortality Account Value and the rate card then in force; it
-is a state transition and has no immediate payment. The first income payment
-is one month later. A Partial Withdrawal may be selected at the Election
-anniversary after the regular event sequence; Full Withdrawal is blocked until
-the following month. Growth surrender and Growth withdrawals remain excluded
-by the product gates. Regular Fixed Income is mandatory and is never treated
-as an optional action.
+The analogy to a Swing right is limited to the Bellman comparison of value
+without exercise against immediate action value plus value in the successor
+regime. The state dimension is the irreversible contract phase, not an
+inventory or a number of interchangeable exercise rights. Election must occur
+before Lapse, START and FULL_WITHDRAWAL cannot occur at the same Anniversary,
+and there is no gas-price, volume or inventory model.
 
-The Income subproblem is solved monthly on a stratified panel of admissible
-Election states. Continue, Full Withdrawal and an adaptive Partial-amount grid
-(AUD 100 and 25/50/75/100% of the maximum gross amount, followed by one local
-midpoint refinement) use the same contractual transition logic. At every
-admissible Growth anniversary, backward induction then
-compares a complete START transition followed by the cross-fitted Income
-policy with WAIT followed by the already-solved later combined policy. Both
-regression surfaces receive only their read-only decision context. Future
-returns, discount factors, later caps, hedge results and backing-asset values
-are not part of either feature surface.
+Both decisions are permitted only at annual Crediting Anniversaries. The
+Income/Lapse subproblem is solved first, backwards over annual
+`CONTINUE_FOR_ONE_YEAR` versus `FULL_WITHDRAWAL_NOW` decisions. Its training
+states use randomized, fold-stratified START dates spanning early, middle,
+late, model-point and forced Election. The Lapse target is
+`Delta_lapse = Q_lapse - Q_continue`: `Q_lapse` is the existing net Surrender
+Benefit after the Projector's fee and MVA logic; `Q_continue` contains every
+monthly Policyholder cashflow and transition through the next Anniversary plus
+the later realised value under the fold-pure policy. A zero Surrender Benefit
+with non-negative continuation and positive remaining guaranteed Income is a
+dominated action: it is assigned deterministically to CONTINUE and is not used
+to learn an artificial exercise boundary.
+
+The Growth/Election recursion is solved second. `Q_wait` contains the complete
+monthly Growth projection through the next Anniversary and the later Growth
+value. `Q_start` uses the Projector's full post-credit, post-fee,
+post-mortality Election transition and then the already-solved annual Lapse
+policy. `START_INCOME_NOW` fixes Income from the rate card and Account Value at
+that boundary; its first regular Income payment remains one month later. The
+first voluntary Lapse is no earlier than the following Crediting Anniversary.
+Growth surrender and all Growth withdrawals remain prohibited.
+
+Partial Withdrawals, Partial-amount grids, Partial-fraction regressions and
+under-year voluntary LSMC actions are not part of the combined optimal policy.
+The general monthly Projector retains contractual Partial-Withdrawal support
+for other behaviour regimes, but an optimal-policy rollout asserts that its
+Partial ledger is zero. Regular Fixed Income, monthly mortality, Spouse
+mortality, Account-Value exhaustion, Guarantee Claims, daily/monthly fee
+posting, Death Benefits and monthly money-market discounting remain in the
+canonical Projector and are not annualised or reimplemented in LSMC.
 
 Complete paths, including all action replicas, remain in one fold. Direct
 action advantages are fitted by augmented truncated-SVD/Ridge least squares;
@@ -374,37 +393,32 @@ Ridge is selected from a fixed grid by out-of-fold decision loss. The action
 buffer is based on advantage RMSE. Material missing or unstable regressions do
 not silently become WAIT or CONTINUE: they make the fit invalid.
 
-At each decision point the estimator tries the compact full basis, then a
-linear core basis, then a paired constant-advantage model, and finally local
-pooling (adjacent Election years or a twelve-month Income window). A fit is
-deployable only if at least 99% of weighted relevant exposure is covered.
+At each annual decision point the estimator tries the compact full basis, then
+a linear core basis, then a paired constant-advantage model, and finally local
+pooling over adjacent policy years. A fit is deployable only if material
+weighted relevant exposure is covered.
 Decision points below one millionth of initial exposure may be recorded as
 `immaterial_no_fit`; this is the only no-action numerical fallback.
 
-After the initial backward fit, at most two cross-fit on-policy rollouts update
-the visited-state distribution. Convergence requires at least 99% action
-agreement on common paths and a Policyholder lower-bound change no larger than
-0.1% of premium. Failure is reported as `policy_iteration_not_converged` and
-invalidates the policy.
-
 Before the policy is frozen, its cross-fitted training value is compared with
 the pre-declared fixed Election library (earliest, year 5, year 10, model-point
-date and contractual force, with duplicates removed). Fixed-date LSMC Income
-actions are retained only when their paired 95% training lower bound is at
-least one basis point of premium higher than Continue. The fully dynamic policy
-is retained only when its paired 95% training lower bound clears the best
-remaining fixed candidate by the same amount. Otherwise that fixed candidate
-is stored explicitly as the training anchor. This selection uses training paths
-only and therefore does not weaken or tune on the independent validation gate.
+date and contractual force, with duplicates removed), each with Continue-only
+and annual-Lapse variants. The fully dynamic candidate is retained only when
+its paired 95% training lower bound clears the best fixed candidate by one
+basis point of premium. Otherwise that fixed candidate is stored explicitly as
+the training selection. This uses training paths only.
 
 Training, validation and final evaluation are three independent samples. The
-frozen policy must pass paired 95% non-inferiority gates for Election-only,
-Income-action-only and Combined behaviour against a pre-declared deterministic
-benchmark library, with a tolerance of one basis point of premium. Validation
-does not tune the policy; a failed gate writes diagnostics and aborts before
-the final sample is used. Three separately trained policies, using three
+frozen candidate is checked by paired Common-Random-Number 95%
+non-inferiority gates for Election-only, Lapse-only and Combined behaviour
+against the pre-declared library, with a tolerance of one basis point of
+premium. Validation does not tune regressions. If V11 fails, the policy
+actually deployed on the evaluation sample is the best pre-declared fixed
+validation baseline; candidate value, selected value and fallback reason are
+reported separately. Three separately trained policies, using three
 pre-declared training-seed triplets, must each pass all gates on the same
-validation paths and are each reported on the same final evaluation paths.
+validation paths or deploy their recorded fallback, and are each reported on
+the same final evaluation paths.
 The first seed is the pre-declared primary reporting policy; final evaluation
 is never used to select among seeds. The fit-basis fingerprint includes
 training scenario content, Cap,
@@ -413,12 +427,20 @@ benchmark date, mortality, expenses, projection
 configuration and LSMC settings. A Cap×stress analysis must therefore refit,
 and evidence a distinct fit basis, for every cell.
 
-The V00/V01/V10/V11 report is a factor decomposition of that frozen joint
-policy. V01 deploys its monthly Income-action rule under deterministic Election
-without a separate refit; V10 deploys its Election rule with all voluntary
-Income actions suppressed without a Continue-only refit. These deliberate
-restrictions are manifest limitations, not four independently re-optimised
-contracts.
+The V00/V01/V10/V11 report explicitly separates fixed Election/Continue (V00),
+fixed Election/annual Lapse (V01), annual Election/Continue (V10) and annual
+Election/annual Lapse (V11). It reports paired `V01 - V00` Lapse optionality,
+`V10 - V00` Election optionality and `V11 - V00` combined optionality, and
+compares V11 with `max(V00, V01, V10)` on identical scenarios and cashflow
+definitions.
+
+The annual action frequency is a model convention: it assumes the customer can
+elect Income and voluntarily fully withdraw only at the yearly Crediting
+Anniversary. Under-year reactions to the Hull-White curve, MVA or Account Value
+are not modelled. This restriction does not alter the monthly contract and
+cashflow projection inside each annual Bellman step. The resulting fitted LSMC
+value is a risk-neutral Policyholder lower bound, not an insurer-profit or CSM
+optimisation.
 
 ## 10. Market models and measures
 
@@ -589,8 +611,16 @@ PV_policyholder_benefits
   = PV(income_paid)
   + PV(death_benefits)
   + PV(surrender_benefits)
-  + PV(partial_withdrawals).
+  + PV(partial_withdrawals)
+  + PV(terminal_closeout).
 ```
+
+For the ordered optimal-behaviour LSMC specifically,
+`partial_withdrawals = 0` by construction. Its objective is therefore the
+risk-neutral expected present value of Income, Death Benefits, Surrender
+Benefits and terminal closeout. CSM, insurer fees, hedge results and Guarantee
+Claims are not separate optimisation terms; product mechanics affect the
+objective only through actual Policyholder payments and later contract state.
 
 Future fee income is based on collected event cashflows:
 

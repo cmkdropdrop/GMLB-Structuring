@@ -4,10 +4,10 @@ This is a standalone counterfactual management-action study.  It deliberately
 does not use the archived American-option-style ``agile_engine.lsmc`` module.
 Instead, it treats the annual cap as a repeated discrete Stackelberg control.
 Fixed-cap benchmarks and the coupled cap-randomised response-surface candidate
-use the same signature-specific combined-v2 follower through both
-``income_election_policy`` and
-``income_action_policy``.  That follower chooses Growth WAIT/START and monthly
-Income CONTINUE/PARTIAL/FULL.  For the coupled fit it is trained across the
+use the same signature-specific ordered annual follower through
+``income_election_policy`` and ``surrender_policy``.  That follower chooses
+Growth WAIT_FOR_ONE_YEAR/START_INCOME_NOW and annual Income
+CONTINUE_FOR_ONE_YEAR/FULL_WITHDRAWAL_NOW.  For the coupled fit it is trained across the
 complete randomised cap paths; its complete-path out-of-fold policy generates
 the insurer Fitted-Q targets.  The response surface itself is validation-only
 until nested Leader/Follower folds, joint on-policy iteration and the full
@@ -204,14 +204,13 @@ DEFAULT_FAST_MODEL_POINTS_PATH = (
     / "model_points_policyholders_1_point_proxy.csv"
 )
 LOGGER = logging.getLogger("crediting_cap_lsmc")
-COMBINED_FOLLOWER_VERSION = "combined_optimal_behaviour_lsmc_v2"
+COMBINED_FOLLOWER_VERSION = "ordered_annual_multiple_stopping_lsmc_v4"
 LEGACY_COUPLED_FOLLOWER_VERSION = "legacy_annual_surrender_benchmark_v1"
 COMBINED_FOLLOWER_ACTION_SET = (
-    "WAIT",
+    "WAIT_FOR_ONE_YEAR",
     "START_INCOME_NOW",
-    "CONTINUE",
-    "PARTIAL_WITHDRAWAL",
-    "FULL_WITHDRAWAL",
+    "CONTINUE_FOR_ONE_YEAR",
+    "FULL_WITHDRAWAL_NOW",
 )
 
 
@@ -519,6 +518,10 @@ _FOLLOWER_CORE_NAMES = (
     "previous_reference_return",
     "previous_credited_return",
     "performance_gap",
+    "mva_factor",
+    "attained_age",
+    "primary_alive",
+    "spouse_alive",
     "inforce_weight",
 )
 
@@ -551,6 +554,10 @@ def _compact_follower_core(
         np.maximum(
             np.asarray(getattr(context, "performance_gap"), dtype=float), 0.0
         ),
+        np.asarray(getattr(context, "mva_factor"), dtype=float),
+        np.asarray(getattr(context, "attained_age"), dtype=float),
+        np.asarray(getattr(context, "primary_alive"), dtype=float),
+        np.asarray(getattr(context, "spouse_alive"), dtype=float),
         np.maximum(
             np.asarray(getattr(context, "inforce_weight"), dtype=float), 0.0
         ),
@@ -593,6 +600,10 @@ def _follower_features_from_core(
         previous_reference_return=values[:, 9],
         previous_credited_return=values[:, 10],
         performance_gap=values[:, 11],
+        mva_factor=values[:, 12],
+        attained_age=values[:, 13],
+        primary_alive=values[:, 14],
+        spouse_alive=values[:, 15],
         # Compact monetary values were already divided by premium.
         premium=1.0,
     )
@@ -610,7 +621,7 @@ def _diagnostic_action_accepted(diagnostic: object) -> bool:
     """Read the v2 action gate and reject legacy fixed-cap diagnostics."""
     if not hasattr(diagnostic, "regression_accepted_for_action"):
         raise RuntimeError(
-            "Fixed-cap follower diagnostics do not implement the combined-v2 "
+            "Fixed-cap follower diagnostics do not implement the ordered annual "
             "action contract. Legacy surrender diagnostics are benchmark-only."
         )
     return bool(getattr(diagnostic, "regression_accepted_for_action"))
@@ -626,8 +637,8 @@ def _require_combined_follower_fit_v2(
     The old surrender-only policy happens to satisfy the Projector's legacy
     ``surrender_policy`` hook, which makes accidental deployment otherwise too
     easy.  This capability/version gate is deliberately structural as well as
-    metadata based: a deployable Stackelberg follower must own both phase
-    transitions and the unified monthly Income action surface.
+    metadata based: a deployable Stackelberg follower must own both ordered
+    annual phase transitions.
     """
     version = getattr(fit, "fit_version", None)
     if version != COMBINED_FOLLOWER_VERSION:
@@ -642,7 +653,7 @@ def _require_combined_follower_fit_v2(
             + (", ".join(map(str, invalid_reasons)) or "unspecified reason")
         )
     policy = getattr(fit, "policy", None)
-    required_hooks = ("start_income_mask", "choose_income_action")
+    required_hooks = ("start_income_mask", "surrender_mask")
     missing_hooks = tuple(
         name for name in required_hooks
         if not callable(getattr(policy, name, None))
@@ -661,15 +672,9 @@ def _require_combined_follower_fit_v2(
                 or "unspecified reason"
             )
         )
-    if not bool(getattr(policy, "monthly_income_actions_required", False)):
+    if bool(getattr(policy, "monthly_income_actions_required", True)):
         raise RuntimeError(
-            f"{context} does not require the unified monthly Income action surface."
-        )
-    legacy_surrender = getattr(policy, "surrender_policy", None)
-    if getattr(legacy_surrender, "regressions", {}):
-        raise RuntimeError(
-            f"{context} mixes the combined v2 action policy with deployable "
-            "legacy surrender regressions."
+            f"{context} unexpectedly requires a monthly Income action surface."
         )
     for diagnostic in tuple(getattr(fit, "diagnostics", ())):
         _diagnostic_action_accepted(diagnostic)
@@ -678,7 +683,7 @@ def _require_combined_follower_fit_v2(
 
 @dataclass
 class PolicyholderFitSet:
-    """Deployable combined-v2 followers separated by PolicySpec signature."""
+    """Deployable annual two-stage followers separated by PolicySpec signature."""
 
     fits: dict[tuple[object, ...], object]
     scenario_fingerprint: str
@@ -715,18 +720,13 @@ class PolicyholderFitSet:
                     training_policy, "start_income_mask", None
                 )) \
                 or not callable(getattr(
-                    training_policy, "choose_income_action", None
-                )) \
-                or not bool(getattr(
-                    training_policy, "monthly_income_actions_required", False
+                    training_policy, "surrender_mask", None
                 )) \
                 or bool(getattr(
-                    getattr(training_policy, "surrender_policy", None),
-                    "regressions_by_step",
-                    {},
+                    training_policy, "monthly_income_actions_required", True
                 )):
             raise RuntimeError(
-                "Invalid combined-v2 cross-fitted Policyholder policy."
+                "Invalid ordered annual cross-fitted Policyholder policy."
             )
         return training_policy
 
@@ -763,7 +763,7 @@ class PolicyholderFitSet:
                 rejected.update(
                     int(step)
                     for step in getattr(
-                        fit.policy, "income_action_regressions", {}
+                        fit.policy.surrender_policy, "regressions", {}
                     )
                 )
                 rejected.update(
@@ -852,10 +852,10 @@ class CoupledOptimalSurrenderPolicy:
 
 @dataclass
 class CoupledPolicyholderFitSet:
-    """Cap-randomised combined-v2 follower plus optional legacy benchmarks.
+    """Cap-randomised ordered annual follower plus legacy benchmarks.
 
     ``fits`` is authoritative for the coupled response-surface rollouts.  It
-    contains exactly the same combined Election/monthly-action fit objects as
+    contains exactly the same combined annual Election/Lapse fit objects as
     :class:`PolicyholderFitSet`, except that the training product exposes the
     complete randomised cap schedule.  ``policies`` is retained solely for the
     historical annual surrender benchmark returned by
@@ -886,7 +886,7 @@ class CoupledPolicyholderFitSet:
         return self.policies[key]
 
     def factory(self, policy: PolicySpec) -> object:
-        """Return the cap-randomised combined-v2 response policy."""
+        """Return the cap-randomised ordered annual response policy."""
         key = _policy_signature(policy)
         if key not in self.fits:
             raise RuntimeError(
@@ -899,11 +899,11 @@ class CoupledPolicyholderFitSet:
         )
 
     def training_factory(self, policy: PolicySpec) -> object:
-        """Return the complete-path out-of-fold combined-v2 policy."""
+        """Return the complete-path out-of-fold ordered annual policy."""
         key = _policy_signature(policy)
         if key not in self.fits:
             raise RuntimeError(
-                "No combined-v2 coupled follower fit exists for PolicySpec."
+                "No ordered annual coupled follower fit exists for PolicySpec."
             )
         fit = self.fits[key]
         _require_combined_follower_fit_v2(
@@ -916,13 +916,13 @@ class CoupledPolicyholderFitSet:
                     training_policy, "start_income_mask", None
                 )) \
                 or not callable(getattr(
-                    training_policy, "choose_income_action", None
+                    training_policy, "surrender_mask", None
                 )) \
-                or not bool(getattr(
-                    training_policy, "monthly_income_actions_required", False
+                or bool(getattr(
+                    training_policy, "monthly_income_actions_required", True
                 )):
             raise RuntimeError(
-                "Invalid combined-v2 cross-fitted coupled follower policy."
+                "Invalid ordered annual cross-fitted coupled follower policy."
             )
         return training_policy
 
@@ -1592,7 +1592,7 @@ def _fit_cap_aware_policyholder_policies(
     settings: OptimalBehaviourLSMCSettings,
     progress_label: str,
 ) -> PolicyholderFitSet:
-    """Fit one deployable combined-v2 policy per PolicySpec signature.
+    """Fit one deployable ordered annual policy per PolicySpec signature.
 
     The complete pathwise cap schedule is part of the training sample.  Caps
     enter the observable follower state in ``optimal_behaviour_lsmc``; a fit
@@ -1677,7 +1677,7 @@ def _combined_v2_complete_path_fold_ids(
     n_paths: int,
     settings: OptimalBehaviourLSMCSettings,
 ) -> IntArray:
-    """Reproduce combined-v2 folds for consistent own-path OOF targets.
+    """Reproduce ordered annual folds for consistent own-path OOF targets.
 
     This keeps every action replica of one market/mortality path in the same
     Policyholder and insurer fold.  It is not a nested Leader-outerfold fit:
@@ -1686,7 +1686,7 @@ def _combined_v2_complete_path_fold_ids(
     as a non-deployable diagnostic until nested fitting is implemented.
     """
     if n_paths < settings.n_folds:
-        raise ValueError("Each combined-v2 outer fold requires at least one path.")
+        raise ValueError("Each ordered annual outer fold requires at least one path.")
     shuffled = np.arange(n_paths, dtype=np.int64)
     rng = np.random.default_rng(settings.fold_seed)
     rng.shuffle(shuffled)
@@ -1713,7 +1713,7 @@ def _fit_coupled_policyholder_policies_v2(
     """Fit a structurally v2-capable response surface across randomised caps.
 
     This intentionally delegates every Policyholder regression and action to
-    the fixed-cap combined-v2 fitter.  The only difference is the training
+    the fixed-cap ordered annual fitter.  The only difference is the training
     support: ``cap_matrix`` contains all leader actions and histories rather
     than one constant cap.  Consequently an identical cap, observable state
     and action set is evaluated by the identical frozen Policyholder code in
@@ -1740,7 +1740,7 @@ def _fit_coupled_policyholder_policies_v2(
     )
     if not coupled.deployment_eligible:
         raise RuntimeError(
-            "The cap-randomised combined-v2 follower failed its structural "
+            "The cap-randomised ordered annual follower failed its structural "
             "combined-policy capability gate."
         )
     return coupled
@@ -2366,6 +2366,13 @@ def _aggregate_portfolio_paths(
                     if combined_policy_factory is None
                     else combined_policy_factory(policy)
                 )
+                combined_annual = bool(
+                    combined_policy is not None
+                    and getattr(combined_policy, "anniversary_only", False)
+                    and callable(getattr(
+                        combined_policy, "surrender_mask", None
+                    ))
+                )
                 result = projection_module.project(
                     controlled,
                     policy,
@@ -2375,6 +2382,9 @@ def _aggregate_portfolio_paths(
                     expenses=expenses,
                     config=config,
                     surrender_policy=(
+                        combined_policy
+                        if combined_annual
+                        else
                         primitive_collector
                         if primitive_collector is not None
                         else None
@@ -2382,7 +2392,9 @@ def _aggregate_portfolio_paths(
                         else surrender_policy_factory(policy)
                     ),
                     income_election_policy=combined_policy,
-                    income_action_policy=combined_policy,
+                    income_action_policy=(
+                        None if combined_annual else combined_policy
+                    ),
                     cap_decision_observer=cap_state_collector,
                     surrender_decision_observer=primitive_collector,
                 )
@@ -7513,7 +7525,7 @@ def _evaluate_fixed_lsmc_benchmarks(
                 COMBINED_FOLLOWER_VERSION
             ),
             "policyholder_projector_hooks": (
-                "income_election_policy|income_action_policy"
+                "income_election_policy|surrender_policy"
             ),
             "policyholder_action_set": "|".join(
                 COMBINED_FOLLOWER_ACTION_SET
@@ -7791,27 +7803,21 @@ def _surrender_policy_payload(policy: object) -> dict[str, object]:
 
 
 def _combined_policy_payload(fit: object) -> dict[str, object]:
-    """Serialize the deployable Election plus monthly Income-action policy."""
+    """Serialize the deployable ordered annual Election/Lapse policy."""
     policy = _require_combined_follower_fit_v2(
         fit,
         context="Combined follower policy serialization",
     )
     election = getattr(policy, "election_regressions")
-    income_actions = getattr(policy, "income_action_regressions")
-    legacy_surrender = getattr(policy, "surrender_policy")
-    if getattr(legacy_surrender, "regressions", {}):
-        raise RuntimeError(
-            "Combined follower serialization found authoritative legacy surrender "
-            "regressions."
-        )
+    annual_lapse = getattr(policy, "surrender_policy")
     return {
         "follower_contract_version": COMBINED_FOLLOWER_VERSION,
         "deployment_eligible": True,
         "valid": True,
         "invalid_reasons": [],
         "action_set": list(COMBINED_FOLLOWER_ACTION_SET),
-        "projector_hooks": ["income_election_policy", "income_action_policy"],
-        "monthly_income_actions_required": True,
+        "projector_hooks": ["income_election_policy", "surrender_policy"],
+        "monthly_income_actions_required": False,
         "provenance_fingerprint": getattr(
             policy, "provenance_fingerprint", None
         ),
@@ -7824,31 +7830,22 @@ def _combined_policy_payload(fit: object) -> dict[str, object]:
             }
             for step, pair in sorted(election.items())
         ],
-        "income_action_advantage_regressions_by_decision_step": [
+        "annual_lapse_advantage_regressions_by_decision_step": [
             {
                 "decision_step": int(step),
-                "full_withdrawal": (
-                    None
-                    if getattr(models, "full_withdrawal_advantage") is None
-                    else _regression_payload(
-                        getattr(models, "full_withdrawal_advantage")
-                    )
-                ),
-                "partial_withdrawal": (
-                    None
-                    if getattr(models, "partial_withdrawal_advantage") is None
-                    else _regression_payload(
-                        getattr(models, "partial_withdrawal_advantage")
-                    )
-                ),
+                **_regression_payload(regression),
             }
-            for step, models in sorted(income_actions.items())
+            for step, regression in sorted(annual_lapse.regressions.items())
         ],
-        "legacy_surrender_compatibility": {
-            "authoritative_for_deployment": False,
-            "regression_count": 0,
+        "annual_lapse_policy": {
+            "authoritative_for_deployment": True,
+            "regression_count": len(annual_lapse.regressions),
+            "regressions_are_advantages": bool(
+                getattr(annual_lapse, "regressions_are_advantages", False)
+            ),
+            "terminal_step": getattr(annual_lapse, "terminal_step", None),
             "provenance_fingerprint": getattr(
-                legacy_surrender, "provenance_fingerprint", None
+                annual_lapse, "provenance_fingerprint", None
             ),
         },
     }
@@ -7882,8 +7879,8 @@ def _policyholder_fit_set_payload(fit_set: object) -> dict[str, object]:
             "follower_contract_version": LEGACY_COUPLED_FOLLOWER_VERSION,
             "deployment_eligible": False,
             "deployment_block_reason": (
-                "coupled primitives omit Growth Election and monthly Partial-"
-                "Withdrawal counterfactuals"
+                "coupled primitives omit the ordered Growth Election plus "
+                "annual Income Lapse contract"
             ),
             "training_scenario_fingerprint": fit_set.scenario_fingerprint,
             "training_cap_schedule_fingerprint": (
@@ -7927,11 +7924,7 @@ def _policyholder_fit_set_payload(fit_set: object) -> dict[str, object]:
         policy = fit.policy
         deployed_regression_count = (
             len(policy.election_regressions)
-            + sum(
-                int(models.full_withdrawal_advantage is not None)
-                + int(models.partial_withdrawal_advantage is not None)
-                for models in policy.income_action_regressions.values()
-            )
+            + len(policy.surrender_policy.regressions)
         )
         signatures.append({
             "policy_signature": signature_text,
@@ -9101,7 +9094,7 @@ def main() -> None:
             if args.policyholder_behaviour == "lsmc" else None
         ),
         "fixed_cap_lsmc_projector_hooks": (
-            ["income_election_policy", "income_action_policy"]
+            ["income_election_policy", "surrender_policy"]
             if args.policyholder_behaviour == "lsmc" else []
         ),
         "fixed_cap_lsmc_action_set": (
@@ -9124,7 +9117,7 @@ def main() -> None:
             if args.policyholder_behaviour == "lsmc" else None
         ),
         "coupled_candidate_lsmc_projector_hooks": (
-            ["income_election_policy", "income_action_policy"]
+            ["income_election_policy", "surrender_policy"]
             if args.policyholder_behaviour == "lsmc" else []
         ),
         "coupled_candidate_lsmc_action_set": (
@@ -9965,7 +9958,7 @@ def main() -> None:
                     "iteration and three-seed component validation"
                 ),
                 "follower_projector_hooks": [
-                    "income_election_policy", "income_action_policy",
+                    "income_election_policy", "surrender_policy",
                 ],
             })
         validation_row, _ = _projected_policy_benchmark_row(
@@ -10067,9 +10060,7 @@ def main() -> None:
             == COMBINED_FOLLOWER_VERSION
             and all(
                 callable(getattr(fit.policy, "start_income_mask", None))
-                and callable(getattr(
-                    fit.policy, "choose_income_action", None
-                ))
+                and callable(getattr(fit.policy, "surrender_mask", None))
                 for fit in coupled_follower_fit.fits.values()
             )
         )
@@ -10211,7 +10202,7 @@ def main() -> None:
                     if args.policyholder_behaviour == "lsmc" else None
                 ),
                 "follower_projector_hooks": (
-                    ["income_election_policy", "income_action_policy"]
+                    ["income_election_policy", "surrender_policy"]
                     if args.policyholder_behaviour == "lsmc" else []
                 ),
             }
@@ -10626,8 +10617,8 @@ def main() -> None:
         ),
         "adaptive_policy_validation_selection_rule": (
             "deploy adaptive rule only if validation delta exceeds 1.96 paired SE; "
-            "the coupled follower also must implement the combined-v2 Election "
-            "and monthly Income-action contract; otherwise deploy the admissible "
+            "the coupled follower also must implement the ordered annual Election "
+            "and Income-Lapse contract; otherwise deploy the admissible "
             "fixed fallback"
         ),
         "flexible_policy_deviation_rule": (
@@ -10856,8 +10847,9 @@ def main() -> None:
     policy_payload["stackelberg_control"] = {
         "leader": "insurer annual cap chosen first",
         "follower": (
-            "The same combined-v2 Policyholder policy jointly chooses Growth "
-            "WAIT/START and monthly Income CONTINUE/PARTIAL/FULL for fixed-cap "
+            "The same ordered annual Policyholder policy jointly chooses Growth "
+            "WAIT_FOR_ONE_YEAR/START_INCOME_NOW and Income "
+            "CONTINUE_FOR_ONE_YEAR/FULL_WITHDRAWAL_NOW for fixed-cap "
             "and coupled cap-randomised policies"
             if args.policyholder_behaviour == "lsmc"
             else f"{args.policyholder_behaviour} comparison behaviour"
@@ -10867,7 +10859,7 @@ def main() -> None:
             if args.policyholder_behaviour == "lsmc" else None
         ),
         "deployable_follower_projector_hooks": (
-            ["income_election_policy", "income_action_policy"]
+            ["income_election_policy", "surrender_policy"]
             if args.policyholder_behaviour == "lsmc" else []
         ),
         "invalid_combined_follower_handling": (
@@ -11033,7 +11025,7 @@ def main() -> None:
                 args.policyholder_behaviour == "lsmc"
             ),
             "fixed_cap_projector_hooks": (
-                ["income_election_policy", "income_action_policy"]
+                ["income_election_policy", "surrender_policy"]
                 if args.policyholder_behaviour == "lsmc" else []
             ),
             "fixed_cap_action_set": (
@@ -11064,7 +11056,7 @@ def main() -> None:
                 if args.policyholder_behaviour == "lsmc" else None
             ),
             "coupled_candidate_projector_hooks": (
-                ["income_election_policy", "income_action_policy"]
+                ["income_election_policy", "surrender_policy"]
                 if args.policyholder_behaviour == "lsmc" else []
             ),
             "coupled_candidate_action_set": (
@@ -11182,7 +11174,7 @@ def main() -> None:
             "Behaviour or market parameter is introduced.",
             "In LSMC mode statistical Ordinary/Performance lapse and scheduled "
             "voluntary withdrawals are replaced in fixed-cap and coupled deployment "
-            "by the combined-v2 Election and monthly Continue/Partial/Full policy. In the "
+            "by the ordered annual Election and Continue/Full-Withdrawal policy. In the "
             "separately reported dynamic benchmark, the existing Behaviour model "
             "still has no direct announced-cap elasticity.",
             "The cap-randomised combined-v2 follower is trained on the exploratory "

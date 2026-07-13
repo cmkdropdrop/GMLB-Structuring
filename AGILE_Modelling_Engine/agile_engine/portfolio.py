@@ -889,9 +889,15 @@ def _value_model_point(
         if combined_policy_factory is None
         else combined_policy_factory(model_point.policy)
     )
+    combined_annual_surrender = bool(
+        combined_policy is not None
+        and getattr(combined_policy, "anniversary_only", False)
+        and callable(getattr(combined_policy, "surrender_mask", None))
+    )
     income_action_policy = (
         combined_policy
         if combined_policy is not None
+        and not combined_annual_surrender
         and callable(getattr(combined_policy, "choose_income_action", None))
         else None
         if income_action_policy_factory is None
@@ -900,7 +906,7 @@ def _value_model_point(
     surrender_policy = (
         combined_policy
         if combined_policy is not None
-        and income_action_policy is None
+        and combined_annual_surrender
         and callable(getattr(combined_policy, "surrender_mask", None))
         else None
         if surrender_policy_factory is None
@@ -1277,10 +1283,10 @@ def value_policyholder_portfolio(
     model, seed, monthly grid or path dimensions.
 
     ``combined_policy_factory`` supplies one frozen out-of-sample policy per
-    PolicySpec.  A v2 object implements ``start_income_mask`` and
-    ``choose_income_action`` and is passed to the annual Election and monthly
-    Income-action gates.  Older objects implementing ``surrender_mask`` remain
-    supported as explicit Election/Full-Withdrawal research policies.
+    PolicySpec.  The ordered annual policy implements ``start_income_mask``
+    and ``surrender_mask`` and is passed to the two Crediting-Anniversary
+    action gates.  Legacy objects implementing ``choose_income_action`` remain
+    supported only for isolated monthly-action research.
     """
     total_model_points = len(model_points.model_points)
     if total_model_points == 0:
@@ -1524,7 +1530,7 @@ def value_policyholder_portfolio(
             deterministic_benchmark_year if deterministic_election else None
         )
         metrics["behaviour_treatment"] = (
-            "combined_policy_optimal_income_election_and_income_actions"
+            "combined_policy_annual_income_election_and_full_withdrawal"
             if combined_policy_factory is not None
             else "lsmc_optimal_income_partial_or_full_withdrawal"
             if income_action_policy_factory is not None

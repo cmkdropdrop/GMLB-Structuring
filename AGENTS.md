@@ -24,6 +24,12 @@ dürfen ausschließlich aus dem zugehörigen, pfadkongruenten Hedgepreis-Cache
 unter `AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices`
 stammen.
 
+Diese beiden Cache-Verzeichnisse sind damit die einzigen zulässigen operativen
+Quellen für risikoneutrale Kapitalmarktpfade beziehungsweise Optionspreise.
+Insbesondere dürfen diese Größen weder aus anderen Eingabedateien übernommen
+noch in einem Bewertungs-, Behaviour- oder Optimierungslauf ad hoc erzeugt
+werden.
+
 Nur
 `AGILE_Modelling_Engine/portfolio_simulations/precompute_q_market_and_hedge_cache.py`
 darf diese Cache-Einträge erzeugen oder schreiben. Bewertungs-, Behaviour- und

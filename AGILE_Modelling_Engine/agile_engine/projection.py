@@ -1355,6 +1355,10 @@ class SurrenderDecisionContext:
     inforce_weight: Array
     just_elected: NDArray[np.bool_]
     full_withdrawal_eligible: NDArray[np.bool_]
+    mva_factor: Optional[Array] = None
+    attained_age: Optional[Array] = None
+    primary_alive: Optional[NDArray[np.bool_]] = None
+    spouse_alive: Optional[NDArray[np.bool_]] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.step, bool) or int(self.step) != self.step or self.step < 0:
@@ -1369,6 +1373,19 @@ class SurrenderDecisionContext:
             raise ValueError("Surrender decision time and duration must be finite.")
         if not isinstance(self.is_anniversary, (bool, np.bool_)):
             raise ValueError("is_anniversary must be boolean.")
+
+        path_shape = np.asarray(self.account_value).shape
+        if len(path_shape) != 1:
+            raise ValueError("Surrender context account_value must be one-dimensional.")
+        optional_defaults = {
+            "mva_factor": np.zeros(path_shape),
+            "attained_age": np.full(path_shape, float(self.duration_years)),
+            "primary_alive": np.ones(path_shape, dtype=bool),
+            "spouse_alive": np.zeros(path_shape, dtype=bool),
+        }
+        for name, default in optional_defaults.items():
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, default)
 
         array_dtypes: dict[str, object] = {
             "phase": np.int8,
@@ -1388,6 +1405,10 @@ class SurrenderDecisionContext:
             "inforce_weight": float,
             "just_elected": bool,
             "full_withdrawal_eligible": bool,
+            "mva_factor": float,
+            "attained_age": float,
+            "primary_alive": bool,
+            "spouse_alive": bool,
         }
         expected_shape: Optional[tuple[int, ...]] = None
         for name, dtype in array_dtypes.items():
@@ -4432,6 +4453,14 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 inforce_weight=w,
                 just_elected=just_elected,
                 full_withdrawal_eligible=action_lapse_eligible,
+                mva_factor=current_mva_signal(step, float(t)),
+                attained_age=np.full(n_paths, policy.age + float(t)),
+                primary_alive=primary_alive,
+                spouse_alive=(
+                    spouse_alive
+                    if policy.spouse
+                    else np.zeros(n_paths, dtype=bool)
+                ),
             )
 
             if observer_action_point:
@@ -4569,6 +4598,32 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         cfs["mva_retained"][:, step] += w * base_lapse * mva_amt
         cfs["aps_retained"][:, step] += w * base_lapse * aps_forfeit
         w = w * (1.0 - base_lapse)
+        if surrender_policy is not None:
+            # A fitted annual FULL_WITHDRAWAL is a pathwise stopping action,
+            # not a fractional statistical cohort decrement.  Preserve the
+            # existing fee/MVA settlement above, then make the contractual
+            # absorbing state explicit so no later Income, death benefit or
+            # terminal value can arise on the exercised path.
+            deterministic_full = surrender_mask & (
+                base_lapse >= 1.0 - 1.0e-15
+            )
+            iv = np.where(deterministic_full, 0.0, iv)
+            iv_frame = np.where(deterministic_full, 0.0, iv_frame)
+            income_annual = np.where(
+                deterministic_full, 0.0, income_annual
+            )
+            fee_product_accrued = np.where(
+                deterministic_full, 0.0, fee_product_accrued
+            )
+            fee_lip_accrued = np.where(
+                deterministic_full, 0.0, fee_lip_accrued
+            )
+            joint_income_cover = np.where(
+                deterministic_full, False, joint_income_cover
+            )
+            phase = np.where(
+                deterministic_full, Phase.TERMINATED.value, phase
+            ).astype(np.int8)
         if income_action_policy is not None:
             # FULL is a deterministic unified action, not an expected lapse
             # cohort.  Its contract, guarantee and fee subledger terminate.

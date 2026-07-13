@@ -4,11 +4,11 @@ The market, product, mortality, cost, model-point and aggregation mechanics are
 the same as in ``run_portfolio_valuation.py``.  An independently trained,
 phase-aware LSMC lower-bound policy maximises the risk-neutral value of
 Policyholder cashflows over annual ``WAIT | START_INCOME_NOW`` decisions in
-Growth and a configurable monthly Income action set.  Validation and final
-evaluation use separate held-out samples.  One or three predeclared training-
-seed triplets may be fitted; every fitted policy must independently pass the
-Election-, Income-action- and Combined-policy gates on the same validation
-paths.  The first seed remains the predeclared primary policy for the canonical
+Growth and annual ``CONTINUE | FULL_WITHDRAWAL_NOW`` decisions in Income.
+Partial Withdrawals and under-year voluntary actions are excluded.  Validation
+and final evaluation use separate held-out samples.  A rejected candidate is
+replaced in the actual rollout by the best predeclared fixed validation
+baseline.  The first seed remains the predeclared primary policy for the canonical
 V00/V01/V10/V11 outputs.  The model-point ``income_start_year`` remains a
 deterministic benchmark and is also one member of the predeclared training
 anchor library.  A paired dynamic-behaviour benchmark is produced on the same
@@ -92,6 +92,7 @@ from agile_engine.pricing import build_scenarios, resolve_horizon  # noqa: E402
 from agile_engine.optimal_behaviour_validation import (  # noqa: E402
     OptimalBehaviourValidationResult,
     paired_noninferiority_gate,
+    select_deployed_policy,
 )
 from agile_engine.product import PolicySpec  # noqa: E402
 
@@ -290,8 +291,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=("continue_full", "continue_partial_full"),
         default=None,
         help=(
-            "monthly Policyholder actions fitted in Income; continue_full "
-            "treats Full Withdrawal as the only voluntary lapse action"
+            "deprecated compatibility flag; the annual combined model accepts "
+            "continue_full only"
         ),
     )
     parser.add_argument(
@@ -300,7 +301,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=(0.0, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2),
         default=1.0e-6,
         help=(
-            "legacy single-Ridge setting; v3 selection always uses the exact "
+            "legacy single-Ridge setting; v4 selection always uses the exact "
             "documented five-value grid"
         ),
     )
@@ -346,10 +347,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.training_seed_count is None:
         args.training_seed_count = 3 if legacy_replication_requested else 1
     if args.lsmc_income_action_set is None:
-        args.lsmc_income_action_set = (
-            "continue_partial_full"
-            if legacy_replication_requested
-            else "continue_full"
+        args.lsmc_income_action_set = "continue_full"
+    if args.lsmc_income_action_set != "continue_full":
+        parser.error(
+            "--lsmc-income-action-set=continue_partial_full is no longer "
+            "admissible for ordered annual optimal behaviour"
         )
 
     for name in ("n_paths", "n_train", "n_validation", "heston_substeps"):
@@ -478,14 +480,18 @@ def _policy_signature(policy: PolicySpec) -> tuple[object, ...]:
     )
 
 
-def _fresh_policy(fit: OptimalBehaviourPolicyFit) -> OptimalBehaviourPolicy:
+def _fresh_policy(
+    source: OptimalBehaviourPolicyFit | OptimalBehaviourPolicy,
+) -> OptimalBehaviourPolicy:
     """Clone a frozen fit while isolating per-rollout action statistics."""
-    surrender = replace(
-        fit.policy.surrender_policy,
-        evaluation_statistics={},
-    )
+    fitted_policy = source.policy if isinstance(
+        source, OptimalBehaviourPolicyFit
+    ) else source
+    surrender = fitted_policy.surrender_policy
+    if isinstance(surrender, OptimalSurrenderPolicy):
+        surrender = replace(surrender, evaluation_statistics={})
     return replace(
-        fit.policy,
+        fitted_policy,
         surrender_policy=surrender,
         evaluation_statistics={},
     )
@@ -568,11 +574,36 @@ class _FixedIncomeActionPolicy:
         )
 
 
+class _FixedAnnualLapsePolicy:
+    """Predeclared annual validation benchmark: lapse when first eligible."""
+
+    anniversary_only = True
+
+    def __init__(self) -> None:
+        self._acted: Optional[np.ndarray] = None
+        self.provenance_fingerprint = "validation:annual_full_first_eligible"
+
+    def surrender_mask(self, *, context: object) -> np.ndarray:
+        n_paths = int(getattr(context, "n_paths"))
+        if self._acted is None:
+            self._acted = np.zeros(n_paths, dtype=bool)
+        if self._acted.shape != (n_paths,):
+            raise ValueError("Fixed annual policy cannot be reused across samples.")
+        selected = (
+            bool(getattr(context, "is_anniversary"))
+            & np.asarray(
+                getattr(context, "full_withdrawal_eligible"), dtype=bool
+            )
+            & ~self._acted
+        )
+        self._acted[selected] = True
+        return selected
+
+
 _POLICYHOLDER_VALIDATION_CASHFLOWS = (
     "income_paid",
     "death_benefits",
     "surrender_benefits",
-    "partial_withdrawals",
     "terminal_closeout",
 )
 
@@ -647,6 +678,12 @@ def _validation_policyholder_path_values(
             surrender_policy=surrender_policy,
         )
         projection = valuation.projection
+        if np.any(np.abs(np.asarray(
+            projection.cashflows["partial_withdrawals"], dtype=float
+        )) > 1.0e-10):
+            raise RuntimeError(
+                "Optimal-behaviour validation produced a Partial Withdrawal."
+            )
         cashflows = sum(
             projection.cashflows[name]
             for name in _POLICYHOLDER_VALIDATION_CASHFLOWS
@@ -893,8 +930,8 @@ def _write_comparison_report(
     lines.extend([
         "",
         "Der LSMC-Hauptlauf optimiert auf zulässigen Policy Anniversaries "
-        "WAIT gegen START_INCOME_NOW und danach monatlich CONTINUE gegen "
-        "PARTIAL_WITHDRAWAL und FULL_WITHDRAWAL. "
+        "WAIT_FOR_ONE_YEAR gegen START_INCOME_NOW und danach jährlich "
+        "CONTINUE_FOR_ONE_YEAR gegen FULL_WITHDRAWAL_NOW. "
         "Der Modellpunkttermin bleibt ausschließlich ein separat ausgewiesener "
         "deterministischer Validierungsbenchmark; Growth-Surrender und "
         "Growth-Withdrawals bleiben vertraglich ausgeschlossen.",
@@ -1166,9 +1203,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ridge=args.lsmc_ridge,
             n_folds=args.lsmc_folds,
             exercise_buffer_rmse_multiplier=args.exercise_buffer_rmse_multiplier,
-            allow_partial_withdrawal=(
-                args.lsmc_income_action_set == "continue_partial_full"
-            ),
+            allow_partial_withdrawal=False,
         )
 
         policy_labels: dict[tuple[object, ...], list[str]] = {}
@@ -1234,19 +1269,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         deployed_policies: dict[
             tuple[object, ...], OptimalBehaviourPolicy
         ] = {}
+        deployment_selection_by_seed = [
+            "training_selected" for _ in range(args.training_seed_count)
+        ]
         election_only_policies: dict[
             tuple[object, ...], _ElectionOnlyPolicy
         ] = {}
-        deterministic_income_action_policies: dict[
+        deterministic_surrender_policies: dict[
             tuple[object, ...], object
         ] = {}
+
+        def deployment_policy(
+            policy_object: PolicySpec,
+            training_seed_index: int,
+        ) -> OptimalBehaviourPolicy:
+            fit = ensure_fit(policy_object, training_seed_index)
+            selected = deployment_selection_by_seed[training_seed_index]
+            if selected == "training_selected":
+                return fit.policy
+            if selected in fit.policy_variants:
+                return fit.policy_variants[selected]
+            if selected.startswith("V00_"):
+                return fit.policy_variants["V00"]
+            if selected.startswith("V01_"):
+                return fit.policy_variants["V01"]
+            if selected.startswith("V10_"):
+                return fit.policy_variants["V10"]
+            if "|" in selected:
+                election_name, income_name = selected.split("|", 1)
+                base = fit.policy_variants["V00"]
+                return replace(
+                    base,
+                    surrender_policy=(
+                        _FixedAnnualLapsePolicy()
+                        if income_name == "annual_full_first_eligible"
+                        else base.surrender_policy
+                    ),
+                    fixed_election_step=int(round(
+                        _validation_election_year(
+                            policy_object, costs.product, election_name
+                        ) * 12.0
+                    )),
+                )
+            raise RuntimeError(
+                f"Unknown validation deployment selection: {selected}."
+            )
 
         def combined_policy_factory(policy_object: object) -> object:
             if not isinstance(policy_object, PolicySpec):
                 raise TypeError("LSMC policy factory requires PolicySpec.")
             key = _policy_signature(policy_object)
             if key not in deployed_policies:
-                deployed_policies[key] = _fresh_policy(ensure_fit(policy_object))
+                deployed_policies[key] = _fresh_policy(
+                    deployment_policy(policy_object, 0)
+                )
             return deployed_policies[key]
 
         def election_only_policy_factory(policy_object: object) -> object:
@@ -1255,21 +1331,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             key = _policy_signature(policy_object)
             if key not in election_only_policies:
                 election_only_policies[key] = _ElectionOnlyPolicy(
-                    _fresh_policy(ensure_fit(policy_object))
+                    _fresh_policy(
+                        ensure_fit(policy_object).policy_variants["V10"]
+                    )
                 )
             return election_only_policies[key]
 
-        def deterministic_income_action_policy_factory(
+        def deterministic_surrender_policy_factory(
             policy_object: object,
         ) -> object:
             if not isinstance(policy_object, PolicySpec):
                 raise TypeError("LSMC policy factory requires PolicySpec.")
             key = _policy_signature(policy_object)
-            if key not in deterministic_income_action_policies:
-                deterministic_income_action_policies[key] = _fresh_policy(
-                    ensure_fit(policy_object)
+            if key not in deterministic_surrender_policies:
+                deterministic_surrender_policies[key] = _fresh_policy(
+                    ensure_fit(policy_object).policy_variants["V01"]
                 )
-            return deterministic_income_action_policies[key]
+            return deterministic_surrender_policies[key]
 
         validation_projection = replace(
             costs.projection,
@@ -1322,29 +1400,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         def validation_combined_hooks(
             policy_object: PolicySpec,
             training_seed_index: int = 0,
-        ) -> tuple[object, object, None]:
-            policy = _fresh_policy(
-                ensure_fit(policy_object, training_seed_index)
-            )
-            return policy, policy, None
+        ) -> tuple[object, None, object]:
+            fit = ensure_fit(policy_object, training_seed_index)
+            candidate = fit.policy_variants["V11"]
+            policy = _fresh_policy(candidate if candidate.valid else fit.policy)
+            return policy, None, policy
 
         def validation_election_hooks(
             policy_object: PolicySpec,
             training_seed_index: int = 0,
         ) -> tuple[object, None, None]:
-            policy = _ElectionOnlyPolicy(_fresh_policy(
-                ensure_fit(policy_object, training_seed_index)
-            ))
+            fit = ensure_fit(policy_object, training_seed_index)
+            candidate = fit.policy_variants["V10"]
+            policy = _fresh_policy(
+                candidate if candidate.valid else fit.policy_variants["V00"]
+            )
             return policy, None, None
 
         def validation_income_hooks(
             policy_object: PolicySpec,
             training_seed_index: int = 0,
-        ) -> tuple[None, object, None]:
+        ) -> tuple[None, None, object]:
             return (
                 None,
-                _fresh_policy(ensure_fit(policy_object, training_seed_index)),
                 None,
+                _fresh_policy(
+                    ensure_fit(
+                        policy_object, training_seed_index
+                    ).policy_variants["V01"]
+                ),
             )
 
         for training_seed_index in range(args.training_seed_count):
@@ -1541,6 +1625,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
             )
             election_benchmarks[strategy] = values
+        modelpoint_v00_paths = np.asarray(
+            election_benchmarks["model_point"], dtype=float
+        )
         election_benchmarks = _deduplicate_validation_benchmarks(
             election_benchmarks
         )
@@ -1549,25 +1636,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tuple[str, Optional[str], float], ...
         ] = (
             ("continue_only", None, 0.0),
-            ("full_first_eligible", "full_first", 0.0),
+            ("annual_full_first_eligible", "annual_full_first", 0.0),
         )
-        if lsmc_settings.allow_partial_withdrawal:
-            income_benchmark_specs += (
-                ("partial_once_25pct", "partial_once", 0.25),
-                ("partial_once_50pct", "partial_once", 0.50),
-                ("partial_once_100pct", "partial_once", 1.00),
-                ("partial_annual_25pct", "partial_annual", 0.25),
-                ("partial_annual_50pct", "partial_annual", 0.50),
-            )
         income_benchmarks: dict[str, np.ndarray] = {}
         for name, mode, fraction in income_benchmark_specs:
             hooks_factory = None
             if mode is not None:
                 hooks_factory = (
-                    lambda _policy, selected=mode, amount=fraction: (
+                    lambda _policy: (
                         None,
-                        _FixedIncomeActionPolicy(selected, amount),
                         None,
+                        _FixedAnnualLapsePolicy(),
                     )
                 )
             values, _ = _validation_policyholder_path_values(
@@ -1590,10 +1669,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 hooks_factory = None
                 if mode is not None:
                     hooks_factory = (
-                        lambda _policy, selected=mode, amount=fraction: (
+                        lambda _policy: (
                             None,
-                            _FixedIncomeActionPolicy(selected, amount),
                             None,
+                            _FixedAnnualLapsePolicy(),
                         )
                     )
                 values, _ = _validation_policyholder_path_values(
@@ -1645,6 +1724,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for training_seed_index, candidates in enumerate(
             validation_candidates_by_seed
         ):
+            factorial_benchmarks = {
+                **combined_benchmarks,
+                "V00_model_point_fixed_continue": modelpoint_v00_paths,
+                "V01_model_point_fixed_annual_lapse": candidates[
+                    "income_action_only"
+                ],
+                "V10_annual_election_continue": candidates["election_only"],
+            }
             validation_gates_i = (
                 paired_noninferiority_gate(
                     candidates["election_only"],
@@ -1660,7 +1747,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 paired_noninferiority_gate(
                     candidates["combined_policy"],
-                    combined_benchmarks,
+                    factorial_benchmarks,
                     premium_aud=validation_premium,
                     component="combined_policy",
                 ),
@@ -1674,6 +1761,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             validation_results_by_seed.append(result_i)
             seed_triplet = training_seed_triplets[training_seed_index]
+            validation_summary_rows.append({
+                "training_seed_index": training_seed_index + 1,
+                "primary_training_seed": bool(seed_triplet["primary"]),
+                "training_market_seed": seed_triplet["market_seed"],
+                "component": "factorial_paired_effects",
+                "path_count": int(modelpoint_v00_paths.size),
+                "V00_mean_aud": float(np.mean(modelpoint_v00_paths)),
+                "V01_mean_aud": float(np.mean(
+                    candidates["income_action_only"]
+                )),
+                "V10_mean_aud": float(np.mean(candidates["election_only"])),
+                "V11_mean_aud": float(np.mean(candidates["combined_policy"])),
+                "lapse_optionality_V01_minus_V00_aud": float(np.mean(
+                    candidates["income_action_only"] - modelpoint_v00_paths
+                )),
+                "election_optionality_V10_minus_V00_aud": float(np.mean(
+                    candidates["election_only"] - modelpoint_v00_paths
+                )),
+                "combined_optionality_V11_minus_V00_aud": float(np.mean(
+                    candidates["combined_policy"] - modelpoint_v00_paths
+                )),
+            })
             for row in result_i.rows():
                 validation_summary_rows.append({
                     "training_seed_index": training_seed_index + 1,
@@ -1687,6 +1796,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     **row,
                 })
         validation_result = validation_results_by_seed[0]
+        validation_fallback_reasons: dict[int, str] = {}
+        for index, result in enumerate(validation_results_by_seed):
+            candidate_fits_valid = all(
+                bool(fit.policy_variants["V11"].valid)
+                for fit in fits_by_seed[index].values()
+            )
+            selection = select_deployed_policy(
+                result,
+                candidate_policy_name="V11",
+                candidate_fit_valid=candidate_fits_valid,
+            )
+            deployment_selection_by_seed[index] = selection.selected_policy_name
+            if selection.fallback_reason is not None:
+                validation_fallback_reasons[index] = selection.fallback_reason
         validation_summary_path = output / "lsmc_validation_summary.csv"
         validation_manifest_path = output / "lsmc_validation_manifest.json"
         _write_csv(validation_summary_path, validation_summary_rows)
@@ -1701,6 +1824,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "training_seed_count": args.training_seed_count,
             "seed_selection_using_evaluation": False,
             "primary_training_seed_index": 1,
+            "candidate_policy": "V11",
+            "deployed_policy_by_training_seed": {
+                str(index + 1): selection
+                for index, selection in enumerate(
+                    deployment_selection_by_seed
+                )
+            },
+            "validation_fallback_reason_by_training_seed": {
+                str(index + 1): reason
+                for index, reason in validation_fallback_reasons.items()
+            },
             "gates": validation_summary_rows,
             "training_runs": [
                 {
@@ -1757,11 +1891,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not gate.valid
         ]
         if failed_seed_gates:
-            failed = ", ".join(failed_seed_gates)
-            raise RuntimeError(
-                "At least one frozen LSMC seed fit failed independent "
-                "non-inferiority "
-                f"validation: {failed}."
+            logger.warning(
+                "LSMC validation gate(s) failed; the final rollout deploys "
+                "the best predeclared fixed baseline where required: %s",
+                ", ".join(failed_seed_gates),
             )
 
         dynamic_result = None
@@ -1817,8 +1950,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 progress_callback=_make_progress_callback(logger),
                 scenario_transform=scenario_transform,
             )
-            # V01: deterministic model-point Election plus the fitted monthly
-            # Continue/Partial/Full Income rule.
+            # V01: deterministic model-point Election plus fitted annual
+            # CONTINUE_FOR_ONE_YEAR/FULL_WITHDRAWAL_NOW decisions.
             deterministic_surrender_result = value_policyholder_portfolio(
                 costs.product,
                 model_points,
@@ -1832,8 +1965,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.profitability_materiality_bp
                 ),
                 progress_callback=_make_progress_callback(logger),
-                income_action_policy_factory=(
-                    deterministic_income_action_policy_factory
+                surrender_policy_factory=(
+                    deterministic_surrender_policy_factory
                 ),
                 scenario_transform=scenario_transform,
             )
@@ -1890,7 +2023,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 key = _policy_signature(policy_object)
                 if key not in selected_cache:
                     selected_cache[key] = _fresh_policy(
-                        ensure_fit(policy_object, selected_seed_index)
+                        deployment_policy(
+                            policy_object, selected_seed_index
+                        )
                     )
                 return selected_cache[key]
 
@@ -2079,6 +2214,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "lsmc_validation_seed": args.validation_seed,
             "lsmc_validation_take_up_seed": args.validation_take_up_seed,
             "lsmc_validation_mortality_seed": args.validation_mortality_seed,
+            "lsmc_candidate_policy": "V11",
+            "lsmc_deployed_policy": deployment_selection_by_seed[0],
+            "lsmc_validation_fallback_used": (
+                0 in validation_fallback_reasons
+            ),
+            "lsmc_validation_fallback_reason": (
+                validation_fallback_reasons.get(0)
+            ),
+            "lsmc_validation_candidate_value_aud": next(
+                gate.policy_mean_aud
+                for gate in validation_result.gates
+                if gate.component == "combined_policy"
+            ),
+            "lsmc_validation_selected_value_aud": (
+                next(
+                    gate.policy_mean_aud
+                    for gate in validation_result.gates
+                    if gate.component == "combined_policy"
+                )
+                if deployment_selection_by_seed[0] == "V11"
+                else next(
+                    gate.benchmark_mean_aud
+                    for gate in validation_result.gates
+                    if gate.component == "combined_policy"
+                )
+            ),
             "lsmc_evaluation_seed": args.seed,
             "lsmc_evaluation_take_up_seed": args.take_up_seed,
             "lsmc_evaluation_mortality_seed": args.mortality_seed,
@@ -2141,12 +2302,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for fit in fits.values()
             ),
             "lsmc_action_set": (
-                "growth:wait|start_income_now;"
-                + (
-                    "income:continue|partial_withdrawal|full_withdrawal"
-                    if lsmc_settings.allow_partial_withdrawal
-                    else "income:continue|full_withdrawal"
-                )
+                "growth:wait_for_one_year|start_income_now;"
+                "income:continue_for_one_year|full_withdrawal_now"
             ),
             "lsmc_income_election": (
                 "pathwise_optimal_bellman_policy_with_predeclared_"
@@ -2156,7 +2313,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "income_take_up_source": "frozen_combined_lsmc_policy",
             "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
             "lsmc_decision_grid": (
-                "growth:contractual_policy_anniversaries;income:monthly"
+                "growth:crediting_anniversaries;income:crediting_anniversaries"
             ),
             "lsmc_forced_election_rule": (
                 "first_policy_anniversary_strictly_after_attained_age_100"
@@ -2237,7 +2394,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "benchmark_treatment": (
                     "deterministic_model_point_election_with_fitted_"
-                    "monthly_post_election_income_actions"
+                    "annual_post_election_lapse_policy"
                 ),
                 "income_action_rule_refitted_under_deterministic_election": False,
             })
@@ -2284,7 +2441,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 election_continue_result.scenario_fingerprint
             ),
             "benchmark_treatment": (
-                "election_rule_from_combined_fit_with_income_actions_"
+                "annual_election_rule_from_combined_fit_with_lapse_"
                 "suppressed_in_evaluation"
             ),
             "election_rule_refitted_under_continue": False,
@@ -2456,6 +2613,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "selected_income_action_mode": (
                             fit.selected_income_action_mode
                         ),
+                        "candidate_policy_name": "V11",
+                        "training_selected_policy_name": (
+                            fit.selected_policy_name
+                        ),
+                        "training_fallback_reason": (
+                            fit.training_fallback_reason
+                        ),
                         "fit_valid": fit.valid,
                         "fit_invalid_reasons": "|".join(fit.invalid_reasons),
                         "income_action_exposure_coverage": (
@@ -2507,6 +2671,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ),
                     "selected_income_action_mode": (
                         fit.selected_income_action_mode
+                    ),
+                    "candidate_policy_name": "V11",
+                    "training_selected_policy_name": (
+                        fit.selected_policy_name
+                    ),
+                    "training_fallback_reason": (
+                        fit.training_fallback_reason
                     ),
                     "fit_valid": fit.valid,
                     "fit_invalid_reasons": "|".join(fit.invalid_reasons),
@@ -2595,8 +2766,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "surrender_fallback_used": fit.surrender_fallback_used,
                 })
         # Robustness fits are evaluated on the same final paths, so their
-        # monthly action distributions and Partial amount bands are reported
-        # as well; only seed 1 remains the predeclared canonical output.
+        # annual Election/Lapse action distributions are reported as well;
+        # only seed 1 remains the predeclared canonical output.
         for training_seed_index in range(1, args.training_seed_count):
             seed_triplet = training_seed_triplets[training_seed_index]
             selected_deployed = deployed_policies_by_seed[
@@ -2756,12 +2927,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for diagnostic in fit.diagnostics
             if diagnostic.action_type == "full_withdrawal"
         )
-        accepted_partial_regression_count = sum(
-            diagnostic.regression_accepted_for_action
-            for fit in fits.values()
-            for diagnostic in fit.diagnostics
-            if diagnostic.action_type == "partial_withdrawal"
-        )
         election_regression_fallback_count = sum(
             not diagnostic.regression_accepted_for_action
             for fit in fits.values()
@@ -2774,13 +2939,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for diagnostic in fit.diagnostics
             if diagnostic.action_type == "full_withdrawal"
         )
-        partial_regression_fallback_count = sum(
-            not diagnostic.regression_accepted_for_action
-            for fit in fits.values()
-            for diagnostic in fit.diagnostics
-            if diagnostic.action_type == "partial_withdrawal"
-        )
-
         logger.info("[8/8] Run-Manifest schreiben")
         manifest_path = output / "run_manifest.json"
         manifest = {
@@ -2865,24 +3023,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "lsmc_used": True,
                 "lsmc_objective": "maximise_policyholder_cashflow_pv",
                 "lsmc_action_set": {
-                    "growth": ["wait", "start_income_now"],
-                    "income": (
-                        [
-                            "continue",
-                            "partial_withdrawal",
-                            "full_withdrawal",
-                        ]
-                        if lsmc_settings.allow_partial_withdrawal
-                        else ["continue", "full_withdrawal"]
-                    ),
+                    "growth": ["wait_for_one_year", "start_income_now"],
+                    "income": [
+                        "continue_for_one_year", "full_withdrawal_now"
+                    ],
                 },
                 "income_election": "pathwise_optimal_bellman_policy",
                 "model_point_income_start_year_use": (
                     "deterministic_validation_benchmarks_only"
                 ),
                 "decision_frequency": {
-                    "income_election": "contractual_policy_anniversaries",
-                    "income_actions": "monthly",
+                    "income_election": "crediting_anniversaries",
+                    "income_lapse": "crediting_anniversaries",
                 },
                 "earliest_income_election": (
                     "product_min_years_before_income"
@@ -2893,14 +3045,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "first_income_payment": "one_month_after_election",
                 "same_step_election_and_full_withdrawal_allowed": False,
                 "policy_characterisation": (
-                    "cross_fitted_lower_bound_with_annual_election_and_"
-                    "monthly_income_actions"
+                    "cross_fitted_lower_bound_with_ordered_annual_election_"
+                    "and_income_lapse"
                 ),
-                "partial_withdrawal_grid": (
-                    "aud_100_and_25_50_75_100pct_of_max"
-                    if lsmc_settings.allow_partial_withdrawal
-                    else "disabled"
-                ),
+                "partial_withdrawal_in_optimal_policy": False,
                 "growth_surrender_allowed": False,
                 "growth_withdrawal_allowed": False,
                 "out_of_sample_monthly_projector_rollout": True,
@@ -3062,19 +3210,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "accepted_surrender_regression_count": (
                     accepted_surrender_regression_count
                 ),
-                "accepted_partial_regression_count": (
-                    accepted_partial_regression_count
-                ),
                 "election_regression_fallback_count": (
                     election_regression_fallback_count
                 ),
                 "surrender_regression_fallback_count": (
                     surrender_regression_fallback_count
                 ),
-                "partial_regression_fallback_count": (
-                    partial_regression_fallback_count
-                ),
-                "income_action_exposure_coverage_min": min(
+                "annual_income_lapse_exposure_coverage_min": min(
                     (fit.income_action_exposure_coverage for fit in fits.values()),
                     default=1.0,
                 ),
@@ -3275,15 +3417,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "Research valuation gross of reinsurance.",
                 "Mortality is illustrative and not an approved production basis.",
                 "Optimal behaviour is a cross-fitted LSMC lower-bound policy "
-                "with annual Election and monthly Income actions.",
-                (
-                    "Partial Withdrawal uses a finite adaptive training grid "
-                    "and an analytic fitted quadratic optimiser."
-                    if lsmc_settings.allow_partial_withdrawal
-                    else "The optimal Income action set is restricted to "
-                    "Continue or Full Withdrawal (contract-terminating lapse); "
-                    "Partial Withdrawal is excluded."
-                ),
+                "with annual Election and annual Income Lapse decisions.",
+                "The optimal Income action set is restricted to "
+                "CONTINUE_FOR_ONE_YEAR or FULL_WITHDRAWAL_NOW; Partial "
+                "Withdrawal is excluded.",
                 "The five-year government-bond sleeve, monthly rebalancing to "
                 "the CSV-configured target allocation, "
                 "absence of bond term premium and other fixed proxy assumptions "

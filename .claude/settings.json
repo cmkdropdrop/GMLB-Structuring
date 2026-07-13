@@ -14,7 +14,10 @@
       "Bash(grep -q \"First-year gas-storage Bellman diagnostic\\\\|Backward diagnostic\" e2e_run3.log)",
       "Bash(break)",
       "Bash(ping -n 12 127.0.0.1)",
-      "Bash(grep -E \"inventory grid|First-year gas-storage Bellman|Backward diagnostic|Economic cap-policy\" e2e_run3.log)"
+      "Bash(grep -E \"inventory grid|First-year gas-storage Bellman|Backward diagnostic|Economic cap-policy\" e2e_run3.log)",
+      "Bash(grep -q \"First-year gas-storage Bellman\\\\|Backward diagnostic\\\\|Traceback\\\\|Error\" ols_run.log)",
+      "Bash(ping -n 11 127.0.0.1)",
+      "Bash(grep -E \"inventory grid|First-year gas-storage Bellman|Backward diagnostic|marginal value\" ols_run.log)"
     ],
     "additionalDirectories": [
       "C:\\Users\\user\\AppData\\Local\\Temp\\claude\\c--Users-user-Documents-GMLB-Structuring\\84517350-2a57-457f-92b4-01c099e3557b\\scratchpad"

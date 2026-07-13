@@ -7,17 +7,19 @@ Reference-Fund target allocation, daily fee subledger, monthly income,
 mortality, MVA, expenses,
 hedge costs and crediting margin.
 
-The primary API solves ``WAIT | START_INCOME_NOW`` in Growth and
-``CONTINUE | PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL`` in Income.  START is evaluated as the exact
-projector state transition followed by the already-solved Income policy; it is
-not treated as an immediate payment.  The historical surrender-only fit is
-retained under the explicit :func:`fit_optimal_surrender_policy` name as a
-fixed-Election validation API.  Growth surrender and all Growth withdrawals
-remain contractually prohibited.
+The primary API solves an ordered two-regime stopping problem on annual
+Crediting Anniversaries: ``WAIT_FOR_ONE_YEAR | START_INCOME_NOW`` in Growth,
+followed by ``CONTINUE_FOR_ONE_YEAR | FULL_WITHDRAWAL_NOW`` in Income.  START
+is evaluated as the exact projector state transition followed by the
+already-solved annual Income policy; it is not treated as an immediate
+payment.  Partial Withdrawals and voluntary actions between Anniversaries are
+outside the combined optimal-behaviour model.  The historical monthly action
+helpers remain import-compatible for isolated legacy research only.
 
-Version three retains the paired-action advantages introduced in v2 and adds
-fold-cached spectral Ridge solves, analytic Partial optimisation and a pooled
-fold-pure START value surface.
+Version four adds the ordered annual Income-first/Growth-second recursion and
+a pooled fold-pure START value surface.  The compatibility-only monthly helper
+retains its earlier analytic Partial optimiser but is unreachable from the
+primary combined fit.
 All regressions use training-fold standardisation, truncated SVD and a
 spectral Ridge solve in the orthogonal score basis.  In particular, this module
 never forms normal equations: doing so squares the design condition number and
@@ -28,9 +30,8 @@ was the source of mechanically late Elections in the original research implement
 # - Replaced one SVD/least-squares fit per Ridge candidate with one SVD per
 #   training fold and closed-form spectral Ridge updates across the full grid.
 # - Stored each fitted surface as an affine raw-feature form for faster rollout.
-# - Replaced Partial-Withdrawal grid prediction plus two midpoint refinements
-#   with the exact argmax of its fitted quadratic; removed those midpoint
-#   counterfactual transition panels from training.
+# - The compatibility-only Partial helper uses the exact argmax of its fitted
+#   quadratic; the ordered annual primary fit never invokes that helper.
 # - Replaced one full fixed-start projection per Election year with one
 #   randomized pooled START-value fit plus one cross-fitted policy valuation.
 # - No projector event ordering or contractual cashflow formula was changed.
@@ -67,27 +68,36 @@ Array = NDArray[np.float64]
 # are the former cubic terms and correlated value-level cross-products.
 FEATURE_NAMES = (
     "log1p_account_value_ratio",
+    "surrender_value_ratio",
     "annual_income_ratio",
     "guarantee_log_moneyness",
+    "mva_haircut_ratio",
+    "attained_age_scaled",
+    "duration_years_scaled",
     "short_rate",
     "five_year_rate_slope",
     "sqrt_heston_variance",
-    "duration_years_scaled",
+    "primary_alive",
+    "spouse_alive",
     "announced_cap",
     "previous_reference_return",
     "performance_gap",
     "account_value_sq",
+    "surrender_value_sq",
     "annual_income_sq",
     "guarantee_moneyness_sq",
     "account_value_x_guarantee_moneyness",
     "annual_income_x_guarantee_moneyness",
+    "surrender_value_x_guarantee_moneyness",
     "guarantee_moneyness_x_short_rate",
 )
 
 # The documented linear fallback contains only AV, Income, Moneyness, time
 # and rates.  Product controls (including MVA) deliberately remain full-basis
 # features and cannot leak into this fallback.
-CORE_FEATURE_INDICES = np.asarray((0, 1, 2, 3, 4, 6), dtype=np.int64)
+CORE_FEATURE_INDICES = np.asarray(
+    (0, 1, 2, 3, 5, 6, 7, 8, 10, 11), dtype=np.int64
+)
 RIDGE_GRID_DEFAULT = (0.0, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2)
 
 
@@ -108,7 +118,10 @@ class OptimalBehaviourLSMCSettings:
     observations_per_coefficient: int = 10
     immaterial_exposure_fraction: float = 1.0e-6
     fallback_to_no_action_if_training_underperforms: bool = True
-    allow_partial_withdrawal: bool = True
+    # Deprecated compatibility control for the isolated monthly-action API.
+    # The combined annual optimal-behaviour fit ignores it and never permits
+    # or produces a Partial Withdrawal.
+    allow_partial_withdrawal: bool = False
 
     def __post_init__(self) -> None:
         numeric = np.asarray([
@@ -234,6 +247,10 @@ def build_surrender_regression_features(
         previous_credited_return=context.previous_credited_return,
         performance_gap=context.performance_gap,
         premium=premium,
+        mva_factor=context.mva_factor,
+        attained_age=context.attained_age,
+        primary_alive=context.primary_alive,
+        spouse_alive=context.spouse_alive,
     )
 
 
@@ -253,6 +270,10 @@ def build_surrender_regression_features_from_arrays(
     previous_credited_return: object,
     performance_gap: object,
     premium: object,
+    mva_factor: object = 0.0,
+    attained_age: object = 0.0,
+    primary_alive: object = 1.0,
+    spouse_alive: object = 0.0,
 ) -> Array:
     """Build the canonical compact v2 policyholder features from arrays.
 
@@ -284,6 +305,10 @@ def build_surrender_regression_features_from_arrays(
         "previous_reference_return": previous_reference_return,
         "performance_gap": performance_gap,
         "premium": premium,
+        "mva_factor": mva_factor,
+        "attained_age": attained_age,
+        "primary_alive": primary_alive,
+        "spouse_alive": spouse_alive,
     }
     arrays: list[Array] = []
     for name, value in values.items():
@@ -324,8 +349,13 @@ def build_surrender_regression_features_from_arrays(
     premium_array = data["premium"]
     x = np.maximum(data["account_value"], 0.0) / premium_array
     log_x = np.log1p(x)
+    surrender = np.maximum(data["surrender_value"], 0.0) / premium_array
     y = np.maximum(data["locked_annual_income"], 0.0) / premium_array
     m = data["guarantee_log_moneyness"]
+    # ``mva_factor`` is the Projector's current non-negative MVA bite as a
+    # fraction of gross withdrawal/Account Value (zero means no haircut).
+    mva_haircut = np.clip(data["mva_factor"], 0.0, 1.0)
+    attained_age = data["attained_age"] / 100.0
     r = data["short_rate"]
     z5 = data["zero_rate_5y"]
     sqrt_v = np.sqrt(np.maximum(data["heston_variance"], 0.0))
@@ -339,20 +369,27 @@ def build_surrender_regression_features_from_arrays(
 
     out = np.column_stack((
         log_x,
+        surrender,
         y,
         m,
+        mva_haircut,
+        attained_age,
+        duration,
         r,
         z5 - r,
         sqrt_v,
-        duration,
+        data["primary_alive"],
+        data["spouse_alive"],
         cap,
         reference_return,
         gap,
         log_x * log_x,
+        surrender * surrender,
         y * y,
         m * m,
         log_x * m,
         y * m,
+        surrender * m,
         m * r,
     ))
     if out.shape[1] != len(FEATURE_NAMES):
@@ -440,6 +477,7 @@ class OptimalSurrenderPolicy:
     provenance_fingerprint: Optional[str] = None
     regressions_are_advantages: bool = False
     strict_missing_material_regression: bool = False
+    terminal_step: Optional[int] = None
     evaluation_statistics: dict[int, dict[str, int]] = field(default_factory=dict)
     anniversary_only: bool = field(default=True, init=False, repr=False)
 
@@ -460,11 +498,26 @@ class OptimalSurrenderPolicy:
         n_paths = context.n_paths
         if not context.is_anniversary:
             return np.zeros(n_paths, dtype=bool)
+        if self.terminal_step is not None and step >= self.terminal_step:
+            return np.zeros(n_paths, dtype=bool)
         eligible = (
             context.full_withdrawal_eligible
             & (context.phase == Phase.INCOME.value)
             & (context.inforce_weight > self.settings.minimum_inforce_weight)
         )
+        # A zero surrender payment cannot dominate a strictly positive locked
+        # lifetime income for a covered survivor.  Exclude this contractual
+        # dominance region deterministically instead of asking a noisy
+        # regression to manufacture an exercise boundary there.
+        covered_alive = np.asarray(context.primary_alive, dtype=bool) | np.asarray(
+            context.spouse_alive, dtype=bool
+        )
+        dominated_zero_surrender = (
+            context.surrender_value <= self.settings.exercise_tolerance_aud
+        ) & (
+            context.locked_annual_income > self.settings.exercise_tolerance_aud
+        ) & covered_alive
+        eligible &= ~dominated_zero_surrender
         if not np.any(eligible):
             return np.zeros(n_paths, dtype=bool)
         if step not in self.regressions:
@@ -513,6 +566,7 @@ class CrossFittedOptimalSurrenderPolicy:
     settings: OptimalBehaviourLSMCSettings
     regressions_are_advantages: bool = False
     strict_missing_material_regression: bool = False
+    terminal_step: Optional[int] = None
     anniversary_only: bool = field(default=True, init=False, repr=False)
 
     def surrender_mask(
@@ -525,11 +579,28 @@ class CrossFittedOptimalSurrenderPolicy:
         step = int(context.step)
         if not context.is_anniversary:
             return np.zeros(context.n_paths, dtype=bool)
+        if self.terminal_step is not None and step >= self.terminal_step:
+            return np.zeros(context.n_paths, dtype=bool)
         if step not in self.regressions_by_step:
             eligible = (
                 context.full_withdrawal_eligible
                 & (context.phase == Phase.INCOME.value)
                 & (context.inforce_weight > self.settings.minimum_inforce_weight)
+            )
+            covered_alive = (
+                np.asarray(context.primary_alive, dtype=bool)
+                | np.asarray(context.spouse_alive, dtype=bool)
+            )
+            eligible &= ~(
+                (
+                    context.surrender_value
+                    <= self.settings.exercise_tolerance_aud
+                )
+                & (
+                    context.locked_annual_income
+                    > self.settings.exercise_tolerance_aud
+                )
+                & covered_alive
             )
             exposure = float(np.mean(np.where(
                 eligible, context.inforce_weight, 0.0
@@ -551,6 +622,21 @@ class CrossFittedOptimalSurrenderPolicy:
             context.full_withdrawal_eligible
             & (context.phase == Phase.INCOME.value)
             & (context.inforce_weight > self.settings.minimum_inforce_weight)
+        )
+        covered_alive = (
+            np.asarray(context.primary_alive, dtype=bool)
+            | np.asarray(context.spouse_alive, dtype=bool)
+        )
+        eligible &= ~(
+            (
+                context.surrender_value
+                <= self.settings.exercise_tolerance_aud
+            )
+            & (
+                context.locked_annual_income
+                > self.settings.exercise_tolerance_aud
+            )
+            & covered_alive
         )
         prediction = np.zeros(context.n_paths)
         stable = np.ones(context.n_paths, dtype=bool)
@@ -1710,12 +1796,9 @@ START_VALUE_CORE_FEATURE_INDICES = np.asarray(
 
 INCOME_ACTION_FEATURE_NAMES = (
     *FEATURE_NAMES,
-    "attained_age_scaled",
     "time_to_forced_election_scaled",
     "mva_remaining_years_scaled",
     "mva_factor",
-    "primary_alive",
-    "spouse_alive",
 )
 PARTIAL_ACTION_FEATURE_NAMES = (
     *INCOME_ACTION_FEATURE_NAMES,
@@ -1727,8 +1810,7 @@ PARTIAL_ACTION_FEATURE_NAMES = (
 )
 INCOME_ACTION_CORE_FEATURE_INDICES = np.asarray(
     (*CORE_FEATURE_INDICES,
-     len(FEATURE_NAMES),
-     len(FEATURE_NAMES) + 1),
+     len(FEATURE_NAMES)),
     dtype=np.int64,
 )
 PARTIAL_ACTION_CORE_FEATURE_INDICES = np.asarray(
@@ -1760,8 +1842,11 @@ def build_income_action_regression_features(
         previous_credited_return=context.previous_credited_return,
         performance_gap=context.performance_gap,
         premium=premium,
+        mva_factor=context.mva_factor,
+        attained_age=context.attained_age,
+        primary_alive=context.primary_alive,
+        spouse_alive=context.spouse_alive,
     )
-    attained_age = np.asarray(context.attained_age, dtype=float) / 100.0
     time_to_forced = np.asarray(
         context.time_to_forced_election, dtype=float
     ) / 100.0
@@ -1769,18 +1854,13 @@ def build_income_action_regression_features(
         context.n_paths, float(context.mva_remaining_years) / 100.0
     )
     mva_factor = np.asarray(context.mva_factor, dtype=float)
-    primary_alive = np.asarray(context.primary_alive, dtype=float)
-    spouse_alive = np.asarray(context.spouse_alive, dtype=float)
     if not np.all(np.isfinite(mva_factor)) or np.any(mva_factor < 0.0):
         raise ValueError("Income-action MVA factors are invalid.")
     out = np.column_stack((
         base,
-        attained_age,
         time_to_forced,
         mva_remaining,
         mva_factor,
-        primary_alive,
-        spouse_alive,
     ))
     if out.shape != (context.n_paths, len(INCOME_ACTION_FEATURE_NAMES)):
         raise RuntimeError("Income-action feature matrix is inconsistent.")
@@ -2152,7 +2232,7 @@ class _ElectionRegressionPair:
 
 @dataclass
 class OptimalBehaviourPolicy:
-    """Frozen phase-aware Policyholder rule used only out of sample."""
+    """Frozen annual phase-aware Policyholder rule used only out of sample."""
 
     election_regressions: Mapping[int, _ElectionRegressionPair]
     surrender_policy: OptimalSurrenderPolicy
@@ -2166,12 +2246,12 @@ class OptimalBehaviourPolicy:
     ] = field(default_factory=dict)
     valid: bool = True
     invalid_reasons: tuple[str, ...] = ()
-    monthly_income_actions_required: bool = True
+    monthly_income_actions_required: bool = False
     provenance_fingerprint: Optional[str] = None
     evaluation_statistics: dict[
         tuple[str, int], dict[str, float | int]
     ] = field(default_factory=dict)
-    anniversary_only: bool = field(default=False, init=False, repr=False)
+    anniversary_only: bool = field(default=True, init=False, repr=False)
 
     def start_income_mask(
         self,
@@ -2251,12 +2331,12 @@ class OptimalBehaviourPolicy:
         *,
         context: IncomeActionDecisionContext,
     ) -> IncomeActionDecision:
-        """Choose one monthly Income action from paired advantage models.
+        """Compatibility hook for the deprecated monthly action API.
 
-        A missing material step or action-specific model is an error; it is
-        never silently re-labelled as Continue.  The old annual Surrender API
-        is retained only as an explicit compatibility benchmark outside this
-        unified v2 hook.
+        Productive combined policies set ``monthly_income_actions_required``
+        to false and are deployed through :meth:`surrender_mask` only.  In
+        that mode this method deterministically returns CONTINUE and can never
+        create a Partial Withdrawal or an under-year Full Withdrawal.
         """
         if not isinstance(context, IncomeActionDecisionContext):
             raise TypeError("Optimal Income action requires IncomeActionDecisionContext.")
@@ -2458,7 +2538,7 @@ class OptimalBehaviourPolicy:
 
 @dataclass
 class CrossFittedOptimalBehaviourPolicy:
-    """Training-only combined policy; every complete path stays out of fold."""
+    """Training-only annual policy; every complete path stays out of fold."""
 
     election_regressions_by_step: Mapping[
         int, tuple[_ElectionRegressionPair, ...]
@@ -2475,8 +2555,8 @@ class CrossFittedOptimalBehaviourPolicy:
     ] = field(default_factory=dict)
     valid: bool = True
     invalid_reasons: tuple[str, ...] = ()
-    monthly_income_actions_required: bool = True
-    anniversary_only: bool = field(default=False, init=False, repr=False)
+    monthly_income_actions_required: bool = False
+    anniversary_only: bool = field(default=True, init=False, repr=False)
 
     def start_income_mask(
         self,
@@ -2877,12 +2957,18 @@ class OptimalBehaviourPolicyFit:
     selected_income_action_mode: str
     valid: bool = True
     invalid_reasons: tuple[str, ...] = ()
-    fit_version: str = "combined_optimal_behaviour_lsmc_v3"
+    fit_version: str = "ordered_annual_multiple_stopping_lsmc_v4"
     income_action_exposure_coverage: float = 1.0
     policy_iteration_count: int = 0
     policy_iteration_converged: bool = True
     final_action_agreement: float = 1.0
     final_policy_value_change_aud: float = 0.0
+    candidate_policy: Optional[OptimalBehaviourPolicy] = None
+    policy_variants: Mapping[str, OptimalBehaviourPolicy] = field(
+        default_factory=dict
+    )
+    selected_policy_name: str = "V11"
+    training_fallback_reason: Optional[str] = None
 
     @property
     def training_optionality_uplift_aud(self) -> float:
@@ -2903,6 +2989,20 @@ _POLICYHOLDER_CASHFLOW_KEYS = (
     "partial_withdrawals",
     "terminal_closeout",
 )
+
+
+def _assert_no_optimal_partial_withdrawals(
+    projection: ProjectionResult,
+    *,
+    context: str,
+) -> None:
+    """Enforce the annual optimal-policy action set at every rollout boundary."""
+    partial = np.asarray(projection.cashflows["partial_withdrawals"], dtype=float)
+    if np.any(np.abs(partial) > 1.0e-10):
+        raise RuntimeError(
+            f"{context} produced Partial Withdrawals; the annual optimal "
+            "behaviour action set permits only START and FULL_WITHDRAWAL."
+        )
 
 
 def _discounted_policyholder_cashflows(
@@ -3219,6 +3319,21 @@ def _fit_surrender_phase_from_projection(
             & (context.inforce_weight > settings.minimum_inforce_weight)
             & (scale_0 > 1.0e-300)
         )
+        dominated_zero_surrender = (
+            eligible
+            & (
+                context.surrender_value
+                <= settings.exercise_tolerance_aud
+            )
+            & (
+                future_value_0
+                >= -settings.exercise_tolerance_aud * scale_0
+            )
+        )
+        # Do not train an exercise boundary where FULL pays zero and the
+        # realised CONTINUE value is non-negative.  Those rows have the
+        # deterministic CONTINUE action and remain in the carried value.
+        eligible &= ~dominated_zero_surrender
         eligible_index = np.flatnonzero(eligible)
         observations = int(eligible_index.size)
         accepted = False
@@ -3440,6 +3555,7 @@ def _fit_surrender_phase_from_projection(
             settings=settings,
             regressions_are_advantages=True,
             strict_missing_material_regression=not fallback_used,
+            terminal_step=n_steps,
         ),
         cross_fitted_policy=CrossFittedOptimalSurrenderPolicy(
             regressions_by_step=MappingProxyType(dict(sorted(
@@ -3451,6 +3567,7 @@ def _fit_surrender_phase_from_projection(
             settings=settings,
             regressions_are_advantages=True,
             strict_missing_material_regression=not fallback_used,
+            terminal_step=n_steps,
         ),
         diagnostics=tuple(sorted(
             diagnostics, key=lambda item: item.decision_step
@@ -3560,6 +3677,48 @@ def _project_assigned_election_income_branch(
         income_election_policy=election_policy,
         income_action_policy=action_policy,
         income_transition_observer=income_transition_observer,
+    )
+    return projection, election_policy
+
+
+def _project_assigned_election_annual_branch(
+    *,
+    assigned_start_steps: NDArray[np.int64],
+    product: IndexLinkedLifetimeIncomeProduct,
+    policy: PolicySpec,
+    scenarios: ScenarioSet,
+    behaviour: BehaviourModel,
+    mortality: MortalityTable,
+    expenses: Optional[ExpenseAssumptions],
+    config: ProjectionConfig,
+    surrender_policy: Optional[object] = None,
+) -> tuple[ProjectionResult, _AssignedElectionContextRecorder]:
+    """Project assigned STARTs with only annual Income FULL decisions.
+
+    The recorder and the fitted policy both use the Projector's existing
+    Anniversary surrender boundary.  Consequently the twelve monthly
+    transitions between decision dates remain canonical product transitions;
+    this LSMC layer does not recreate fees, mortality, Income or MVA logic.
+    """
+    election_policy = _AssignedElectionContextRecorder(
+        assigned_start_steps=np.asarray(assigned_start_steps, dtype=np.int64)
+    )
+    projection = project(
+        product,
+        policy,
+        scenarios,
+        behaviour,
+        mortality,
+        expenses=expenses,
+        config=config,
+        income_election_policy=election_policy,
+        surrender_policy=(
+            election_policy if surrender_policy is None else surrender_policy
+        ),
+    )
+    _assert_no_optimal_partial_withdrawals(
+        projection,
+        context="Assigned-start annual Income rollout",
     )
     return projection, election_policy
 
@@ -4845,7 +5004,7 @@ def _fit_monthly_income_action_phase(
     )
 
 
-def fit_optimal_behaviour_policy(
+def _fit_monthly_optimal_behaviour_policy_legacy(
     product: IndexLinkedLifetimeIncomeProduct,
     policy: PolicySpec,
     training_scenarios: ScenarioSet,
@@ -5668,6 +5827,791 @@ def fit_optimal_behaviour_policy(
         final_policy_value_change_aud=(
             income_action_fit.final_value_change_aud
         ),
+    )
+
+
+def fit_optimal_behaviour_policy(
+    product: IndexLinkedLifetimeIncomeProduct,
+    policy: PolicySpec,
+    training_scenarios: ScenarioSet,
+    mortality: MortalityTable,
+    *,
+    expenses: Optional[ExpenseAssumptions] = None,
+    projection_config: ProjectionConfig = ProjectionConfig(record_paths=False),
+    settings: OptimalBehaviourLSMCSettings = OptimalBehaviourLSMCSettings(),
+    fit_basis_inputs: Optional[Mapping[str, object]] = None,
+) -> OptimalBehaviourPolicyFit:
+    """Fit the ordered annual Growth-then-Income stopping policy.
+
+    This is analogous to a two-right swing recursion only at the Bellman level:
+    compare value without action with immediate action value plus the value in
+    the next regime.  The state dimension here is the irreversible contractual
+    phase, not a count of interchangeable rights.  Income/Lapse is solved first;
+    Growth/Election is solved second using that frozen downstream policy.
+    """
+    if not isinstance(settings, OptimalBehaviourLSMCSettings):
+        raise TypeError("settings must be OptimalBehaviourLSMCSettings.")
+    if tuple(settings.ridge_grid) != RIDGE_GRID_DEFAULT:
+        raise ValueError(
+            "Annual optimal-behaviour LSMC requires the fixed Ridge grid "
+            f"{RIDGE_GRID_DEFAULT}; got {tuple(settings.ridge_grid)}."
+        )
+    policy.validate_against(product)
+    if policy.age_pension_plus:
+        raise NotImplementedError("Generic optimal behaviour does not support APS.")
+    if product.allows_growth_surrender or product.allows_growth_withdrawals:
+        raise ValueError(
+            "Annual optimal behaviour requires the generic product's Growth "
+            "withdrawal and surrender gates."
+        )
+
+    config = replace(projection_config, record_paths=False, heston_cos=False)
+    behaviour = no_voluntary_action_behaviour()
+    premium = float(policy.net_initial_investment)
+    n_paths = training_scenarios.n_paths
+    n_steps = training_scenarios.n_steps
+    minimum_step = int(product.min_years_before_income) * STEPS_PER_YEAR
+    forced_step = _contractual_forced_election_step(product, policy)
+    if minimum_step <= 0 or minimum_step % STEPS_PER_YEAR:
+        raise ValueError("Income-Election minimum must be a positive whole year.")
+    if forced_step > n_steps:
+        raise ValueError(
+            "Training horizon must reach the contractual forced Election anniversary."
+        )
+    election_steps = tuple(range(
+        minimum_step, forced_step + 1, STEPS_PER_YEAR
+    ))
+    if not election_steps or election_steps[-1] != forced_step:
+        raise ValueError("Contractual Election grid is inconsistent.")
+
+    rng = np.random.default_rng(settings.fold_seed)
+    complete_path_ids = np.arange(n_paths, dtype=np.int64)
+    rng.shuffle(complete_path_ids)
+    fold_labels = complete_path_ids % settings.n_folds
+    assigned_start_steps = np.empty(n_paths, dtype=np.int64)
+    for fold in range(settings.n_folds):
+        fold_paths = np.flatnonzero(fold_labels == fold)
+        rng.shuffle(fold_paths)
+        assigned_start_steps[fold_paths] = np.asarray([
+            election_steps[index % len(election_steps)]
+            for index in range(fold_paths.size)
+        ], dtype=np.int64)
+
+    # Stage 1: cover Income states from all material START dates, then solve
+    # CONTINUE_FOR_ONE_YEAR versus FULL_WITHDRAWAL_NOW backwards.  The recorder
+    # is anniversary-only, so no under-year state can become a regression row.
+    assigned_continue_projection, assigned_recorder = (
+        _project_assigned_election_annual_branch(
+            assigned_start_steps=assigned_start_steps,
+            product=product,
+            policy=policy,
+            scenarios=training_scenarios,
+            behaviour=behaviour,
+            mortality=mortality,
+            expenses=expenses,
+            config=config,
+        )
+    )
+    income_fit_failure: Optional[str] = None
+    try:
+        income_fit = _fit_surrender_phase_from_projection(
+            projection=assigned_continue_projection,
+            contexts=assigned_recorder.surrender_contexts,
+            scenarios=training_scenarios,
+            premium=premium,
+            settings=settings,
+            base_fold_ids=complete_path_ids,
+        )
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        income_fit_failure = f"annual_income_fit_failed:{exc}"
+        continue_value = float(np.mean(np.sum(
+            _discounted_policyholder_cashflows(
+                assigned_continue_projection, training_scenarios
+            ),
+            axis=1,
+        )))
+        income_fit = _SurrenderPhaseFit(
+            policy=OptimalSurrenderPolicy(regressions={}, settings=settings),
+            cross_fitted_policy=CrossFittedOptimalSurrenderPolicy(
+                regressions_by_step={}, fold_ids_by_step={}, settings=settings
+            ),
+            diagnostics=(),
+            training_policyholder_value_aud=continue_value,
+            training_continue_value_aud=continue_value,
+            training_candidate_value_aud=continue_value,
+            fallback_used=True,
+        )
+
+    cross_income_policy: Optional[CrossFittedOptimalSurrenderPolicy] = (
+        None if income_fit.fallback_used else income_fit.cross_fitted_policy
+    )
+    assigned_policy_projection, assigned_policy_recorder = (
+        _project_assigned_election_annual_branch(
+            assigned_start_steps=assigned_start_steps,
+            product=product,
+            policy=policy,
+            scenarios=training_scenarios,
+            behaviour=behaviour,
+            mortality=mortality,
+            expenses=expenses,
+            config=config,
+            surrender_policy=cross_income_policy,
+        )
+    )
+
+    # The pooled START surface uses realised cashflows from the fold-pure annual
+    # Income rollout.  Every counterfactual row retains its complete-path fold.
+    start_surface_failure: Optional[str] = None
+    start_value_fold_regressions: tuple[_ContinuationRegression, ...] = ()
+    try:
+        start_value_raw, start_value_target, start_value_path_ids = (
+            _assigned_start_value_training_panel(
+                projection=assigned_policy_projection,
+                election_contexts=assigned_policy_recorder.election_contexts,
+                assigned_start_steps=assigned_start_steps,
+                election_steps=election_steps,
+                scenarios=training_scenarios,
+                premium=premium,
+                issue_age=float(policy.age),
+                automatic_income_start_age=float(
+                    product.automatic_income_start_age
+                ),
+                settings=settings,
+                complete_path_ids=complete_path_ids,
+            )
+        )
+        (
+            _start_value_regression,
+            _start_value_oof,
+            _start_value_folds_used,
+            start_value_fold_regressions,
+        ) = _cross_fitted_state_value_regression(
+            start_value_raw,
+            start_value_target,
+            premium,
+            settings,
+            start_value_path_ids,
+            core_feature_indices=START_VALUE_CORE_FEATURE_INDICES,
+            enforce_unique_path_minimum=True,
+        )
+        start_value_fold_regressions = tuple(
+            replace(
+                regression,
+                basis_level=f"pooled_annual_start/{regression.basis_level}",
+            )
+            for regression in start_value_fold_regressions
+        )
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        start_surface_failure = f"annual_start_surface_failed:{exc}"
+
+    # The forced-START branch supplies exact WAIT cashflows and annual Growth
+    # contexts.  Annual lapse is already solved and is applied only through the
+    # Projector's surrender hook.
+    branch_projection, election_recorder = _project_fixed_election_branch(
+        start_step=forced_step,
+        product=product,
+        policy=policy,
+        scenarios=training_scenarios,
+        behaviour=behaviour,
+        mortality=mortality,
+        expenses=expenses,
+        config=config,
+        surrender_policy=cross_income_policy,
+    )
+    _assert_no_optimal_partial_withdrawals(
+        branch_projection, context="Annual Growth Bellman branch"
+    )
+    growth_discounted_cashflow = _discounted_policyholder_cashflows(
+        branch_projection, training_scenarios
+    )
+    if branch_projection.phase_cashflows is None:
+        raise RuntimeError("Annual Election fit requires phase cashflow ledgers.")
+    growth_pre_election_benefit_0 = (
+        branch_projection.phase_cashflows["policyholder_benefits_pre_election"]
+        * training_scenarios.discount[:, :len(branch_projection.times)]
+    )
+    forced_post_election_current_0 = (
+        branch_projection.phase_cashflows[
+            "policyholder_benefits_post_election"
+        ][:, forced_step]
+        * training_scenarios.discount[:, forced_step]
+    )
+    forced_start_value_0 = (
+        forced_post_election_current_0
+        + np.sum(growth_discounted_cashflow[:, forced_step + 1:], axis=1)
+    )
+    wait_path_value_0 = np.sum(growth_discounted_cashflow, axis=1)
+    growth_contexts = dict(election_recorder.election_contexts)
+
+    election_regressions: dict[int, _ElectionRegressionPair] = {}
+    election_fold_regressions: dict[
+        int, tuple[_ElectionRegressionPair, ...]
+    ] = {}
+    election_fold_ids: dict[int, NDArray[np.int64]] = {}
+    election_diagnostics: list[OptimalBehaviourRegressionDiagnostic] = []
+    election_panels: dict[
+        int, tuple[Array, Array, Array, NDArray[np.int64]]
+    ] = {}
+    material_election_failures: list[str] = []
+    if start_surface_failure is not None:
+        material_election_failures.append(start_surface_failure)
+
+    future_value_0 = forced_start_value_0.copy()
+    next_step = forced_step
+    if start_value_fold_regressions:
+        for step in reversed(election_steps[:-1]):
+            # WAIT carries every monthly cashflow to the next Anniversary.  At
+            # that boundary the already-solved realised action value is used;
+            # there is no pathwise maximum of future realised outcomes.
+            future_value_0 += (
+                np.sum(
+                    growth_discounted_cashflow[:, step + 1:next_step], axis=1
+                )
+                + growth_pre_election_benefit_0[:, next_step]
+            )
+            wait_realised_0 = future_value_0.copy()
+            start_realised_0 = np.zeros(n_paths)
+            context = growth_contexts.get(step)
+            if context is None:
+                raise ValueError(
+                    f"Projector did not expose Election context at step {step}."
+                )
+            scale_0 = training_scenarios.discount[:, step] * context.inforce_weight
+            eligible = (
+                context.voluntary_election_eligible
+                & (context.phase == Phase.GROWTH.value)
+                & (context.inforce_weight > settings.minimum_inforce_weight)
+                & (scale_0 > 1.0e-300)
+            )
+            eligible_index = np.flatnonzero(eligible)
+            observations = int(eligible_index.size)
+            accepted = False
+            fallback_reason: Optional[str] = None
+            folds_used = 0
+            wait_target = np.zeros(0)
+            start_target = np.zeros(0)
+            advantage_oof = np.zeros(0)
+            pair: Optional[_ElectionRegressionPair] = None
+            fold_pairs: tuple[_ElectionRegressionPair, ...] = ()
+            panel_ids = complete_path_ids[eligible_index]
+            if observations:
+                wait_target = wait_realised_0[eligible] / scale_0[eligible]
+                election_features = build_income_election_regression_features(
+                    context,
+                    premium,
+                    policy.age,
+                    product.automatic_income_start_age,
+                )
+                raw = election_features[eligible]
+                start_raw = _build_income_start_value_features(
+                    election_features
+                )[eligible]
+                start_target = _predict_fold_pure_regression(
+                    start_raw, panel_ids, start_value_fold_regressions
+                )
+                start_realised_0[eligible_index] = (
+                    scale_0[eligible_index] * start_target
+                )
+                election_panels[step] = (
+                    raw, wait_target, start_target, panel_ids
+                )
+            minimum = _minimum_cross_fit_observations(settings, 1)
+            if observations < minimum:
+                fallback_reason = f"too_few_observations:{observations}<{minimum}"
+            else:
+                try:
+                    pair, advantage_oof, folds_used, fold_pairs = (
+                        _fit_election_regression_pair(
+                            raw,
+                            wait_target,
+                            start_target,
+                            premium=premium,
+                            settings=settings,
+                            fold_ids=panel_ids,
+                        )
+                    )
+                    accepted = bool(
+                        pair.stable(settings)
+                        and all(item.stable(settings) for item in fold_pairs)
+                    )
+                    if not accepted:
+                        fallback_reason = "election_regression_unstable"
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    fallback_reason = f"cross_fit_failed:{exc}"
+
+            # Local annual pooling is the last action-regression fallback after
+            # full/core/constant bases inside the cross-fitted Ridge/SVD fit.
+            if not accepted and observations:
+                neighbours = sorted(
+                    (
+                        (other_step, panel)
+                        for other_step, panel in election_panels.items()
+                        if other_step != step
+                    ),
+                    key=lambda item: abs(item[0] - step),
+                )[:2]
+                if neighbours:
+                    pooled_raw = np.concatenate((
+                        raw, *(panel[0] for _, panel in neighbours)
+                    ))
+                    pooled_wait = np.concatenate((
+                        wait_target, *(panel[1] for _, panel in neighbours)
+                    ))
+                    pooled_start = np.concatenate((
+                        start_target, *(panel[2] for _, panel in neighbours)
+                    ))
+                    pooled_ids = np.concatenate((
+                        panel_ids, *(panel[3] for _, panel in neighbours)
+                    ))
+                    try:
+                        pooled_pair, pooled_oof, folds_used, pooled_folds = (
+                            _fit_election_regression_pair(
+                                pooled_raw,
+                                pooled_wait,
+                                pooled_start,
+                                premium=premium,
+                                settings=settings,
+                                fold_ids=pooled_ids,
+                            )
+                        )
+                        basis = (
+                            "pooled_election_years/"
+                            f"{pooled_pair.advantage.basis_level}"
+                        )
+                        pair = _ElectionRegressionPair(advantage=replace(
+                            pooled_pair.advantage, basis_level=basis
+                        ))
+                        fold_pairs = tuple(
+                            _ElectionRegressionPair(advantage=replace(
+                                item.advantage, basis_level=basis
+                            ))
+                            for item in pooled_folds
+                        )
+                        advantage_oof = pooled_oof[:observations]
+                        accepted = bool(
+                            pair.stable(settings)
+                            and all(item.stable(settings) for item in fold_pairs)
+                        )
+                        fallback_reason = (
+                            None if accepted else "pooled_election_unstable"
+                        )
+                    except (ValueError, np.linalg.LinAlgError) as exc:
+                        fallback_reason = f"pooled_election_failed:{exc}"
+
+            start_action = np.zeros(n_paths, dtype=bool)
+            training_action_rate = 0.0
+            if accepted and pair is not None:
+                buffer = (
+                    settings.exercise_tolerance_aud
+                    + settings.exercise_buffer_rmse_multiplier
+                    * pair.combined_oof_rmse_aud
+                )
+                selected = advantage_oof > buffer
+                start_action[eligible_index] = selected
+                training_action_rate = float(np.mean(selected))
+                election_regressions[step] = pair
+                election_fold_regressions[step] = fold_pairs
+                election_fold_ids[step] = np.mod(
+                    complete_path_ids, folds_used
+                ).astype(np.int64)
+            exposure = float(np.mean(np.where(
+                eligible, context.inforce_weight, 0.0
+            )))
+            if not accepted and exposure > settings.immaterial_exposure_fraction:
+                material_election_failures.append(
+                    f"step={step},exposure={exposure:.12g},reason={fallback_reason}"
+                )
+            elif not accepted:
+                fallback_reason = "immaterial_no_fit"
+            future_value_0 = np.where(
+                start_action, start_realised_0, wait_realised_0
+            )
+            election_diagnostics.append(OptimalBehaviourRegressionDiagnostic(
+                action_type="income_election",
+                phase="growth",
+                policy_year=step // STEPS_PER_YEAR,
+                decision_step=step,
+                observations=observations,
+                folds_used=folds_used,
+                feature_count=0 if pair is None else pair.advantage.coefficients.size,
+                matrix_rank=0 if pair is None else pair.advantage.matrix_rank,
+                condition_number=None if pair is None else pair.advantage.condition_number,
+                oof_rmse_aud=None if pair is None else pair.combined_oof_rmse_aud,
+                oof_r_squared=(
+                    None if pair is None
+                    else _oof_r_squared(start_target - wait_target, advantage_oof)
+                ),
+                mean_wait_or_continue_value_aud=(
+                    float(np.mean(wait_target)) if wait_target.size else 0.0
+                ),
+                mean_action_value_aud=(
+                    float(np.mean(start_target)) if start_target.size else 0.0
+                ),
+                training_action_rate=training_action_rate,
+                regression_accepted_for_action=accepted,
+                fallback_reason=fallback_reason,
+                wait_regression_rank=None if pair is None else pair.advantage.matrix_rank,
+                wait_regression_condition_number=(
+                    None if pair is None else pair.advantage.condition_number
+                ),
+                wait_regression_oof_rmse_aud=(
+                    None if pair is None else pair.advantage.oof_rmse_aud
+                ),
+                action_regression_rank=None if pair is None else pair.advantage.matrix_rank,
+                action_regression_condition_number=(
+                    None if pair is None else pair.advantage.condition_number
+                ),
+                action_regression_oof_rmse_aud=(
+                    None if pair is None else pair.advantage.oof_rmse_aud
+                ),
+                selected_ridge=None if pair is None else pair.advantage.selected_ridge,
+                effective_rank=0 if pair is None else pair.advantage.effective_rank,
+                basis_level="none" if pair is None else pair.advantage.basis_level,
+                oof_policy_uplift_aud=(
+                    None if pair is None else float(np.mean(np.where(
+                        advantage_oof > (
+                            settings.exercise_tolerance_aud
+                            + settings.exercise_buffer_rmse_multiplier
+                            * pair.advantage.oof_rmse_aud
+                        ),
+                        start_target - wait_target,
+                        0.0,
+                    )))
+                ),
+                relevant_exposure_fraction=exposure,
+            ))
+            next_step = step
+
+    first_step = election_steps[0]
+    bellman_candidate_path_value = (
+        np.sum(growth_discounted_cashflow[:, :first_step + 1], axis=1)
+        + future_value_0
+    )
+    wait_value = float(np.mean(wait_path_value_0))
+
+    empty_surrender = OptimalSurrenderPolicy(regressions={}, settings=settings)
+    empty_cross_surrender = CrossFittedOptimalSurrenderPolicy(
+        regressions_by_step={}, fold_ids_by_step={}, settings=settings
+    )
+    dynamic_complete = not material_election_failures and income_fit_failure is None
+    candidate_policy = OptimalBehaviourPolicy(
+        election_regressions=MappingProxyType(dict(sorted(
+            election_regressions.items()
+        ))),
+        surrender_policy=income_fit.policy,
+        premium=premium,
+        issue_age=float(policy.age),
+        settings=settings,
+        automatic_income_start_age=float(product.automatic_income_start_age),
+        monthly_income_actions_required=False,
+        valid=dynamic_complete,
+        invalid_reasons=tuple((*material_election_failures,) + (
+            () if income_fit_failure is None else (income_fit_failure,)
+        )),
+    )
+    cross_candidate = CrossFittedOptimalBehaviourPolicy(
+        election_regressions_by_step=MappingProxyType(dict(sorted(
+            election_fold_regressions.items()
+        ))),
+        election_fold_ids_by_step=MappingProxyType(dict(sorted(
+            election_fold_ids.items()
+        ))),
+        surrender_policy=(
+            income_fit.cross_fitted_policy
+            if not income_fit.fallback_used else empty_cross_surrender
+        ),
+        premium=premium,
+        issue_age=float(policy.age),
+        settings=settings,
+        automatic_income_start_age=float(product.automatic_income_start_age),
+        monthly_income_actions_required=False,
+        valid=dynamic_complete,
+        invalid_reasons=candidate_policy.invalid_reasons,
+    )
+    candidate_path_value = bellman_candidate_path_value
+    if dynamic_complete:
+        candidate_projection = project(
+            product,
+            policy,
+            training_scenarios,
+            behaviour,
+            mortality,
+            expenses=expenses,
+            config=config,
+            income_election_policy=cross_candidate,
+            surrender_policy=cross_candidate,
+        )
+        _assert_no_optimal_partial_withdrawals(
+            candidate_projection, context="Cross-fitted annual candidate"
+        )
+        candidate_path_value = np.sum(
+            _discounted_policyholder_cashflows(
+                candidate_projection, training_scenarios
+            ),
+            axis=1,
+        )
+    candidate_value = float(np.mean(candidate_path_value))
+
+    # Predeclared fixed library.  Each anchor is valued both with CONTINUE only
+    # and with the already-fitted annual Lapse policy.  Selection uses paired
+    # complete-path differences on training paths; evaluation paths never feed
+    # back into this choice.
+    def fixed_step(year: int) -> int:
+        return min(forced_step, max(minimum_step, int(year) * STEPS_PER_YEAR))
+
+    fixed_election_steps = tuple(dict.fromkeys((
+        minimum_step,
+        fixed_step(5),
+        fixed_step(10),
+        fixed_step(policy.effective_income_start_year(product)),
+        forced_step,
+    )))
+
+    def path_values(result: ProjectionResult) -> Array:
+        _assert_no_optimal_partial_withdrawals(
+            result, context="Annual fixed-policy baseline"
+        )
+        return np.sum(
+            _discounted_policyholder_cashflows(result, training_scenarios),
+            axis=1,
+        )
+
+    fixed_candidates: list[tuple[float, int, str, Array]] = []
+    for anchor_step in fixed_election_steps:
+        continue_projection, _ = _project_fixed_election_branch(
+            start_step=anchor_step,
+            product=product,
+            policy=policy,
+            scenarios=training_scenarios,
+            behaviour=behaviour,
+            mortality=mortality,
+            expenses=expenses,
+            config=config,
+        )
+        continue_paths = path_values(continue_projection)
+        fixed_candidates.append((
+            float(np.mean(continue_paths)), anchor_step, "continue", continue_paths
+        ))
+        if not income_fit.fallback_used:
+            lapse_projection, _ = _project_fixed_election_branch(
+                start_step=anchor_step,
+                product=product,
+                policy=policy,
+                scenarios=training_scenarios,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=expenses,
+                config=config,
+                surrender_policy=income_fit.cross_fitted_policy,
+            )
+            lapse_paths = path_values(lapse_projection)
+            fixed_candidates.append((
+                float(np.mean(lapse_paths)), anchor_step, "annual_lapse", lapse_paths
+            ))
+    best_fixed_value, best_fixed_step, best_fixed_mode, best_fixed_paths = max(
+        fixed_candidates, key=lambda item: item[0]
+    )
+    no_action_value = max(
+        value for value, _step, mode, _paths in fixed_candidates
+        if mode == "continue"
+    )
+
+    def paired_lower_bound(selected: Array, benchmark: Array) -> float:
+        difference = np.asarray(selected) - np.asarray(benchmark)
+        if difference.size < 2:
+            return float(np.mean(difference))
+        return float(
+            np.mean(difference)
+            - 1.96 * np.std(difference, ddof=1) / np.sqrt(difference.size)
+        )
+
+    training_margin = premium / 10_000.0
+    use_fixed_fallback = bool(
+        not dynamic_complete
+        or (
+            settings.fallback_to_no_action_if_training_underperforms
+            and paired_lower_bound(candidate_path_value, best_fixed_paths)
+            < training_margin
+        )
+    )
+    selected_surrender = (
+        income_fit.policy
+        if best_fixed_mode == "annual_lapse" else empty_surrender
+    )
+    selected_policy = (
+        OptimalBehaviourPolicy(
+            election_regressions=MappingProxyType({}),
+            surrender_policy=selected_surrender,
+            premium=premium,
+            issue_age=float(policy.age),
+            settings=settings,
+            automatic_income_start_age=float(
+                product.automatic_income_start_age
+            ),
+            fixed_election_step=int(best_fixed_step),
+            monthly_income_actions_required=False,
+        )
+        if use_fixed_fallback else candidate_policy
+    )
+    selected_cross_policy = (
+        CrossFittedOptimalBehaviourPolicy(
+            election_regressions_by_step=MappingProxyType({}),
+            election_fold_ids_by_step=MappingProxyType({}),
+            surrender_policy=(
+                income_fit.cross_fitted_policy
+                if best_fixed_mode == "annual_lapse"
+                else empty_cross_surrender
+            ),
+            premium=premium,
+            issue_age=float(policy.age),
+            settings=settings,
+            automatic_income_start_age=float(
+                product.automatic_income_start_age
+            ),
+            fixed_election_step=int(best_fixed_step),
+            monthly_income_actions_required=False,
+        )
+        if use_fixed_fallback else cross_candidate
+    )
+    selected_value = best_fixed_value if use_fixed_fallback else candidate_value
+    selected_name = (
+        f"fixed_year_{best_fixed_step // STEPS_PER_YEAR}_{best_fixed_mode}"
+        if use_fixed_fallback else "V11"
+    )
+    fallback_reason = (
+        None
+        if not use_fixed_fallback
+        else "candidate_fit_incomplete"
+        if not dynamic_complete
+        else "candidate_failed_paired_training_lower_bound"
+    )
+
+    modelpoint_step = fixed_step(policy.effective_income_start_year(product))
+    variants = {
+        "V00": OptimalBehaviourPolicy(
+            election_regressions=MappingProxyType({}),
+            surrender_policy=empty_surrender,
+            premium=premium,
+            issue_age=float(policy.age),
+            settings=settings,
+            automatic_income_start_age=float(product.automatic_income_start_age),
+            fixed_election_step=modelpoint_step,
+            monthly_income_actions_required=False,
+        ),
+        "V01": OptimalBehaviourPolicy(
+            election_regressions=MappingProxyType({}),
+            surrender_policy=income_fit.policy,
+            premium=premium,
+            issue_age=float(policy.age),
+            settings=settings,
+            automatic_income_start_age=float(product.automatic_income_start_age),
+            fixed_election_step=modelpoint_step,
+            monthly_income_actions_required=False,
+        ),
+        "V10": replace(candidate_policy, surrender_policy=empty_surrender),
+        "V11": candidate_policy,
+    }
+
+    fit_basis_fingerprint = assumption_fingerprint(
+        "ordered_annual_multiple_stopping_lsmc_v4",
+        training_scenarios.content_fingerprint,
+        product,
+        policy,
+        mortality,
+        expenses,
+        config,
+        settings,
+        fit_basis_inputs,
+    )
+    fitted_income_surrender = replace(
+        income_fit.policy,
+        provenance_fingerprint=assumption_fingerprint(
+            fit_basis_fingerprint, "annual_income_lapse_policy"
+        ),
+    )
+    fitted_continue_surrender = replace(
+        empty_surrender,
+        provenance_fingerprint=assumption_fingerprint(
+            fit_basis_fingerprint, "annual_income_continue_policy"
+        ),
+    )
+    candidate_policy = replace(
+        candidate_policy,
+        surrender_policy=fitted_income_surrender,
+        provenance_fingerprint=assumption_fingerprint(
+            fit_basis_fingerprint, "candidate_V11_annual_election_and_lapse"
+        ),
+    )
+    selected_policy = replace(
+        selected_policy,
+        surrender_policy=(
+            fitted_income_surrender
+            if selected_policy.surrender_policy.regressions
+            else fitted_continue_surrender
+        ),
+        provenance_fingerprint=assumption_fingerprint(
+            fit_basis_fingerprint, f"selected_{selected_name}"
+        ),
+    )
+    variants["V11"] = candidate_policy
+    variants["V10"] = replace(
+        variants["V10"],
+        surrender_policy=fitted_continue_surrender,
+        provenance_fingerprint=assumption_fingerprint(
+            fit_basis_fingerprint, "candidate_V10_annual_election_continue"
+        ),
+    )
+    variants["V00"] = replace(
+        variants["V00"],
+        surrender_policy=fitted_continue_surrender,
+        provenance_fingerprint=assumption_fingerprint(
+            fit_basis_fingerprint, "baseline_V00_fixed_election_continue"
+        ),
+    )
+    variants["V01"] = replace(
+        variants["V01"],
+        surrender_policy=fitted_income_surrender,
+        provenance_fingerprint=assumption_fingerprint(
+            fit_basis_fingerprint, "candidate_V01_fixed_election_annual_lapse"
+        ),
+    )
+    diagnostics = tuple(sorted(
+        (*income_fit.diagnostics, *election_diagnostics),
+        key=lambda item: (item.decision_step, item.action_type, item.basis_level),
+    ))
+    return OptimalBehaviourPolicyFit(
+        policy=selected_policy,
+        cross_fitted_training_policy=selected_cross_policy,
+        diagnostics=diagnostics,
+        training_scenario_fingerprint=training_scenarios.content_fingerprint,
+        fit_basis_fingerprint=fit_basis_fingerprint,
+        training_path_count=n_paths,
+        training_policyholder_value_aud=float(selected_value),
+        training_wait_policyholder_value_aud=wait_value,
+        training_no_action_policyholder_value_aud=float(no_action_value),
+        training_candidate_policyholder_value_aud=candidate_value,
+        election_fallback_used=use_fixed_fallback,
+        surrender_fallback_used=(
+            income_fit.fallback_used
+            or (use_fixed_fallback and best_fixed_mode == "continue")
+        ),
+        selected_fixed_election_step=(
+            int(best_fixed_step) if use_fixed_fallback else None
+        ),
+        selected_income_action_mode=(
+            best_fixed_mode if use_fixed_fallback else "annual_lapse"
+        ),
+        valid=True,
+        invalid_reasons=(),
+        income_action_exposure_coverage=1.0,
+        policy_iteration_count=0,
+        policy_iteration_converged=True,
+        final_action_agreement=1.0,
+        final_policy_value_change_aud=0.0,
+        candidate_policy=candidate_policy,
+        policy_variants=MappingProxyType(variants),
+        selected_policy_name=selected_name,
+        training_fallback_reason=fallback_reason,
     )
 
 

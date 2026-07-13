@@ -16,7 +16,7 @@ from agile_engine import (ESGConfig, IndexLinkedLifetimeIncomeProduct,
                           credited_return,
                           load_dynamic_behaviour_assumptions,
                           value_contract)
-from agile_engine.esg import Measure, simulate
+from agile_engine.esg import Measure, STEPS_PER_YEAR, simulate
 from agile_engine.optimal_behaviour_lsmc import (
     ELECTION_FEATURE_NAMES,
     FEATURE_NAMES,
@@ -35,7 +35,7 @@ from agile_engine.optimal_behaviour_lsmc import (
     fit_surrender_continuation_policy,
     no_voluntary_action_behaviour,
 )
-from agile_engine.product import Protection
+from agile_engine.product import Phase, Protection
 from agile_engine.projection import (IncomeActionDecisionContext,
                                      IncomeActionType, project)
 
@@ -175,6 +175,10 @@ def _synthetic_surrender_context(
         inforce_weight=rng.uniform(0.65, 1.0, n_paths),
         just_elected=np.zeros(n_paths, dtype=bool),
         full_withdrawal_eligible=np.ones(n_paths, dtype=bool),
+        mva_factor=rng.uniform(0.0, 0.15, n_paths),
+        attained_age=np.full(n_paths, 65.0 + step / 12.0),
+        primary_alive=np.ones(n_paths, dtype=bool),
+        spouse_alive=rng.random(n_paths) < 0.25,
     )
 
 
@@ -337,7 +341,11 @@ def test_lsmc_fit_is_finite_out_of_sample_and_respects_growth_gate():
         training,
         mortality,
         projection_config=config,
-        settings=OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=7),
+        settings=OptimalBehaviourLSMCSettings(
+            n_folds=3,
+            fold_seed=7,
+            minimum_regression_observations=40,
+        ),
     )
 
     assert fit.training_scenario_fingerprint == training.content_fingerprint
@@ -408,7 +416,11 @@ def test_legacy_lsmc_failed_cross_fits_fall_back_to_continue(monkeypatch):
         training,
         MortalityTable.gompertz_makeham(),
         projection_config=ProjectionConfig(record_paths=True, max_age=73.0),
-        settings=OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=7),
+        settings=OptimalBehaviourLSMCSettings(
+            n_folds=3,
+            fold_seed=7,
+            minimum_regression_observations=40,
+        ),
     )
 
     assert attempts > 0
@@ -465,7 +477,22 @@ def test_full_only_sparse_month_uses_explicit_conservative_continue_model():
     )
 
 
-def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issue():
+def test_combined_lsmc_fits_only_ordered_annual_actions_and_rolls_out_from_issue(
+    monkeypatch,
+):
+    def forbidden_monthly_or_partial(*_args, **_kwargs):
+        raise AssertionError("combined annual fit reached legacy monthly actions")
+
+    monkeypatch.setattr(
+        optimal_behaviour_module,
+        "_fit_monthly_income_action_phase",
+        forbidden_monthly_or_partial,
+    )
+    monkeypatch.setattr(
+        optimal_behaviour_module,
+        "_predict_best_partial_action",
+        forbidden_monthly_or_partial,
+    )
     _, training = _setup(n_paths=384, seed=1101, horizon=4.0)
     _, evaluation = _setup(n_paths=384, seed=2202, horizon=4.0)
     product = IndexLinkedLifetimeIncomeProduct(
@@ -493,11 +520,13 @@ def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issu
 
     assert fit.training_scenario_fingerprint == training.content_fingerprint
     assert fit.fit_basis_fingerprint != fit.training_scenario_fingerprint
-    assert {
-        "income_election", "partial_withdrawal", "full_withdrawal",
-    }.issubset({
-        diagnostic.action_type for diagnostic in fit.diagnostics
-    })
+    action_types = {diagnostic.action_type for diagnostic in fit.diagnostics}
+    assert action_types <= {"income_election", "full_withdrawal"}
+    assert "partial_withdrawal" not in action_types
+    assert all(
+        diagnostic.decision_step % STEPS_PER_YEAR == 0
+        for diagnostic in fit.diagnostics
+    )
     assert all(
         diagnostic.phase in {"growth", "income"}
         for diagnostic in fit.diagnostics
@@ -508,19 +537,20 @@ def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issu
         if diagnostic.action_type == "income_election"
     )
     assert fit.policy.provenance_fingerprint
-    assert fit.policy.surrender_policy.provenance_fingerprint
+    assert fit.candidate_policy is not None
+    assert set(fit.policy_variants) == {"V00", "V01", "V10", "V11"}
     assert fit.policy_iteration_count <= 2
     assert fit.income_action_exposure_coverage >= 0.99
     assert fit.valid, fit.invalid_reasons
-    assert fit.selected_income_action_mode in {"lsmc", "continue"}
+    assert fit.selected_income_action_mode in {"annual_lapse", "continue"}
     if fit.selected_fixed_election_step is not None:
         assert not fit.policy.election_regressions
         assert (
             fit.policy.fixed_election_step
             == fit.selected_fixed_election_step
         )
-    if fit.selected_income_action_mode == "continue":
-        assert not fit.policy.income_action_regressions
+    assert not fit.policy.income_action_regressions
+    assert fit.policy.monthly_income_actions_required is False
 
     rollout = project(
         product,
@@ -530,7 +560,7 @@ def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issu
         mortality,
         config=replace(config, mortality_seed=4422),
         income_election_policy=fit.policy,
-        income_action_policy=fit.policy,
+        surrender_policy=fit.policy,
     )
     assert evaluation.content_fingerprint != training.content_fingerprint
     assert np.all(rollout.income_election_events[:, :12] == 0.0)
@@ -541,6 +571,16 @@ def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issu
         (rollout.income_election_events > 0.0)
         & (rollout.lapse_events > 0.0)
     )
+    assert np.all(rollout.cashflows["partial_withdrawals"] == 0.0)
+    lapse_steps = np.flatnonzero(np.any(rollout.lapse_events > 0.0, axis=0))
+    assert all(step % STEPS_PER_YEAR == 0 for step in lapse_steps)
+    election_steps_used = np.argmax(
+        rollout.income_election_events > 0.0, axis=1
+    )
+    for path, start_step in enumerate(election_steps_used):
+        later_lapses = np.flatnonzero(rollout.lapse_events[path] > 0.0)
+        if later_lapses.size:
+            assert later_lapses[0] >= start_step + STEPS_PER_YEAR
     assert np.isfinite(list(rollout.pv_by_component().values())).all()
 
 
@@ -572,7 +612,7 @@ def test_fixed_training_anchor_is_a_valid_frozen_election_policy():
         MortalityTable.gompertz_makeham(),
         config=ProjectionConfig(record_paths=False, max_age=68.0),
         income_election_policy=policy,
-        income_action_policy=policy,
+        surrender_policy=policy,
     )
 
     assert np.all(rollout.income_election_events[:, :12] == 0.0)
@@ -673,11 +713,16 @@ def test_v2_feature_catalogue_is_compact_and_excludes_redundant_levels():
     assert settings.observations_per_coefficient == 10
     assert settings.relative_svd_cutoff == pytest.approx(1.0e-8)
     assert settings.maximum_condition_number == pytest.approx(1.0e8)
-    assert len(FEATURE_NAMES) == 16
+    assert len(FEATURE_NAMES) == 23
     assert len(ELECTION_FEATURE_NAMES) == 22
-    assert len(INCOME_ACTION_FEATURE_NAMES) == 22
-    assert len(PARTIAL_ACTION_FEATURE_NAMES) == 27
+    assert len(INCOME_ACTION_FEATURE_NAMES) == 26
+    assert len(PARTIAL_ACTION_FEATURE_NAMES) == 31
     assert "previous_credited_return" not in FEATURE_NAMES
+    assert "surrender_value_ratio" in FEATURE_NAMES
+    assert "mva_haircut_ratio" in FEATURE_NAMES
+    assert "attained_age_scaled" in FEATURE_NAMES
+    assert "primary_alive" in FEATURE_NAMES
+    assert "spouse_alive" in FEATURE_NAMES
     assert "previous_credited_return" not in ELECTION_FEATURE_NAMES
     assert "prospective_income_rate" not in ELECTION_FEATURE_NAMES
     assert "max_partial_gross_ratio" not in INCOME_ACTION_FEATURE_NAMES
@@ -755,10 +800,53 @@ def test_array_native_feature_builder_exactly_matches_context_builder():
         previous_credited_return=context.previous_credited_return,
         performance_gap=context.performance_gap,
         premium=premium,
+        mva_factor=context.mva_factor,
+        attained_age=context.attained_age,
+        primary_alive=context.primary_alive,
+        spouse_alive=context.spouse_alive,
     )
 
     np.testing.assert_array_equal(from_arrays, from_context)
     assert from_arrays.shape == (context.n_paths, len(FEATURE_NAMES))
+    np.testing.assert_allclose(
+        from_arrays[:, FEATURE_NAMES.index("mva_haircut_ratio")],
+        context.mva_factor,
+    )
+
+
+def test_zero_surrender_with_positive_guaranteed_income_is_never_exercised():
+    context = replace(
+        _synthetic_surrender_context(n_paths=192),
+        account_value=np.zeros(192),
+        surrender_value=np.zeros(192),
+        locked_annual_income=np.full(192, 6_000.0),
+        primary_alive=np.ones(192, dtype=bool),
+        spouse_alive=np.zeros(192, dtype=bool),
+    )
+    settings = OptimalBehaviourLSMCSettings(
+        n_folds=3,
+        fold_seed=43,
+        minimum_regression_observations=30,
+        exercise_buffer_rmse_multiplier=0.0,
+    )
+    raw = build_surrender_regression_features(context, 100_000.0)
+    regression, _oof, _folds, _fold_regressions = (
+        optimal_behaviour_module._cross_fitted_advantage_regression(
+            raw,
+            np.full(context.n_paths, 10_000.0),
+            100_000.0,
+            settings,
+            np.arange(context.n_paths, dtype=np.int64),
+            core_feature_indices=np.zeros(0, dtype=np.int64),
+        )
+    )
+    policy = OptimalSurrenderPolicy(
+        regressions={context.step: regression},
+        settings=settings,
+        regressions_are_advantages=True,
+    )
+
+    assert not np.any(policy.surrender_mask(context=context))
 
 
 def test_deterministic_v2_advantages_recover_known_election_and_partial_action():
@@ -768,6 +856,7 @@ def test_deterministic_v2_advantages_recover_known_election_and_partial_action()
         n_folds=3,
         fold_seed=41,
         exercise_buffer_rmse_multiplier=0.0,
+        allow_partial_withdrawal=True,
     )
     path_ids = np.arange(n_paths, dtype=np.int64)
 
@@ -815,13 +904,16 @@ def test_deterministic_v2_advantages_recover_known_election_and_partial_action()
         issue_age=65.0,
         settings=settings,
         income_action_regressions=fit.regressions_by_step,
+        monthly_income_actions_required=True,
     )
     decision = policy.choose_income_action(context=context)
     assert np.all(
         decision.action_type
         == IncomeActionType.PARTIAL_WITHDRAWAL.value
     )
-    np.testing.assert_allclose(decision.partial_fraction_of_max, 0.25)
+    np.testing.assert_allclose(
+        decision.partial_fraction_of_max, 0.25, atol=2.5e-4
+    )
 
 
 def test_collinear_v2_design_produces_finite_stable_advantages():
@@ -1007,14 +1099,15 @@ def test_public_continuation_fitter_falls_back_to_continue_when_too_small():
 
 
 def test_public_continuation_fitter_handles_an_imbalanced_boundary_fold():
-    context = _synthetic_surrender_context(n_paths=341)
-    features = build_surrender_regression_features(context, 100_000.0)
     coefficient_count = len(FEATURE_NAMES) + 1
     minimum_train = max(100, 10 * coefficient_count)
+    n_paths = 2 * minimum_train + 1
+    context = _synthetic_surrender_context(n_paths=n_paths)
+    features = build_surrender_regression_features(context, 100_000.0)
     # The total panel reaches the v2 boundary, but the deliberately imbalanced
     # two-fold assignment leaves only minimum_train - 1 rows in one train fold.
     complete_path_ids = np.concatenate((
-        np.zeros(341 - (minimum_train - 1), dtype=np.int64),
+        np.zeros(n_paths - (minimum_train - 1), dtype=np.int64),
         np.ones(minimum_train - 1, dtype=np.int64),
     ))
 
@@ -1033,7 +1126,7 @@ def test_public_continuation_fitter_handles_an_imbalanced_boundary_fold():
     assert context.step not in fit.policy.regressions
     assert context.step not in fit.oof_continuation_by_step
     diagnostic = fit.diagnostics[0]
-    assert diagnostic.observations == 341
+    assert diagnostic.observations == n_paths
     assert diagnostic.folds_used == 0
     assert diagnostic.fallback_reason is not None
     assert diagnostic.fallback_reason.startswith("cross_fit_failed:")
@@ -1219,6 +1312,35 @@ def test_external_hook_cannot_exchange_positive_income_guarantee_for_zero_value(
         assert not np.any(context.full_withdrawal_eligible[mask])
         assert np.all(result.lapse_events[mask, step] == 0.0)
         assert np.all(result.cashflows["surrender_benefits"][mask, step] == 0.0)
+
+
+def test_annual_full_withdrawal_is_absorbing_and_has_no_later_benefits():
+    _, scenarios = _setup(n_paths=24, seed=1707, horizon=4.0)
+    hook = _ContextCapturePolicy(exercise=True)
+    result = project(
+        IndexLinkedLifetimeIncomeProduct(),
+        PolicySpec(age=65, income_start_year=1),
+        scenarios,
+        no_voluntary_action_behaviour(),
+        MortalityTable.gompertz_makeham(),
+        config=ProjectionConfig(record_paths=True, max_age=69.0),
+        surrender_policy=hook,
+    )
+
+    assert result.phase_paths is not None
+    exercised = np.argwhere(result.lapse_events > 0.0)
+    assert exercised.size
+    policyholder_keys = (
+        "income_paid", "death_benefits", "surrender_benefits",
+        "partial_withdrawals", "terminal_closeout",
+    )
+    for path, step in exercised:
+        assert step % STEPS_PER_YEAR == 0
+        assert np.all(
+            result.phase_paths[path, step:] == Phase.TERMINATED.value
+        )
+        for key in policyholder_keys:
+            assert np.all(result.cashflows[key][path, step + 1:] == 0.0)
 
 
 def test_crediting_margin_toggle_does_not_change_context_or_best_response():

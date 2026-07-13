@@ -41,6 +41,7 @@ from portfolio_simulations.optimize_crediting_rate_lsmc import (
     _annual_discounted_control_paths,
     _annual_discounted_paths,
     _constant_first_year_policy,
+    _combined_policy_payload,
     _controlled_product,
     _control_state_inputs,
     _control_state_paths,
@@ -133,13 +134,20 @@ def test_adaptive_deployment_gate_is_validation_only_and_conservative(
 
 
 def _minimal_combined_policy():
+    settings = OptimalBehaviourLSMCSettings()
     return SimpleNamespace(
         valid=True,
         invalid_reasons=(),
-        monthly_income_actions_required=True,
-        surrender_policy=SimpleNamespace(regressions={}),
+        monthly_income_actions_required=False,
+        anniversary_only=True,
+        election_regressions={},
+        surrender_policy=OptimalSurrenderPolicy(
+            regressions={}, settings=settings, regressions_are_advantages=True
+        ),
+        settings=settings,
+        provenance_fingerprint="ordered-annual-test-policy",
         start_income_mask=lambda *, context: context,
-        choose_income_action=lambda *, context: context,
+        surrender_mask=lambda *, context: context,
     )
 
 
@@ -203,9 +211,25 @@ def test_policyholder_fit_set_factory_returns_the_same_combined_v2_policy():
     assert deployed is fit.policy
     assert fit_set.factory(policy_spec) is deployed
     assert callable(deployed.start_income_mask)
-    assert callable(deployed.choose_income_action)
-    assert deployed.monthly_income_actions_required is True
+    assert callable(deployed.surrender_mask)
+    assert deployed.monthly_income_actions_required is False
     assert deployed.surrender_policy.regressions == {}
+
+
+def test_combined_follower_payload_exposes_only_ordered_annual_hooks():
+    payload = _combined_policy_payload(_minimal_combined_fit())
+
+    assert payload["projector_hooks"] == [
+        "income_election_policy", "surrender_policy"
+    ]
+    assert payload["action_set"] == [
+        "WAIT_FOR_ONE_YEAR",
+        "START_INCOME_NOW",
+        "CONTINUE_FOR_ONE_YEAR",
+        "FULL_WITHDRAWAL_NOW",
+    ]
+    assert "income_action_advantage_regressions_by_decision_step" not in payload
+    assert payload["annual_lapse_policy"]["authoritative_for_deployment"]
 
 
 def test_coupled_fit_set_exposes_legacy_policy_only_as_benchmark():
@@ -250,7 +274,7 @@ def test_coupled_and_fixed_fit_sets_deploy_the_same_combined_v2_surface():
         fit.cross_fitted_training_policy
     )
     assert callable(coupled.factory(policy_spec).start_income_mask)
-    assert callable(coupled.factory(policy_spec).choose_income_action)
+    assert callable(coupled.factory(policy_spec).surrender_mask)
 
 
 @pytest.mark.parametrize(

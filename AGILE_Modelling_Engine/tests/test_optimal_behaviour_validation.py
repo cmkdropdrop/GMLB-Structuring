@@ -6,6 +6,7 @@ import pytest
 from agile_engine.optimal_behaviour_validation import (
     build_validation_result,
     paired_noninferiority_gate,
+    select_deployed_policy,
 )
 
 
@@ -76,3 +77,56 @@ def test_validation_rejects_mismatched_or_nonfinite_paths():
             premium_aud=1_000.0,
             component="combined",
         )
+
+
+def test_failed_combined_gate_selects_the_recorded_fixed_baseline():
+    gate = paired_noninferiority_gate(
+        np.full(8, 80.0),
+        {"year_5|continue_only": np.full(8, 100.0)},
+        premium_aud=100_000.0,
+        component="combined_policy",
+    )
+    result = build_validation_result(
+        scenario_fingerprint="validation-sample",
+        gates=(gate,),
+        benchmark_path_values_aud={
+            "year_5|continue_only": np.full(8, 100.0)
+        },
+    )
+
+    selection = select_deployed_policy(result)
+
+    assert selection.candidate_policy_name == "V11"
+    assert selection.selected_policy_name == "year_5|continue_only"
+    assert selection.fallback_reason == "combined_noninferiority_gate_failed"
+    assert not selection.candidate_valid
+
+
+def test_failed_component_gate_rejects_v11_even_if_combined_gate_passes():
+    bad_lapse = paired_noninferiority_gate(
+        np.full(8, 80.0),
+        {"continue_only": np.full(8, 100.0)},
+        premium_aud=100_000.0,
+        component="income_action_only",
+    )
+    good_combined = paired_noninferiority_gate(
+        np.full(8, 101.0),
+        {"year_5|continue_only": np.full(8, 100.0)},
+        premium_aud=100_000.0,
+        component="combined_policy",
+    )
+    result = build_validation_result(
+        scenario_fingerprint="validation-sample",
+        gates=(bad_lapse, good_combined),
+        benchmark_path_values_aud={
+            "year_5|continue_only": np.full(8, 100.0)
+        },
+    )
+
+    selection = select_deployed_policy(result)
+
+    assert selection.selected_policy_name == "year_5|continue_only"
+    assert selection.fallback_reason == (
+        "component_noninferiority_gate_failed:income_action_only"
+    )
+    assert not selection.candidate_valid

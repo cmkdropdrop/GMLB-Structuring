@@ -20,16 +20,19 @@ for every anniversary, admissible cap and grid node,
       + continuation value at the resulting account value
       | information at the cap-setting time].
 
-The continuation value is fitted by a separate regression on the exogenous
-market/portfolio state per grid node and interpolated across nodes; the
-inter-node delta V(A_{k+1}) - V(A_k) is the discrete marginal value of account
-value (the storage shadow price) that determines the optimal cap.  The signed
-objective is the repository's market-consistent insurer net value before Risk
-Margin and is used here as an approximate New Business CSM proxy.  The
-optimisation selects, at each account-value node, the cap with the largest
-proxy value after the projector has applied dynamic Income lapse and withdrawal
-behaviour.  Income Election is also left in the loaded dynamic Behaviour mode,
-subject to the existing contractual eligibility and forced-start gates.
+The continuation value is fitted by a separate regression per grid node on the
+slim exogenous basis ``{1, ATM one-year call, Reference-Fund level, overnight
+rate}`` and interpolated across nodes.  Reward and account-value transition
+regressions add standardised account value and its square to those four
+columns.  The inter-node delta V(A_{k+1}) - V(A_k) is the discrete marginal
+value of account value (the storage shadow price) that determines the optimal
+cap.  The signed objective is the repository's market-consistent insurer net
+value before Risk Margin and is used here as an approximate New Business CSM
+proxy.  The optimisation selects, at each account-value node, the cap with the
+largest proxy value after the projector has applied dynamic Income lapse and
+withdrawal behaviour.  Income Election is also left in the loaded dynamic
+Behaviour mode, subject to the existing contractual eligibility and
+forced-start gates.
 
 The admissible action grid is ``{0.25%, 1%, 2%, ..., 20%}``, matching the
 documented Guaranteed Minimum Cap while replacing the case study's fixed 6%
@@ -77,6 +80,14 @@ progress to the console.  Merely importing it has no side effects.
 # monthly-projection rollout, plots and JSON payload keep working.  The previous
 # outer-fold-pure single-continuation chain is replaced by the inventory-grid
 # value function; per-cap out-of-fold diagnostics are still reported.
+#
+# Basis change: 2026-07-13 (Europe/Zurich).
+# The gas-storage regressions now use the parsimonious economic basis
+# {1, ATM one-year call, Reference-Fund level, overnight rate}, augmented by
+# standardised account value and its square for reward and transition.  The
+# deployable Q-functions remain on the full 25-column rollout basis: the slim
+# per-cap component Q-values are projected onto that full basis after each
+# Bellman step, preserving the existing RegressionPolicyYear interface.
 
 from __future__ import annotations
 
@@ -199,6 +210,9 @@ FOLLOWER_PRE_CAP_FEATURE_NAMES = (
 )
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "crediting_cap_dynamic_behaviour"
+)
+DEFAULT_BENCHMARK_CACHE_DIRECTORY = (
+    Path(__file__).resolve().parent / "output" / "benchmark_projection_cache"
 )
 LOGGER = logging.getLogger("crediting_cap_dynamic_behaviour")
 
@@ -906,13 +920,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="control-randomisation paths (default gives 200 paths/action/year)",
     )
     parser.add_argument(
-        "--benchmark-paths", type=int, default=150,
+        "--benchmark-paths", type=int, default=None,
         help=(
             "paths in each independent fixed-cap selection, adaptive-policy "
-            "validation and final evaluation sample; this is the dominant "
-            "runtime lever (fixed-cap benchmarks and the causal rollouts scale "
-            "~linearly with it) -- raise to ~500 for a final run, lower to ~50 "
-            "for fast iteration"
+            "validation and final evaluation sample; defaults to 10%% of "
+            "--n-paths.  This is the dominant runtime lever (fixed-cap "
+            "benchmarks and the causal rollouts scale ~linearly with it); pass "
+            "an explicit value to override the 10%% rule"
         ),
     )
     parser.add_argument(
@@ -927,7 +941,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--cross-fit-folds", type=int, default=5)
     parser.add_argument(
         "--ridge", type=float, default=1.0e-4,
-        help="dimensionless ridge multiplier for the regression normal matrix",
+        help=(
+            "dimensionless ridge multiplier for the regression normal matrix; "
+            "pass 0 for ordinary least squares (OLS, the classic gas-storage "
+            "regression).  The internal Bellman regressions use the slim "
+            "economic 4/6-column basis; deployable policies are projected "
+            "onto the full rollout basis"
+        ),
     )
     parser.add_argument(
         "--persistent-exploration-fraction", type=float, default=0.5,
@@ -953,6 +973,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "lower/upper quantile clip when placing the account-value grid "
             "nodes on the pooled in-force fund distribution"
         ),
+    )
+    parser.add_argument(
+        "--benchmark-cache-dir", type=Path,
+        default=DEFAULT_BENCHMARK_CACHE_DIRECTORY,
+        help=(
+            "directory holding cached fixed-cap benchmark projections; the "
+            "fixed-cap benchmarks depend only on the market scenarios, cap and "
+            "assumptions (not on the fitted LSMC policy), so an identical "
+            "repeat configuration reuses them instead of re-projecting"
+        ),
+    )
+    parser.add_argument(
+        "--no-benchmark-cache", action="store_true",
+        help="disable the fixed-cap benchmark projection cache",
     )
     parser.add_argument(
         "--log-level", choices=("DEBUG", "INFO", "WARNING"), default="INFO",
@@ -982,8 +1016,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # one stable schema.  It is intentionally not user-configurable here.
     args.policyholder_behaviour = "dynamic"
 
-    if args.n_paths <= 0 or args.benchmark_paths <= 0:
-        parser.error("--n-paths and --benchmark-paths must be positive")
+    if args.n_paths <= 0:
+        parser.error("--n-paths must be positive")
+    if args.benchmark_paths is None:
+        # Default: the benchmark (fixed-cap selection, adaptive validation and
+        # final evaluation) paths are 10% of the capital-market training paths.
+        args.benchmark_paths = max(30, int(round(0.1 * args.n_paths)))
+    if args.benchmark_paths <= 0:
+        parser.error("--benchmark-paths must be positive")
     if args.benchmark_batch_size <= 0:
         parser.error("--benchmark-batch-size must be positive")
     if args.model_point_log_interval <= 0:
@@ -994,8 +1034,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("seed must be non-negative and Heston substeps positive")
     if args.cross_fit_folds < 3:
         parser.error("--cross-fit-folds must be at least three")
-    if not np.isfinite(args.ridge) or args.ridge <= 0.0:
-        parser.error("--ridge must be finite and strictly positive")
+    if not np.isfinite(args.ridge) or args.ridge < 0.0:
+        parser.error("--ridge must be finite and non-negative (0 = OLS)")
     if not 0.0 <= args.persistent_exploration_fraction < 1.0:
         parser.error("--persistent-exploration-fraction must be in [0, 1)")
     if args.inventory_nodes < 3:
@@ -2942,6 +2982,12 @@ def _design_matrix(
 def _ridge_fit_multioutput(design: Array, targets: Array, ridge: float) -> Array:
     if design.ndim != 2 or targets.ndim != 2 or design.shape[0] != targets.shape[0]:
         raise ValueError("Regression design and targets are shape-inconsistent.")
+    if ridge <= 0.0:
+        # Ordinary least squares (the classic gas-storage regression): an SVD
+        # solve that returns the minimum-norm coefficients if the design is
+        # rank-deficient.  No shrinkage, so the fit is less biased but more
+        # variable than the ridge path below.
+        return np.linalg.lstsq(design, targets, rcond=None)[0]
     gram = design.T @ design
     penalty_scale = float(np.trace(gram) / max(gram.shape[0], 1))
     penalty = np.eye(gram.shape[0]) * ridge * max(penalty_scale, 1.0)
@@ -6848,12 +6894,10 @@ def _backward_induction(
 
 
 def _benchmark_cases() -> list[tuple[str, float, str]]:
+    # Thinned comparator grid: the 0.25% guaranteed-minimum cap, every third
+    # per-cent cap from 1% to 19% and the uncapped extreme.  The zero-crediting
+    # case was dropped as a benchmark.
     cases: list[tuple[str, float, str]] = [
-        (
-            "no_crediting_cap_0pct",
-            0.0,
-            "credited return is identically zero",
-        ),
         (
             "fixed_cap_0.25pct",
             0.0025,
@@ -6866,7 +6910,7 @@ def _benchmark_cases() -> list[tuple[str, float, str]]:
             percent / 100.0,
             f"same {percent}% cap in every crediting year",
         )
-        for percent in range(1, 21)
+        for percent in range(1, 21, 3)
     )
     cases.append((
         "uncapped_positive_credit",
@@ -7040,6 +7084,104 @@ def _csm_benchmark_row(
     }
 
 
+def _projection_input_fingerprint(args: argparse.Namespace) -> str:
+    """Content hash of every non-market projection input.
+
+    The fixed-cap benchmark projections are a deterministic function of the
+    market scenarios (captured by their content fingerprint and the projector
+    seeds), the cap and these assumption inputs.  Hashing the input file bytes
+    makes the benchmark cache key change whenever any assumption changes, so a
+    stale cached result can never be reused.
+    """
+    digest = hashlib.sha256()
+    digest.update(ENGINE_VERSION.encode("utf-8"))
+    for path in (
+        args.model_points, args.cost_assumptions,
+        args.zero_curve, args.model_parameters,
+    ):
+        digest.update(b"|file|")
+        digest.update(str(path).encode("utf-8"))
+        digest.update(Path(path).read_bytes())
+    behaviour_directory = Path(args.dynamic_behaviour)
+    for path in sorted(
+        item for item in behaviour_directory.rglob("*") if item.is_file()
+    ):
+        digest.update(b"|behaviour|")
+        digest.update(
+            str(path.relative_to(behaviour_directory)).encode("utf-8")
+        )
+        digest.update(path.read_bytes())
+    for value in (
+        args.cost_assumption_set, args.behaviour_assumption_set,
+        args.behaviour_value_basis, args.performance_gap_behaviour,
+    ):
+        digest.update(f"|{value}".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _benchmark_cache_path(
+    cache_dir: Path,
+    projection_fingerprint: str,
+    *,
+    selection_scenarios: ScenarioSet,
+    evaluation_scenarios: ScenarioSet,
+    selection_projection_config: ProjectionConfig,
+    evaluation_projection_config: ProjectionConfig,
+    cap: float,
+    n_years: int,
+) -> Path:
+    """Deterministic cache path for one fixed-cap benchmark case."""
+    def sample_fingerprint(
+        scenarios: ScenarioSet, config: ProjectionConfig
+    ) -> str:
+        return hashlib.sha256((
+            scenarios.content_fingerprint
+            + f"|take_up={config.take_up_seed}"
+            + f"|mortality={config.mortality_seed}"
+        ).encode("ascii")).hexdigest()
+
+    key = hashlib.sha256((
+        f"{projection_fingerprint}"
+        f"|sel={sample_fingerprint(selection_scenarios, selection_projection_config)}"
+        f"|evl={sample_fingerprint(evaluation_scenarios, evaluation_projection_config)}"
+        f"|cap={cap!r}|n_years={int(n_years)}"
+    ).encode("ascii")).hexdigest()
+    return cache_dir / f"benchmark_{key}.npz"
+
+
+def _store_benchmark_cache(
+    path: Path,
+    selection_csm: Array,
+    evaluation_csm: Array,
+    evaluation_components: Mapping[str, Array],
+) -> None:
+    arrays = {
+        "selection_csm": np.asarray(selection_csm, dtype=float),
+        "evaluation_csm": np.asarray(evaluation_csm, dtype=float),
+    }
+    for name, values in evaluation_components.items():
+        arrays[f"component__{name}"] = np.asarray(values, dtype=float)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with open(temporary, "wb") as handle:
+        np.savez(handle, **arrays)
+    temporary.replace(path)
+
+
+def _load_benchmark_cache(
+    path: Path,
+) -> tuple[Array, Array, dict[str, Array]]:
+    with np.load(path) as data:
+        selection_csm = np.asarray(data["selection_csm"], dtype=float)
+        evaluation_csm = np.asarray(data["evaluation_csm"], dtype=float)
+        components = {
+            name[len("component__"):]: np.asarray(data[name], dtype=float)
+            for name in data.files
+            if name.startswith("component__")
+        }
+    return selection_csm, evaluation_csm, components
+
+
 def _evaluate_fixed_benchmarks(
     *,
     selection_scenarios: ScenarioSet,
@@ -7054,6 +7196,8 @@ def _evaluate_fixed_benchmarks(
     evaluation_projection_config: ProjectionConfig,
     portfolio_scale: float,
     model_point_log_interval: int,
+    cache_dir: Optional[Path] = None,
+    projection_fingerprint: str = "",
 ) -> tuple[
     list[dict[str, object]],
     dict[str, Array],
@@ -7083,6 +7227,34 @@ def _evaluate_fixed_benchmarks(
         LOGGER.info(
             "Benchmark case %d/%d | %s", case_number, len(cases), label
         )
+        cache_path = (
+            _benchmark_cache_path(
+                cache_dir, projection_fingerprint,
+                selection_scenarios=selection_scenarios,
+                evaluation_scenarios=evaluation_scenarios,
+                selection_projection_config=selection_projection_config,
+                evaluation_projection_config=evaluation_projection_config,
+                cap=cap, n_years=n_years,
+            )
+            if cache_dir is not None else None
+        )
+        if cache_path is not None and cache_path.exists():
+            try:
+                (
+                    selection_path_values[label],
+                    evaluation_path_values[label],
+                    evaluation_component_paths[label],
+                ) = _load_benchmark_cache(cache_path)
+                LOGGER.info(
+                    "Benchmark case %d/%d complete | reused cached projection",
+                    case_number, len(cases),
+                )
+                continue
+            except Exception as error:  # noqa: BLE001 - cache must never be fatal
+                LOGGER.warning(
+                    "Benchmark cache read failed for %s (%s); recomputing.",
+                    label, error,
+                )
         selection_projected = _aggregate_portfolio_paths(
             scenarios=selection_scenarios,
             cap_matrix=np.full(
@@ -7126,6 +7298,18 @@ def _evaluate_fixed_benchmarks(
         evaluation_component_paths[label] = _summed_csm_components(
             evaluation_projected, slice(None)
         )
+        if cache_path is not None:
+            try:
+                _store_benchmark_cache(
+                    cache_path,
+                    selection_path_values[label],
+                    evaluation_path_values[label],
+                    evaluation_component_paths[label],
+                )
+            except Exception as error:  # noqa: BLE001 - cache must never be fatal
+                LOGGER.warning(
+                    "Benchmark cache write failed for %s (%s).", label, error
+                )
         LOGGER.info(
             "Benchmark case %d/%d complete | elapsed %.1fs",
             case_number, len(cases), time.perf_counter() - case_started,
@@ -8104,8 +8288,11 @@ def _plot_flexibility_value(
     dpi: int,
 ) -> list[Path]:
     """Plain-language comparison based only on direct evaluation cashflows."""
+    # The zero-crediting comparator is optional; it is only drawn when present.
     no_credit = next(
-        row for row in benchmark_rows if row["case"] == "no_crediting_cap_0pct"
+        (row for row in benchmark_rows
+         if row["case"] == "no_crediting_cap_0pct"),
+        None,
     )
     best_fixed = next(
         row for row in benchmark_rows
@@ -8119,16 +8306,24 @@ def _plot_flexibility_value(
         row for row in benchmark_rows
         if row["case"] == "flexible_dynamic_behaviour_policy"
     )
-    rows = (no_credit, requested_fixed, best_fixed, flexible)
-    labels = (
-        "Keine Gutschrift\n(0 %)",
-        (
-            "Bester fixer Cap\n"
-            f"nur 1–20 % ({float(requested_fixed['cap_percent']):g} %)"
-        ),
+    entries: list[tuple[Mapping[str, object], str, str]] = []
+    if no_credit is not None:
+        entries.append((no_credit, "Keine Gutschrift\n(0 %)", "#8A94A3"))
+    entries.append((
+        requested_fixed,
+        "Bester fixer Cap\n"
+        f"nur 1–20 % ({float(requested_fixed['cap_percent']):g} %)",
+        "#5B8DB8",
+    ))
+    entries.append((
+        best_fixed,
         f"Bester fixer Cap\n({float(best_fixed['cap_percent']):g} %)",
-        "Flexibler jährlicher\nKandidat",
-    )
+        "#2F6B9A",
+    ))
+    entries.append((flexible, "Flexibler jährlicher\nKandidat", "#168A45"))
+    rows = tuple(entry[0] for entry in entries)
+    labels = tuple(entry[1] for entry in entries)
+    bar_colours = tuple(entry[2] for entry in entries)
     values = np.asarray([
         float(row["estimated_new_business_csm_proxy_aud"]) for row in rows
     ])
@@ -8150,10 +8345,9 @@ def _plot_flexibility_value(
         2, 1, figsize=(10.5, 8.2),
         gridspec_kw={"height_ratios": (2.2, 1.0)},
     )
-    colours = ("#8A94A3", "#5B8DB8", "#2F6B9A", "#168A45")
-    positions = np.arange(4)
+    positions = np.arange(len(rows))
     bars = top.bar(
-        positions, values, yerr=errors, capsize=5, color=colours, alpha=0.9
+        positions, values, yerr=errors, capsize=5, color=bar_colours, alpha=0.9
     )
     top.axhline(0.0, color="black", linewidth=0.8)
     top.set_xticks(positions, labels)
@@ -9405,6 +9599,10 @@ def main() -> None:
             evaluation_projection_config=evaluation_projection_config,
             portfolio_scale=portfolio_scale,
             model_point_log_interval=args.model_point_log_interval,
+            cache_dir=(
+                None if args.no_benchmark_cache else args.benchmark_cache_dir
+            ),
+            projection_fingerprint=_projection_input_fingerprint(args),
         )
 
     fixed_policyholder_exercise_rows: list[dict[str, object]] = []

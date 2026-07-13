@@ -79,7 +79,14 @@ def test_lsmc_runner_accepts_explicit_second_and_third_seed_triplets():
         args.train_mortality_seed_3,
     ) == (52001, 52002, 52003)
     assert args.training_seed_count == 3
-    assert args.lsmc_income_action_set == "continue_partial_full"
+    assert args.lsmc_income_action_set == "continue_full"
+
+
+def test_lsmc_runner_rejects_deprecated_partial_action_set():
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--lsmc-income-action-set", "continue_partial_full",
+        ])
 
 
 def test_lsmc_runner_accepts_explicit_streamlined_mode_with_legacy_seed_values():

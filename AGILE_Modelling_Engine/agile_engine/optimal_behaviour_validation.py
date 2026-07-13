@@ -84,6 +84,60 @@ class OptimalBehaviourValidationResult:
         ]
 
 
+@dataclass(frozen=True)
+class ValidationPolicySelection:
+    """Candidate/deployed split determined solely on validation paths."""
+
+    candidate_policy_name: str
+    selected_policy_name: str
+    candidate_valid: bool
+    fallback_reason: str | None
+
+
+def select_deployed_policy(
+    result: OptimalBehaviourValidationResult,
+    *,
+    candidate_policy_name: str = "V11",
+    component: str = "combined_policy",
+    candidate_fit_valid: bool = True,
+) -> ValidationPolicySelection:
+    """Select the candidate or its recorded best predeclared benchmark.
+
+    Regression fitting and benchmark construction have already finished when
+    this function is called.  It therefore cannot tune the candidate; it only
+    makes the validation fallback explicit for the later evaluation rollout.
+    """
+    gates = tuple(gate for gate in result.gates if gate.component == component)
+    if len(gates) != 1:
+        raise ValueError(
+            f"Validation requires exactly one {component!r} gate."
+        )
+    gate = gates[0]
+    failed_components = tuple(
+        item.component for item in result.gates if not item.valid
+    )
+    if not failed_components and candidate_fit_valid:
+        return ValidationPolicySelection(
+            candidate_policy_name=str(candidate_policy_name),
+            selected_policy_name=str(candidate_policy_name),
+            candidate_valid=True,
+            fallback_reason=None,
+        )
+    return ValidationPolicySelection(
+        candidate_policy_name=str(candidate_policy_name),
+        selected_policy_name=str(gate.benchmark_name),
+        candidate_valid=False,
+        fallback_reason=(
+            "candidate_fit_invalid"
+            if not candidate_fit_valid
+            else "combined_noninferiority_gate_failed"
+            if failed_components == (component,)
+            else "component_noninferiority_gate_failed:"
+            + "|".join(failed_components)
+        ),
+    )
+
+
 def paired_noninferiority_gate(
     policy_path_values_aud: object,
     benchmark_path_values_aud: Mapping[str, object],
@@ -161,6 +215,8 @@ def build_validation_result(
 __all__ = [
     "OptimalBehaviourValidationResult",
     "PairedPolicyValidationGate",
+    "ValidationPolicySelection",
     "build_validation_result",
     "paired_noninferiority_gate",
+    "select_deployed_policy",
 ]
