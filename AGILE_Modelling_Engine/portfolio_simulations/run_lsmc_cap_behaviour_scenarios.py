@@ -24,9 +24,17 @@ from typing import Mapping, Optional, Sequence
 import numpy as np
 
 if __package__:
+    from ._mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from ._run_layout import behaviour_benchmark_directories
     from ._run_logging import log_to_console
 else:
+    from _mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from _run_layout import behaviour_benchmark_directories
     from _run_logging import log_to_console
 
@@ -108,6 +116,7 @@ HEDGE_MONETARY_FIELDS = (
     "pv_hedge_costs_aud",
 )
 HEDGE_CAP_LEG_MODES = tuple(mode.value for mode in HedgeCapLegMode)
+LSMC_TRAINING_SEED_SET_COUNT = 3
 
 
 def _parse_rate(text: str) -> float:
@@ -127,6 +136,18 @@ def _parse_rate(text: str) -> float:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    mc_inputs = load_mc_analysis_inputs()
+    evaluation_input = require_mc_samples(
+        mc_inputs, "evaluation", 1
+    )[0]
+    training_inputs = require_mc_samples(
+        mc_inputs,
+        "lsmc_training",
+        LSMC_TRAINING_SEED_SET_COUNT,
+    )
+    validation_input = require_mc_samples(
+        mc_inputs, "lsmc_validation", 1
+    )[0]
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -151,24 +172,76 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "unstressed comparison"
         ),
     )
-    parser.add_argument("--n-paths", type=int, default=2_000)
-    parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--take-up-seed", type=int, default=97)
-    parser.add_argument("--mortality-seed", type=int, default=197)
-    parser.add_argument("--n-train", type=int, default=4_000)
-    parser.add_argument("--train-seed", type=int, default=12026)
-    parser.add_argument("--train-take-up-seed", type=int, default=10097)
-    parser.add_argument("--train-mortality-seed", type=int, default=10197)
-    parser.add_argument("--train-seed-2", type=int, default=32026)
-    parser.add_argument("--train-take-up-seed-2", type=int, default=30097)
-    parser.add_argument("--train-mortality-seed-2", type=int, default=30197)
-    parser.add_argument("--train-seed-3", type=int, default=42026)
-    parser.add_argument("--train-take-up-seed-3", type=int, default=40097)
-    parser.add_argument("--train-mortality-seed-3", type=int, default=40197)
-    parser.add_argument("--n-validation", type=int, default=2_000)
-    parser.add_argument("--validation-seed", type=int, default=22026)
-    parser.add_argument("--validation-take-up-seed", type=int, default=20097)
-    parser.add_argument("--validation-mortality-seed", type=int, default=20197)
+    parser.add_argument(
+        "--n-paths", type=int, default=evaluation_input.n_paths
+    )
+    parser.add_argument(
+        "--seed", type=int, default=evaluation_input.market_seed
+    )
+    parser.add_argument(
+        "--take-up-seed", type=int, default=evaluation_input.take_up_seed
+    )
+    parser.add_argument(
+        "--mortality-seed", type=int, default=evaluation_input.mortality_seed
+    )
+    parser.add_argument(
+        "--n-train", type=int, default=training_inputs[0].n_paths
+    )
+    parser.add_argument(
+        "--train-seed", type=int, default=training_inputs[0].market_seed
+    )
+    parser.add_argument(
+        "--train-take-up-seed",
+        type=int,
+        default=training_inputs[0].take_up_seed,
+    )
+    parser.add_argument(
+        "--train-mortality-seed",
+        type=int,
+        default=training_inputs[0].mortality_seed,
+    )
+    parser.add_argument(
+        "--train-seed-2", type=int, default=training_inputs[1].market_seed
+    )
+    parser.add_argument(
+        "--train-take-up-seed-2",
+        type=int,
+        default=training_inputs[1].take_up_seed,
+    )
+    parser.add_argument(
+        "--train-mortality-seed-2",
+        type=int,
+        default=training_inputs[1].mortality_seed,
+    )
+    parser.add_argument(
+        "--train-seed-3", type=int, default=training_inputs[2].market_seed
+    )
+    parser.add_argument(
+        "--train-take-up-seed-3",
+        type=int,
+        default=training_inputs[2].take_up_seed,
+    )
+    parser.add_argument(
+        "--train-mortality-seed-3",
+        type=int,
+        default=training_inputs[2].mortality_seed,
+    )
+    parser.add_argument(
+        "--n-validation", type=int, default=validation_input.n_paths
+    )
+    parser.add_argument(
+        "--validation-seed", type=int, default=validation_input.market_seed
+    )
+    parser.add_argument(
+        "--validation-take-up-seed",
+        type=int,
+        default=validation_input.take_up_seed,
+    )
+    parser.add_argument(
+        "--validation-mortality-seed",
+        type=int,
+        default=validation_input.mortality_seed,
+    )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--hedge-cap-leg-mode",

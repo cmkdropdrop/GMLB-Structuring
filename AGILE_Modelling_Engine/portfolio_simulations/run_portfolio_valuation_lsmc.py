@@ -4,13 +4,12 @@ The market, product, mortality, cost, model-point and aggregation mechanics are
 the same as in ``run_portfolio_valuation.py``.  An independently trained,
 phase-aware LSMC lower-bound policy maximises the risk-neutral value of
 Policyholder cashflows over annual ``WAIT | START_INCOME_NOW`` decisions in
-Growth and monthly ``CONTINUE | PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL``
-decisions in Income.  Validation and final evaluation use separate held-out
-samples.  Exactly three predeclared training-seed triplets are fitted and each
-must independently pass Election-, Income-action- and Combined-policy gates on
-the same validation paths; all three frozen policies are then reported on the
-same final paths without evaluation-based selection.  The first seed remains
-the predeclared primary policy for the canonical V00/V01/V10/V11 outputs.  The
+Growth and a configurable monthly Income action set.  Validation and final
+evaluation use separate held-out samples.  One or three predeclared training-
+seed triplets may be fitted; every fitted policy must independently pass the
+Election-, Income-action- and Combined-policy gates on the same validation
+paths.  The first seed remains the predeclared primary policy for the canonical
+V00/V01/V10/V11 outputs.  The
 model-point ``income_start_year`` is retained only for explicit
 deterministic validation benchmarks.  A paired dynamic-behaviour benchmark is
 produced on the same final evaluation scenarios by default.
@@ -33,8 +32,16 @@ from typing import Callable, Mapping, Optional, Sequence
 import numpy as np
 
 if __package__:
+    from ._mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from ._run_layout import behaviour_benchmark_directories
 else:
+    from _mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from _run_layout import behaviour_benchmark_directories
 
 
@@ -86,23 +93,48 @@ from agile_engine.optimal_behaviour_validation import (  # noqa: E402
 )
 from agile_engine.product import PolicySpec  # noqa: E402
 
-from run_portfolio_valuation import (  # noqa: E402
-    _as_float,
-    _build_aggregation_reconciliation,
-    _configure_logging,
-    _create_plots,
-    _make_progress_callback,
-    _validate_hedge_backing_summary,
-    _write_csv,
-)
+if __package__:
+    from .run_portfolio_valuation import (  # noqa: E402
+        _as_float,
+        _build_aggregation_reconciliation,
+        _configure_logging,
+        _create_plots,
+        _make_progress_callback,
+        _validate_hedge_backing_summary,
+        _write_csv,
+    )
+else:
+    from run_portfolio_valuation import (  # noqa: E402
+        _as_float,
+        _build_aggregation_reconciliation,
+        _configure_logging,
+        _create_plots,
+        _make_progress_callback,
+        _validate_hedge_backing_summary,
+        _write_csv,
+    )
 
 
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "portfolio_valuation_lsmc"
 )
+AVAILABLE_LSMC_TRAINING_SEED_SETS = 3
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    supplied_argv = list(sys.argv[1:] if argv is None else argv)
+    mc_inputs = load_mc_analysis_inputs()
+    evaluation_input = require_mc_samples(
+        mc_inputs, "evaluation", 1
+    )[0]
+    training_inputs = require_mc_samples(
+        mc_inputs,
+        "lsmc_training",
+        AVAILABLE_LSMC_TRAINING_SEED_SETS,
+    )
+    validation_input = require_mc_samples(
+        mc_inputs, "lsmc_validation", 1
+    )[0]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-points", type=Path,
                         default=DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH)
@@ -117,82 +149,104 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         default=DEFAULT_AUSTRALIAN_ZERO_CURVE_PATH)
     parser.add_argument("--model-parameters", type=Path,
                         default=DEFAULT_MODEL_PARAMETERS_PATH)
-    parser.add_argument("--n-paths", type=int, default=2_000,
+    parser.add_argument("--n-paths", type=int, default=evaluation_input.n_paths,
                         help="independent out-of-sample evaluation paths")
-    parser.add_argument("--seed", type=int, default=2026,
+    parser.add_argument("--seed", type=int, default=evaluation_input.market_seed,
                         help="out-of-sample evaluation seed")
     parser.add_argument(
         "--take-up-seed",
         type=int,
-        default=97,
+        default=evaluation_input.take_up_seed,
         help="out-of-sample common-random-number seed for Election",
     )
     parser.add_argument(
         "--mortality-seed",
         type=int,
-        default=197,
+        default=evaluation_input.mortality_seed,
         help="out-of-sample pathwise Joint-Life mortality seed",
     )
-    parser.add_argument("--n-train", type=int, default=4_000,
+    parser.add_argument("--n-train", type=int, default=training_inputs[0].n_paths,
                         help="independent LSMC training paths")
-    parser.add_argument("--train-seed", type=int, default=12026)
+    parser.add_argument(
+        "--train-seed", type=int, default=training_inputs[0].market_seed
+    )
     parser.add_argument(
         "--train-take-up-seed",
         type=int,
-        default=10097,
+        default=training_inputs[0].take_up_seed,
         help="independent Election seed recorded for the LSMC training basis",
     )
     parser.add_argument(
         "--train-mortality-seed",
         type=int,
-        default=10197,
+        default=training_inputs[0].mortality_seed,
         help="independent pathwise Joint-Life mortality seed for LSMC training",
     )
     parser.add_argument(
         "--train-seed-2",
         type=int,
-        default=32026,
+        default=training_inputs[1].market_seed,
         help="market seed for the second independently validated LSMC fit",
     )
     parser.add_argument(
         "--train-take-up-seed-2",
         type=int,
-        default=30097,
+        default=training_inputs[1].take_up_seed,
         help="Election stream for the second independently validated LSMC fit",
     )
     parser.add_argument(
         "--train-mortality-seed-2",
         type=int,
-        default=30197,
+        default=training_inputs[1].mortality_seed,
         help="mortality stream for the second independently validated LSMC fit",
     )
     parser.add_argument(
         "--train-seed-3",
         type=int,
-        default=42026,
+        default=training_inputs[2].market_seed,
         help="market seed for the third independently validated LSMC fit",
     )
     parser.add_argument(
         "--train-take-up-seed-3",
         type=int,
-        default=40097,
+        default=training_inputs[2].take_up_seed,
         help="Election stream for the third independently validated LSMC fit",
     )
     parser.add_argument(
         "--train-mortality-seed-3",
         type=int,
-        default=40197,
+        default=training_inputs[2].mortality_seed,
         help="mortality stream for the third independently validated LSMC fit",
+    )
+    parser.add_argument(
+        "--training-seed-count",
+        type=int,
+        choices=(1, 3),
+        default=None,
+        help=(
+            "number of independently fitted training policies; one is the "
+            "fast production baseline and three retains the robustness study"
+        ),
     )
     parser.add_argument(
         "--n-validation",
         type=int,
-        default=2_000,
+        default=validation_input.n_paths,
         help="independent paths used only for frozen-policy validation gates",
     )
-    parser.add_argument("--validation-seed", type=int, default=22026)
-    parser.add_argument("--validation-take-up-seed", type=int, default=20097)
-    parser.add_argument("--validation-mortality-seed", type=int, default=20197)
+    parser.add_argument(
+        "--validation-seed", type=int, default=validation_input.market_seed
+    )
+    parser.add_argument(
+        "--validation-take-up-seed",
+        type=int,
+        default=validation_input.take_up_seed,
+    )
+    parser.add_argument(
+        "--validation-mortality-seed",
+        type=int,
+        default=validation_input.mortality_seed,
+    )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--hedge-cap-leg-mode",
@@ -211,12 +265,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--lsmc-folds", type=int, default=5)
     parser.add_argument(
+        "--lsmc-income-action-set",
+        choices=("continue_full", "continue_partial_full"),
+        default=None,
+        help=(
+            "monthly Policyholder actions fitted in Income; continue_full "
+            "treats Full Withdrawal as the only voluntary lapse action"
+        ),
+    )
+    parser.add_argument(
         "--lsmc-ridge",
         type=float,
         choices=(0.0, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2),
         default=1.0e-6,
         help=(
-            "legacy single-Ridge setting; v2 selection always uses the exact "
+            "legacy single-Ridge setting; v3 selection always uses the exact "
             "documented five-value grid"
         ),
     )
@@ -248,6 +311,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--log-file", type=Path, default=None)
     args = parser.parse_args(argv)
+    legacy_replication_requested = any(
+        token in supplied_argv
+        for token in (
+            "--train-seed-2",
+            "--train-take-up-seed-2",
+            "--train-mortality-seed-2",
+            "--train-seed-3",
+            "--train-take-up-seed-3",
+            "--train-mortality-seed-3",
+        )
+    )
+    if args.training_seed_count is None:
+        args.training_seed_count = 3 if legacy_replication_requested else 1
+    if args.lsmc_income_action_set is None:
+        args.lsmc_income_action_set = (
+            "continue_partial_full"
+            if legacy_replication_requested
+            else "continue_full"
+        )
 
     for name in ("n_paths", "n_train", "n_validation", "heston_substeps"):
         if getattr(args, name) <= 0:
@@ -273,38 +355,43 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     if any(getattr(args, name) < 0 for name in seed_names):
         parser.error("all seeds must be non-negative")
-    market_seeds = (
-        args.train_seed,
-        args.train_seed_2,
-        args.train_seed_3,
-        args.validation_seed,
-        args.seed,
-    )
-    take_up_seeds = (
+    active_market_training_seeds = (
+        args.train_seed, args.train_seed_2, args.train_seed_3
+    )[:args.training_seed_count]
+    active_take_up_training_seeds = (
         args.train_take_up_seed,
         args.train_take_up_seed_2,
         args.train_take_up_seed_3,
+    )[:args.training_seed_count]
+    active_mortality_training_seeds = (
+        args.train_mortality_seed,
+        args.train_mortality_seed_2,
+        args.train_mortality_seed_3,
+    )[:args.training_seed_count]
+    market_seeds = (
+        *active_market_training_seeds, args.validation_seed, args.seed
+    )
+    take_up_seeds = (
+        *active_take_up_training_seeds,
         args.validation_take_up_seed,
         args.take_up_seed,
     )
     mortality_seeds = (
-        args.train_mortality_seed,
-        args.train_mortality_seed_2,
-        args.train_mortality_seed_3,
+        *active_mortality_training_seeds,
         args.validation_mortality_seed,
         args.mortality_seed,
     )
     if len(set(market_seeds)) != len(market_seeds):
         parser.error(
-            "all three training, validation and evaluation market seeds must differ"
+            "all active training, validation and evaluation market seeds must differ"
         )
     if len(set(take_up_seeds)) != len(take_up_seeds):
         parser.error(
-            "all three training, validation and evaluation take-up seeds must differ"
+            "all active training, validation and evaluation take-up seeds must differ"
         )
     if len(set(mortality_seeds)) != len(mortality_seeds):
         parser.error(
-            "all three training, validation and evaluation mortality seeds must differ"
+            "all active training, validation and evaluation mortality seeds must differ"
         )
     if not math.isfinite(args.lsmc_ridge) or args.lsmc_ridge < 0.0:
         parser.error("--lsmc-ridge must be finite and non-negative")
@@ -412,8 +499,12 @@ class _FixedIncomeActionPolicy:
             self._acted = np.zeros(n_paths, dtype=bool)
         if self._acted.shape != (n_paths,):
             raise ValueError("Fixed validation policy cannot be reused across samples.")
+        # Store the Enum values explicitly.  NumPy may otherwise coerce the
+        # ``str``-Enum through the eight-character ``continue`` scalar and
+        # truncate a later ``IncomeActionType.FULL_WITHDRAWAL`` assignment to
+        # ``IncomeAc``.
         actions = np.full(
-            n_paths, IncomeActionType.CONTINUE, dtype=object
+            n_paths, IncomeActionType.CONTINUE.value, dtype="<U18"
         )
         fractions = np.zeros(n_paths)
         if self.mode == "full_first":
@@ -421,7 +512,7 @@ class _FixedIncomeActionPolicy:
                 np.asarray(getattr(context, "full_withdrawal_eligible"), dtype=bool)
                 & ~self._acted
             )
-            actions[selected] = IncomeActionType.FULL_WITHDRAWAL
+            actions[selected] = IncomeActionType.FULL_WITHDRAWAL.value
         else:
             selected = np.asarray(
                 getattr(context, "partial_withdrawal_eligible"), dtype=bool
@@ -437,7 +528,7 @@ class _FixedIncomeActionPolicy:
                 selected &= ~self._acted
             else:
                 selected &= int(getattr(context, "step")) % 12 == 0
-            actions[selected] = IncomeActionType.PARTIAL_WITHDRAWAL
+            actions[selected] = IncomeActionType.PARTIAL_WITHDRAWAL.value
             fractions[selected] = self.fraction
         self._acted[selected] = True
         return IncomeActionDecision(
@@ -912,7 +1003,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             resolve_horizon(horizon_basis, point.policy)
             for point in model_points.model_points
         )
-        training_seed_triplets = (
+        available_training_seed_triplets = (
             {
                 "seed_index": 1,
                 "market_seed": args.train_seed,
@@ -935,11 +1026,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "primary": False,
             },
         )
+        training_seed_triplets = available_training_seed_triplets[
+            :args.training_seed_count
+        ]
         training_projections: list[ProjectionConfig] = []
         training_scenarios_by_seed: list[object] = []
         logger.info(
-            "[2/8] Drei getrennte LSMC-Trainingssamples erzeugen | "
+            "[2/8] %d getrennte LSMC-Trainingssample(s) erzeugen | "
             "paths je Sample=%d | horizon=%.1f",
+            args.training_seed_count,
             args.n_train,
             common_horizon,
         )
@@ -962,9 +1057,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 real_world_model="hull_white_bs",
             )
             logger.info(
-                "LSMC-Trainingssample %d/3 | market=%d | take-up=%d | "
+                "LSMC-Trainingssample %d/%d | market=%d | take-up=%d | "
                 "mortality=%d",
                 seed_triplet["seed_index"],
+                args.training_seed_count,
                 seed_triplet["market_seed"],
                 seed_triplet["take_up_seed"],
                 seed_triplet["mortality_seed"],
@@ -985,14 +1081,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             scenario.content_fingerprint
             for scenario in training_scenarios_by_seed
         )
-        if len(set(training_scenario_fingerprints)) != 3:
+        if len(set(training_scenario_fingerprints)) \
+                != args.training_seed_count:
             raise RuntimeError(
-                "The three LSMC training samples must have distinct fingerprints."
+                "The active LSMC training samples must have distinct fingerprints."
             )
         lsmc_settings = OptimalBehaviourLSMCSettings(
             ridge=args.lsmc_ridge,
             n_folds=args.lsmc_folds,
             exercise_buffer_rmse_multiplier=args.exercise_buffer_rmse_multiplier,
+            allow_partial_withdrawal=(
+                args.lsmc_income_action_set == "continue_partial_full"
+            ),
         )
 
         policy_labels: dict[tuple[object, ...], list[str]] = {}
@@ -1002,7 +1102,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         fits_by_seed: list[
             dict[tuple[object, ...], OptimalBehaviourPolicyFit]
-        ] = [{}, {}, {}]
+        ] = [{} for _ in training_seed_triplets]
         # The primary seed remains the only fit driving the canonical
         # V00/V01/V10/V11 output files.  Seeds two and three are independent
         # robustness replications and are never candidates for selection.
@@ -1014,8 +1114,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ) -> OptimalBehaviourPolicyFit:
             if not isinstance(policy_object, PolicySpec):
                 raise TypeError("LSMC policy factory requires PolicySpec.")
-            if training_seed_index not in (0, 1, 2):
-                raise ValueError("training_seed_index must be zero, one or two.")
+            if not 0 <= training_seed_index < len(training_seed_triplets):
+                raise ValueError("training_seed_index is outside the active seeds.")
             selected_fits = fits_by_seed[training_seed_index]
             key = _policy_signature(policy_object)
             if key not in selected_fits:
@@ -1161,7 +1261,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 None,
             )
 
-        for training_seed_index in range(3):
+        for training_seed_index in range(args.training_seed_count):
             for point in model_points.model_points:
                 ensure_fit(point.policy, training_seed_index)
         invalid_fit_records = [
@@ -1237,7 +1337,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         validation_candidates_by_seed: list[dict[str, np.ndarray]] = []
         validation_premium: Optional[float] = None
-        for training_seed_index in range(3):
+        for training_seed_index in range(args.training_seed_count):
             election_candidate, election_premium = (
                 _validation_policyholder_path_values(
                     product=costs.product,
@@ -1359,15 +1459,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             election_benchmarks
         )
 
-        income_benchmark_specs: tuple[tuple[str, Optional[str], float], ...] = (
+        income_benchmark_specs: tuple[
+            tuple[str, Optional[str], float], ...
+        ] = (
             ("continue_only", None, 0.0),
             ("full_first_eligible", "full_first", 0.0),
-            ("partial_once_25pct", "partial_once", 0.25),
-            ("partial_once_50pct", "partial_once", 0.50),
-            ("partial_once_100pct", "partial_once", 1.00),
-            ("partial_annual_25pct", "partial_annual", 0.25),
-            ("partial_annual_50pct", "partial_annual", 0.50),
         )
+        if lsmc_settings.allow_partial_withdrawal:
+            income_benchmark_specs += (
+                ("partial_once_25pct", "partial_once", 0.25),
+                ("partial_once_50pct", "partial_once", 0.50),
+                ("partial_once_100pct", "partial_once", 1.00),
+                ("partial_annual_25pct", "partial_annual", 0.25),
+                ("partial_annual_50pct", "partial_annual", 0.50),
+            )
         income_benchmarks: dict[str, np.ndarray] = {}
         for name, mode, fraction in income_benchmark_specs:
             hooks_factory = None
@@ -1507,7 +1612,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "seed": validation_settings.seed,
             "take_up_seed": validation_settings.projection.take_up_seed,
             "mortality_seed": validation_settings.projection.mortality_seed,
-            "training_seed_count": 3,
+            "training_seed_count": args.training_seed_count,
             "seed_selection_using_evaluation": False,
             "primary_training_seed_index": 1,
             "gates": validation_summary_rows,
@@ -1662,7 +1767,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         deployed_policies_by_seed: list[
             dict[tuple[object, ...], OptimalBehaviourPolicy]
         ] = [deployed_policies]
-        for training_seed_index in (1, 2):
+        for training_seed_index in range(1, args.training_seed_count):
             evaluation_policy_cache: dict[
                 tuple[object, ...], OptimalBehaviourPolicy
             ] = {}
@@ -1685,9 +1790,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return selected_cache[key]
 
             logger.info(
-                "Finale Evaluation des eingefrorenen Trainings-Seeds %d/3 "
+                "Finale Evaluation des eingefrorenen Trainings-Seeds %d/%d "
                 "auf identischen Evaluationspfaden",
                 training_seed_index + 1,
+                args.training_seed_count,
             )
             replicated_result = value_policyholder_portfolio(
                 costs.product,
@@ -1707,18 +1813,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             lsmc_results_by_seed.append(replicated_result)
             deployed_policies_by_seed.append(evaluation_policy_cache)
-        if len(lsmc_results_by_seed) != 3:
-            raise RuntimeError("Exactly three final LSMC evaluations are required.")
+        if len(lsmc_results_by_seed) != args.training_seed_count:
+            raise RuntimeError(
+                "Every active training seed requires one final LSMC evaluation."
+            )
         evaluation_fingerprints = {
             "election_continue": election_continue_result.scenario_fingerprint,
             "combined_lsmc": lsmc_result.scenario_fingerprint,
-            "combined_lsmc_seed_2": (
-                lsmc_results_by_seed[1].scenario_fingerprint
-            ),
-            "combined_lsmc_seed_3": (
-                lsmc_results_by_seed[2].scenario_fingerprint
-            ),
         }
+        evaluation_fingerprints.update({
+            f"combined_lsmc_seed_{index + 1}": result.scenario_fingerprint
+            for index, result in enumerate(lsmc_results_by_seed[1:], start=1)
+        })
         if continue_result is not None:
             evaluation_fingerprints["continue"] = (
                 continue_result.scenario_fingerprint
@@ -1857,7 +1963,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "lsmc_training_seed": args.train_seed,
             "lsmc_training_take_up_seed": args.train_take_up_seed,
             "lsmc_training_mortality_seed": args.train_mortality_seed,
-            "lsmc_training_seed_count": 3,
+            "lsmc_training_seed_count": args.training_seed_count,
             "lsmc_training_seed_triplets_json": json.dumps(
                 list(training_seed_triplets), sort_keys=True
             ),
@@ -1879,10 +1985,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "lsmc_validation_valid": all(
                 result.valid for result in validation_results_by_seed
             ),
-            "lsmc_validation_all_three_seeds_valid": all(
+            "lsmc_validation_all_active_seeds_valid": all(
                 result.valid for result in validation_results_by_seed
             ),
-            "lsmc_final_evaluation_all_three_seeds_reported": True,
+            "lsmc_final_evaluation_all_active_seeds_reported": True,
+            # Backward-compatible evidence for already-running three-seed
+            # orchestrators that imported the pre-streamlining validator.
+            "lsmc_validation_all_three_seeds_valid": (
+                args.training_seed_count == 3
+                and all(result.valid for result in validation_results_by_seed)
+            ),
+            "lsmc_final_evaluation_all_three_seeds_reported": (
+                args.training_seed_count == 3
+            ),
             "lsmc_primary_seed_selection_rule": (
                 "predeclared_first_seed_not_evaluation_based"
             ),
@@ -1918,7 +2033,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             "lsmc_action_set": (
                 "growth:wait|start_income_now;"
-                "income:continue|partial_withdrawal|full_withdrawal"
+                + (
+                    "income:continue|partial_withdrawal|full_withdrawal"
+                    if lsmc_settings.allow_partial_withdrawal
+                    else "income:continue|full_withdrawal"
+                )
             ),
             "lsmc_income_election": "pathwise_optimal_bellman_policy",
             "income_take_up_mode": "optimal_lsmc",
@@ -2178,7 +2297,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         diagnostic_rows: list[dict[str, object]] = []
         action_rows: list[dict[str, object]] = []
-        for training_seed_index in (1, 2):
+        for training_seed_index in range(1, args.training_seed_count):
             seed_triplet = training_seed_triplets[training_seed_index]
             for key, fit in fits_by_seed[training_seed_index].items():
                 labels = "|".join(policy_labels.get(key, ["unlabelled"]))
@@ -2344,7 +2463,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Robustness fits are evaluated on the same final paths, so their
         # monthly action distributions and Partial amount bands are reported
         # as well; only seed 1 remains the predeclared canonical output.
-        for training_seed_index in (1, 2):
+        for training_seed_index in range(1, args.training_seed_count):
             seed_triplet = training_seed_triplets[training_seed_index]
             selected_deployed = deployed_policies_by_seed[
                 training_seed_index
@@ -2486,7 +2605,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if any(
             len(fit_basis_fingerprints_by_seed[f"training_seed_{index + 1}"])
             != len(fits_by_seed[index])
-            for index in range(3)
+            for index in range(args.training_seed_count)
         ):
             raise RuntimeError(
                 "Multi-seed LSMC fit-basis provenance keys are not unique."
@@ -2544,11 +2663,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "lsmc_objective": "maximise_policyholder_cashflow_pv",
                 "lsmc_action_set": {
                     "growth": ["wait", "start_income_now"],
-                    "income": [
-                        "continue",
-                        "partial_withdrawal",
-                        "full_withdrawal",
-                    ],
+                    "income": (
+                        [
+                            "continue",
+                            "partial_withdrawal",
+                            "full_withdrawal",
+                        ]
+                        if lsmc_settings.allow_partial_withdrawal
+                        else ["continue", "full_withdrawal"]
+                    ),
                 },
                 "income_election": "pathwise_optimal_bellman_policy",
                 "model_point_income_start_year_use": (
@@ -2571,7 +2694,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "monthly_income_actions"
                 ),
                 "partial_withdrawal_grid": (
-                    "aud_100_and_25_50_75_100pct_of_max_with_local_midpoints"
+                    "aud_100_and_25_50_75_100pct_of_max"
+                    if lsmc_settings.allow_partial_withdrawal
+                    else "disabled"
                 ),
                 "growth_surrender_allowed": False,
                 "growth_withdrawal_allowed": False,
@@ -2621,7 +2746,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "train_seed": args.train_seed,
                 "train_take_up_seed": args.train_take_up_seed,
                 "train_mortality_seed": args.train_mortality_seed,
-                "training_seed_count": 3,
+                "training_seed_count": args.training_seed_count,
                 "primary_training_seed_index": 1,
                 "primary_seed_selection_rule": (
                     "predeclared_first_seed_not_evaluation_based"
@@ -2657,6 +2782,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "lsmc_settings",
                 ],
                 "n_folds": args.lsmc_folds,
+                "income_action_set": args.lsmc_income_action_set,
+                "allow_partial_withdrawal": (
+                    lsmc_settings.allow_partial_withdrawal
+                ),
                 "ridge": args.lsmc_ridge,
                 "ridge_grid": list(lsmc_settings.ridge_grid),
                 "ridge_selection": "oof_decision_loss_one_standard_error",
@@ -2679,13 +2808,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "material_fit_failure_policy": "hard_abort_after_diagnostics",
                 "unique_policy_fits": len(fits),
-                "unique_policy_fits_across_three_training_seeds": sum(
+                "unique_policy_fits_across_active_training_seeds": sum(
                     len(selected_fits) for selected_fits in fits_by_seed
                 ),
-                "all_fits_valid_across_three_training_seeds": all(
+                "all_fits_valid_across_active_training_seeds": all(
                     fit.valid
                     for selected_fits in fits_by_seed
                     for fit in selected_fits.values()
+                ),
+                "unique_policy_fits_across_three_training_seeds": (
+                    sum(len(selected_fits) for selected_fits in fits_by_seed)
+                    if args.training_seed_count == 3 else 0
+                ),
+                "all_fits_valid_across_three_training_seeds": (
+                    args.training_seed_count == 3
+                    and all(
+                        fit.valid
+                        for selected_fits in fits_by_seed
+                        for fit in selected_fits.values()
+                    )
                 ),
                 "primary_only_diagnostic_counts": True,
                 "training_fallback_policy_count": sum(
@@ -2773,15 +2914,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "dynamic_benchmark_same_scenarios": (
                     None if dynamic_result is None else True),
                 "continue_benchmark_same_scenarios": True,
-                "deterministic_election_benchmarks_same_scenarios": True,
+                "deterministic_election_benchmarks_same_scenarios": (
+                    None if args.no_factorial_benchmarks else True
+                ),
                 "training_and_evaluation_market_seeds_distinct": (
                     args.train_seed != args.seed
                 ),
                 "all_training_and_evaluation_market_seeds_distinct": (
                     args.seed not in {
-                        args.train_seed,
-                        args.train_seed_2,
-                        args.train_seed_3,
+                        int(item["market_seed"])
+                        for item in training_seed_triplets
                     }
                 ),
                 "training_and_evaluation_take_up_seeds_distinct": (
@@ -2789,9 +2931,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "all_training_and_evaluation_take_up_seeds_distinct": (
                     args.take_up_seed not in {
-                        args.train_take_up_seed,
-                        args.train_take_up_seed_2,
-                        args.train_take_up_seed_3,
+                        int(item["take_up_seed"])
+                        for item in training_seed_triplets
                     }
                 ),
                 "training_and_evaluation_mortality_seeds_distinct": (
@@ -2799,12 +2940,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "all_training_and_evaluation_mortality_seeds_distinct": (
                     args.mortality_seed not in {
-                        args.train_mortality_seed,
-                        args.train_mortality_seed_2,
-                        args.train_mortality_seed_3,
+                        int(item["mortality_seed"])
+                        for item in training_seed_triplets
                     }
                 ),
-                "all_three_frozen_training_policies_evaluated": True,
+                "all_active_frozen_training_policies_evaluated": True,
+                "all_three_frozen_training_policies_evaluated": (
+                    args.training_seed_count == 3
+                ),
                 "training_seed_selected_using_evaluation": False,
                 "multi_seed_evaluation_scenario_fingerprints": [
                     result.scenario_fingerprint
@@ -2859,7 +3002,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "valid": all(
                     result.valid for result in validation_results_by_seed
                 ),
-                "training_seed_count": 3,
+                "training_seed_count": args.training_seed_count,
                 "n_paths": args.n_validation,
                 "seed": args.validation_seed,
                 "take_up_seed": args.validation_take_up_seed,
@@ -2872,7 +3015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         *training_scenario_fingerprints,
                         validation_scenarios.content_fingerprint,
                         lsmc_result.scenario_fingerprint,
-                    }) == 5
+                    }) == args.training_seed_count + 2
                 ),
                 "common_random_numbers_across_policy_and_benchmarks": True,
                 "confidence_level": 0.95,
@@ -2911,8 +3054,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "Mortality is illustrative and not an approved production basis.",
                 "Optimal behaviour is a cross-fitted LSMC lower-bound policy "
                 "with annual Election and monthly Income actions.",
-                "Partial Withdrawal uses a finite adaptive amount grid rather "
-                "than a continuous optimiser.",
+                (
+                    "Partial Withdrawal uses a finite adaptive training grid "
+                    "and an analytic fitted quadratic optimiser."
+                    if lsmc_settings.allow_partial_withdrawal
+                    else "The optimal Income action set is restricted to "
+                    "Continue or Full Withdrawal (contract-terminating lapse); "
+                    "Partial Withdrawal is excluded."
+                ),
                 "The five-year government-bond sleeve, monthly 50/50 rebalancing, "
                 "absence of bond term premium and other fixed proxy assumptions "
                 "remain unchanged from the dynamic benchmark.",

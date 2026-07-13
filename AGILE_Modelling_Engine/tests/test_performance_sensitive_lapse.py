@@ -104,6 +104,44 @@ def test_low_cap_after_good_return_increases_income_lapse_but_not_growth_lapse()
     assert np.sum(low.performance_lapse_events) > 0.0
 
 
+def test_growth_product_gate_overrides_shared_performance_hazard_for_all_years():
+    behaviour = load_dynamic_behaviour_assumptions().behaviour
+    behaviour = replace(
+        behaviour,
+        take_up=replace(
+            behaviour.take_up,
+            mode="hazard",
+            hazard=(0.0,),
+            force_by_year=None,
+        ),
+    )
+    # The generic statistical function is deliberately reusable and can
+    # produce a performance cause at a zero ordinary baseline.  The product's
+    # stronger contractual Growth prohibition must still win in projection.
+    assert behaviour.dynamic.growth_probability(
+        0.0,
+        0.0,
+        100_000.0,
+        1.0,
+        performance_shortfall=0.10,
+    ) > 0.0
+
+    result = project(
+        IndexLinkedLifetimeIncomeProduct(
+            reference_fund=ReferenceFundSpec(scenario_maximum_return=0.0025)
+        ),
+        PolicySpec(age=65.0, income_start_year=1.0),
+        _good_market_scenarios(horizon_years=3),
+        behaviour,
+        MortalityTable.gompertz_makeham(),
+        config=ProjectionConfig(dva_enabled=False, record_paths=True),
+    )
+    np.testing.assert_array_equal(result.lapse_events, 0.0)
+    assert result.phase_paths is not None
+    np.testing.assert_array_equal(result.phase_paths[:, :-1], 0)
+    np.testing.assert_array_equal(result.phase_paths[:, -1], 2)
+
+
 def test_hedge_gain_toggle_does_not_change_lapses_or_inforce():
     without_hedge_gain = _project_with_cap(0.0025, hedge_gain=False)
     with_hedge_gain = _project_with_cap(0.0025, hedge_gain=True)

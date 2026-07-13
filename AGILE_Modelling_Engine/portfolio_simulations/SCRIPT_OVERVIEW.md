@@ -46,6 +46,14 @@ Szenario-Orchestratoren reichen diese Einstellungen an ihre untergeordneten
 Runner weiter. Es werden keine zusätzlichen Volatilitätsflächen,
 Credit-Spread-Kurven oder separaten Kalibrierungsdateien verlangt.
 
+Die Standardwerte für Monte-Carlo-Pfadanzahlen und Seeds der Portfolioanalyse
+stehen zentral in
+`../../input_MC_analysis/portfolio_analysis.csv`. Die Rollen `evaluation`,
+`lsmc_training` und `lsmc_validation` trennen Evaluation, LSMC-Training und
+Validierung. Die genaue Anzahl aktiver LSMC-Trainings-Seed-Sätze wird weiterhin
+im jeweiligen Skript festgelegt; die CSV enthält nur die nummerierten
+verfügbaren Seed-Sätze. Explizite CLI-Werte überschreiben den CSV-Standard.
+
 ## Bewertungsrunner
 
 ### `run_portfolio_valuation.py`

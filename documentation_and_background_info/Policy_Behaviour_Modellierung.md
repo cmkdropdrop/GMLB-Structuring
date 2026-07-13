@@ -1,455 +1,583 @@
-# Policy Behaviour im Repository
-
-**Stand:** 12. Juli 2026  
-**Status:** vereinfachtes dynamisches Behaviour-Modell mit festen, nicht
-kalibrierten Proxy-Annahmen (`uncalibrated_proxy`)
-
-Diese Dokumentation beschreibt den produktiv vorgesehenen Ist-Stand der
-Policyholder-Behaviour-Modellierung. Entsprechend der Repository-Vorgabe wurde
-der Stand statisch geprüft; es wurden keine Skripte oder Tests ausgeführt.
-
-## 1. Kurzfassung
-
-Der reguläre Projektionspfad verwendet für die nachfolgend modellierten
-Verhaltensentscheidungen dynamische Funktionen, soweit Produkt-Gates und die
-unten beschriebene Joint-Life-Zustandsgrenze nicht vorrangig sind:
-
-| Verhalten | Modellform | Dynamische Eingaben | Auswertung |
-| --- | --- | --- | --- |
-| Full Surrender/Lapse in Growth | Cox-artiger proportionaler Hazard / Complementary-Log-Log | aktueller IV-/Surrender-Value-Zustand und eingezahlte Bruttoprämie | monatlich |
-| Full Surrender/Lapse in Income | Cox-artiger proportionaler Hazard / Complementary-Log-Log | aktueller Garantie-PV relativ zum Surrender Value und Bruttoprämie | am Anniversary neu bestimmt, innerhalb des Policy Year gehalten |
-| Income Take-up | Cox-artiger proportionaler Hazard / Complementary-Log-Log | aktueller PV des bei sofortigem Start erreichbaren Income relativ zum IV und Bruttoprämie | Entscheidung am jeweils aktuellen Anniversary |
-| Free Withdrawal | Fractional Logit | aktueller Garantie-PV relativ zum IV, Bruttoprämie und MVA-Signal | am Anniversary beziehungsweise bei Income Election neu bestimmt, innerhalb des Policy Year gehalten |
-| Excess Withdrawal | Fractional Logit | aktueller Garantie-PV relativ zum IV, Bruttoprämie und MVA-Signal | am Anniversary beziehungsweise bei Income Election neu bestimmt, innerhalb des Policy Year gehalten |
-
-Für das inzwischen aktive generische Produkt gilt eine vorrangige
-Vertragsgrenze: In Growth sind Full Surrender/Lapse sowie sämtliche Free-,
-Partial- und Excess Withdrawals verboten. Die entsprechenden positiven
-Legacy-Basiswerte werden aus Provenienzgründen weiterhin geladen, aber im
-generischen Projektor strukturell auf null gesetzt. Aktiv bleiben im Kernmotor
-Income Take-up sowie Lapse und Excess Withdrawal in der Income Phase; im
-Portfolio-Runner wird Take-up durch den expliziten Modellpunkt-Termin ersetzt.
-
-Der produktive Default wird nicht aus fest im Runner verdrahteten Behaviour-
-Werten gebaut. Er wird mit `load_dynamic_behaviour_assumptions()` aus zwei CSVs
-im Verzeichnis `input_dynamic_behaviour` geladen. Der Loader liefert ein
-`DynamicBehaviourAssumptionSet`; dessen `behaviour` wird an Pricing,
-Projektion, Profitability und Capital weitergereicht.
-
-Der neue Portfolio-Runner besitzt eine ausdrücklich dokumentierte Ausnahme:
-`income_start_year` ist in den gelieferten New-Business-Modellpunkten ein
-vorgegebener Produkteingang und hat für diesen Lauf Vorrang vor dem dynamischen
-Take-up-Hazard. Der Runner lädt und dokumentiert dennoch den vollständigen
-Behaviour-Annahmensatz, verwendet daraus aber operativ die dynamischen
-Income-Lapse- und Withdrawal-Komponenten für Single Life, den Single-Life-
-Fallback und die Lump-Sum-Spouse-Ausprägung. Der bedingt gemeinsame
-Continue-Income-Joint-Zweig verwendet die geladenen statischen CSV-Basisraten,
-weil noch keine getrennten `p11/p10/p01`-Account-Value-Kohorten bestehen. Ein
-anderer Runner kann weiterhin den nachfolgend beschriebenen dynamischen
-Take-up-Zweig wählen, muss `spouse=True` derzeit aber deterministisch electen.
-Ein direkter Continue-Income-Joint-Life-Kernaufruf muss außerdem statische,
-state-unabhängige Lapse-/Withdrawal-Annahmen verwenden; der Portfolio-Wrapper
-stellt diesen Joint-Zweig automatisch her und belässt den Single-Life-Fallback
-dynamisch.
-
-Die eingezahlte Prämie ist in allen Funktionen
-`PolicySpec.initial_investment`. Sie ist die **bezahlte Bruttoprämie**, nicht
-der nach Upfront Adviser Fee, Kosten oder Bonus verbleibende Investment Amount.
-
-Der LSMC-Code bleibt aus Gründen der Nachvollziehbarkeit in
-`AGILE_Modelling_Engine/agile_engine/lsmc.py` erhalten. Er ist aber archiviert:
-Er gehört weder zur öffentlichen Paket-API noch zur CLI oder zum produktiven
-Pricing-, Projection-, Capital- oder Profitability-Pfad. `optimal` ist kein
-zulässiges `BehaviourModel`-Regime.
-
-## 2. Scope und Begriffe
-
-Gemäß Repository-Konvention bezeichnet **Policyholder** hier die versicherte
-Person. Ein **Modelpoint** ist ein Beispiel für eine versicherte Person. Im
-heutigen Vertragsmodell werden versicherte Person, Investor und wirtschaftlich
-entscheidende Person noch nicht als getrennte Rollen geführt. Das ist eine
-Modellgrenze für die weitere Generifizierung.
-
-Zum grundsätzlich unterstützten Policy Behaviour zählen:
-
-1. der Wechsel von Growth zu Lifetime Income,
-2. Full Surrender/Lapse, soweit die jeweilige Produktphase dies zulässt,
-3. Free und Excess Partial Withdrawals, soweit vertraglich zulässig,
-4. die pfadweise Reaktion dieser Handlungen auf Markt-/Moneyness-Zustand und
-   Prämienhöhe.
-
-Mortalität ist ein konkurrierendes Decrement, aber kein Behaviour-Input.
-Produktwahlen wie Fixed Income und Spouse sind weiterhin
-Vertragseigenschaften beziehungsweise Szenarioinputs und keine vom
-Behaviour-Modell optimierten Aktionen. Rising Income, Age Pension+ und eine
-kundenseitige Investment Allocation gehören nicht zum generischen Produkt.
-
-## 3. Architektur und Eingabequellen
-
-| Datei | Aufgabe |
-| --- | --- |
-| `AGILE_Modelling_Engine/agile_engine/behavior.py` | validierte Hazard- und Fractional-Logit-Funktionen sowie typisierte Behaviour-Annahmen |
-| `AGILE_Modelling_Engine/agile_engine/dynamic_behaviour_assumptions.py` | strikter CSV-Loader, Auswahl von Base/Low/High und Provenienz |
-| `input_dynamic_behaviour/dynamic_behaviour_baselines.csv` | Basiswahrscheinlichkeiten und Basisutilisationen nach Phase und Policy Year |
-| `input_dynamic_behaviour/dynamic_behaviour_coefficients.csv` | Regressionskoeffizienten, Referenzprämie, Signal-Clips, Floors und Caps |
-| `AGILE_Modelling_Engine/agile_engine/projection.py` | Ermittlung der aktuellen Signale und Anwendung im Monatsmotor |
-| `AGILE_Modelling_Engine/agile_engine/market_assumptions.py` | lädt australische Zinskurve und vorhandene ESG-Parameter aus `input_market_data`; Quelle der Marktpfade für die Signale |
-| `AGILE_Modelling_Engine/agile_engine/product.py` | vertragliche Zulässigkeit, Withdrawal-Grenzen, MVA und Income Ratecard |
-| `input_cost_assumptions/cost_assumptions.csv` | einzige Kostenquelle; Gebühren und MVA-Loadings verändern indirekt den Vertragszustand |
-| `AGILE_Modelling_Engine/agile_engine/lsmc.py` | nur archivierter, nicht angebundener Forschungsstand |
-
-Die Behaviour-CSV-Dateien liegen bewusst außerhalb von `input_market_data`.
-Sie sind weder Marktdaten noch Kosten. Umgekehrt enthält die Kosten-CSV keine
-Behaviour-Koeffizienten.
+# Dynamische Policyholder-Verhaltensfunktionen
+
+> **Stand:** 13. Juli 2026
+>
+> **Aktiver Annahmensatz:** `dynamic_proxy_2026-07-13_v2`
+>
+> **Status:** vereinfachtes statistisches Dynamic Behaviour; Mischung aus
+> vertraglichen Restriktionen (`contractual_constraint`) und nicht kalibrierten
+> Proxy-Annahmen (`uncalibrated_proxy`)
+
+Dieses Dokument erklärt die im Repository verwendeten **dynamischen**
+Verhaltensfunktionen fachlich und schematisch. Die exakten, maschinenlesbaren
+Werte stehen in den beiden CSV-Dateien unter
+[`input_dynamic_behaviour`](../input_dynamic_behaviour/README.md). Die CSVs sind
+für Parameterwerte, der strikte Loader für deren Validierung und Behaviour-
+sowie Projektionscode für Algorithmus und Timing maßgeblich. Dieses Dokument
+fasst diese drei Ebenen verständlich zusammen.
+
+`Policyholder` bezeichnet hier die versicherte Person. Ein `Modelpoint` ist ein
+konkretes Beispiel für eine solche Person oder einen Joint-Life-Vertrag.
+
+## 1. Zweck und Abgrenzung
+
+Das statistische Modell beantwortet drei Fragen:
+
+1. Beginnt die versicherte Person an einem zulässigen Anniversary freiwillig
+   die Income Phase?
+2. Nimmt sie in der Income Phase mehr als das reguläre Einkommen heraus?
+3. Beendet sie den Vertrag in der Income Phase durch Full Withdrawal/Lapse?
+
+Nicht Gegenstand dieser Funktionen sind Tod, Gebühren, Crediting, MVA- oder
+Income-Reduktionsformeln. Diese Größen beeinflussen jedoch den beobachtbaren
+Vertragszustand, auf den das Behaviour reagiert.
+
+Eine freiwillige Entnahme **unterhalb** des regulär vorgesehenen Income ist im
+aktuellen statistischen Modell keine eigene Handlung. Das vertragliche Income
+wird ausgezahlt; eine Excess Withdrawal kann das künftige Income anschließend
+mechanisch reduzieren. „Weniger entnehmen“ ist damit derzeit eine
+Modellierungslücke, keine stillschweigend angenommene Behaviour-Funktion.
+
+Ebenfalls getrennt ist **optimales Verhalten mit LSMC**. Dynamic Behaviour
+verwendet feste statistische Proxy-Funktionen. LSMC lernt dagegen auf separaten
+Trainingspfaden eine wertmaximierende Entscheidungsregel und reicht diese als
+externe Policy an denselben Projektor. Es ist kein `BehaviourModel`-Regime.
+
+Im generischen Portfolio-Runner sind dynamische Income Election und dynamisches
+Post-Income-Behaviour die Defaults. Ein deterministischer Income-Start und
+`continue` nach Election sind ausdrücklich gekennzeichnete Benchmarks.
+
+## 2. Das Modell in einer Minute
+
+Die wichtigste Vertragsregel steht **vor** jeder statistischen Funktion: Im
+aktuellen generischen Produkt sind Growth-Lapse sowie Free-, Partial- und
+Excess-Withdrawals in der Growth Phase nicht zulässig. Ordinary Growth-Lapse
+und Growth-Free-Utilisation sind in den v2-Eingaben null. Die gemeinsame
+Excess-Baseline und der generische Performance-Hazard sind dagegen nicht
+phasenexklusiv; erst die Produkt-Gates im Projektor garantieren auch für diese
+Kanäle den Growth-Output null.
+
+```mermaid
+flowchart LR
+    S[Vertragsbeginn] --> G[Growth Phase]
+    G --> A{Zulässiges<br/>Policy Anniversary?}
+    A -->|keine Election| G
+    A -->|Income Take-up| I[Income Phase]
+
+    G -.-> XG[Growth-Gates:<br/>kein Lapse<br/>keine Withdrawals]
+
+    I --> P[Reguläres Lifetime Income]
+    P --> B{Dynamisches<br/>Verhalten}
+    B -->|Fortführen| I
+    B -->|Excess Withdrawal| R[Investment Value und<br/>Income werden angepasst]
+    R --> I
+    B -->|Full Withdrawal / Lapse| E[Vertrag beendet]
+```
+
+Für die Interpretation sind drei Ebenen auseinanderzuhalten:
+
+| Ebene | Frage | Beispiel |
+|---|---|---|
+| Vertrag | Ist die Handlung überhaupt zulässig? | Growth-Lapse ist gesperrt. |
+| Behaviour-Funktion | Wie reagiert die Rate auf den aktuellen Zustand? | Wertvollere Garantie senkt Income-Lapse. |
+| Projektions-Timing | Wann werden Zustand und Handlung ausgewertet? | Income-Lapse wird monatlich neu berechnet. |
+
+Income Election ist eine pfadweise Ja/Nein-Entscheidung mit reproduzierbaren
+Zufallsziehungen. Income-Lapse wird dagegen als erwartungswertgewichtetes
+Decrement und Excess Withdrawal als erwartete Rate modelliert. Die beiden
+letzten Größen sind daher keine simulierten individuellen Kundenhistorien.
+
+## 3. Gemeinsame Zustandssignale
+
+### 3.1 Garantie-Moneyness
+
+Das zentrale Signal ist die signierte logarithmische Garantie-Moneyness
+
+```text
+m_raw = log(G / A)
+m_std = clip(m_raw, -log(2), log(2))
+```
+
+mit dem Barwert `G` des relevanten künftigen Garantieeinkommens und einem zur
+Handlung passenden Vergleichswert `A`.
 
-### 3.1 Loader und Provenienz
+| Funktion | Zähler `G` | Nenner `A` |
+|---|---|---|
+| Income Election | PV des Einkommens bei sofortigem Start | aktuelles Investment Value |
+| Income Full Withdrawal/Lapse | PV des bereits gelockten restlichen Einkommens | aktueller Surrender Value |
+| Income Excess Withdrawal | PV des bereits gelockten restlichen Einkommens | aktuelles Investment Value |
 
-`load_dynamic_behaviour_assumptions()`:
+Der Garantie-PV ist das prospektive beziehungsweise gelockte Jahreseinkommen
+mal pfadweisem Annuitätenfaktor. Aktuelle Mortalitäts- und Joint-Life-Zustände
+wirken deshalb mittelbar auf die Moneyness, obwohl Mortalität kein eigener
+CSV-Regressionskoeffizient ist.
 
-- erwartet beide CSV-Dateien mit einem festen Schema,
-- validiert vollständige und lückenlose Policy-Year-Bänder,
-- verlangt für jede Zeile den Status `uncalibrated_proxy`,
-- prüft Einheiten, Wertebereiche, strukturelle Nullen und den erzwungenen
-  Income Start,
-- verlangt für Income Lapse und Withdrawal-Komponenten genau ein offenes Band
-  ab Policy Year 1, weil diese Felder im Kernmotor derzeit skalare Annahmen
-  sind; weitere formal gültige Bänder werden nicht still ignoriert,
-- wählt konsistent `value_basis="low"`, `"base"` oder `"high"`,
-- liefert Quellpfade, SHA-256-Hashes, Effective Dates und die tatsächlich
-  angewandten Werte für Run-Provenienz.
+Die Leseregel lautet:
 
-Low und High sind geordnete Sensitivitätsbänder, keine Konfidenzintervalle.
-Bei negativen Koeffizienten ist `low` der numerisch kleinere und damit stärker
-negative Wert.
+| Verhältnis `G/A` | `m_std` | Bedeutung |
+|---:|---:|---|
+| 0,5 oder kleiner | `-log(2)` | Garantie relativ wenig wertvoll |
+| 1,0 | `0` | at the money (ATM) |
+| 2,0 oder größer | `+log(2)` | Garantie relativ wertvoll |
 
-### 3.2 Kostenquelle
+Der Standard-Clip verhindert, dass extreme oder nahezu null werdende
+Vergleichswerte die Proxy-Funktion dominieren. Die Standardfunktionen verwenden
+`m_std`. Nur das Retention-Gate des Performance-Lapse nutzt separat `m_raw` und
+clippt dessen positiven Teil erst bei `log(4)`.
 
-Kosten werden ausschließlich aus folgender Datei geladen:
+### 3.2 Sichtbarer Crediting-Gap
 
-`C:\Users\user\Documents\GMLB Structuring\input_cost_assumptions\cost_assumptions.csv`
+Nach jedem abgeschlossenen Crediting Year wird ausschließlich aus der für den
+Kunden sichtbaren Entwicklung berechnet:
 
-Insbesondere dürfen Gebühren, Maintenance Expenses, Hedge Execution Costs
-oder MVA-Loadings nicht aus den Behaviour-CSV-Dateien oder zusätzlichen
-Fallback-Dateien bezogen werden. Vertragswertwirksame Kundenentgelte und
-MVA-Loadings beeinflussen Behaviour indirekt über IV, Surrender Value oder das
-MVA-Signal; reine Versicherer-Expenses mindern den Kunden-IV nicht. Die
-Prämienkovariate bleibt davon unberührt.
+```text
+g_raw = max(log(1 + R_reference) - log(1 + R_credited), 0)
+```
 
-## 4. Gemeinsame dynamische Kovariaten
+Unter Total Protection ist dies vor allem ein **Cap-Gap**: Der Reference Fund
+ist stärker gestiegen als die vertragliche Gutschrift. Das Signal ist nicht
+gleichbedeutend mit allgemein schlechter Marktperformance. Backing Assets,
+Hedge-P&L und zukünftige Information gehen nicht ein. Zwischen zwei
+Anniversaries bleibt der zuletzt beobachtete Gap unverändert.
 
-### 4.1 Bruttoprämie
+### 3.3 MVA-Biss und Bruttoprämie
 
-Für jede Funktion gilt
+Der Projektor stellt für Excess Withdrawals einen aktuellen MVA-Biss `v` im
+Intervall `[0, 1]` bereit. Eine höhere mögliche MVA-Belastung soll eine
+Mehrentnahme weniger attraktiv machen. Der MVA-freie Free-Withdrawal-Kanal
+erhält dieses Signal bewusst nicht.
 
-\[
-z=\operatorname{clip}\left(\log\frac{P}{100{.}000},-2,2\right),
-\]
+Die technische Modellform unterstützt außerdem
 
-mit
+```text
+z = clip(log(P / 100000), -2, 2)
+```
 
-- \(P=\texttt{PolicySpec.initial_investment}\),
-- Referenzprämie \(P_{ref}=\text{AUD }100{.}000\).
+mit der eingezahlten **Bruttoprämie** `P`. Im aktiven v2-Satz sind jedoch alle
+Premium- und Moneyness-mal-Premium-Koeffizienten null. Die Prämienhöhe ist
+damit derzeit kein aktiver Behaviour-Treiber.
 
-Damit ist die Prämienhöhe nicht nur ein Selektionsmerkmal für eine
-Modelpoint-Gruppe, sondern eine explizite Kovariate jeder dynamischen
-Behaviour-Funktion. Der Clip verhindert extreme Extrapolation weit außerhalb
-des Proxy-Bereichs.
+### 3.4 Welche Signale wirken wo?
 
-### 4.2 Moneyness
+Kurz gelesen:
 
-Ein rohes Entscheidungssignal wird grundsätzlich als logarithmisches
-Wertverhältnis formuliert und begrenzt:
+- Eine wertvollere Garantie erhöht Take-up, senkt gewöhnlichen Lapse und senkt
+  Excess Withdrawal.
+- Ein größerer sichtbarer Crediting-Gap erhöht Take-up und Performance-Lapse.
+- Ein höherer MVA-Biss senkt Excess Withdrawal.
 
-\[
-m_{raw}=\log(G/A),\qquad
-m=\operatorname{clip}(m_{raw},-\log 2,\log 2).
-\]
+Die x/y-Grafiken in den folgenden Abschnitten zeigen die **tatsächlich aus dem
+geladenen Base-Modell berechneten** Funktionsverläufe. Auf der x-Achse steht bei
+Moneyness-Grafiken das anschauliche Verhältnis `G/A`; intern wird daraus
+`m_raw` beziehungsweise `m_std` gebildet.
 
-`G` und `A` hängen von der Entscheidung ab:
+## 4. Gemeinsame mathematische Bausteine
 
-| Entscheidung | Rohes Signal | Transformation |
-| --- | --- | --- |
-| Growth Lapse | \(\log(IV/SV)\); erfasst den aktuellen Exit-/MVA-Nachteil | positiver Teil |
-| Income Lapse | \(\log(PV(Income)/SV)\) | positiver Teil |
-| Income Take-up | \(\log(PV(prospective\ Income)/IV)\) | vorzeichenbehaftet |
-| Free/Excess Withdrawal | \(\log(PV(guaranteed\ Income)/IV)\) | positiver Teil; zusätzlich separates MVA-Signal |
+### 4.1 Proportionaler Hazard für Ereigniswahrscheinlichkeiten
 
-In Growth wird der prospektive Garantie-PV aus aktuellem IV, der bei sofortigem
-Income Start geltenden Ratecard und dem pfadweisen Annuitätenfaktor bestimmt.
-In Income wird das bereits festgesetzte `income_annual` verwendet. Der
-Annuitätenfaktor berücksichtigt aktuelles Alter, Mortalität, gegebenenfalls
-Joint Life und einen pfadweisen Zehnjahres-Forward-Zero-Zins als transparenten
-Diskontierungsproxy. Er bewertet monatlich nachschüssige Zahlungen auf derselben
-jährlich reconciliierten Monatsmortalität wie der Cashflow-Projektor.
+Income Take-up und gewöhnlicher Income-Lapse verwenden eine Cox-/complementary-
+log-log-artige Transformation. Aus einer jährlichen Basiswahrscheinlichkeit
+`p0` wird zunächst der integrierte Basishazard
 
-Der positive Teil bedeutet: Für Lapse und Withdrawals löst ein negatives
-Garantie-Moneyness-Signal keine spiegelbildliche dynamische Reaktion aus.
-Take-up verwendet dagegen das Vorzeichen, weil sowohl ein über als auch unter
-dem IV liegender Garantie-PV für die Startentscheidung relevant sein soll.
+```text
+mu0 = -log(1 - p0)
+eta = beta_m * m_std + beta_p * z + beta_mp * m_std * z + beta_mva * v
+q   = clip(exp(eta), multiplier_floor, multiplier_cap)
+p_a = clip(1 - exp(-mu0 * q), annual_floor, annual_cap)
+```
 
-## 5. Cox-/Proportional-Hazard-Modell
+Eine strukturelle Basis von `0` bleibt exakt `0`, eine Basis von `1` exakt
+`1`. Für einen Zeitschritt der Länge `dt` Jahre gilt anschließend
 
-Lapse und Income Take-up verwenden dieselbe etablierte Hazard-Struktur. Aus
-einer jährlichen bedingten Basiswahrscheinlichkeit \(p_0\) wird zunächst der
-integrierte Basishazard
+```text
+p_dt = 1 - (1 - p_a)^dt
+```
 
-\[
-\mu_0=-\log(1-p_0).
-\]
+Zwölf identische Monatswahrscheinlichkeiten reproduzieren dadurch exakt die
+Jahreswahrscheinlichkeit; eine bloße Division durch zwölf wird vermieden.
 
-Der lineare Prädiktor lautet
+### 4.2 Fractional Logit für erwartete Entnahmeraten
 
-\[
-\eta=\beta_m m+\beta_p z+\beta_{mp}mz+\beta_{MVA}MVA.
-\]
+Excess Withdrawal ist keine Ereigniswahrscheinlichkeit, sondern ein erwarteter
+Anteil des Investment Value. Dafür gilt
 
-Nach den vorgesehenen Hazard-Grenzen gilt
+```text
+logit(u) = logit(u0)
+           + beta_m * m_std
+           + beta_p * z
+           + beta_mp * m_std * z
+           + beta_mva * v
+```
 
-\[
-h=\operatorname{clip}(\exp(\eta),h_{min},h_{max}),
-\]
-
-\[
-p_a=1-\exp(-\mu_0 h).
-\]
-
-Das ist die diskrete Anwendung eines proportionalen Hazard-Modells; die
-zugehörige Probability-Link-Darstellung ist Complementary Log-Log. Floors und
-Caps begrenzen anschließend die jährliche Wahrscheinlichkeit. Eine
-strukturelle Basiswahrscheinlichkeit von null bleibt exakt null, eine
-erzwungene Wahrscheinlichkeit von eins bleibt eins.
+Danach wird mit der inversen Logit-Funktion in `[0, 1]` zurücktransformiert.
+Strukturelle Endpunkte `u0 = 0` und `u0 = 1` bleiben exakt erhalten.
 
-### 5.1 Exakte Umrechnung auf den Monatsraster
-
-Bei Lapse wird **zuerst** die jährliche Basisrate dynamisch skaliert. Erst
-danach erfolgt die exakte Konversion:
-
-\[
-p_m=1-(1-p_a)^{1/12}.
-\]
-
-Damit wird nicht ein bereits monatlich konvertierter Wert linear
-multipliziert. Growth Lapse wird mit dem aktuellen Exit-Zustand monatlich neu
-bestimmt. Die Income-Lapse-Wahrscheinlichkeit wird am Anniversary sowie bei
-Income Election aktualisiert und über das folgende Policy Year gehalten.
-
-### 5.2 Income Take-up am aktuellen Anniversary
-
-Dynamic Take-up ist eine bedingte jährliche Entscheidung auf dem jeweils
-aktuellen Anniversary. Nach Crediting und Gebühren werden anhand des dann
-vorliegenden Markt-, IV-, Zins- und Prämienzustands die prospektive Income Rate,
-der Garantie-PV und die dynamische Take-up-Wahrscheinlichkeit ermittelt.
-
-Der Projektor zieht dafür reproduzierbare jährliche Uniform-Variablen je
-Marktpfad. Die Entscheidung wird nicht am Projektionsstart für alle späteren
-Jahre vorweggenommen. Vertragliche Mindestwartezeiten und die automatische
-Startregel nach Alter 100 bleiben vorrangige Grenzen. Im dynamischen Proxy ist
-der Income Start ab Policy Year 15 erzwungen.
-
-Diese Mechanik gilt für Läufe ohne vorrangigen expliziten
-Modelpoint-Election-Termin. In der aktuellen Portfoliobewertung wird stattdessen
-deterministisch am `income_start_year` electet, damit Spouse-Survival bis zu
-einem eindeutigen Eligibility-Termin und der Single-Life-Fallback konsistent
-gemischt werden können.
-
-## 6. Fractional Logit für Withdrawals
-
-Free- und Excess-Withdrawal-Nutzung sind erwartete Anteile im Intervall
-`[0,1]`. Dafür wird die Basisutilisation \(u_0\) auf der Logit-Skala
-verschoben:
-
-\[
-\operatorname{logit}(u)=\operatorname{logit}(u_0)
- +\beta_m m+\beta_p z+\beta_{mp}mz+\beta_{MVA}MVA.
-\]
-
-Die inverse Logit-Funktion liefert die dynamische Utilisation. Strukturelle
-Nullen und Einsen bleiben erhalten. Das MVA-Signal ist der nichtnegative,
-aktuell wirksame MVA-Anteil; ein negativer `beta_mva` dämpft die Nutzung bei
-höherem MVA-Nachteil.
-
-Die Werte werden zum Projektionsstart, am Anniversary und bei Income Election
-neu bestimmt und innerhalb des Policy Year gehalten:
-
-- Free Withdrawal: erwarteter Anteil der vertraglich verfügbaren Free
-  Withdrawal Allowance,
-- Excess Withdrawal: erwartete annualisierte Entnahme als Anteil des aktuellen
-  IV.
-
-Erst danach wendet `product.py` die Vertragsmechanik an, insbesondere Free
-Allowance, Mindestentnahme, 95-%-Grenzen, Mindestrestwert, MVA und die
-proportionale Reduktion des Lifetime Income. Das Behaviour-Modell darf diese
-vertraglichen Grenzen nicht ersetzen.
-
-Der Excess-Ansatz ist ein vereinfachtes Fractional-Response-Modell. Er trennt
-nicht zwischen Entnahme-Inzidenz und -Höhe wie ein vollständiges
-Hurdle-/Frequency-Severity-Modell.
-
-## 7. Geladene Base-Annahmen
-
-### 7.1 Basisraten und -utilisationen
-
-| Komponente | Base |
-| --- | --- |
-| Growth Lapse Policy Year 1–11+ | 3,0 %, 3,5 %, 4,0 %, 4,0 %, 4,0 %, 3,5 %, 3,0 %, 3,0 %, 2,5 %, 2,0 %, 2,0 % p.a. |
-| Income Lapse | 0,5 % p.a. |
-| Income Take-up Policy Year 1–7 | 0 %, 10 %, 15 %, 20 %, 25 %, 30 %, 30 % p.a. |
-| Income Take-up Policy Year 8–14 | 30 % p.a. |
-| Income Take-up ab Policy Year 15 | 100 %; erzwungen |
-| Free-Withdrawal-Utilisation | 25 % der verfügbaren Allowance p.a. |
-| Excess-Withdrawal-Rate | 0,5 % des aktuellen IV p.a. |
-
-### 7.2 Base-Koeffizienten
-
-| Komponente | \(\beta_m\) | \(\beta_p\) | \(\beta_{mp}\) | \(\beta_{MVA}\) | wesentliche Grenze |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Growth Lapse | -1,50 | -0,10 | -0,50 | 0 | Hazard-Multiplikator 0,2–3,0; jährlicher Cap 30 % |
-| Income Lapse | -1,50 | -0,10 | -0,50 | 0 | Hazard-Multiplikator 0,2–3,0; jährlicher Cap 30 % |
-| Income Take-up | 4,00 | 0,50 | 0,25 | 0 | Hazard-Multiplikator 0,05–25; jährlicher Cap 50 % vor Force-Regel |
-| Free Withdrawal | 0,50 | -0,25 | -0,10 | -2,00 | Output 0–100 % |
-| Excess Withdrawal | 0,50 | -0,25 | -0,10 | -2,00 | Output 0–100 % |
-
-Diese Werte sind **keine** aus den unten genannten Quellen übernommene
-Kalibrierung. Alle Basisraten, Koeffizienten, Clips, Floors und Caps sind als
-`uncalibrated_proxy` gekennzeichnet. Sie sind weder eine australische
-Experience Study noch eine vollständig kalibrierte Kundenprognose.
-
-## 8. Einbindung in den Monatsmotor
-
-Behaviour wird in eine erwartungswertgewichtete Zustandsprojektion eingebettet.
-Tod und Lapse reduzieren das In-force-Gewicht; sie werden nicht als separate
-binäre Kundenhistorie je Marktpfad simuliert. Income Take-up kann dynamisch
-gezogen werden; der aktuelle Portfolio-Runner verwendet dagegen den expliziten
-deterministischen Modelpoint-Termin.
-
-Die behaviour-relevante Reihenfolge im Monat ist:
-
-1. Markt-/Indexentwicklung,
-2. am Anniversary vollständiger Fondscredit ohne Fixed-Income-Ratchet,
-3. Fee-Accrual beziehungsweise Anniversary-Posting aus der zentralen Kostenbasis,
-4. Expected-Death-Decrement des abgelaufenen Intervalls,
-5. bei Survivors gegebenenfalls Income Election,
-6. Lifetime-Income-Zahlung,
-7. Free/Excess Partial Withdrawals,
-8. Full Surrender/Lapse.
-
-Dadurch sehen Take-up, zulässige Income-Withdrawals und Income-Lapse den zu
-ihrem Entscheidungszeitpunkt aktuellen Vertragszustand. Growth-Lapse und
-Growth-Withdrawals bleiben unabhängig von den CSV-Werten null. Income-Lapse
-bleibt bei fortbestehender Garantie auch nach Aufzehrung des Account Value
-möglich; ein Null-AV beendet nur einen Growth-Vertrag ohne Garantie. Ein Cap,
-Floor oder Schutzmechanismus wird weiterhin
-auf den gemäß Vertrag vollständig gebildeten Kundenfonds- beziehungsweise
-Optionsreturn angewandt; Behaviour ändert diese Crediting-Reihenfolge nicht.
-
-## 9. LSMC ist archiviert
-
-Der frühere LSMC-Ansatz für wertmaximierendes Verhalten wird vorerst vollständig
-aus dem verwendeten Modellpfad ausgeklammert:
-
-- die fachliche Implementierung in `agile_engine/lsmc.py` bleibt als klar
-  gekennzeichnetes Forschungs-/Historienartefakt erhalten,
-- `value_optimal_behaviour` und `LSMCSettings` sind keine öffentliche
-  Top-Level-API,
-- die CLI bietet keinen `--lsmc`-Produktionslauf,
-- `run_full_analysis.py` und `run_insurer_analysis.py` dispatchen nicht in den
-  LSMC,
-- `BehaviourModel(regime="optimal")` wird abgewiesen,
-- Pricing, Projection, Capital, Sensitivities und Profitability verwenden nur
-  die CSV-konfigurierte dynamische Behaviour-Basis.
-
-Frühere Dokumentations- oder Changelog-Passagen zu LSMC-Ergebnissen beschreiben
-nur die Entwicklungshistorie. Sie sind keine Aussage über den aktuellen
-Produktionsdefault und dürfen nicht als Ergebnis des heutigen Basismodells
-zitiert werden.
-
-## 10. Verwendung unter Q und Real World
-
-Dasselbe dokumentierte Behaviour-Assumption-Set wird unter beiden Maßen
-angewandt; es gibt keine separate physische Behaviour-Kalibrierung. Die
-effektiven Entscheidungen unterscheiden sich dennoch pfadweise, weil IV,
-Surrender Value, MVA, Zins und Garantie-PV aus dem jeweiligen Marktpfad stammen.
-
-Gemäß Repository-Konvention gilt:
-
-- marktkonsistente Bewertung: standardmäßig Heston-Hull-White unter Q,
-- vereinfachte Real-World-Projektion: Black-Scholes-Hull-White unter
-  `Measure.REAL_WORLD`.
-
-Die Real-World-Ergebnisse sind als vereinfachte Projektionen mit festen
-Proxy-Annahmen zu kennzeichnen. Das Behaviour-Modell führt keine zusätzliche
-Marktzeitreihe oder physische Verhaltenskalibrierung ein.
+## 5. Dynamischer Start der Income Phase
+
+### 5.1 Basisraten
+
+Die freiwillige Election wird nur an einem zulässigen Anniversary in der
+Growth Phase geprüft. Die Baseline hängt vom Policy Year ab:
+
+| Policy Year | Low | Base | High |
+|---:|---:|---:|---:|
+| 1 | 0 % | 0 % | 0 % |
+| 2 | 5 % | 10 % | 15 % |
+| 3 | 7,5 % | 15 % | 22,5 % |
+| 4 | 10 % | 20 % | 30 % |
+| 5 | 12,5 % | 25 % | 37,5 % |
+| 6–7 | 15 % | 30 % | 45 % |
+| 8+ | 15 % | 30 % | 45 % |
+
+Das Band bleibt ab Policy Year 8 offen. Es gibt **keinen** Behaviour-bedingten
+Force-Year. Vertragliche automatische Starts, insbesondere am ersten
+Anniversary nach Erreichen von Alter 100, sind separate Produktlogik und
+überschreiben die freiwillige Entscheidung. Der im generischen Produkt nicht
+zulässige Age-Pension+-Pfad bleibt außerhalb dieses Dokuments.
+
+### 5.2 Zustandsreaktion
+
+Im v2-Satz ist der aktive lineare Predictor
+
+```text
+g_takeup = clip(g_raw, 0, 1)
+eta_takeup = 4 * m_std + 4 * g_takeup
+```
+
+Der gemeinsame relative Hazard-Multiplikator ist auf `[0,05; 25]` begrenzt.
+Die jährliche Ausgabewahrscheinlichkeit ist in Low/Base/High auf
+`35 % / 50 % / 65 %` begrenzt. Technisch verfügbare Effekte für Account Value,
+prospektive Income Ratio, einzelne Returns, Prämie und Interaktionen sind in v2
+alle null.
+
+![Income-Election-Wahrscheinlichkeit über der Garantie-Moneyness, mit und ohne sichtbaren Crediting-Gap](dynamic_behaviour_takeup_xy.svg)
+
+*Abbildung 1: Base-Funktionsverlauf in Policy Year 6. Der horizontale Abschnitt
+ist der jährliche Base-Cap von 50 %.*
+
+Beispiel für Base, Policy Year 6 und AUD 100.000 Bruttoprämie:
+
+| `G/A` | ohne Gap | mit `g_raw = 0,10` |
+|---:|---:|---:|
+| 0,5 | 2,20 % | 3,27 % |
+| 1,0 | 30,00 % | 41,26 % |
+| 2,0 | 50,00 % Cap | 50,00 % Cap |
+
+Die Zufallszahl wird reproduzierbar je Pfad und Policy Year erzeugt. Die
+Wahrscheinlichkeit selbst entsteht erst am aktuellen Anniversary aus dem dann
+beobachtbaren Zustand; es gibt keinen Look-ahead.
+
+## 6. Dynamischer Full Withdrawal/Lapse in der Income Phase
+
+Income-Lapse besteht aus zwei **konkurrierenden Exit-Ursachen**. Sie werden auf
+Hazard-Ebene kombiniert, damit dieselbe Exit-Masse nicht doppelt gezählt wird.
+
+### 6.1 Gewöhnlicher Income-Lapse
+
+Die jährliche Basis beträgt Low/Base/High
+`0,25 % / 0,50 % / 0,75 %`. Aktiv ist nur
+
+```text
+eta_ordinary = -1.5 * m_std
+```
+
+Der relative Hazard-Multiplikator ist auf `[0,20; 3,00]` begrenzt. Der
+gewöhnliche jährliche Output-Cap beträgt `20 % / 30 % / 40 %`. Die negative
+Steigung bedeutet: Je wertvoller das verbleibende garantierte Einkommen im
+Verhältnis zum aktuellen Surrender Value ist, desto geringer ist der Anreiz
+zum Full Withdrawal.
+
+### 6.2 Zusätzlicher Performance-Lapse
+
+Der zweite Hazard reagiert auf den sichtbaren Gap, ohne diesen in denselben
+linearen Predictor wie die Garantie-Moneyness zu pressen:
+
+```text
+g_eff = clip(max(g_raw - 0.02, 0), 0, 0.30)
+m_ret = clip(max(m_raw, 0), 0, log(4))
+retention = max(0.20, exp(-1.5 * m_ret))
+mu_perf = retention * mu_max * (1 - exp(-g_eff / 0.08))
+```
+
+`mu_max` ist in Low `0 %` und in Base/High `8 %`. Der Deadband ignoriert die
+ersten `0,02` logarithmischen Gap-Einheiten, bei kleinen Returns näherungsweise
+zwei Prozentpunkte. Positive Garantie-Moneyness reduziert den Performance-
+Hazard bis zu einem Retention-Floor von 20 %. Negative Moneyness verstärkt ihn
+nicht zusätzlich.
+
+![Income-Lapse-Wahrscheinlichkeit über dem sichtbaren Crediting-Gap für drei Garantie-Moneyness-Niveaus](dynamic_behaviour_performance_gap_xy.svg)
+
+*Abbildung 2: Der 2-%-Deadband, der anschließende Anstieg und die Retention bei
+wertvoller Garantie sind im Base-Verlauf direkt sichtbar.*
+
+### 6.3 Competing-Risk-Zusammenführung
+
+Mit `mu_ord = -log(1 - p_ordinary)` gilt zunächst
+
+```text
+p_raw = 1 - exp(-(mu_ord + mu_perf))
+p_total = max(p_ordinary, min(p_raw, combined_annual_cap))
+```
+
+Der gemeinsame Jahres-Cap beträgt Low/Base/High `20 % / 30 % / 40 %`. Er
+begrenzt nur das **inkrementelle** kombinierte Risiko und darf eine bereits
+höhere gewöhnliche Wahrscheinlichkeit niemals reduzieren. Danach wird
+`p_total` exakt auf den Monat umgerechnet und im Verhältnis der ursprünglichen
+cause-specific Hazards auf Ordinary und Performance verteilt.
+
+```mermaid
+flowchart LR
+    B[Income-Lapse-<br/>Basisrate] --> O[Gewöhnlicher Hazard]
+    M[Garantie-Moneyness] --> O
+
+    G[Sichtbarer Gap] --> DB[2-%-Deadband<br/>max. 30 %]
+    M --> R[Retention-Gate]
+    DB --> P[Performance-Hazard]
+    R --> P
+
+    O --> S[Hazards addieren]
+    P --> S
+    S --> C[Jährlicher Gesamt-Cap<br/>nie unter Ordinary]
+    C --> DT[Exakte Monatsumrechnung]
+    DT --> AO[Ordinary Exit-Masse]
+    DT --> AP[Performance Exit-Masse]
+```
+
+![Income-Lapse-Wahrscheinlichkeit über der Garantie-Moneyness, mit und ohne sichtbaren Crediting-Gap](dynamic_behaviour_income_lapse_xy.svg)
+
+*Abbildung 3: Gesamt-Lapse aus Ordinary und Performance Cause. Ohne Gap bleibt
+nur der fallende Ordinary-Hazard; mit Gap liegt die Kurve deutlich höher.*
+
+Beispiel für Base und AUD 100.000 Bruttoprämie:
+
+| `G/A` | kein Gap | `g_raw = 0,10` |
+|---:|---:|---:|
+| 0,5 | 1,4078 % p.a. | 6,2696 % p.a. |
+| 1,0 | 0,5000 % p.a. | 5,4066 % p.a. |
+| 2,0 | 0,1771 % p.a. | 1,9459 % p.a. |
+
+ATM entsprechen `0,5 %` p.a. rund `0,04176 %` pro Monat. Mit `g_raw = 0,10` sind
+es rund `0,46211 %` pro Monat. Die Performance-Komponente ist damit im Base-
+Satz materiell und ausdrücklich ein unkalibriertes Modellrisiko.
+
+### 6.4 Anwendung und Vertrags-Gates
+
+Der Income-Lapse wird an **jedem monatlichen Full-Withdrawal-Zeitpunkt** mit
+aktuellem, post-payment und post-withdrawal ermitteltem Surrender Value neu
+berechnet. Er wird nicht einmal jährlich berechnet und anschließend zwölf
+Monate konstant gehalten.
+
+Full Withdrawal ist nicht zulässig
+
+- in der Growth Phase,
+- im selben Ereigniszeitpunkt wie eine neue Income Election,
+- nach Tod beziehungsweise außerhalb des In-force-Bestands oder
+- wenn der Surrender Value materiell null ist. Eine positive verbleibende
+  Einkommensgarantie kann nicht gegen eine Auszahlung von null aufgegeben
+  werden.
+
+## 7. Dynamische Excess Withdrawals
+
+### 7.1 Basis und Reaktion
+
+Die erwartete jährliche Excess-Withdrawal-Rate als Anteil des aktuellen
+Investment Value beträgt Low/Base/High `0 % / 0,50 % / 2,00 %`. Im v2-Satz gilt
+
+```text
+logit(u_excess) = logit(u0) - 0.5 * m_std - 2 * v
+```
+
+Die Moneyness wird **signiert** verwendet. Eine wenig wertvolle Garantie erhöht
+die erwartete Mehrentnahme; eine wertvolle Garantie und ein höherer MVA-Biss
+senken sie. Premium und Interaktion sind null. Die Low-Basis von null bleibt
+exakt null.
+
+![Erwartete Excess-Withdrawal-Rate über der Garantie-Moneyness, mit und ohne MVA-Biss](dynamic_behaviour_excess_withdrawal_xy.svg)
+
+*Abbildung 4: Sowohl eine wertvollere Garantie als auch ein höherer MVA-Biss
+senken die erwartete Mehrentnahme.*
+
+Beispiel für Base und AUD 100.000 Bruttoprämie:
+
+| `G/A` | ohne MVA-Biss | bei `v = 0,10` |
+|---:|---:|---:|
+| 0,5 | 0,7056 % | 0,5785 % |
+| 1,0 | 0,5000 % | 0,4097 % |
+| 2,0 | 0,3541 % | 0,2901 % |
+
+### 7.2 Anwendung im Projektor
+
+Der v2-Satz verwendet die Frequenz `annual`. Die Rate wird am tatsächlichen
+Anniversary-Aktionspunkt aus dem aktuellen Zustand **nach** einer dort fälligen
+regulären Income-Zahlung berechnet und einmal angewandt. Danach greifen die
+vertraglichen Mindestbeträge, der Mindest-Restwert, MVA und die
+Income-Reduktion. Der Legacy-kompatible CAS-/Age-Pension+-Pfad ist im aktuellen
+generischen Produkt nicht zulässig.
+
+Der technisch verfügbare Monatsmodus würde die Zustandsrate monatlich neu
+berechnen und `u/12` auf das jeweils aktuelle, im Jahresverlauf sinkende
+Investment Value anwenden. Er rekonstruiert deshalb nicht exakt eine einmalige
+Entnahme von `u` auf dem Jahresanfangswert und ist nicht der v2-Default.
+
+Growth-Free-Utilisation ist in der CSV strukturell null. Die gemeinsame Excess-
+Baseline ist es nicht; das Produkt-Gate setzt sie in der Growth Phase auf null.
+Das generische Produkt hat keine alte 5-%-Free-Allowance in der Growth Phase.
+
+## 8. Ereignisreihenfolge im Monatsmotor
+
+Die Verhaltensfunktion sieht immer nur Information, die am jeweiligen
+Entscheidungspunkt bereits verfügbar ist.
+
+```mermaid
+flowchart LR
+    M[Markt- und<br/>Indexentwicklung] --> A{Anniversary?}
+    A -->|ja| C[Crediting und<br/>Gap aktualisieren]
+    A -->|nein| FM[Monatliche<br/>Fee Accrual]
+    C --> FA[Fee Accrual und<br/>Anniversary-Posting]
+    FM --> D[Mortalitätsdekrement für<br/>abgelaufenes Intervall]
+    FA --> D
+    D -->|terminierender Tod| X[Vertrag beendet]
+    D -->|Survivor / weiter in force| A2{Anniversary?}
+    A2 -->|ja| E[Dynamisches Take-up<br/>falls zulässig]
+    A2 -->|nein| I[Reguläre Income-Zahlung<br/>falls bereits fällig]
+    E --> R[Neuer Cap- und<br/>DVA-Zeitraum]
+    R --> I
+    I --> W[Partial / Excess Withdrawal]
+    W --> L[Monatlicher Full-Withdrawal-<br/>Hazard aus aktuellem Zustand]
+    L --> N[Nächster Monat]
+```
+
+Wichtige Timing-Folgen:
+
+- Die erste reguläre Income-Zahlung erfolgt einen Monat nach Election.
+- Eine neue Election sperrt Full Withdrawal am selben Zeitstempel. Die
+  annualisierte Partial-/Excess-Mechanik ist davon nicht gesperrt.
+- Scheduled Partial/Excess Withdrawal wird vor Full Withdrawal verarbeitet;
+  der anschließende Lapse sieht deshalb den aktualisierten Surrender Value.
+- Der sichtbare Gap wird nur am Anniversary erneuert; Moneyness und MVA-Signal
+  werden am tatsächlichen Aktionspunkt erneuert.
+
+Bei dynamischen Portfolio-Läufen werden Primary- und Spouse-Status pfadweise
+getrennt geführt. Election, Garantie-PV, Lapse und Withdrawal sehen damit den
+tatsächlichen Joint-Life-Zustand. Mortalität selbst bleibt eine eigene
+Projektionsannahme und keine vierte Behaviour-Funktion.
+
+## 9. Aktueller Parametersatz im Überblick
+
+| Funktion | Low | Base | High | Aktive Formparameter |
+|---|---:|---:|---:|---|
+| Growth Full Withdrawal/Lapse | 0 % | 0 % | 0 % | Produktoutput null; Ordinary-Basis null, Performance Cause gegated |
+| Income Full Withdrawal/Lapse | 0,25 % | 0,50 % | 0,75 % | `beta_m=-1,5`; Performance-Hazard separat |
+| Income Election, PY 8+ | 15 % | 30 % | 45 % | `beta_m=+4`, `beta_gap=+4` |
+| Growth Free Withdrawal | 0 % | 0 % | 0 % | strukturelle Vertragsnull |
+| Income Excess Withdrawal | 0 % | 0,50 % | 2,00 % | `beta_m=-0,5`, `beta_mva=-2` |
+
+Low/Base/High sind gerichtete Sensitivitätslevel, keine Konfidenzintervalle und
+keine unterschiedlichen empirischen Kalibrierungen. In v2 variieren Baselines
+und dafür freigegebene Caps; die signierten Slopes und Shape-Parameter bleiben
+zwischen den Levels gleich.
+
+## 10. Sanity-Invarianten
+
+Die Implementierung und ihre Tests sichern insbesondere folgende Eigenschaften:
+
+- Alle Wahrscheinlichkeiten und erwarteten Utilisationen bleiben in `[0, 1]`.
+- Strukturelle Baselines von `0` beziehungsweise `1` bleiben exakt erhalten.
+- Bei ATM, Referenzprämie, Gap null und MVA null wird die Baseline reproduziert.
+- Eine höhere Garantie-Moneyness erhöht Take-up und senkt Ordinary Lapse sowie
+  Excess Withdrawal.
+- Ein größerer Gap senkt niemals den Performance-Hazard.
+- Der kombinierte Lapse-Cap reduziert niemals eine bereits höhere Ordinary-
+  Wahrscheinlichkeit.
+- Ordinary- und Performance-Exit-Masse addieren sich exakt zur gesamten
+  Lapse-Masse; es gibt keine Doppelzählung.
+- Monats- und Jahreswahrscheinlichkeit sind über
+  `1 - (1 - p_a)^dt` konsistent.
+- Growth-Lapse und Growth-Withdrawals bleiben in der Produktprojektion null.
+- Die Funktionen verwenden keine zukünftigen Szenariowerte.
+
+Wichtig: Die generischen Low-Level-Funktionen kennen die Produkt-Gates nicht
+selbst. `DynamicLapseParams.growth_probability()` kann über die gemeinsame
+Performance Cause einen positiven Wert liefern, und die gemeinsame Excess-
+Response hat keine eigene Growth-Sperre. Solche Direktaufrufe testen die
+mathematische Funktion, nicht die zulässige Handlung des generischen Produkts.
+Maßgeblich für Produktcashflows ist der Projektor.
+
+Auch ein nackter `BehaviourModel()`-Konstruktor lädt v2 nicht automatisch; sein
+absichtlich statischer Default dient isolierten Tests und Kompatibilität.
+Produktive Entrypoints müssen den versionierten CSV-Loader verwenden.
 
 ## 11. Modellgrenzen und Governance
 
-1. **Keine Experience-Kalibrierung.** Die Parameter sind literatur- und
-   praxisinformierte Startwerte, aber nicht auf Bestands- oder australischen
-   Marktdaten geschätzt.
-2. **Begrenzte Segmentierung.** Phase, Policy Duration, aktueller Markt-/
-   Garantiezustand und Prämienhöhe wirken; weitere Merkmale wie Vertriebskanal,
-   Steuerstatus, Liquiditätsbedarf, Gesundheit oder Adviser-Einfluss fehlen.
-3. **Proxy für Garantie-PV.** Der Annuitätenfaktor nutzt einen
-   Zehnjahres-Forward-Zero-Zins und ist kein vollständiger Cashflow-PV über die
-   gesamte pfadweise Zinskurve.
-4. **Einmalige Bruttoprämie.** Die Prämienkovariate ist der anfängliche bezahlte
-   Betrag; spätere Beiträge oder Premium-Historien werden nicht modelliert.
-5. **Gemischte Ereignisdarstellung.** Lapse und Tod sind gewichtete Decrements,
-   Take-up wird diskret gezogen, Withdrawals sind erwartete Utilisationen.
-6. **Withdrawal-Vereinfachung.** Es gibt kein kalibriertes
-   Incidence-/Severity-Hurdle-Modell.
-7. **LSMC ausgeschlossen.** Das Basismodell bildet kein optimal-rationales oder
-   wertmaximierendes Verhalten ab.
-8. **Kosten sind Proxy-Annahmen, sofern die Kosten-CSV sie so kennzeichnet.**
-   Die zentrale Ablage macht sie nachvollziehbar, aber nicht automatisch
-   beobachtet oder kalibriert.
-9. **Produkt-Gates gehen vor.** Positive Legacy-Annahmen für Growth-Lapse oder
-   Growth-Withdrawals werden im generischen Produkt geladen und dokumentiert,
-   erzeugen aber keinen vertraglich unzulässigen Cashflow.
-10. **Joint-Life-State-Grenze.** Der bedingt gemeinsame Continue-Income-Zweig
-    verwendet state-unabhängige statische CSV-Basisraten. Der Single-Life-
-    Fallback bleibt dynamisch. Vollständig dynamisches Joint-Life-Behaviour
-    erfordert getrennte `p11`-, `p10`- und `p01`-AV-, Fee- und In-force-
-    Kohorten und wird bis dahin nicht durch eine Nichtlinearität auf einem
-    gemittelten Zustand approximiert.
+Die nicht vertraglichen Parameter sind literatur- und praxisinformierte
+Startwerte, aber **keine australische Experience-Kalibrierung**. Insbesondere
+der zusätzliche Performance-Hazard kann das Ergebnis materiell verändern.
+Vor Produktionsverwendung sind interne Bestandsdaten, Segmentierung,
+Credibility, Backtesting, Stabilitätsanalyse und Governance-Freigabe notwendig.
 
-Ergebnisse sind deshalb als **vereinfachte dynamische Policy-Behaviour-
-Projektionen mit festen Proxy-Annahmen** zu bezeichnen.
+Weitere Grenzen:
 
-## 12. Methodische Quellen
+- Es gibt noch kein getrenntes Incidence-/Severity-Modell für Partial oder
+  Excess Withdrawals; modelliert wird eine erwartete Rate.
+- Eine freiwillige Unterentnahme des regulären Income ist nicht modelliert;
+  nur Mehrentnahme und die daraus folgende mechanische Income-Reduktion.
+- Die Prämiengröße ist technisch vorhanden, aber in v2 bewusst neutral.
+- Der Performance-Gap ist ein einfacher kundenbezogener Cap-Gap-Proxy.
+- Lapse wird als Kohortendecrement, nicht als diskreter Kundendraw simuliert.
+- Low/Base/High ersetzen keine Parameterschätzunsicherheit oder
+  Experience-Studie.
+- Die Behaviour-Funktion ist unter Real World und risikoneutralem Maß formal
+  dieselbe; unterschiedlich ist die Verteilung der Markt- und Vertragszustände.
 
-Die Quellen begründen die Wahl etablierter Modellklassen und relevanter
-Kovariaten. Sie begründen **nicht** die konkreten CSV-Koeffizienten:
+Ergebnisse sind daher als **vereinfachte dynamische Policyholder-Projektionen
+mit festen Proxy-Annahmen** zu kennzeichnen.
+
+## 12. Abgrenzung zum optimalen LSMC-Verhalten
+
+| Dynamic Behaviour | Optimales Behaviour mit LSMC |
+|---|---|
+| feste, versionierte Proxy-Funktionen | aus Trainingspfaden gelernte Policy |
+| Election als Zufallsentscheidung | wertmaximierendes `WAIT` oder `START` |
+| Lapse/Withdrawal als erwartete Rate | pfadweise Aktion `CONTINUE`, `PARTIAL_WITHDRAWAL` oder `FULL_WITHDRAWAL` |
+| geeignet als transparente Baseline | separater Research-/Stress-Benchmark |
+
+Nur das alte Modul `agile_engine/lsmc.py` ist Legacy. Die aktuelle
+Implementierung in `optimal_behaviour_lsmc.py` sowie ihr eigener Portfolio-
+Runner sind aktiv. Beide Ansätze verwenden dieselben Vertrags-Gates und
+Ereigniszeitpunkte, dürfen aber nicht innerhalb eines Behaviour-Regimes
+vermischt werden.
+
+## 13. Methodische Quellen
+
+Die Quellen begründen Modellklassen und Reaktionsrichtungen, nicht die konkrete
+Höhe der CSV-Parameter:
 
 - Cox, *Regression Models and Life-Tables* (1972): Grundlage proportionaler
   Hazard-Modelle. [JSTOR](https://www.jstor.org/stable/2985181),
   [DOI](https://doi.org/10.1111/j.2517-6161.1972.tb00899.x)
-- Society of Actuaries, *Predictive Analytics Call for Essays* (2016):
-  versicherungsmathematische Anwendung von Lapse-Modellen mit Duration,
-  Moneyness und weiteren erklärenden Variablen.
-  [SOA-PDF](https://www.soa.org/4938ac/globalassets/assets/files/resources/essays-monographs/research-2016-predictive-analytics-call-essays.pdf)
-- Society of Actuaries, *Policyholder Behavior in the Tail: Variable Annuity
-  Guaranteed Benefits Survey* (2019/2020): Moneyness und Policy Size als in der
-  Praxis verwendete Behaviour-Faktoren.
-  [SOA-PDF](https://www.soa.org/4929f2/globalassets/assets/files/resources/research-report/2020/policy-behavior-tail-risk.pdf)
-- Papke/Wooldridge, *Econometric Methods for Fractional Response Variables with
-  an Application to 401(k) Plan Participation Rates*: methodischer Anker für
-  Fractional-Logit-Antworten im Einheitsintervall.
+- Papke/Wooldridge, *Econometric Methods for Fractional Response Variables*:
+  methodischer Anker für Fractional-Logit-Antworten im Einheitsintervall.
   [NBER](https://www.nber.org/papers/t0147)
 - Knoller/Kraut/Schoenmaekers, *On the Propensity to Surrender a Variable
-  Annuity Contract*: empirische Einordnung der Bedeutung von Moneyness und
-  Vertrags-/Prämienmerkmalen für dynamisches Verhalten.
+  Annuity Contract*: empirische Einordnung von Garantie-Moneyness.
   [Journal of Risk and Insurance](https://onlinelibrary.wiley.com/doi/10.1111/jori.12076)
+- NAIC, *Variable Annuity Statutory Reserve and Capital Reform – QIS II Public
+  Report* (2018), insbesondere Abschnitt 7: beobachtete Behaviour-Richtungen.
+  [NAIC-PDF](https://content.naic.org/sites/default/files/committee_related_documents/cmte_e_va_issues_wg_related_qis_ii_public_report.pdf)
+- SOA/LIMRA, *Variable Annuity Guaranteed Living Benefits Utilization – 2015
+  Experience*: Nutzung von Living-Benefit-Garantien.
+  [SOA-PDF](https://www.soa.org/globalassets/assets/files/resources/research-report/2018/variable-annuity-guaranteed-utilization.pdf)
 
-## 13. Zentrale Fundstellen
+## 14. Zentrale Fundstellen
 
-- `input_dynamic_behaviour/README.md`
-- `input_dynamic_behaviour/dynamic_behaviour_baselines.csv`
-- `input_dynamic_behaviour/dynamic_behaviour_coefficients.csv`
-- `AGILE_Modelling_Engine/agile_engine/dynamic_behaviour_assumptions.py`
-- `AGILE_Modelling_Engine/agile_engine/behavior.py`
-- `AGILE_Modelling_Engine/agile_engine/projection.py`
-- `AGILE_Modelling_Engine/agile_engine/product.py`
-- `AGILE_Modelling_Engine/agile_engine/cost_assumptions.py`
-- `C:\Users\user\Documents\GMLB Structuring\input_cost_assumptions\cost_assumptions.csv`
-- `AGILE_Modelling_Engine/agile_engine/lsmc.py` (archiviert, nicht angebunden)
-- `Produktdesign_Index_Linked_Lifetime_Income_Fallbeispiel.md`
+- [Technisches Input-README](../input_dynamic_behaviour/README.md)
+- [Basisraten und Utilisationen](../input_dynamic_behaviour/dynamic_behaviour_baselines.csv)
+- [Koeffizienten und Grenzen](../input_dynamic_behaviour/dynamic_behaviour_coefficients.csv)
+- [Mathematische Behaviour-Funktionen](../AGILE_Modelling_Engine/agile_engine/behavior.py)
+- [Strikter CSV-Loader](../AGILE_Modelling_Engine/agile_engine/dynamic_behaviour_assumptions.py)
+- [Projektionsintegration und Ereignisreihenfolge](../AGILE_Modelling_Engine/agile_engine/projection.py)
+- [Generischer Portfolio-Runner](../AGILE_Modelling_Engine/portfolio_simulations/run_portfolio_valuation.py)
+- [Aktuelles optimales LSMC-Verhalten](../AGILE_Modelling_Engine/agile_engine/optimal_behaviour_lsmc.py)
+- [Separater LSMC-Portfolio-Runner](../AGILE_Modelling_Engine/portfolio_simulations/run_portfolio_valuation_lsmc.py)
+- [Generisches Produktdesign](Produktdesign_Index_Linked_Lifetime_Income_Fallbeispiel.md)
+- [Relevante Tests](../AGILE_Modelling_Engine/tests/test_dynamic_behaviour_assumptions.py)

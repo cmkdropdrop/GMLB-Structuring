@@ -1,0 +1,1452 @@
+diff --git a/optimal_behaviour_lsmc.py b/optimal_behaviour_lsmc.py
+index 8534c65..cd9b33c 100644
+--- a/optimal_behaviour_lsmc.py
++++ b/optimal_behaviour_lsmc.py
+@@ -14,13 +14,26 @@ retained under the explicit :func:`fit_optimal_surrender_policy` name as a
+ fixed-Election validation API.  Growth surrender and all Growth withdrawals
+ remain contractually prohibited.
+ 
+-Version two fits *paired action advantages* rather than two noisy value levels.
+-All regressions use training-fold standardisation and a truncated-SVD,
+-augmented Ridge least-squares solve.  In particular, this module never forms
+-normal equations: doing so squares the design condition number and was the
+-source of mechanically late Elections in the original research implementation.
++Version three retains the paired-action advantages introduced in v2 and adds
++fold-cached spectral Ridge solves, analytic Partial optimisation and a pooled
++fold-pure START value surface.
++All regressions use training-fold standardisation, truncated SVD and a
++spectral Ridge solve in the orthogonal score basis.  In particular, this module
++never forms normal equations: doing so squares the design condition number and
++was the source of mechanically late Elections in the original research implementation.
+ """
+ 
++# 2026-07-13 18:27 CEST — Performance and algorithm update:
++# - Replaced one SVD/least-squares fit per Ridge candidate with one SVD per
++#   training fold and closed-form spectral Ridge updates across the full grid.
++# - Stored each fitted surface as an affine raw-feature form for faster rollout.
++# - Replaced Partial-Withdrawal grid prediction plus two midpoint refinements
++#   with the exact argmax of its fitted quadratic; removed those midpoint
++#   counterfactual transition panels from training.
++# - Replaced one full fixed-start projection per Election year with one
++#   randomized pooled START-value fit plus one cross-fitted policy valuation.
++# - No projector event ordering or contractual cashflow formula was changed.
++
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field, replace
+@@ -361,6 +374,36 @@ class _ContinuationRegression:
+     effective_rank: int = 0
+     basis_level: str = "full"
+     clip_non_negative: bool = True
++    # Optional cached affine representation.  Defaults preserve evaluation of
++    # regression objects persisted before the v3 performance upgrade.
++    raw_intercept_aud: Optional[float] = None
++    raw_coefficients_aud: Optional[Array] = None
++
++    def raw_affine_form(self) -> tuple[float, Array]:
++        """Return the exact AUD affine surface in original feature space."""
++        cached_intercept = getattr(self, "raw_intercept_aud", None)
++        cached_coefficients = getattr(self, "raw_coefficients_aud", None)
++        if cached_intercept is not None and cached_coefficients is not None:
++            coefficients = np.asarray(cached_coefficients, dtype=float)
++            if coefficients.shape == (self.raw_feature_count,):
++                return float(cached_intercept), coefficients
++
++        raw_coefficients_normalised = np.zeros(self.raw_feature_count)
++        if self.active_feature_indices.size:
++            component_loadings = (
++                self.orthogonal_components.T @ self.coefficients[1:]
++            )
++            raw_coefficients_normalised[self.active_feature_indices] = (
++                component_loadings / self.scale
++            )
++        raw_intercept_normalised = float(self.coefficients[0]) - float(np.dot(
++            raw_coefficients_normalised[self.active_feature_indices],
++            self.centre,
++        ))
++        return (
++            raw_intercept_normalised * self.premium,
++            raw_coefficients_normalised * self.premium,
++        )
+ 
+     def predict_features(self, raw_features: Array) -> Array:
+         """Evaluate a frozen level or paired-advantage regression."""
+@@ -371,13 +414,12 @@ class _ContinuationRegression:
+             )
+         if not np.all(np.isfinite(raw)):
+             raise ValueError("Surrender features must be finite.")
+-        design = np.column_stack((
+-            np.ones(raw.shape[0]),
+-            ((
+-                raw[:, self.active_feature_indices] - self.centre
+-            ) / self.scale) @ self.orthogonal_components.T,
+-        ))
+-        prediction = design @ self.coefficients * self.premium
++        # The PCA/SVD representation is affine in the original feature space.
++        # Store that affine form once at fit time so every policy rollout uses
++        # one BLAS matrix-vector multiply instead of repeated standardisation,
++        # projection and design-matrix allocation.
++        raw_intercept, raw_coefficients = self.raw_affine_form()
++        prediction = raw @ raw_coefficients + raw_intercept
+         return np.maximum(prediction, 0.0) if self.clip_non_negative else prediction
+ 
+     def predict(self, context: SurrenderDecisionContext) -> Array:
+@@ -633,27 +675,34 @@ class _SurrenderContextRecorder:
+         return np.zeros(context.n_paths, dtype=bool)
+ 
+ 
+-def _fit_regression(
++@dataclass(frozen=True)
++class _PreparedRegressionDesign:
++    """One SVD-prepared design reused across the complete Ridge grid."""
++
++    raw_feature_count: int
++    active_feature_indices: NDArray[np.int64]
++    orthogonal_components: Array
++    centre: Array
++    scale: Array
++    orthogonal_scores: Array
++    singular_values: Array
++    condition_number: float
++    matrix_rank: int
++    effective_rank: int
++    basis_level: str
++
++
++def _prepare_regression_design(
+     raw_features: Array,
+-    target_aud: Array,
+-    premium: float,
+-    ridge: float,
+     *,
+-    oof_rmse_aud: float = 0.0,
+-    relative_svd_cutoff: float = 1.0e-8,
++    relative_svd_cutoff: float,
+     feature_indices: Optional[NDArray[np.int64]] = None,
+     basis_level: str = "full",
+-    clip_non_negative: bool = True,
+-) -> _ContinuationRegression:
++) -> _PreparedRegressionDesign:
++    """Standardise and orthogonalise a regression sample exactly once."""
+     raw = np.asarray(raw_features, dtype=float)
+-    target_aud_array = np.asarray(target_aud, dtype=float)
+-    if raw.ndim != 2 or target_aud_array.shape != (raw.shape[0],):
+-        raise ValueError("Regression feature and target shapes are inconsistent.")
+-    if raw.shape[0] < 2 or not np.all(np.isfinite(raw)) \
+-            or not np.all(np.isfinite(target_aud_array)):
+-        raise ValueError("Regression inputs must contain finite observations.")
+-    if not np.isfinite(ridge) or ridge < 0.0:
+-        raise ValueError("Ridge must be finite and non-negative.")
++    if raw.ndim != 2 or raw.shape[0] < 2 or not np.all(np.isfinite(raw)):
++        raise ValueError("Regression features must contain finite observations.")
+     if not 0.0 < relative_svd_cutoff < 1.0:
+         raise ValueError("relative_svd_cutoff must lie in (0, 1).")
+ 
+@@ -666,72 +715,168 @@ def _fit_regression(
+             or np.any(selected >= raw.shape[1]) \
+             or np.unique(selected).size != selected.size:
+         raise ValueError("Regression feature indices are invalid.")
++
+     selected_centre = np.mean(raw[:, selected], axis=0)
+     selected_scale = np.std(raw[:, selected], axis=0)
+     varying = selected_scale > 1.0e-10
+     active = selected[varying]
+     centre = selected_centre[varying]
+     scale = selected_scale[varying]
+-    standardised = (raw[:, active] - centre) / scale
+     if active.size:
+-        _left, singular, right = np.linalg.svd(
++        standardised = (raw[:, active] - centre) / scale
++        # One correction makes the intercept numerically orthogonal to every
++        # feature score.  It preserves the represented affine surface while
++        # allowing all Ridge solutions to use the singular spectrum directly.
++        centring_correction = np.mean(standardised, axis=0)
++        centre = centre + centring_correction * scale
++        standardised = standardised - centring_correction
++        left, singular, right = np.linalg.svd(
+             standardised, full_matrices=False
+         )
+-        # The v2 truncation is defined relative to the largest singular value
+-        # of the standardised feature matrix itself.  The intercept is added
+-        # only afterwards and must not change that contractual threshold.
+         if singular.size and singular[0] > 0.0:
+             keep = singular >= relative_svd_cutoff * float(singular[0])
++            retained_singular = singular[keep]
+             components = right[keep]
++            scores = left[:, keep] * retained_singular
+         else:
++            retained_singular = np.zeros(0)
+             components = np.zeros((0, active.size))
++            scores = np.zeros((raw.shape[0], 0))
+     else:
++        retained_singular = np.zeros(0)
+         components = np.zeros((0, 0))
+-    design = np.column_stack((
+-        np.ones(raw.shape[0]),
+-        standardised @ components.T,
++        scores = np.zeros((raw.shape[0], 0))
++
++    solve_singular = np.concatenate((
++        np.asarray([np.sqrt(raw.shape[0])], dtype=float),
++        np.asarray(retained_singular, dtype=float),
+     ))
+-    target = target_aud_array / premium
+-
+-    # Ridge is solved as an augmented least-squares problem.  This keeps the
+-    # conditioning of X visible instead of squaring it through X'X.
+-    if ridge > 0.0 and design.shape[1] > 1:
+-        penalty = np.zeros((design.shape[1] - 1, design.shape[1]))
+-        penalty[:, 1:] = np.sqrt(ridge) * np.eye(design.shape[1] - 1)
+-        augmented_design = np.vstack((design, penalty))
+-        augmented_target = np.concatenate((target, np.zeros(penalty.shape[0])))
+-    else:
+-        augmented_design = design
+-        augmented_target = target
+-    coefficients = np.linalg.lstsq(
+-        augmented_design, augmented_target, rcond=relative_svd_cutoff
+-    )[0]
+-    if not np.all(np.isfinite(coefficients)):
+-        raise ValueError("LSMC regression produced non-finite coefficients.")
+-    design_singular = np.linalg.svd(design, compute_uv=False)
++    positive = solve_singular > 0.0
+     condition = (
+-        float(design_singular[0] / design_singular[-1])
+-        if design_singular.size and design_singular[-1] > 0.0
++        float(np.max(solve_singular[positive]) / np.min(solve_singular[positive]))
++        if np.any(positive)
+         else float("inf")
+     )
+-    return _ContinuationRegression(
+-        premium=float(premium),
++    return _PreparedRegressionDesign(
+         raw_feature_count=int(raw.shape[1]),
+-        active_feature_indices=active,
++        active_feature_indices=np.asarray(active, dtype=np.int64),
+         orthogonal_components=np.asarray(components, dtype=float),
+         centre=np.asarray(centre, dtype=float),
+         scale=np.asarray(scale, dtype=float),
+-        coefficients=np.asarray(coefficients, dtype=float),
++        orthogonal_scores=np.asarray(scores, dtype=float),
++        singular_values=np.asarray(retained_singular, dtype=float),
+         condition_number=condition,
+-        matrix_rank=int(np.linalg.matrix_rank(design)),
++        matrix_rank=int(1 + retained_singular.size),
++        effective_rank=int(1 + retained_singular.size),
++        basis_level=str(basis_level),
++    )
++
++
++def _solve_prepared_regression(
++    prepared: _PreparedRegressionDesign,
++    target_aud: Array,
++    premium: float,
++    ridge: float,
++    *,
++    oof_rmse_aud: float = 0.0,
++    clip_non_negative: bool = True,
++) -> _ContinuationRegression:
++    """Solve one Ridge value in the already orthogonalised design."""
++    target_aud_array = np.asarray(target_aud, dtype=float)
++    n_obs = prepared.orthogonal_scores.shape[0]
++    if target_aud_array.shape != (n_obs,) or not np.all(
++        np.isfinite(target_aud_array)
++    ):
++        raise ValueError("Regression targets must match the prepared sample.")
++    if not np.isfinite(premium) or premium <= 0.0:
++        raise ValueError("Regression premium must be positive and finite.")
++    if not np.isfinite(ridge) or ridge < 0.0:
++        raise ValueError("Ridge must be finite and non-negative.")
++
++    target = target_aud_array / float(premium)
++    intercept = float(np.mean(target))
++    if prepared.singular_values.size:
++        centred_target = target - intercept
++        numerator = prepared.orthogonal_scores.T @ centred_target
++        denominator = prepared.singular_values ** 2 + float(ridge)
++        component_coefficients = np.divide(
++            numerator,
++            denominator,
++            out=np.zeros_like(numerator),
++            where=denominator > 0.0,
++        )
++    else:
++        component_coefficients = np.zeros(0)
++    coefficients = np.concatenate((
++        np.asarray([intercept], dtype=float),
++        np.asarray(component_coefficients, dtype=float),
++    ))
++    if not np.all(np.isfinite(coefficients)):
++        raise ValueError("LSMC regression produced non-finite coefficients.")
++
++    raw_coefficients_normalised = np.zeros(prepared.raw_feature_count)
++    if prepared.active_feature_indices.size:
++        active_component_loadings = (
++            prepared.orthogonal_components.T @ component_coefficients
++        )
++        raw_coefficients_normalised[prepared.active_feature_indices] = (
++            active_component_loadings / prepared.scale
++        )
++    raw_intercept_normalised = intercept - float(np.dot(
++        raw_coefficients_normalised[prepared.active_feature_indices],
++        prepared.centre,
++    ))
++    return _ContinuationRegression(
++        premium=float(premium),
++        raw_feature_count=prepared.raw_feature_count,
++        active_feature_indices=prepared.active_feature_indices,
++        orthogonal_components=prepared.orthogonal_components,
++        centre=prepared.centre,
++        scale=prepared.scale,
++        coefficients=coefficients,
++        raw_intercept_aud=float(raw_intercept_normalised * premium),
++        raw_coefficients_aud=np.asarray(
++            raw_coefficients_normalised * premium, dtype=float
++        ),
++        condition_number=prepared.condition_number,
++        matrix_rank=prepared.matrix_rank,
+         oof_rmse_aud=float(oof_rmse_aud),
+         selected_ridge=float(ridge),
+-        effective_rank=int(design.shape[1]),
+-        basis_level=str(basis_level),
++        effective_rank=prepared.effective_rank,
++        basis_level=prepared.basis_level,
+         clip_non_negative=bool(clip_non_negative),
+     )
+ 
+ 
++def _fit_regression(
++    raw_features: Array,
++    target_aud: Array,
++    premium: float,
++    ridge: float,
++    *,
++    oof_rmse_aud: float = 0.0,
++    relative_svd_cutoff: float = 1.0e-8,
++    feature_indices: Optional[NDArray[np.int64]] = None,
++    basis_level: str = "full",
++    clip_non_negative: bool = True,
++) -> _ContinuationRegression:
++    """Fit one model; callers with a Ridge grid should reuse its prepared SVD."""
++    prepared = _prepare_regression_design(
++        raw_features,
++        relative_svd_cutoff=relative_svd_cutoff,
++        feature_indices=feature_indices,
++        basis_level=basis_level,
++    )
++    return _solve_prepared_regression(
++        prepared,
++        target_aud,
++        premium,
++        ridge,
++        oof_rmse_aud=oof_rmse_aud,
++        clip_non_negative=clip_non_negative,
++    )
++
++
+ def _minimum_cross_fit_observations(
+     settings: OptimalBehaviourLSMCSettings,
+     coefficient_count: int,
+@@ -809,56 +954,63 @@ def _cross_fitted_regression(
+     int,
+     tuple[_ContinuationRegression, ...],
+ ]:
+-    n_obs = raw_features.shape[0]
++    raw = np.asarray(raw_features, dtype=float)
++    target = np.asarray(target_aud, dtype=float)
++    if raw.ndim != 2 or target.shape != (raw.shape[0],) \
++            or not np.all(np.isfinite(raw)) or not np.all(np.isfinite(target)):
++        raise ValueError("Cross-fit regression inputs are inconsistent or non-finite.")
++    n_obs = raw.shape[0]
+     selected = (
+-        np.arange(raw_features.shape[1], dtype=np.int64)
++        np.arange(raw.shape[1], dtype=np.int64)
+         if feature_indices is None
+         else np.asarray(feature_indices, dtype=np.int64)
+     )
+     if selected.ndim != 1 or np.any(selected < 0) \
+-            or np.any(selected >= raw_features.shape[1]) \
++            or np.any(selected >= raw.shape[1]) \
+             or np.unique(selected).size != selected.size:
+         raise ValueError("Regression feature indices are invalid.")
+-
+-    def required_training_observations(train_raw: Array) -> int:
+-        """Count the coefficients actually retained by the v2 SVD basis."""
+-        selected_raw = np.asarray(train_raw, dtype=float)[:, selected]
+-        scale = np.std(selected_raw, axis=0)
+-        varying = scale > 1.0e-10
+-        if np.any(varying):
+-            standardised = (
+-                selected_raw[:, varying]
+-                - np.mean(selected_raw[:, varying], axis=0)
+-            ) / scale[varying]
+-            singular = np.linalg.svd(standardised, compute_uv=False)
+-            retained = int(np.count_nonzero(
+-                singular >= settings.relative_svd_cutoff * float(singular[0])
+-            )) if singular.size and singular[0] > 0.0 else 0
+-        else:
+-            retained = 0
+-        coefficient_count = retained + 1  # intercept
+-        return max(
+-            settings.minimum_regression_observations,
+-            settings.observations_per_coefficient * coefficient_count,
+-        )
+-
+     if n_obs <= settings.minimum_regression_observations:
+         raise ValueError(
+             "LSMC requires more observations than the per-regression minimum; "
+             f"got {n_obs}."
+         )
++
+     supplied_ids = np.asarray(fold_ids, dtype=np.int64)
+     if supplied_ids.shape != (n_obs,) or np.any(supplied_ids < 0):
+         raise ValueError("Cross-fit IDs must match all regression rows.")
+-    viable_folds: list[int] = []
+-    for folds in range(2, settings.n_folds + 1):
+-        candidate_folds = np.mod(supplied_ids, folds)
++
++    # Try the largest fold count first.  Each candidate training fold is SVD-
++    # prepared once, and its *retained* coefficient count drives the sample
++    # gate.  This preserves the original adaptive observation rule without
++    # repeating the SVD for every Ridge value or every smaller fold count.
++    folds_used: Optional[int] = None
++    prepared_folds: list[tuple[
++        NDArray[np.bool_], NDArray[np.bool_], _PreparedRegressionDesign
++    ]] = []
++    for folds in range(settings.n_folds, 1, -1):
++        candidate_fold_ids = np.mod(supplied_ids, folds)
++        candidate_prepared: list[tuple[
++            NDArray[np.bool_], NDArray[np.bool_], _PreparedRegressionDesign
++        ]] = []
+         viable = True
+         for fold in range(folds):
+-            test = candidate_folds == fold
++            test = candidate_fold_ids == fold
+             train = ~test
+-            minimum_train = required_training_observations(raw_features[train])
+-            if not np.any(test) or np.count_nonzero(train) < minimum_train:
++            if not np.any(test):
++                viable = False
++                break
++            prepared = _prepare_regression_design(
++                raw[train],
++                relative_svd_cutoff=settings.relative_svd_cutoff,
++                feature_indices=feature_indices,
++                basis_level=basis_level,
++            )
++            minimum_train = max(
++                settings.minimum_regression_observations,
++                settings.observations_per_coefficient
++                * prepared.effective_rank,
++            )
++            if np.count_nonzero(train) < minimum_train:
+                 viable = False
+                 break
+             if enforce_unique_path_minimum and np.unique(
+@@ -866,50 +1018,37 @@ def _cross_fitted_regression(
+             ).size < minimum_train:
+                 viable = False
+                 break
++            candidate_prepared.append((train, test, prepared))
+         if viable:
+-            viable_folds.append(folds)
+-    if not viable_folds:
++            folds_used = folds
++            prepared_folds = candidate_prepared
++            break
++    if folds_used is None:
+         raise ValueError(
+             "No cross-fit partition leaves the required number of unique "
+             "complete paths for its active coefficient count."
+         )
+-    folds_used = max(viable_folds)
+-    effective_folds = np.mod(supplied_ids, folds_used)
+-    target = np.asarray(target_aud, dtype=float)
+ 
+     candidate_results: list[tuple[
+         float, float, Array, Array, tuple[_ContinuationRegression, ...]
+     ]] = []
+     for ridge in settings.ridge_grid:
+         candidate_oof = np.zeros(n_obs)
+-        candidate_folds: list[_ContinuationRegression] = []
+-        for fold in range(folds_used):
+-            test = effective_folds == fold
+-            train = ~test
+-            minimum_train = required_training_observations(raw_features[train])
+-            if not np.any(test) or np.count_nonzero(train) < minimum_train \
+-                    or (
+-                        enforce_unique_path_minimum
+-                        and np.unique(supplied_ids[train]).size < minimum_train
+-                    ):
+-                raise ValueError("Insufficient observations in an LSMC cross-fit fold.")
+-            regression = _fit_regression(
+-                raw_features[train],
++        candidate_fold_models: list[_ContinuationRegression] = []
++        for train, test, prepared in prepared_folds:
++            regression = _solve_prepared_regression(
++                prepared,
+                 target[train],
+                 premium,
+                 ridge,
+-                relative_svd_cutoff=settings.relative_svd_cutoff,
+-                feature_indices=feature_indices,
+-                basis_level=basis_level,
+                 clip_non_negative=not advantage_target,
+             )
+-            candidate_folds.append(regression)
+-            candidate_oof[test] = regression.predict_features(raw_features[test])
++            candidate_fold_models.append(regression)
++            candidate_oof[test] = regression.predict_features(raw[test])
+         if advantage_target:
+             # Regret in AUD: realised positive advantage lost by Continue plus
+             # realised negative advantage incurred by exercising.  Ridge
+-            # selection uses the same buffered action boundary as deployment,
+-            # including the candidate's own OOF RMSE.
++            # selection uses the deployment buffer and the candidate OOF RMSE.
+             candidate_rmse = float(np.sqrt(np.mean(
+                 (candidate_oof - target) ** 2
+             )))
+@@ -918,8 +1057,9 @@ def _cross_fitted_regression(
+                 + settings.exercise_buffer_rmse_multiplier * candidate_rmse
+             )
+             action = candidate_oof > candidate_buffer
+-            losses = np.where(action, np.maximum(-target, 0.0),
+-                              np.maximum(target, 0.0))
++            losses = np.where(
++                action, np.maximum(-target, 0.0), np.maximum(target, 0.0)
++            )
+         else:
+             losses = (candidate_oof - target) ** 2
+         candidate_results.append((
+@@ -927,7 +1067,7 @@ def _cross_fitted_regression(
+             float(ridge),
+             np.asarray(losses, dtype=float),
+             candidate_oof,
+-            tuple(candidate_folds),
++            tuple(candidate_fold_models),
+         ))
+ 
+     best_mean = min(item[0] for item in candidate_results)
+@@ -936,9 +1076,6 @@ def _cross_fitted_regression(
+         float(np.std(best_losses, ddof=1) / np.sqrt(n_obs))
+         if n_obs > 1 else 0.0
+     )
+-    # One-standard-error rule with the stronger Ridge as deterministic
+-    # tie-break: this selects a simpler boundary when decision loss is
+-    # statistically indistinguishable.
+     eligible_candidates = [
+         item for item in candidate_results
+         if item[0] <= best_mean + one_standard_error + 1.0e-14
+@@ -947,22 +1084,25 @@ def _cross_fitted_regression(
+         eligible_candidates, key=lambda item: item[1]
+     )
+     rmse = float(np.sqrt(np.mean((oof - target) ** 2)))
+-    full = _fit_regression(
+-        raw_features,
++    full_prepared = _prepare_regression_design(
++        raw,
++        relative_svd_cutoff=settings.relative_svd_cutoff,
++        feature_indices=feature_indices,
++        basis_level=basis_level,
++    )
++    full = _solve_prepared_regression(
++        full_prepared,
+         target,
+         premium,
+         selected_ridge,
+         oof_rmse_aud=rmse,
+-        relative_svd_cutoff=settings.relative_svd_cutoff,
+-        feature_indices=feature_indices,
+-        basis_level=basis_level,
+         clip_non_negative=not advantage_target,
+     )
+-    fold_regressions = [
++    fold_regressions = tuple(
+         replace(regression, oof_rmse_aud=rmse)
+         for regression in selected_fold_regressions
+-    ]
+-    return full, oof, folds_used, tuple(fold_regressions)
++    )
++    return full, oof, folds_used, fold_regressions
+ 
+ 
+ def _cross_fitted_advantage_regression(
+@@ -1553,6 +1693,16 @@ ELECTION_FEATURE_NAMES = (
+ ELECTION_CORE_FEATURE_INDICES = np.asarray(
+     (0, 1, 2, 3, 4, 6, 7, 8), dtype=np.int64
+ )
++START_VALUE_FEATURE_NAMES = (
++    *ELECTION_FEATURE_NAMES,
++    "duration_years_sq",
++    "duration_x_log_account_value",
++    "duration_x_guarantee_moneyness",
++)
++START_VALUE_CORE_FEATURE_INDICES = np.asarray(
++    (*ELECTION_CORE_FEATURE_INDICES, len(ELECTION_FEATURE_NAMES)),
++    dtype=np.int64,
++)
+ 
+ INCOME_ACTION_FEATURE_NAMES = (
+     *FEATURE_NAMES,
+@@ -1705,78 +1855,88 @@ def _predict_best_partial_action(
+     base_features: Array,
+     settings: OptimalBehaviourLSMCSettings,
+ ) -> tuple[Array, Array]:
+-    """Return best buffered partial score and fraction, including refinement."""
++    """Maximise the fitted quadratic Partial advantage analytically.
++
++    The documented Partial basis is affine in state and quadratic in the
++    withdrawal fraction.  Therefore a five-point prediction loop plus two
++    midpoint refinements is unnecessary: the exact fitted optimum is one of
++    the contractual lower bound, the upper bound, or the concave vertex.
++    """
+     if not _regression_is_stable(regression, settings):
+         raise RuntimeError("Partial-withdrawal advantage regression is unstable.")
++    if regression.clip_non_negative:
++        raise RuntimeError("Partial advantage regressions must remain signed.")
++    if regression.raw_feature_count != len(PARTIAL_ACTION_FEATURE_NAMES):
++        raise ValueError("Partial regression has an inconsistent feature count.")
++    base = np.asarray(base_features, dtype=float)
++    if base.shape != (context.n_paths, len(INCOME_ACTION_FEATURE_NAMES)):
++        raise ValueError("Partial base features have an inconsistent shape.")
++
+     maximum = np.asarray(context.max_partial_gross_amount, dtype=float)
+-    eligible = np.asarray(context.partial_withdrawal_eligible, dtype=bool)
+-    candidates = _partial_candidate_fractions(context)
+-    scores = np.full(candidates.shape, -np.inf)
+-    buffer = (
+-        settings.exercise_tolerance_aud
+-        + settings.exercise_buffer_rmse_multiplier * regression.oof_rmse_aud
++    eligible = (
++        np.asarray(context.partial_withdrawal_eligible, dtype=bool)
++        & (maximum >= 100.0 - 1.0e-10)
+     )
+-    for column in range(candidates.shape[1]):
+-        fraction = candidates[:, column]
+-        valid = eligible & (maximum * fraction >= 100.0 - 1.0e-10) \
+-            & (fraction > 0.0)
+-        safe_fraction = np.where(valid, fraction, 1.0)
+-        raw = build_partial_action_regression_features(base_features, safe_fraction)
+-        prediction = regression.predict_features(raw) - buffer
+-        scores[:, column] = np.where(valid, prediction, -np.inf)
+-
+-    # np.argmax provides the desired smaller-grid-index tie break; the AUD-100
+-    # candidate is first, followed by increasing proportional amounts.
+-    best_column = np.argmax(scores, axis=1)
+-    rows = np.arange(context.n_paths)
+-    best_fraction = candidates[rows, best_column]
+-    best_score = scores[rows, best_column]
+-
+-    # True midpoints to the adjacent admissible gross-amount candidates.
+-    gross_candidates = candidates * maximum[:, None]
+-    coarse_valid = gross_candidates >= 100.0 - 1.0e-10
+-    best_gross = best_fraction * maximum
+-    lower_gross = np.max(np.where(
+-        coarse_valid & (gross_candidates < best_gross[:, None] - 1.0e-8),
+-        gross_candidates,
+-        -np.inf,
+-    ), axis=1)
+-    upper_gross = np.min(np.where(
+-        coarse_valid & (gross_candidates > best_gross[:, None] + 1.0e-8),
+-        gross_candidates,
+-        np.inf,
+-    ), axis=1)
+-    has_lower = np.isfinite(lower_gross)
+-    has_upper = np.isfinite(upper_gross)
+-    lower = np.divide(
+-        0.5 * (best_gross + np.where(has_lower, lower_gross, best_gross)),
++    minimum_fraction = np.divide(
++        100.0,
+         maximum,
+-        out=np.zeros_like(maximum),
++        out=np.ones_like(maximum),
+         where=maximum > 0.0,
+     )
+-    upper = np.divide(
+-        0.5 * (best_gross + np.where(has_upper, upper_gross, best_gross)),
+-        maximum,
+-        out=np.zeros_like(maximum),
+-        where=maximum > 0.0,
++    minimum_fraction = np.clip(minimum_fraction, 0.0, 1.0)
++
++    raw_intercept, weights = regression.raw_affine_form()
++    base_count = len(INCOME_ACTION_FEATURE_NAMES)
++    fraction_index = base_count
++    square_index = base_count + 1
++    moneyness_index = FEATURE_NAMES.index("guarantee_log_moneyness")
++    mva_index = INCOME_ACTION_FEATURE_NAMES.index("mva_factor")
++    income_index = FEATURE_NAMES.index("annual_income_ratio")
++    linear = (
++        weights[fraction_index]
++        + weights[base_count + 2] * base[:, moneyness_index]
++        + weights[base_count + 3] * base[:, mva_index]
++        + weights[base_count + 4] * base[:, income_index]
+     )
+-    for fraction, has_neighbour in (
+-        (lower, has_lower),
+-        (upper, has_upper),
+-    ):
+-        valid = has_neighbour & eligible & (fraction > 0.0) & (fraction <= 1.0) \
+-            & (maximum * fraction >= 100.0 - 1.0e-10)
+-        safe_fraction = np.where(valid, fraction, 1.0)
+-        raw = build_partial_action_regression_features(base_features, safe_fraction)
+-        score = regression.predict_features(raw) - buffer
++    quadratic = float(weights[square_index])
++    buffer = (
++        settings.exercise_tolerance_aud
++        + settings.exercise_buffer_rmse_multiplier * regression.oof_rmse_aud
++    )
++    state_constant = (
++        raw_intercept
++        + base @ weights[:base_count]
++        - buffer
++    )
++
++    def score(fraction: Array) -> Array:
++        return state_constant + linear * fraction + quadratic * fraction * fraction
++
++    best_fraction = minimum_fraction.copy()
++    best_score = np.where(eligible, score(best_fraction), -np.inf)
++
++    def consider(fraction: Array, valid: NDArray[np.bool_]) -> None:
++        nonlocal best_fraction, best_score
++        candidate_score = score(fraction)
+         improve = valid & (
+-            (score > best_score + settings.exercise_tolerance_aud)
++            (candidate_score > best_score + settings.exercise_tolerance_aud)
+             | (
+-                np.abs(score - best_score) <= settings.exercise_tolerance_aud
++                np.abs(candidate_score - best_score)
++                <= settings.exercise_tolerance_aud
+             ) & (fraction < best_fraction)
+         )
+-        best_score = np.where(improve, score, best_score)
++        best_score = np.where(improve, candidate_score, best_score)
+         best_fraction = np.where(improve, fraction, best_fraction)
++
++    upper = np.ones(context.n_paths)
++    consider(upper, eligible)
++    if quadratic < -1.0e-14:
++        vertex = np.clip(
++            -linear / (2.0 * quadratic), minimum_fraction, 1.0
++        )
++        consider(vertex, eligible)
++
++    best_fraction = np.where(eligible, best_fraction, 0.0)
+     return best_score, best_fraction
+ 
+ 
+@@ -1926,6 +2086,29 @@ def build_income_election_regression_features(
+     return np.asarray(out, dtype=float)
+ 
+ 
++def _build_income_start_value_features(election_features: Array) -> Array:
++    """Add a compact nonlinear time basis to the pooled START value model."""
++    base = np.asarray(election_features, dtype=float)
++    if base.ndim != 2 or base.shape[1] != len(ELECTION_FEATURE_NAMES):
++        raise ValueError("START-value base features have an inconsistent shape.")
++    duration = base[:, ELECTION_FEATURE_NAMES.index("duration_years_scaled")]
++    log_account = base[:, ELECTION_FEATURE_NAMES.index(
++        "log1p_account_value_ratio"
++    )]
++    moneyness = base[:, ELECTION_FEATURE_NAMES.index(
++        "guarantee_log_moneyness"
++    )]
++    out = np.column_stack((
++        base,
++        duration * duration,
++        duration * log_account,
++        duration * moneyness,
++    ))
++    if out.shape[1] != len(START_VALUE_FEATURE_NAMES):
++        raise RuntimeError("START-value feature matrix is inconsistent.")
++    return np.asarray(out, dtype=float)
++
++
+ def _regression_is_stable(
+     regression: _ContinuationRegression,
+     settings: OptimalBehaviourLSMCSettings,
+@@ -2657,7 +2840,7 @@ class OptimalBehaviourPolicyFit:
+     surrender_fallback_used: bool
+     valid: bool = True
+     invalid_reasons: tuple[str, ...] = ()
+-    fit_version: str = "combined_optimal_behaviour_lsmc_v2"
++    fit_version: str = "combined_optimal_behaviour_lsmc_v3"
+     income_action_exposure_coverage: float = 1.0
+     policy_iteration_count: int = 0
+     policy_iteration_converged: bool = True
+@@ -3325,11 +3508,11 @@ def _project_assigned_election_income_branch(
+     expenses: Optional[ExpenseAssumptions],
+     config: ProjectionConfig,
+     income_transition_observer: Optional[object] = None,
+-) -> ProjectionResult:
++) -> tuple[ProjectionResult, _AssignedElectionContextRecorder]:
+     election_policy = _AssignedElectionContextRecorder(
+         assigned_start_steps=np.asarray(assigned_start_steps, dtype=np.int64)
+     )
+-    return project(
++    projection = project(
+         product,
+         policy,
+         scenarios,
+@@ -3341,6 +3524,7 @@ def _project_assigned_election_income_branch(
+         income_action_policy=action_policy,
+         income_transition_observer=income_transition_observer,
+     )
++    return projection, election_policy
+ 
+ 
+ @dataclass(frozen=True)
+@@ -3358,6 +3542,9 @@ class _MonthlyIncomeActionFit:
+     policy_iteration_converged: bool
+     final_action_agreement: float
+     final_value_change_aud: float
++    assigned_start_features: Array
++    assigned_start_value_targets_aud: Array
++    assigned_start_path_ids: NDArray[np.int64]
+     valid: bool
+     invalid_reasons: tuple[str, ...]
+ 
+@@ -3369,6 +3556,9 @@ def _cross_fitted_state_value_regression(
+     settings: OptimalBehaviourLSMCSettings,
+     fold_ids: NDArray[np.int64],
+     *,
++    core_feature_indices: NDArray[np.int64] = (
++        INCOME_ACTION_CORE_FEATURE_INDICES
++    ),
+     enforce_unique_path_minimum: bool = False,
+ ) -> tuple[
+     _ContinuationRegression,
+@@ -3379,7 +3569,7 @@ def _cross_fitted_state_value_regression(
+     """Fit full -> linear core -> constant for an internal state value."""
+     attempts = (
+         ("full", None),
+-        ("core", INCOME_ACTION_CORE_FEATURE_INDICES),
++        ("core", np.asarray(core_feature_indices, dtype=np.int64)),
+         ("constant", np.zeros(0, dtype=np.int64)),
+     )
+     failures: list[str] = []
+@@ -3408,6 +3598,108 @@ def _cross_fitted_state_value_regression(
+     raise ValueError(";".join(failures))
+ 
+ 
++
++def _assigned_start_value_training_panel(
++    *,
++    projection: ProjectionResult,
++    election_contexts: Mapping[int, IncomeElectionDecisionContext],
++    assigned_start_steps: NDArray[np.int64],
++    election_steps: tuple[int, ...],
++    scenarios: ScenarioSet,
++    premium: float,
++    issue_age: float,
++    automatic_income_start_age: float,
++    settings: OptimalBehaviourLSMCSettings,
++    complete_path_ids: NDArray[np.int64],
++) -> tuple[Array, Array, NDArray[np.int64]]:
++    """Build one randomized, pooled START-value sample across Election years."""
++    if projection.phase_cashflows is None:
++        raise RuntimeError(
++            "Assigned-start value fitting requires phase cashflow ledgers."
++        )
++    assigned = np.asarray(assigned_start_steps, dtype=np.int64)
++    path_ids = np.asarray(complete_path_ids, dtype=np.int64)
++    if assigned.shape != (scenarios.n_paths,) \
++            or path_ids.shape != (scenarios.n_paths,):
++        raise ValueError("Assigned starts and complete-path IDs must match paths.")
++    discounted = _discounted_policyholder_cashflows(projection, scenarios)
++    post_election = projection.phase_cashflows[
++        "policyholder_benefits_post_election"
++    ]
++    raw_panels: list[Array] = []
++    target_panels: list[Array] = []
++    id_panels: list[NDArray[np.int64]] = []
++    for step in election_steps:
++        context = election_contexts.get(step)
++        if context is None:
++            continue
++        scale_0 = scenarios.discount[:, step] * context.inforce_weight
++        eligible = (
++            (assigned == step)
++            & (context.phase == Phase.GROWTH.value)
++            & (
++                context.voluntary_election_eligible
++                | np.asarray(context.forced_election, dtype=bool)
++            )
++            & (
++                context.inforce_weight
++                > settings.minimum_inforce_weight
++            )
++            & (scale_0 > 1.0e-300)
++        )
++        index = np.flatnonzero(eligible)
++        if index.size == 0:
++            continue
++        current_post_election_0 = (
++            post_election[index, step] * scenarios.discount[index, step]
++        )
++        future_0 = np.sum(discounted[index, step + 1:], axis=1)
++        target_panels.append(
++            (current_post_election_0 + future_0) / scale_0[index]
++        )
++        election_features = build_income_election_regression_features(
++            context,
++            premium,
++            issue_age,
++            automatic_income_start_age,
++        )
++        raw_panels.append(
++            _build_income_start_value_features(election_features)[index]
++        )
++        id_panels.append(path_ids[index])
++    if not raw_panels:
++        raise ValueError("Assigned-start rollout produced no material START sample.")
++    raw = np.concatenate(raw_panels, axis=0)
++    target = np.concatenate(target_panels)
++    ids = np.concatenate(id_panels).astype(np.int64, copy=False)
++    if np.unique(ids).size != ids.size:
++        raise ValueError(
++            "Each complete path must enter the randomized START panel once."
++        )
++    return raw, target, ids
++
++
++def _predict_fold_pure_regression(
++    raw_features: Array,
++    complete_path_ids: NDArray[np.int64],
++    fold_regressions: tuple[_ContinuationRegression, ...],
++) -> Array:
++    """Evaluate each row with the model that excluded its complete path."""
++    raw = np.asarray(raw_features, dtype=float)
++    ids = np.asarray(complete_path_ids, dtype=np.int64)
++    if raw.ndim != 2 or ids.shape != (raw.shape[0],):
++        raise ValueError("Fold-pure prediction inputs are inconsistent.")
++    if not fold_regressions:
++        raise ValueError("Fold-pure prediction requires fitted fold models.")
++    fold_ids = np.mod(ids, len(fold_regressions))
++    prediction = np.zeros(raw.shape[0])
++    for fold, regression in enumerate(fold_regressions):
++        selected = fold_ids == fold
++        if np.any(selected):
++            prediction[selected] = regression.predict_features(raw[selected])
++    return prediction
++
++
+ def _monthly_action_diagnostic(
+     *,
+     action_type: str,
+@@ -3502,6 +3794,7 @@ def _income_policy_rollout(
+     _CrossFittedIncomeActionPolicy,
+     ProjectionResult,
+     IncomeTransitionPanelCollector,
++    _AssignedElectionContextRecorder,
+ ]:
+     action_policy = _CrossFittedIncomeActionPolicy(
+         regressions_by_step=regressions_by_step,
+@@ -3509,7 +3802,7 @@ def _income_policy_rollout(
+         settings=settings,
+     )
+     transition_collector = IncomeTransitionPanelCollector()
+-    projection = _project_assigned_election_income_branch(
++    projection, election_recorder = _project_assigned_election_income_branch(
+         assigned_start_steps=assigned_start_steps,
+         action_policy=action_policy,
+         product=product,
+@@ -3529,6 +3822,7 @@ def _income_policy_rollout(
+         action_policy,
+         projection,
+         transition_collector,
++        election_recorder,
+     )
+ 
+ 
+@@ -3629,6 +3923,7 @@ def _fit_monthly_income_action_phase(
+         prior_rollout_policy,
+         _continue_projection,
+         continue_collector,
++        _continue_election_recorder,
+     ) = _income_policy_rollout(
+         regressions_by_step={},
+         assigned_start_steps=assigned,
+@@ -4012,84 +4307,12 @@ def _fit_monthly_income_action_phase(
+                         evaluate_partial_candidate(fraction, valid)
+                     )
+ 
+-                coarse_targets = np.column_stack(candidate_targets)
+-                coarse_valid = np.column_stack(candidate_valid)
+-                realised = np.where(coarse_valid, coarse_targets, -np.inf)
+-                best_column = np.argmax(realised, axis=1)
+-                rows = np.arange(context.n_paths)
+-                best_fraction = coarse_fraction[rows, best_column]
+-                coarse_gross = (
+-                    coarse_fraction
+-                    * context.max_partial_gross_amount[:, None]
+-                )
+-                best_gross = best_fraction * context.max_partial_gross_amount
+-                lower_gross = np.max(np.where(
+-                    coarse_valid
+-                    & (coarse_gross < best_gross[:, None] - 1.0e-8),
+-                    coarse_gross,
+-                    -np.inf,
+-                ), axis=1)
+-                upper_gross = np.min(np.where(
+-                    coarse_valid
+-                    & (coarse_gross > best_gross[:, None] + 1.0e-8),
+-                    coarse_gross,
+-                    np.inf,
+-                ), axis=1)
+-                has_lower = np.isfinite(lower_gross)
+-                has_upper = np.isfinite(upper_gross)
+-                refinements = (
+-                    np.divide(
+-                        0.5 * (
+-                            best_gross
+-                            + np.where(has_lower, lower_gross, best_gross)
+-                        ),
+-                        context.max_partial_gross_amount,
+-                        out=np.zeros(context.n_paths),
+-                        where=context.max_partial_gross_amount > 0.0,
+-                    ),
+-                    np.divide(
+-                        0.5 * (
+-                            best_gross
+-                            + np.where(has_upper, upper_gross, best_gross)
+-                        ),
+-                        context.max_partial_gross_amount,
+-                        out=np.zeros(context.n_paths),
+-                        where=context.max_partial_gross_amount > 0.0,
+-                    ),
+-                )
+-                for fraction, neighbour_exists in zip(
+-                    refinements, (has_lower, has_upper)
+-                ):
+-                    valid = (
+-                        neighbour_exists
+-                        & partial_eligible
+-                        & (fraction > 0.0)
+-                        & (fraction <= 1.0)
+-                        & (
+-                            context.max_partial_gross_amount * fraction
+-                            >= 100.0 - 1.0e-10
+-                        )
+-                    )
+-                    gross = context.max_partial_gross_amount * fraction
+-                    for prior_fraction, prior_valid in zip(
+-                        candidate_fractions, candidate_valid
+-                    ):
+-                        valid &= ~(
+-                            prior_valid
+-                            & np.isclose(
+-                                gross,
+-                                context.max_partial_gross_amount * prior_fraction,
+-                                atol=1.0e-8,
+-                                rtol=0.0,
+-                            )
+-                        )
+-                    candidate_fractions.append(fraction)
+-                    candidate_valid.append(valid)
+-                    candidate_targets.append(
+-                        evaluate_partial_candidate(fraction, valid)
+-                    )
+-
+-                fraction_matrix = np.column_stack(candidate_fractions)
++                # The fitted Partial surface is quadratic in the action
++                # fraction, so the five contractual anchor amounts identify
++                # its shape.  The former two realised midpoint transitions
++                # were redundant once deployment maximises that quadratic
++                # analytically.
++                fraction_matrix = coarse_fraction
+                 target_matrix = np.column_stack(candidate_targets)
+                 valid_matrix = np.column_stack(candidate_valid)
+                 training_valid = valid_matrix & train_path[:, None]
+@@ -4316,6 +4539,10 @@ def _fit_monthly_income_action_phase(
+     final_agreement = 1.0
+     final_value_change = 0.0
+     final_material_failures: tuple[str, ...] = ()
++    final_assigned_projection: Optional[ProjectionResult] = None
++    final_assigned_election_recorder: Optional[
++        _AssignedElectionContextRecorder
++    ] = None
+     converged = False
+     iteration_count = 0
+ 
+@@ -4362,8 +4589,9 @@ def _fit_monthly_income_action_phase(
+         (
+             new_value,
+             new_rollout_policy,
+-            _new_projection,
++            new_projection,
+             new_cross_collector,
++            new_election_recorder,
+         ) = _income_policy_rollout(
+             regressions_by_step=cross,
+             assigned_start_steps=assigned,
+@@ -4391,6 +4619,8 @@ def _fit_monthly_income_action_phase(
+         final_agreement = agreement
+         final_value_change = value_change
+         final_material_failures = material_failures
++        final_assigned_projection = new_projection
++        final_assigned_election_recorder = new_election_recorder
+         prior_value = new_value
+         prior_rollout_policy = new_rollout_policy
+         if converged:
+@@ -4408,6 +4638,7 @@ def _fit_monthly_income_action_phase(
+                     _chain_policy,
+                     _chain_projection,
+                     chain_collector,
++                    _chain_election_recorder,
+                 ) = _income_policy_rollout(
+                     regressions_by_step=uniform_chain_models(chain),
+                     assigned_start_steps=assigned,
+@@ -4424,6 +4655,31 @@ def _fit_monthly_income_action_phase(
+                 next_fold_collectors.append(chain_collector)
+             fold_collectors = tuple(next_fold_collectors)
+ 
++    if final_assigned_projection is None \
++            or final_assigned_election_recorder is None:
++        raise RuntimeError("Income policy iteration produced no assigned-start rollout.")
++
++    (
++        assigned_start_features,
++        assigned_start_value_targets,
++        assigned_start_path_ids,
++    ) = _assigned_start_value_training_panel(
++        projection=final_assigned_projection,
++        election_contexts=final_assigned_election_recorder.election_contexts,
++        assigned_start_steps=assigned,
++        election_steps=tuple(sorted(
++            int(step) for step in np.unique(assigned)
++        )),
++        scenarios=scenarios,
++        premium=premium,
++        issue_age=float(policy.age),
++        automatic_income_start_age=float(
++            product.automatic_income_start_age
++        ),
++        settings=settings,
++        complete_path_ids=fold_source,
++    )
++
+     candidate_value = prior_value
+     invalid_reasons: list[str] = []
+     if final_coverage < 0.99:
+@@ -4459,6 +4715,9 @@ def _fit_monthly_income_action_phase(
+         policy_iteration_converged=converged,
+         final_action_agreement=final_agreement,
+         final_value_change_aud=final_value_change,
++        assigned_start_features=assigned_start_features,
++        assigned_start_value_targets_aud=assigned_start_value_targets,
++        assigned_start_path_ids=assigned_start_path_ids,
+         valid=not invalid_reasons,
+         invalid_reasons=tuple(dict.fromkeys(invalid_reasons)),
+     )
+@@ -4479,17 +4738,17 @@ def fit_optimal_behaviour_policy(
+ 
+     The absorbing phase order permits the Income subproblem to be solved first.
+     Its state sample is stratified over every admissible Election anniversary.
+-    A complete pathwise START counterfactual panel is then rolled through that
+-    cross-fitted Income policy.  Growth backward induction compares each START
+-    panel value with WAIT followed by the already-fitted later combined policy.
+-    Thus the panel is a transition-value engine, not a scalar comparison of
+-    deterministic start years.
++    One fold-stratified randomized START rollout is then used to fit a pooled,
++    cross-fitted START value surface across all admissible Election years.
++    Growth backward induction compares that fold-pure START value with WAIT
++    followed by the already-fitted later combined policy.  This removes the
++    former full monthly re-projection for every possible start year.
+     """
+     if not isinstance(settings, OptimalBehaviourLSMCSettings):
+         raise TypeError("settings must be OptimalBehaviourLSMCSettings.")
+     if tuple(settings.ridge_grid) != RIDGE_GRID_DEFAULT:
+         raise ValueError(
+-            "Combined optimal-behaviour LSMC v2 requires the fixed Ridge grid "
++            "Combined optimal-behaviour LSMC v3 requires the fixed Ridge grid "
+             f"{RIDGE_GRID_DEFAULT}; got {tuple(settings.ridge_grid)}."
+         )
+     policy.validate_against(product)
+@@ -4571,70 +4830,92 @@ def fit_optimal_behaviour_policy(
+         axis=1,
+     )))
+ 
+-    start_value_0_by_step: dict[int, Array] = {}
+-    growth_discounted_cashflow: Optional[Array] = None
+-    growth_pre_election_benefit_0: Optional[Array] = None
+-    growth_contexts: Optional[dict[int, IncomeElectionDecisionContext]] = None
+-    wait_path_value_0: Optional[Array] = None
+-    for start_step in election_steps:
+-        cross_fitted_income_policy = _CrossFittedIncomeActionPolicy(
+-            regressions_by_step=(
+-                income_action_fit.cross_fitted_regressions_by_step
++    # One randomized assigned-start rollout already spans every admissible
++    # Election year.  Fit a fold-pure pooled START value surface from that
++    # rollout instead of re-running the complete monthly projector once for
++    # every possible start year.
++    start_value_raw = income_action_fit.assigned_start_features
++    start_value_target = (
++        income_action_fit.assigned_start_value_targets_aud
++    )
++    start_value_path_ids = income_action_fit.assigned_start_path_ids
++    (
++        _start_value_regression,
++        _start_value_oof,
++        _start_value_folds_used,
++        start_value_fold_regressions,
++    ) = _cross_fitted_state_value_regression(
++        start_value_raw,
++        start_value_target,
++        premium,
++        settings,
++        start_value_path_ids,
++        core_feature_indices=START_VALUE_CORE_FEATURE_INDICES,
++        enforce_unique_path_minimum=True,
++    )
++    start_value_fold_regressions = tuple(
++        replace(
++            regression,
++            basis_level=(
++                "pooled_assigned_start/"
++                f"{regression.basis_level}"
+             ),
+-            premium=premium,
+-            settings=settings,
+         )
+-        branch_projection, election_recorder = _project_fixed_election_branch(
+-            start_step=start_step,
+-            product=product,
+-            policy=policy,
+-            scenarios=training_scenarios,
+-            behaviour=behaviour,
+-            mortality=mortality,
+-            expenses=expenses,
+-            config=config,
+-            income_action_policy=cross_fitted_income_policy,
+-        )
+-        branch_discounted = _discounted_policyholder_cashflows(
+-            branch_projection, training_scenarios
+-        )
+-        if branch_projection.phase_cashflows is None:
+-            raise RuntimeError(
+-                "Income-Election Bellman fit requires phase cashflow ledgers."
+-            )
+-        # Fixed Income starts one month later, but v2 permits a Partial action
+-        # immediately after Election.  Include that exact post-Election
+-        # current-step benefit while excluding mortality/other pre-Election
+-        # cashflows which are common to START and WAIT.
+-        post_election_current_0 = (
+-            branch_projection.phase_cashflows[
+-                "policyholder_benefits_post_election"
+-            ][:, start_step]
+-            * training_scenarios.discount[:, start_step]
++        for regression in start_value_fold_regressions
++    )
++
++    # A single forced-Election branch supplies all WAIT cashflows and every
++    # annual pre-Election context.  Its forced START value remains pathwise and
++    # exact; voluntary START values use the fold-pure pooled surface above.
++    cross_fitted_income_policy = _CrossFittedIncomeActionPolicy(
++        regressions_by_step=(
++            income_action_fit.cross_fitted_regressions_by_step
++        ),
++        premium=premium,
++        settings=settings,
++    )
++    branch_projection, election_recorder = _project_fixed_election_branch(
++        start_step=forced_step,
++        product=product,
++        policy=policy,
++        scenarios=training_scenarios,
++        behaviour=behaviour,
++        mortality=mortality,
++        expenses=expenses,
++        config=config,
++        income_action_policy=cross_fitted_income_policy,
++    )
++    growth_discounted_cashflow = _discounted_policyholder_cashflows(
++        branch_projection, training_scenarios
++    )
++    if branch_projection.phase_cashflows is None:
++        raise RuntimeError(
++            "Income-Election Bellman fit requires phase cashflow ledgers."
+         )
+-        start_value_0_by_step[start_step] = (
+-            post_election_current_0
+-            + np.sum(branch_discounted[:, start_step + 1:], axis=1)
++    growth_pre_election_benefit_0 = (
++        branch_projection.phase_cashflows[
++            "policyholder_benefits_pre_election"
++        ]
++        * training_scenarios.discount[
++            :, :branch_projection.phase_cashflows[
++                "policyholder_benefits_pre_election"
++            ].shape[1]
++        ]
++    )
++    forced_post_election_current_0 = (
++        branch_projection.phase_cashflows[
++            "policyholder_benefits_post_election"
++        ][:, forced_step]
++        * training_scenarios.discount[:, forced_step]
++    )
++    forced_start_value_0 = (
++        forced_post_election_current_0
++        + np.sum(
++            growth_discounted_cashflow[:, forced_step + 1:], axis=1
+         )
+-        if start_step == forced_step:
+-            growth_discounted_cashflow = branch_discounted
+-            growth_pre_election_benefit_0 = (
+-                branch_projection.phase_cashflows[
+-                    "policyholder_benefits_pre_election"
+-                ]
+-                * training_scenarios.discount[
+-                    :, :branch_projection.phase_cashflows[
+-                        "policyholder_benefits_pre_election"
+-                    ].shape[1]
+-                ]
+-            )
+-            growth_contexts = dict(election_recorder.election_contexts)
+-            wait_path_value_0 = np.sum(branch_discounted, axis=1)
+-
+-    if growth_discounted_cashflow is None or growth_contexts is None \
+-            or growth_pre_election_benefit_0 is None \
+-            or wait_path_value_0 is None:
+-        raise RuntimeError("Forced-Election branch was not projected.")
++    )
++    growth_contexts = dict(election_recorder.election_contexts)
++    wait_path_value_0 = np.sum(growth_discounted_cashflow, axis=1)
+ 
+     election_regressions: dict[int, _ElectionRegressionPair] = {}
+     election_fold_regressions: dict[
+@@ -4651,7 +4932,7 @@ def fit_optimal_behaviour_policy(
+         tuple[Array, Array, Array, NDArray[np.int64]],
+     ] = {}
+ 
+-    future_value_0 = start_value_0_by_step[forced_step].copy()
++    future_value_0 = forced_start_value_0.copy()
+     next_step = forced_step
+     for step in reversed(election_steps[:-1]):
+         future_value_0 += (
+@@ -4661,7 +4942,7 @@ def fit_optimal_behaviour_policy(
+             + growth_pre_election_benefit_0[:, next_step]
+         )
+         wait_realised_0 = future_value_0.copy()
+-        start_realised_0 = start_value_0_by_step[step]
++        start_realised_0 = np.zeros(n_paths)
+         context = growth_contexts.get(step)
+         if context is None:
+             raise ValueError(
+@@ -4686,14 +4967,25 @@ def fit_optimal_behaviour_policy(
+         fold_pairs: tuple[_ElectionRegressionPair, ...] = ()
+         if observations:
+             wait_target = wait_realised_0[eligible] / scale_0[eligible]
+-            start_target = start_realised_0[eligible] / scale_0[eligible]
+-            raw = build_income_election_regression_features(
++            election_features = build_income_election_regression_features(
+                 context,
+                 premium,
+                 policy.age,
+                 product.automatic_income_start_age,
++            )
++            raw = election_features[eligible]
++            start_raw = _build_income_start_value_features(
++                election_features
+             )[eligible]
+             panel_ids = base_fold_ids[eligible_index]
++            start_target = _predict_fold_pure_regression(
++                start_raw,
++                panel_ids,
++                start_value_fold_regressions,
++            )
++            start_realised_0[eligible_index] = (
++                scale_0[eligible_index] * start_target
++            )
+             election_panels[step] = (
+                 raw, wait_target, start_target, panel_ids
+             )
+@@ -4923,19 +5215,14 @@ def fit_optimal_behaviour_policy(
+         next_step = step
+ 
+     first_step = election_steps[0]
+-    candidate_path_value = (
++    bellman_candidate_path_value = (
+         np.sum(growth_discounted_cashflow[:, :first_step + 1], axis=1)
+         + future_value_0
+     )
+-    candidate_value = float(np.mean(candidate_path_value))
++    bellman_candidate_value = float(np.mean(bellman_candidate_path_value))
+     wait_value = float(np.mean(wait_path_value_0))
+-    election_fallback = bool(
+-        settings.fallback_to_no_action_if_training_underperforms
+-        and candidate_value < wait_value
+-    )
+-    selected_value = candidate_value
+ 
+-    # The v2 combined policy deploys only the unified monthly Income-action
++    # The v3 combined policy deploys only the unified monthly Income-action
+     # surface.  The explicit legacy Surrender object remains empty and is kept
+     # solely for API compatibility with fixed-Election Stackelberg callers.
+     surrender_policy = OptimalSurrenderPolicy(
+@@ -4944,6 +5231,55 @@ def fit_optimal_behaviour_policy(
+     cross_surrender_policy = CrossFittedOptimalSurrenderPolicy(
+         regressions_by_step={}, fold_ids_by_step={}, settings=settings
+     )
++
++    # The pooled START surface is used only to learn the boundary.  Value the
++    # resulting complete cross-fitted policy once through the canonical
++    # projector before applying either training lower-bound gate.  This keeps
++    # the speed-up while removing regression-value bias from policy selection.
++    candidate_value = bellman_candidate_value
++    if not material_election_failures and income_action_fit.valid:
++        validation_policy = CrossFittedOptimalBehaviourPolicy(
++            election_regressions_by_step=MappingProxyType(dict(sorted(
++                election_fold_regressions.items()
++            ))),
++            election_fold_ids_by_step=MappingProxyType(dict(sorted(
++                election_fold_ids.items()
++            ))),
++            surrender_policy=cross_surrender_policy,
++            premium=premium,
++            issue_age=float(policy.age),
++            settings=settings,
++            automatic_income_start_age=float(
++                product.automatic_income_start_age
++            ),
++            income_action_regressions_by_step=(
++                income_action_fit.cross_fitted_regressions_by_step
++            ),
++            valid=True,
++        )
++        validation_projection = project(
++            product,
++            policy,
++            training_scenarios,
++            behaviour,
++            mortality,
++            expenses=expenses,
++            config=config,
++            income_election_policy=validation_policy,
++            income_action_policy=validation_policy,
++        )
++        candidate_value = float(np.mean(np.sum(
++            _discounted_policyholder_cashflows(
++                validation_projection, training_scenarios
++            ),
++            axis=1,
++        )))
++
++    election_fallback = bool(
++        settings.fallback_to_no_action_if_training_underperforms
++        and candidate_value < wait_value
++    )
++    selected_value = candidate_value
+     surrender_fallback = not income_action_fit.valid
+     # A final cross-fitted lower-bound gate protects against an adverse
+     # interaction between the separately solved absorbing phase and Growth
+@@ -5007,7 +5343,7 @@ def fit_optimal_behaviour_policy(
+         income_start_year=float(product.min_years_before_income),
+     )
+     fit_basis_fingerprint = assumption_fingerprint(
+-        "combined_optimal_behaviour_lsmc_v2",
++        "combined_optimal_behaviour_lsmc_v3",
+         training_scenarios.content_fingerprint,
+         product,
+         optimal_policy_basis,

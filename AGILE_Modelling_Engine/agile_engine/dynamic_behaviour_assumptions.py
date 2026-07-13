@@ -6,15 +6,16 @@ data and insurer costs.  This module reads the two versioned CSV sources under
 the monthly projection engine.  Every numeric assumption in the configured
 base behaviour is therefore auditable back to a file digest and source row.
 
-The shipped values are deliberately marked ``uncalibrated_proxy``.  They are
-literature- and practice-informed starting points, not Australian experience
-rates or a production calibration.
+The shipped values distinguish ``contractual_constraint`` rows from
+``uncalibrated_proxy`` rows.  The latter are literature- and practice-informed
+starting points, not Australian experience rates or a production calibration.
 """
 
 from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, replace
+from datetime import date
 from hashlib import sha256
 from io import StringIO
 from math import isfinite
@@ -46,6 +47,11 @@ _VALUE_COLUMNS = {
     "base": "base_value",
     "low": "low_value",
     "high": "high_value",
+}
+
+_ALLOWED_ASSUMPTION_STATUSES = {
+    "uncalibrated_proxy",
+    "contractual_constraint",
 }
 
 _BASELINE_COLUMNS = (
@@ -161,8 +167,23 @@ _COEFFICIENT_GROUP_SPEC = {
         "fractional_logit", "positive_part",
         _FRACTIONAL_LOGIT_PARAMETER_UNITS),
     ("excess_withdrawal_rate", "all"): (
-        "fractional_logit", "positive_part",
+        "fractional_logit", "signed",
         _FRACTIONAL_LOGIT_PARAMETER_UNITS),
+}
+
+# ``low`` and ``high`` are directional behaviour-level scenarios, not
+# simultaneous confidence bounds for every signed slope.  Allowing signed
+# slopes to move in all three columns reverses scenario ordering whenever the
+# associated covariate changes sign.  Only level/cap parameters may vary by
+# value basis; slope sensitivity is governed separately.
+_DIRECTIONAL_BAND_PARAMETERS = {
+    ("lapse", "growth"): {"output_cap"},
+    ("lapse", "income"): {"output_cap"},
+    ("performance_lapse", "all"): {
+        "excess_hazard_cap",
+        "annual_probability_cap",
+    },
+    ("income_take_up", "growth"): {"output_cap"},
 }
 
 
@@ -175,6 +196,7 @@ class DynamicBehaviourAssumptionSet:
     source_paths: Mapping[str, str]
     source_sha256: Mapping[str, str]
     effective_dates: tuple[str, ...]
+    assumption_statuses: tuple[str, ...]
     values: Mapping[str, float]
     behaviour: BehaviourModel
 
@@ -198,8 +220,13 @@ class DynamicBehaviourAssumptionSet:
             "source_paths": dict(self.source_paths),
             "source_sha256": dict(self.source_sha256),
             "effective_dates": list(self.effective_dates),
+            "assumption_status": (
+                self.assumption_statuses[0]
+                if len(self.assumption_statuses) == 1
+                else "mixed"
+            ),
+            "assumption_statuses": list(self.assumption_statuses),
             "applied_engine_parameters": dict(self.values),
-            "assumption_status": "uncalibrated_proxy",
         }
 
 
@@ -230,6 +257,32 @@ def _parse_bool(value: str, *, column: str, row_number: int,
         f"Invalid boolean value {value!r} in {column} at "
         f"{source_name} row {row_number}; expected true or false."
     )
+
+
+def _validate_effective_date(value: str, *, row_number: int,
+                             source_name: str) -> None:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"effective_date must be ISO YYYY-MM-DD at "
+            f"{source_name} row {row_number}."
+        ) from exc
+    if parsed.isoformat() != value:
+        raise ValueError(
+            f"effective_date must use canonical ISO YYYY-MM-DD at "
+            f"{source_name} row {row_number}."
+        )
+
+
+def _validate_assumption_status(value: str, *, row_number: int,
+                                source_name: str) -> None:
+    if value not in _ALLOWED_ASSUMPTION_STATUSES:
+        allowed = ", ".join(sorted(_ALLOWED_ASSUMPTION_STATUSES))
+        raise ValueError(
+            f"Unsupported assumption_status at {source_name} row "
+            f"{row_number}; expected one of: {allowed}."
+        )
 
 
 def _parse_positive_int(value: str, *, column: str, row_number: int,
@@ -319,11 +372,14 @@ def _parse_baselines(rows: list[dict[str, str]]) -> list[dict[str, object]]:
         ):
             row[column] = _require_text(
                 raw_row, column, source_name=source_name, row_number=row_number)
-        if row["assumption_status"] != "uncalibrated_proxy":
-            raise ValueError(
-                f"Unsupported assumption_status at baseline row {row_number}; "
-                "expected 'uncalibrated_proxy'."
-            )
+        _validate_effective_date(
+            str(row["effective_date"]), row_number=row_number,
+            source_name=source_name,
+        )
+        _validate_assumption_status(
+            str(row["assumption_status"]), row_number=row_number,
+            source_name=source_name,
+        )
 
         year_from = _parse_positive_int(
             raw_row["policy_year_from"], column="policy_year_from",
@@ -398,11 +454,11 @@ def _parse_baselines(rows: list[dict[str, str]]) -> list[dict[str, object]]:
                     f"Forced take-up band must be exactly one at baseline row "
                     f"{row_number}."
                 )
-        elif group != ("income_take_up", "growth") \
-                and bool(row["_structural_zero"]):
+        if bool(row["_structural_zero"]) \
+                and row["assumption_status"] != "contractual_constraint":
             raise ValueError(
-                f"Structural-zero markers are only supported for income take-up; "
-                f"baseline row {row_number}."
+                f"Structural-zero bands must use assumption_status "
+                f"'contractual_constraint' at baseline row {row_number}."
             )
 
         key = (
@@ -430,11 +486,14 @@ def _parse_coefficients(rows: list[dict[str, str]]) -> list[dict[str, object]]:
         ):
             row[column] = _require_text(
                 raw_row, column, source_name=source_name, row_number=row_number)
-        if row["assumption_status"] != "uncalibrated_proxy":
-            raise ValueError(
-                f"Unsupported assumption_status at coefficient row {row_number}; "
-                "expected 'uncalibrated_proxy'."
-            )
+        _validate_effective_date(
+            str(row["effective_date"]), row_number=row_number,
+            source_name=source_name,
+        )
+        _validate_assumption_status(
+            str(row["assumption_status"]), row_number=row_number,
+            source_name=source_name,
+        )
 
         for column in _VALUE_COLUMNS.values():
             row[f"_{column}"] = _parse_number(
@@ -475,6 +534,16 @@ def _parse_coefficients(rows: list[dict[str, str]]) -> list[dict[str, object]]:
             raise ValueError(
                 f"Unexpected unit for {group!r}/{parameter!r} at coefficient "
                 f"row {row_number}; expected {parameter_units[parameter]!r}."
+            )
+        allowed_to_vary = parameter in _DIRECTIONAL_BAND_PARAMETERS.get(
+            group, set()
+        )
+        if not allowed_to_vary and not (low == base == high):
+            raise ValueError(
+                f"Coefficient band {group!r}/{parameter!r} changes a slope or "
+                f"shape parameter at row {row_number}.  Directional low/base/"
+                "high scenarios require identical values for this parameter; "
+                "stress the coefficient separately instead."
             )
 
         key = (
@@ -586,19 +655,14 @@ def _validate_schedules(rows: list[dict[str, object]]) -> None:
         row for row in rows
         if (row["component"], row["phase"])
         == ("income_take_up", "growth")]
-    structural = [row for row in take_up if bool(row["_structural_zero"])]
     forced = [row for row in take_up if bool(row["_force_at_year"])]
-    if len(structural) != 1 or int(structural[0]["_year_from"]) != 1 \
-            or structural[0]["_year_to"] != 1:
+    if len(forced) > 1:
         raise ValueError(
-            "Income take-up must contain exactly one structural-zero band for "
-            "policy year 1."
+            "Income take-up may contain at most one forced band."
         )
-    if len(forced) != 1 or int(forced[0]["_year_from"]) != 15 \
-            or forced[0]["_year_to"] is not None:
+    if forced and forced[0]["_year_to"] is not None:
         raise ValueError(
-            "Income take-up must contain exactly one open-ended forced band "
-            "beginning at policy year 15."
+            "An Income take-up forced band must be open-ended."
         )
 
 
@@ -701,6 +765,38 @@ def _expanded_schedule(rows: list[dict[str, object]], component: str,
     return tuple(values)
 
 
+def _validate_baseline_output_bounds(
+    rows: list[dict[str, object]],
+    coefficient_values: dict[tuple[str, str], dict[str, float]],
+    value_column: str,
+) -> None:
+    """Ensure neutral-state baselines are not silently clipped."""
+    coefficient_group = {
+        ("lapse", "growth"): ("lapse", "growth"),
+        ("lapse", "income"): ("lapse", "income"),
+        ("income_take_up", "growth"): ("income_take_up", "growth"),
+        ("free_withdrawal_utilisation", "growth"):
+            ("free_withdrawal_utilisation", "growth"),
+        ("excess_withdrawal_rate", "all"):
+            ("excess_withdrawal_rate", "all"),
+    }
+    for row in rows:
+        group = (str(row["component"]), str(row["phase"]))
+        values = coefficient_values[coefficient_group[group]]
+        baseline = float(row[f"_{value_column}"])
+        if baseline in (0.0, 1.0):
+            continue
+        floor = values["output_floor"]
+        cap = values["output_cap"]
+        if not floor <= baseline <= cap:
+            row_number = int(row["_row_number"])
+            raise ValueError(
+                f"Baseline {baseline} for {group!r} at row {row_number} "
+                f"lies outside the configured neutral-state output bounds "
+                f"[{floor}, {cap}] for value basis {value_column!r}."
+            )
+
+
 def load_dynamic_behaviour_assumptions(
     directory: str | Path | None = None,
     *,
@@ -711,9 +807,10 @@ def load_dynamic_behaviour_assumptions(
     """Load, validate and apply one dynamic-behaviour assumption set.
 
     ``directory`` must contain both repository-schema CSV files.  ``value_basis``
-    selects their consistently ordered base, low or high band.  Supplying an
-    existing ``BehaviourModel`` applies the CSV as an overlay while preserving
-    unrelated future behaviour fields.
+    selects a directionally ordered low, base or high behaviour level.  Signed
+    slope uncertainty is not mixed into these levels and must be stressed
+    separately.  Supplying an existing ``BehaviourModel`` applies the CSV as an
+    overlay while preserving unrelated future behaviour fields.
     """
     if value_basis not in _VALUE_COLUMNS:
         allowed = ", ".join(sorted(_VALUE_COLUMNS))
@@ -747,6 +844,9 @@ def load_dynamic_behaviour_assumptions(
     _validate_schedules(selected_baselines)
     coefficient_values = _coefficient_values(
         selected_coefficients, value_column)
+    _validate_baseline_output_bounds(
+        selected_baselines, coefficient_values, value_column
+    )
     shared = coefficient_values[("shared", "all")]
 
     def hazard_function(component: str, phase: str) -> DynamicHazardFunction:
@@ -805,7 +905,9 @@ def load_dynamic_behaviour_assumptions(
         if row["component"] == "income_take_up"
         and bool(row["_force_at_year"])
     ]
-    force_by_year = int(force_rows[0]["_year_from"])
+    force_by_year = (
+        int(force_rows[0]["_year_from"]) if force_rows else None
+    )
     lapse_growth = _expanded_schedule(
         selected_baselines, "lapse", "growth", value_column)
     lapse_income = _expanded_schedule(
@@ -889,6 +991,10 @@ def load_dynamic_behaviour_assumptions(
         str(row["effective_date"])
         for row in (*selected_baselines, *selected_coefficients)
     }))
+    assumption_statuses = tuple(sorted({
+        str(row["assumption_status"])
+        for row in (*selected_baselines, *selected_coefficients)
+    }))
     return DynamicBehaviourAssumptionSet(
         assumption_set_id=selected_id,
         value_basis=value_basis,
@@ -901,6 +1007,7 @@ def load_dynamic_behaviour_assumptions(
             "coefficients": sha256(coefficient_raw).hexdigest(),
         },
         effective_dates=effective_dates,
+        assumption_statuses=assumption_statuses,
         values=applied_values,
         behaviour=configured_behaviour,
     )

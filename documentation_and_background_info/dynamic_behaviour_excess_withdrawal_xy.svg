@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="460" viewBox="0 0 780 460" role="img" aria-labelledby="title desc">
+  <title id="title">Erwartete Excess-Withdrawal-Rate über der Garantie-Moneyness</title>
+  <desc id="desc">Base-Annahme. Die erwartete jährliche Excess-Withdrawal-Rate fällt mit dem Verhältnis aus Garantiebarwert und Investment Value. Ein MVA-Signal von 0,10 verschiebt die Rate zusätzlich nach unten.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .grid { stroke: #d9dee7; stroke-width: 1; }
+    .axis { stroke: #273142; stroke-width: 1.5; }
+    .tick { fill: #273142; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .label { fill: #172033; font: 15px system-ui, -apple-system, "Segoe UI", sans-serif; font-weight: 600; }
+    .note { fill: #4b5565; font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .blue { fill: none; stroke: #1769aa; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+    .orange { fill: none; stroke: #d55e00; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; stroke-dasharray: 9 5; }
+  </style>
+  <rect class="bg" width="100%" height="100%"/>
+
+  <text x="85" y="20" class="note">Base · erwarteter Anteil des aktuellen Investment Value · AUD 100.000</text>
+  <line x1="85" y1="42" x2="117" y2="42" class="blue"/>
+  <text x="125" y="46" class="tick">MVA = 0</text>
+  <line x1="215" y1="42" x2="247" y2="42" class="orange"/>
+  <text x="255" y="46" class="tick">MVA = 0,10</text>
+
+  <g transform="translate(0 25)">
+  <g>
+    <line x1="85" y1="350" x2="720" y2="350" class="grid"/>
+    <line x1="85" y1="271.3" x2="720" y2="271.3" class="grid"/>
+    <line x1="85" y1="192.5" x2="720" y2="192.5" class="grid"/>
+    <line x1="85" y1="113.8" x2="720" y2="113.8" class="grid"/>
+    <line x1="85" y1="35" x2="720" y2="35" class="grid"/>
+    <line x1="85" y1="35" x2="85" y2="350" class="axis"/>
+    <line x1="85" y1="350" x2="720" y2="350" class="axis"/>
+  </g>
+
+  <g text-anchor="end">
+    <text x="75" y="355" class="tick">0 %</text>
+    <text x="75" y="276.3" class="tick">0,2 %</text>
+    <text x="75" y="197.5" class="tick">0,4 %</text>
+    <text x="75" y="118.8" class="tick">0,6 %</text>
+    <text x="75" y="40" class="tick">0,8 %</text>
+  </g>
+  <g text-anchor="middle">
+    <line x1="85" y1="350" x2="85" y2="356" class="axis"/>
+    <line x1="296.7" y1="350" x2="296.7" y2="356" class="axis"/>
+    <line x1="508.3" y1="350" x2="508.3" y2="356" class="axis"/>
+    <line x1="720" y1="350" x2="720" y2="356" class="axis"/>
+    <text x="85" y="376" class="tick">0,5</text>
+    <text x="296.7" y="376" class="tick">1,0</text>
+    <text x="508.3" y="376" class="tick">1,5</text>
+    <text x="720" y="376" class="tick">2,0</text>
+  </g>
+
+  <polyline class="blue" points="85.0,72.2 106.2,85.0 127.3,96.2 148.5,106.1 169.7,114.9 190.8,122.8 212.0,130.0 233.2,136.5 254.3,142.5 275.5,148.0 296.7,153.1 317.8,157.8 339.0,162.2 360.2,166.4 381.3,170.2 402.5,173.8 423.7,177.2 444.8,180.4 466.0,183.5 487.2,186.4 508.3,189.1 529.5,191.7 550.7,194.2 571.8,196.6 593.0,198.8 614.2,201.0 635.3,203.1 656.5,205.1 677.7,207.0 698.8,208.8 720.0,210.6"/>
+  <polyline class="orange" points="85.0,122.2 106.2,132.8 127.3,142.0 148.5,150.1 169.7,157.3 190.8,163.8 212.0,169.7 233.2,175.1 254.3,180.0 275.5,184.5 296.7,188.7 317.8,192.5 339.0,196.1 360.2,199.5 381.3,202.7 402.5,205.6 423.7,208.4 444.8,211.1 466.0,213.6 487.2,215.9 508.3,218.2 529.5,220.3 550.7,222.3 571.8,224.3 593.0,226.1 614.2,227.9 635.3,229.6 656.5,231.3 677.7,232.8 698.8,234.3 720.0,235.8"/>
+
+  <text x="402.5" y="407" text-anchor="middle" class="label">Garantie-Moneyness G / A</text>
+  <text x="21" y="192.5" text-anchor="middle" transform="rotate(-90 21 192.5)" class="label">Erwartete Excess-Rate p.a.</text>
+  </g>
+</svg>

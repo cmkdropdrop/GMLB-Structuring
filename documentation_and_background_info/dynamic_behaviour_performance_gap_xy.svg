@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="460" viewBox="0 0 780 460" role="img" aria-labelledby="title desc">
+  <title id="title">Income-Lapse-Wahrscheinlichkeit über dem sichtbaren Crediting-Gap</title>
+  <desc id="desc">Base-Annahme für drei Garantie-Moneyness-Niveaus. Bis zum Deadband von 0,02 bleibt der Performance-Hazard null. Danach steigt die Gesamtwahrscheinlichkeit und sättigt, wenn der effektive Gap den Clip von 0,30 erreicht. Eine wertvollere Garantie bewirkt stärkere Retention.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .grid { stroke: #d9dee7; stroke-width: 1; }
+    .axis { stroke: #273142; stroke-width: 1.5; }
+    .guide { stroke: #7b8494; stroke-width: 1.25; stroke-dasharray: 5 4; }
+    .tick { fill: #273142; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .label { fill: #172033; font: 15px system-ui, -apple-system, "Segoe UI", sans-serif; font-weight: 600; }
+    .note { fill: #4b5565; font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .blue { fill: none; stroke: #1769aa; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+    .orange { fill: none; stroke: #d55e00; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; stroke-dasharray: 9 5; }
+    .green { fill: none; stroke: #2b8a3e; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; stroke-dasharray: 2 4; }
+  </style>
+  <rect class="bg" width="100%" height="100%"/>
+
+  <text x="85" y="20" class="note">Base · Gesamtwahrscheinlichkeit aus Ordinary plus Performance Cause</text>
+  <line x1="85" y1="42" x2="113" y2="42" class="blue"/>
+  <text x="120" y="46" class="tick">G/A = 0,5</text>
+  <line x1="205" y1="42" x2="233" y2="42" class="orange"/>
+  <text x="240" y="46" class="tick">G/A = 1,0</text>
+  <line x1="325" y1="42" x2="353" y2="42" class="green"/>
+  <text x="360" y="46" class="tick">G/A = 2,0</text>
+
+  <g transform="translate(0 25)">
+  <g>
+    <line x1="85" y1="350" x2="720" y2="350" class="grid"/>
+    <line x1="85" y1="287" x2="720" y2="287" class="grid"/>
+    <line x1="85" y1="224" x2="720" y2="224" class="grid"/>
+    <line x1="85" y1="161" x2="720" y2="161" class="grid"/>
+    <line x1="85" y1="98" x2="720" y2="98" class="grid"/>
+    <line x1="85" y1="35" x2="720" y2="35" class="grid"/>
+    <line x1="85" y1="35" x2="85" y2="350" class="axis"/>
+    <line x1="85" y1="350" x2="720" y2="350" class="axis"/>
+    <line x1="116.8" y1="35" x2="116.8" y2="350" class="guide"/>
+    <line x1="593" y1="35" x2="593" y2="350" class="guide"/>
+  </g>
+
+  <g text-anchor="end">
+    <text x="75" y="355" class="tick">0 %</text>
+    <text x="75" y="292" class="tick">2 %</text>
+    <text x="75" y="229" class="tick">4 %</text>
+    <text x="75" y="166" class="tick">6 %</text>
+    <text x="75" y="103" class="tick">8 %</text>
+    <text x="75" y="40" class="tick">10 %</text>
+  </g>
+  <g text-anchor="middle">
+    <line x1="85" y1="350" x2="85" y2="356" class="axis"/>
+    <line x1="116.8" y1="350" x2="116.8" y2="356" class="axis"/>
+    <line x1="243.8" y1="350" x2="243.8" y2="356" class="axis"/>
+    <line x1="402.5" y1="350" x2="402.5" y2="356" class="axis"/>
+    <line x1="561.3" y1="350" x2="561.3" y2="356" class="axis"/>
+    <line x1="720" y1="350" x2="720" y2="356" class="axis"/>
+    <text x="85" y="376" class="tick">0</text>
+    <text x="116.8" y="376" class="tick">0,02</text>
+    <text x="243.8" y="376" class="tick">0,10</text>
+    <text x="402.5" y="376" class="tick">0,20</text>
+    <text x="561.3" y="376" class="tick">0,30</text>
+    <text x="720" y="376" class="tick">0,40</text>
+  </g>
+
+  <polyline class="blue" points="85.0,305.7 100.9,305.7 116.8,305.7 132.6,276.6 148.5,251.2 164.4,228.9 180.2,209.4 196.1,192.3 212.0,177.3 227.9,164.1 243.8,152.5 259.6,142.3 275.5,133.4 291.4,125.5 307.2,118.5 323.1,112.4 339.0,107.0 354.9,102.3 370.8,98.1 386.6,94.4 402.5,91.2 418.4,88.3 434.2,85.8 450.1,83.5 466.0,81.6 481.9,79.8 497.8,78.3 513.6,77.0 529.5,75.8 545.4,74.7 561.2,73.8 577.1,73.0 593.0,72.3 608.9,72.3 624.8,72.3 640.6,72.3 656.5,72.3 672.4,72.3 688.2,72.3 704.1,72.3 720.0,72.3"/>
+  <polyline class="orange" points="85.0,334.2 100.9,334.2 116.8,334.2 132.6,304.9 148.5,279.3 164.4,256.8 180.2,237.1 196.1,219.9 212.0,204.7 227.9,191.4 243.8,179.7 259.6,169.4 275.5,160.4 291.4,152.4 307.2,145.4 323.1,139.2 339.0,133.8 354.9,129.0 370.8,124.8 386.6,121.1 402.5,117.8 418.4,114.9 434.2,112.3 450.1,110.1 466.0,108.1 481.9,106.4 497.8,104.8 513.6,103.5 529.5,102.3 545.4,101.2 561.2,100.3 577.1,99.5 593.0,98.7 608.9,98.7 624.8,98.7 640.6,98.7 656.5,98.7 672.4,98.7 688.2,98.7 704.1,98.7 720.0,98.7"/>
+  <polyline class="green" points="85.0,344.4 100.9,344.4 116.8,344.4 132.6,334.0 148.5,324.8 164.4,316.7 180.2,309.6 196.1,303.4 212.0,297.8 227.9,293.0 243.8,288.7 259.6,284.9 275.5,281.6 291.4,278.7 307.2,276.1 323.1,273.8 339.0,271.8 354.9,270.0 370.8,268.5 386.6,267.1 402.5,265.9 418.4,264.8 434.2,263.8 450.1,263.0 466.0,262.3 481.9,261.6 497.8,261.0 513.6,260.5 529.5,260.1 545.4,259.7 561.2,259.3 577.1,259.0 593.0,258.8 608.9,258.8 624.8,258.8 640.6,258.8 656.5,258.8 672.4,258.8 688.2,258.8 704.1,258.8 720.0,258.8"/>
+
+  <text x="402.5" y="407" text-anchor="middle" class="label">Sichtbarer Crediting-Gap g_raw</text>
+  <text x="21" y="192.5" text-anchor="middle" transform="rotate(-90 21 192.5)" class="label">Gesamt-Income-Lapse p.a.</text>
+  <text x="123" y="48" class="note">Deadband endet</text>
+  <text x="600" y="48" class="note">Gap-Clip erreicht</text>
+  </g>
+</svg>

@@ -64,7 +64,7 @@ from calendar import isleap
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from enum import Enum
-from inspect import signature
+from inspect import Parameter, signature
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional
 
@@ -2069,6 +2069,21 @@ def _build_decrements(policy: PolicySpec, mortality: MortalityTable,
 # Main projection
 # ---------------------------------------------------------------------------
 
+def _annual_take_up_uniforms(
+    seed: int,
+    n_paths: int,
+    n_years: int,
+) -> Array:
+    """Return horizon-stable take-up uniforms indexed by path and year.
+
+    Draw policy years on the leading RNG axis before transposing to the
+    projector's ``(path, year)`` layout.  Extending ``n_years`` therefore only
+    appends draws: every existing path/year pair keeps the same uniform.  A
+    common seed still gives identical draws across product alternatives.
+    """
+    return np.random.default_rng(seed).random((n_years, n_paths)).T
+
+
 def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             scenarios: ScenarioSet,
             behaviour: BehaviourModel, mortality: MortalityTable,
@@ -2246,6 +2261,7 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     dynamic_take_up = (
         take_up.mode == "dynamic" and not policy_controlled_election
     )
+    no_scheduled_step = np.iinfo(np.int32).max
     take_up_draws = None
     if take_up.mode == "deterministic" and not policy_controlled_election:
         effective_income_start_year = policy.effective_income_start_year(product)
@@ -2254,29 +2270,37 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             policy_time_to_step(effective_income_start_year),
         )
     elif take_up.mode == "hazard" and not policy_controlled_election:
-        rng = np.random.default_rng(config.take_up_seed)
-        income_step = np.full(n_paths, int(take_up.force_by_year) * STEPS_PER_YEAR)
-        u = rng.random((n_paths, take_up.force_by_year + 1))
-        for y in range(1, take_up.force_by_year):
+        last_projection_year = int(np.ceil(n_steps / STEPS_PER_YEAR))
+        income_step = np.full(
+            n_paths, no_scheduled_step, dtype=np.int64
+        )
+        u = _annual_take_up_uniforms(
+            config.take_up_seed,
+            n_paths,
+            last_projection_year + 1,
+        )
+        for y in range(1, last_projection_year + 1):
             p = take_up.probability(y)
-            newly = (income_step == take_up.force_by_year * STEPS_PER_YEAR) & (u[:, y] < p)
+            newly = (income_step == no_scheduled_step) & (u[:, y] < p)
             income_step[newly] = y * STEPS_PER_YEAR
     elif dynamic_take_up:
         # Dynamic take-up is deliberately not pre-simulated at issue.  One
         # common-random-number draw per path and policy year is stored, while
         # the annual probability itself is evaluated from the market state at
         # the relevant Anniversary Date below.
-        rng = np.random.default_rng(config.take_up_seed)
-        draw_years = max(int(np.ceil(n_steps / STEPS_PER_YEAR)) + 1,
-                         int(take_up.force_by_year) + 1)
-        take_up_draws = rng.random((n_paths, draw_years))
-        income_step = np.full(n_paths, np.iinfo(np.int32).max, dtype=np.int64)
+        draw_years = int(np.ceil(n_steps / STEPS_PER_YEAR)) + 1
+        take_up_draws = _annual_take_up_uniforms(
+            config.take_up_seed,
+            n_paths,
+            draw_years,
+        )
+        income_step = np.full(n_paths, no_scheduled_step, dtype=np.int64)
     else:
         # A Policy-controlled Election has no model-point scheduled date.  The
         # object is queried only at eligible Anniversaries below.  Missing,
         # malformed or unstable voluntary decisions are hard errors; only a
         # valid WAIT decision can defer to a later contractual force.
-        income_step = np.full(n_paths, np.iinfo(np.int32).max, dtype=np.int64)
+        income_step = np.full(n_paths, no_scheduled_step, dtype=np.int64)
 
     min_income_step = product.min_years_before_income * STEPS_PER_YEAR
     income_step = np.maximum(income_step, min_income_step)
@@ -2294,7 +2318,6 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     )
     income_step = np.minimum(income_step, age_100_force_step)
 
-    no_scheduled_step = np.iinfo(np.int32).max
     if policy.age_pension_plus:
         if policy.funding_source == FundingSource.NON_SUPERANNUATION:
             # Non-super APS commences at the earlier of income commencement
@@ -2922,11 +2945,10 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         )
 
     def wd_dynamic_rates(step: int, t: float) -> tuple[Array, Array]:
-        """Expected free and excess withdrawal rates for the current year.
+        """Expected free and excess withdrawal rates for the current step.
 
         The fractional-logit responses use current guarantee moneyness, the
-        gross paid premium and the current MVA bite.  They are evaluated at
-        anniversaries (and an income election) and then held within the year.
+        gross paid premium and, for excess withdrawals, the current MVA bite.
         """
         wb = behaviour.withdrawals
         if not behaviour.use_dynamic_withdrawals:
@@ -2935,19 +2957,22 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         log_mny = guarantee_log_moneyness(step, t, iv)
         mva_signal = current_mva_signal(step, t)
         dwp = behaviour.dynamic_withdrawals
+        # The contractual free amount is MVA-free.  Only the excess-
+        # withdrawal response may use the current MVA bite as a covariate.
         free = dwp.free_utilisation(
-            wb.free_utilisation, log_mny, gross_premium, mva_signal)
+            wb.free_utilisation, log_mny, gross_premium, 0.0)
         excess = dwp.excess_rate(
             wb.excess_rate, log_mny, gross_premium, mva_signal)
         return np.asarray(free, dtype=float), np.asarray(excess, dtype=float)
 
     free_utilisation, excess_rate = wd_dynamic_rates(0, 0.0)
-    # Income-phase lapse probabilities are evaluated at anniversaries (and at
-    # election) and held constant within the policy year.  The base assumption
-    # remains annual until after dynamic scaling.
-    income_lapse_prob = np.full(
-        n_paths, 1.0 - (1.0 - dec.lapse_income_a) ** (1.0 / STEPS_PER_YEAR))
-    income_lapse_ordinary_prob = income_lapse_prob.copy()
+    # Initial values are replaced at every monthly Full-Withdrawal boundary.
+    # The annual base assumption is dynamically scaled from current state and
+    # only then converted to mutually exclusive monthly cause probabilities.
+    income_lapse_ordinary_prob = np.full(
+        n_paths,
+        1.0 - (1.0 - dec.lapse_income_a) ** (1.0 / STEPS_PER_YEAR),
+    )
     income_lapse_performance_prob = np.zeros(n_paths)
 
     def reference_customer_package_value(step: int) -> Array:
@@ -3073,14 +3098,6 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         # No arrears are carried after a contractual deduction event.
         fee_product_accrued = np.zeros(n_paths)
         fee_lip_accrued = np.zeros(n_paths)
-
-    def income_lapse_probability_at(step: int, t: float,
-                                    surrender_value: Array) -> Array:
-        """Monthly income-phase lapse probability at a reset point."""
-        ordinary, performance = income_lapse_cause_probabilities_at(
-            step, t, surrender_value
-        )
-        return ordinary + performance
 
     def income_lapse_cause_probabilities_at(
         step: int,
@@ -3337,6 +3354,17 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         """
         method = behaviour.dynamic_take_up.probability
         try:
+            parameters = signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        supports_state = (
+            "account_value" in parameters
+            or any(
+                parameter.kind == Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        )
+        if supports_state:
             value = method(
                 base_probability,
                 context.guarantee_log_moneyness,
@@ -3349,11 +3377,10 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 previous_credited_return=context.previous_credited_return,
                 performance_gap=context.performance_gap,
             )
-        except TypeError:
-            # Compatibility with extension callables whose signature cannot be
-            # inspected reliably.  This is the historical, fully current-state
-            # API; model/configuration errors outside this compatibility case
-            # continue to be validated by the Behaviour object itself.
+        else:
+            # Extension callables with the historical three-argument API are
+            # still supported, but a TypeError raised inside a rich callable
+            # is no longer swallowed as an accidental compatibility fallback.
             value = method(
                 base_probability,
                 context.guarantee_log_moneyness,
@@ -3414,9 +3441,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             zero_b = np.zeros(n_paths, dtype=bool)
             return zero_b, np.zeros(n_paths), eligible.astype(float), zero_b
 
-        # These are contractual product gates.  The Behaviour CSV's year-15
-        # p=1 band remains a behavioural probability-one decision and is not
-        # reported as a forced start.
+        # These are the only contractual forced starts.  An optional legacy
+        # Behaviour ``force_by_year`` remains a behavioural probability-one
+        # event and is deliberately not reported in the forced-event ledger.
         forced = eligible & (
             (step >= age_100_force_step)
             | (step >= aps_auto_income_step)
@@ -3454,7 +3481,6 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         nonlocal phase, income_annual, iv_frame
         nonlocal free_utilisation, excess_rate
         nonlocal joint_surv_primary, joint_surv_spouse, joint_income_cover
-        nonlocal income_lapse_prob
         nonlocal income_lapse_ordinary_prob, income_lapse_performance_prob
 
         if not elect.any():
@@ -3488,9 +3514,6 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         )
         income_lapse_performance_prob = np.where(
             income_mask, election_performance, income_lapse_performance_prob
-        )
-        income_lapse_prob = (
-            income_lapse_ordinary_prob + income_lapse_performance_prob
         )
 
     # APS may already commence at issue (for example a non-super policy whose
@@ -3646,10 +3669,13 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             previous_reference_return = np.asarray(
                 fund_ratio - 1.0, dtype=float).copy()
             previous_credited_return = np.asarray(credit, dtype=float).copy()
-            # Johansson-style performance-disappointment signal.  Both
-            # quantities are customer-observable returns for the period just
-            # ended; insurer backing assets and hedge P&L are deliberately not
-            # used.  The hazard function applies the versioned CSV clip.
+            # Customer-visible log gap between the complete Reference Fund
+            # and the credited factor for the period just ended.  Under Total
+            # Protection it is positive principally when the Reference-Fund
+            # return exceeds the contractual cap.  Insurer backing assets and
+            # hedge P&L are deliberately excluded.  The governed Base and High
+            # bases activate the uncalibrated excess-hazard proxy; Low disables
+            # it.
             performance_shortfall = np.maximum(
                 np.log(np.maximum(fund_ratio, 1.0e-300))
                 - np.log1p(np.maximum(credit, -1.0 + 1.0e-15)),
@@ -3679,14 +3705,14 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 # Only the explicit uncapped hedge retains performance above
                 # the customer's cap.  It has already incurred the higher
                 # long-call fair premium at the start of this crediting year.
-                excess_rate = np.asarray(retained_excess_return(
+                retained_rate = np.asarray(retained_excess_return(
                     previous_reference_return,
                     reference_spec.cap(year_idx),
                     config.hedge_cap_leg_mode,
                 ))
                 gain = w * np.where(
                     growth | income,
-                    iv_frame * excess_rate,
+                    iv_frame * retained_rate,
                     0.0,
                 )
                 cfs["hedge_gain"][:, step] += gain
@@ -4095,6 +4121,11 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         # ---- scheduled partial withdrawals -------------------------------- #
         wb = behaviour.withdrawals
         wd_scheduled = wb.free_utilisation > 0.0 or wb.excess_rate > 0.0
+        # Evaluate at the actual action boundary.  In annual mode this is
+        # deliberately after the regular Income payment, just like the amount
+        # and contractual eligibility checks applied below.
+        if wb.frequency == "monthly" or is_anniv:
+            free_utilisation, excess_rate = wd_dynamic_rates(step, float(t))
         if income_action_policy is None:
             # Keep the historical Static/Dynamic path byte-for-byte isolated
             # from the new optimal-action branch.
@@ -4139,7 +4170,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 free_utilisation=np.where(
                     growth_mask, free_utilisation, 0.0
                 ),
-                excess_rate=np.where(growth_mask, excess_rate, 0.0),
+                excess_rate=np.where(
+                    growth_mask, excess_rate, 0.0
+                ),
             )
 
         income_action_full_mask = np.zeros(n_paths, dtype=bool)
@@ -4217,33 +4250,26 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             growth_performance_prob = np.asarray(
                 growth_performance_prob, dtype=float
             )
-            growth_lapse_prob = growth_ordinary_prob + growth_performance_prob
             i_mask = phase == Phase.INCOME.value
-            if i_mask.any() and is_anniv:
-                anniversary_ordinary, anniversary_performance = (
+            if i_mask.any():
+                current_ordinary, current_performance = (
                     income_lapse_cause_probabilities_at(step, t, sv)
                 )
                 income_lapse_ordinary_prob = np.where(
-                    i_mask, anniversary_ordinary, income_lapse_ordinary_prob
+                    i_mask, current_ordinary, income_lapse_ordinary_prob
                 )
                 income_lapse_performance_prob = np.where(
                     i_mask,
-                    anniversary_performance,
+                    current_performance,
                     income_lapse_performance_prob,
-                )
-                income_lapse_prob = (
-                    income_lapse_ordinary_prob
-                    + income_lapse_performance_prob
                 )
         else:
             growth_ordinary_prob = np.full(n_paths, static_growth_lapse)
             growth_performance_prob = np.zeros(n_paths)
-            growth_lapse_prob = growth_ordinary_prob
-            income_lapse_prob = np.full(
+            income_lapse_ordinary_prob = np.full(
                 n_paths,
                 1.0 - (1.0 - dec.lapse_income_a) ** (1.0 / STEPS_PER_YEAR),
             )
-            income_lapse_ordinary_prob = income_lapse_prob.copy()
             income_lapse_performance_prob = np.zeros(n_paths)
         ordinary_lapse = np.where(
             phase == Phase.INCOME.value, income_lapse_ordinary_prob,

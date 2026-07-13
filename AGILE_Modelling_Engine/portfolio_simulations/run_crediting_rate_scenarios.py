@@ -24,8 +24,16 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 if __package__:
+    from ._mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from ._run_logging import log_to_console
 else:
+    from _mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from _run_logging import log_to_console
 
 
@@ -58,6 +66,10 @@ def _parse_rate(text: str) -> float:
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    mc_inputs = load_mc_analysis_inputs()
+    evaluation_input = require_mc_samples(
+        mc_inputs, "evaluation", 1
+    )[0]
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -76,8 +88,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_BASELINE_RATE,
         help="comparison baseline; it is added to the run list if necessary",
     )
-    parser.add_argument("--n-paths", type=int, default=2_000)
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--n-paths", type=int, default=evaluation_input.n_paths
+    )
+    parser.add_argument(
+        "--seed", type=int, default=evaluation_input.market_seed
+    )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--hedge-cap-leg-mode",

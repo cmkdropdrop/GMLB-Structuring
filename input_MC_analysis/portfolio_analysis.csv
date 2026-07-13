@@ -1,0 +1,6 @@
+sample_role,seed_set,n_paths,market_seed,take_up_seed,mortality_seed,description
+evaluation,1,2000,2026,97,197,Common out-of-sample evaluation paths for Dynamic and LSMC
+lsmc_training,1,4000,12026,10097,10197,Primary LSMC training sample
+lsmc_training,2,4000,32026,30097,30197,Second optional LSMC training sample
+lsmc_training,3,4000,42026,40097,40197,Third optional LSMC training sample
+lsmc_validation,1,2000,22026,20097,20197,Held-out LSMC validation sample

@@ -18,14 +18,16 @@ toc-title: Inhaltsverzeichnis
 > Kapital-, Hedge- oder Produktfreigabe. Nicht veröffentlichte Allianz-
 > Adminformeln werden nicht als bekannt vorausgesetzt.
 
-> **Aktueller Behaviour-Stand (12. Juli 2026).** Für Policy Behaviour ist
-> [Policy_Behaviour_Modellierung.md](documentation_and_background_info/Policy_Behaviour_Modellierung.md)
-> maßgeblich. Der produktive Pfad lädt dynamische Lapse-, Income-Take-up- und
-> Withdrawal-Annahmen aus `input_dynamic_behaviour`; jede Reaktion verwendet
-> Markt-/Moneyness-Zustand und die eingezahlte Bruttoprämie. LSMC bleibt als
-> Quellcode archiviert, ist aber aus API, CLI und allen verwendeten Modellpfaden
-> ausgeklammert. Abweichende LSMC- oder statische Behaviour-Passagen weiter
-> unten beschreiben einen historischen Implementierungsstand.
+> **Aktueller Behaviour-Stand (13. Juli 2026).** Für das statistische Dynamic-
+> Behaviour ist die
+> [fachliche Erklärung der dynamischen Verhaltensfunktionen](documentation_and_background_info/Policy_Behaviour_Modellierung.md)
+> der Einstieg. Das
+> [`input_dynamic_behaviour/README.md`](input_dynamic_behaviour/README.md)
+> und die dort versionierten CSVs sind die exakte technische Parameterquelle.
+> Das getrennte Optimal-Behaviour-/LSMC-Modell ist kein statistisches
+> Behaviour-Regime und wird über seinen eigenen Runner validiert. Bei
+> Abweichungen haben diese Spezialquellen Vorrang vor den kompakten Behaviour-
+> Zusammenfassungen weiter unten.
 
 # 1. Zweck und Leselogik
 

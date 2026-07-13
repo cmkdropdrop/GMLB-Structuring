@@ -78,6 +78,10 @@ ENV/
 
 # Tabular data and bibliography files
 *.csv
+!input_model_points_policyholders/model_points_policyholders_1_point_proxy.csv
+!input_dynamic_behaviour/dynamic_behaviour_baselines.csv
+!input_dynamic_behaviour/dynamic_behaviour_coefficients.csv
+!input_MC_analysis/portfolio_analysis.csv
 *.bib
 
 # Stylesheets and text files

@@ -15,6 +15,7 @@ import pytest
 from agile_engine import (
     ESGConfig,
     IndexLinkedLifetimeIncomeProduct,
+    IncomeTakeUp,
     MortalityTable,
     PolicySpec,
     ProjectionConfig,
@@ -24,7 +25,11 @@ from agile_engine import (
 from agile_engine.esg import Measure, simulate
 from agile_engine.optimal_behaviour_lsmc import no_voluntary_action_behaviour
 from agile_engine.product import Phase
-from agile_engine.projection import IncomeElectionDecisionContext, project
+from agile_engine.projection import (
+    IncomeElectionDecisionContext,
+    _annual_take_up_uniforms,
+    project,
+)
 
 
 class _StartAtEveryEligibleAnniversary:
@@ -192,6 +197,76 @@ def test_dynamic_take_up_does_not_use_model_point_start_as_realised_date():
     # date, proving that the two modes no longer share a silent override.
     assert np.all(dynamic.income_election_events[:, 12] == 0.0)
     assert np.any(deterministic.income_election_events[:, 12] > 0.0)
+
+
+def test_annual_take_up_uniforms_are_horizon_stable_and_retain_crn():
+    prefix = _annual_take_up_uniforms(seed=29, n_paths=17, n_years=4)
+    full = _annual_take_up_uniforms(seed=29, n_paths=17, n_years=9)
+    alternative = _annual_take_up_uniforms(seed=29, n_paths=17, n_years=9)
+
+    np.testing.assert_array_equal(prefix, full[:, :prefix.shape[1]])
+    np.testing.assert_array_equal(alternative, full)
+
+
+@pytest.mark.parametrize("take_up_mode", ["hazard", "dynamic"])
+def test_take_up_events_are_horizon_stable_for_prefix_rollouts(take_up_mode):
+    n_paths = 128
+    prefix_years = 3
+    base = no_voluntary_action_behaviour()
+    behaviour = replace(
+        base,
+        regime="dynamic" if take_up_mode == "dynamic" else "static",
+        take_up=IncomeTakeUp(
+            mode=take_up_mode,
+            hazard=(0.35,) * 8,
+        ),
+        dynamic_take_up=replace(
+            base.dynamic_take_up,
+            enabled=take_up_mode == "dynamic",
+        ),
+    )
+    product = IndexLinkedLifetimeIncomeProduct()
+    policy = PolicySpec(age=65, income_start_year=8)
+    mortality = MortalityTable.gompertz_makeham()
+    config = ProjectionConfig(
+        record_paths=False,
+        max_age=80.0,
+        take_up_seed=29,
+    )
+
+    full_scenarios = _scenarios(horizon=6.0, n_paths=n_paths, seed=83)
+    prefix_step_count = prefix_years * 12 + 1
+    prefix_scenarios = replace(
+        full_scenarios,
+        times=full_scenarios.times[:prefix_step_count],
+        index_levels={
+            index: values[:, :prefix_step_count]
+            for index, values in full_scenarios.index_levels.items()
+        },
+        short_rate=full_scenarios.short_rate[:, :prefix_step_count],
+        discount=full_scenarios.discount[:, :prefix_step_count],
+    )
+    prefix = project(
+        product,
+        policy,
+        prefix_scenarios,
+        behaviour,
+        mortality,
+        config=config,
+    )
+    full = project(
+        product,
+        policy,
+        full_scenarios,
+        behaviour,
+        mortality,
+        config=config,
+    )
+
+    np.testing.assert_array_equal(
+        prefix.income_election_events,
+        full.income_election_events[:, :prefix_step_count],
+    )
 
 
 def test_election_context_is_read_only_and_contains_no_future_surface():

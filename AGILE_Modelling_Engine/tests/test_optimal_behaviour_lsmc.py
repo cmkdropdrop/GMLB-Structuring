@@ -432,6 +432,39 @@ def test_legacy_lsmc_failed_cross_fits_fall_back_to_continue(monkeypatch):
     )
 
 
+def test_full_only_sparse_month_uses_explicit_conservative_continue_model():
+    context = _synthetic_income_action_context(n_paths=4, step=540)
+    settings = OptimalBehaviourLSMCSettings(allow_partial_withdrawal=False)
+    regression = (
+        optimal_behaviour_module._conservative_continue_advantage_regression(
+            raw_feature_count=len(INCOME_ACTION_FEATURE_NAMES),
+            premium=100_000.0,
+        )
+    )
+    policy = OptimalBehaviourPolicy(
+        election_regressions={},
+        surrender_policy=OptimalSurrenderPolicy(
+            regressions={}, settings=settings
+        ),
+        premium=100_000.0,
+        issue_age=65.0,
+        settings=settings,
+        income_action_regressions={
+            context.step: optimal_behaviour_module.IncomeActionRegressionSet(
+                full_withdrawal_advantage=regression,
+            )
+        },
+    )
+
+    decision = policy.choose_income_action(context=context)
+
+    assert np.all(decision.action_type == IncomeActionType.CONTINUE.value)
+    assert np.all(decision.partial_fraction_of_max == 0.0)
+    assert regression.basis_level == (
+        "conservative_continue_insufficient_sample"
+    )
+
+
 def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issue():
     _, training = _setup(n_paths=384, seed=1101, horizon=4.0)
     _, evaluation = _setup(n_paths=384, seed=2202, horizon=4.0)

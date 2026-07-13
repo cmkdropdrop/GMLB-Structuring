@@ -23,6 +23,18 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 
+if __package__:
+    from ._mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
+else:
+    from _mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
+
+
 ENGINE_ROOT = Path(__file__).resolve().parents[1]
 if str(ENGINE_ROOT) not in sys.path:
     sys.path.insert(0, str(ENGINE_ROOT))
@@ -190,6 +202,10 @@ def _configure_logging(
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    mc_inputs = load_mc_analysis_inputs()
+    evaluation_input = require_mc_samples(
+        mc_inputs, "evaluation", 1
+    )[0]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-points",
@@ -231,8 +247,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_MODEL_PARAMETERS_PATH,
         help="repository market-model-parameter CSV",
     )
-    parser.add_argument("--n-paths", type=int, default=2_000)
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--n-paths", type=int, default=evaluation_input.n_paths
+    )
+    parser.add_argument(
+        "--seed", type=int, default=evaluation_input.market_seed
+    )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--hedge-cap-leg-mode",
@@ -266,13 +286,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--take-up-seed",
         type=int,
-        default=97,
+        default=evaluation_input.take_up_seed,
         help="independent common-random-number seed for Dynamic Election",
     )
     parser.add_argument(
         "--mortality-seed",
         type=int,
-        default=197,
+        default=evaluation_input.mortality_seed,
         help=(
             "independent common-random-number life-status seed for pathwise "
             "Joint-Life states in every portfolio Behaviour arm"
@@ -1478,7 +1498,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "decisions;state_dependent_actions_when_enabled"
                 ),
                 "income_lapse_after_account_value_exhaustion": (
-                    "remains_active_while_income_guarantee_is_in_force"
+                    "blocked_when_surrender_value_is_exhausted_and_positive_"
+                    "income_guarantee_remains"
                     if args.post_income_behaviour == "dynamic"
                     else "disabled_continue_benchmark"
                 ),
@@ -1498,7 +1519,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "income_election_decision_grid": "policy_anniversaries_only",
                 "post_income_action_set": (
-                    ["continue", "statistical_full_withdrawal"]
+                    [
+                        "continue",
+                        "statistical_partial_excess_withdrawal",
+                        "statistical_full_withdrawal",
+                    ]
                     if args.post_income_behaviour == "dynamic"
                     else ["continue"]
                 ),

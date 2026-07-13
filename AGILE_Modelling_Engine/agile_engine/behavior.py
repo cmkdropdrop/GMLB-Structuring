@@ -111,18 +111,36 @@ class DynamicHazardFunction:
                     self.log_premium_min, self.log_premium_max)
         return m, z, mva
 
-    def multiplier(self, log_moneyness, premium,
-                   mva_signal=0.0) -> float | Array:
+    def log_multiplier(self, log_moneyness, premium,
+                       mva_signal=0.0) -> float | Array:
+        """Uncapped log relative hazard for the supplied state."""
         m, z, mva = self._signals(log_moneyness, premium, mva_signal)
         eta = (self.beta_moneyness * m
                + self.beta_log_premium * z
                + self.beta_interaction * m * z
                + self.beta_mva * mva)
+        return _scalar_or_array(
+            np.asarray(eta, dtype=float),
+            log_moneyness,
+            premium,
+            mva_signal,
+        )
+
+    def multiplier(self, log_moneyness, premium,
+                   mva_signal=0.0) -> float | Array:
+        eta = np.asarray(
+            self.log_multiplier(log_moneyness, premium, mva_signal),
+            dtype=float,
+        )
         relative_hazard = np.exp(np.clip(eta, -50.0, 50.0))
-        relative_hazard = np.clip(relative_hazard,
-                                  self.multiplier_floor,
-                                  self.multiplier_cap)
-        return _scalar_or_array(relative_hazard, log_moneyness, premium, mva_signal)
+        relative_hazard = np.clip(
+            relative_hazard,
+            self.multiplier_floor,
+            self.multiplier_cap,
+        )
+        return _scalar_or_array(
+            relative_hazard, log_moneyness, premium, mva_signal
+        )
 
     def annual_probability(self, base_probability, log_moneyness, premium,
                            mva_signal=0.0) -> float | Array:
@@ -157,21 +175,24 @@ class DynamicHazardFunction:
 
 @dataclass(frozen=True)
 class PerformanceLapseFunction:
-    """Cause-specific excess hazard from visible credited underperformance.
+    """Cause-specific stress hazard from a customer-visible crediting gap.
 
-    ``g`` is the positive trailing log-return gap after a deadband.  The raw
-    disappointment hazard rises smoothly towards ``excess_hazard_cap``.  A
-    valuable guarantee applies a separate retention gate, but the performance
-    cause is never constrained to be a multiple of the small ordinary lapse
-    baseline:
+    ``g`` is the positive trailing log gap between the Reference-Fund factor
+    and the credited factor after a deadband.  For the supplied Total-
+    Protection design it is therefore principally a cap-shortfall signal, not
+    a general measure of poor market performance.  The raw stress hazard rises
+    smoothly towards ``excess_hazard_cap``.  A valuable guarantee applies a
+    separate retention gate, but the performance cause is never constrained to
+    be a multiple of the small ordinary lapse baseline:
 
         r(m)     = max(retention_floor, exp(-retention_gamma * max(m, 0)))
         mu_gap   = r(m) * mu_max * (1 - exp(-g / scale))
 
     This is deliberately an uncalibrated competing-risk proxy.  It prevents
-    guarantee moneyness and performance disappointment from cancelling inside
-    one linear predictor while preserving rational retention for valuable
-    guarantees.
+    guarantee moneyness and the cap-shortfall signal from cancelling inside one
+    linear predictor while preserving rational retention for valuable
+    guarantees.  The supplied central assumption set activates it explicitly;
+    that choice is a model-risk convention, not an experience calibration.
     """
 
     retention_gamma: float = 1.50
@@ -295,6 +316,8 @@ class FractionalLogitFunction:
             raise ValueError("Fractional-logit inputs must be finite.")
         if np.any(p <= 0.0):
             raise ValueError("Gross premium must be positive.")
+        if np.any((mva < 0.0) | (mva > 1.0)):
+            raise ValueError("MVA signal must lie in [0, 1].")
         m = np.clip(m, self.log_moneyness_min, self.log_moneyness_max)
         if self.moneyness_transform == "positive_part":
             m = np.maximum(m, 0.0)
@@ -348,6 +371,10 @@ class LapseAssumptions:
         object.__setattr__(self, "growth_phase", growth)
 
     def growth_rate(self, policy_year: int) -> float:
+        if isinstance(policy_year, bool) \
+                or not isinstance(policy_year, (int, np.integer)) \
+                or policy_year < 1:
+            raise ValueError("policy_year must be a positive integer.")
         seq = list(self.growth_phase)
         return float(seq[min(policy_year - 1, len(seq) - 1)]) if seq else 0.0
 
@@ -355,7 +382,7 @@ class LapseAssumptions:
 def _default_growth_lapse_function() -> DynamicHazardFunction:
     return DynamicHazardFunction(
         beta_moneyness=-1.50, beta_log_premium=-0.10,
-        beta_interaction=-0.50, moneyness_transform="positive_part",
+        beta_interaction=-0.50, moneyness_transform="signed",
         annual_floor=0.0, annual_cap=0.30,
         multiplier_floor=0.20, multiplier_cap=3.0,
     )
@@ -364,7 +391,7 @@ def _default_growth_lapse_function() -> DynamicHazardFunction:
 def _default_income_lapse_function() -> DynamicHazardFunction:
     return DynamicHazardFunction(
         beta_moneyness=-1.50, beta_log_premium=-0.10,
-        beta_interaction=-0.50, moneyness_transform="positive_part",
+        beta_interaction=-0.50, moneyness_transform="signed",
         annual_floor=0.0, annual_cap=0.30,
         multiplier_floor=0.20, multiplier_cap=3.0,
     )
@@ -383,13 +410,34 @@ class DynamicLapseParams:
         if not isinstance(self.enabled, (bool, np.bool_)):
             raise ValueError("Dynamic-lapse enabled must be boolean.")
 
+    @staticmethod
+    def _static_step_probability(base_annual, dt: float, *states):
+        """Validated annual-to-step conversion when dynamics are disabled."""
+        if not np.isfinite(dt) or not 0.0 < dt <= 1.0:
+            raise ValueError("Behaviour time step must be in (0, 1].")
+        arrays = np.broadcast_arrays(
+            np.asarray(base_annual, dtype=float),
+            *(np.asarray(state, dtype=float) for state in states),
+        )
+        annual = arrays[0]
+        if not np.all(np.isfinite(annual)) or np.any(
+            (annual < 0.0) | (annual > 1.0)
+        ):
+            raise ValueError("Base hazard probabilities must lie in [0, 1].")
+        step = 1.0 - np.power(1.0 - annual, float(dt))
+        return _scalar_or_array(step, base_annual, *states)
+
     def growth_probability(self, base_annual, log_iv_over_surrender,
                            premium, dt: float,
                            performance_shortfall=0.0) -> float | Array:
         if not self.enabled:
-            annual = np.asarray(base_annual, dtype=float)
-            out = 1.0 - np.power(1.0 - annual, dt)
-            return _scalar_or_array(out, base_annual, log_iv_over_surrender, premium)
+            return self._static_step_probability(
+                base_annual,
+                dt,
+                log_iv_over_surrender,
+                premium,
+                performance_shortfall,
+            )
         return self._combined_step_probability(
             self.growth,
             base_annual,
@@ -403,10 +451,13 @@ class DynamicLapseParams:
                            premium, dt: float,
                            performance_shortfall=0.0) -> float | Array:
         if not self.enabled:
-            annual = np.asarray(base_annual, dtype=float)
-            out = 1.0 - np.power(1.0 - annual, dt)
-            return _scalar_or_array(out, base_annual,
-                                    log_guarantee_moneyness, premium)
+            return self._static_step_probability(
+                base_annual,
+                dt,
+                log_guarantee_moneyness,
+                premium,
+                performance_shortfall,
+            )
         return self._combined_step_probability(
             self.income,
             base_annual,
@@ -483,9 +534,15 @@ class DynamicLapseParams:
         )
         total_hazard = ordinary_hazard + performance_hazard
         combined_annual = -np.expm1(-total_hazard)
-        combined_annual = np.minimum(
-            combined_annual,
-            self.performance.annual_probability_cap,
+        # The cap limits only the incremental combined risk.  It must never
+        # reduce an already larger ordinary probability (in particular an
+        # exact contractual/base probability of one).
+        combined_annual = np.maximum(
+            ordinary_annual,
+            np.minimum(
+                combined_annual,
+                self.performance.annual_probability_cap,
+            ),
         )
         total_step = 1.0 - np.power(1.0 - combined_annual, float(dt))
         ordinary_step = np.divide(
@@ -494,7 +551,11 @@ class DynamicLapseParams:
             out=np.zeros_like(total_step),
             where=total_hazard > 0.0,
         )
+        ordinary_step = np.clip(ordinary_step, 0.0, total_step)
         performance_step = total_step - ordinary_step
+        certain_ordinary = ordinary_annual >= 1.0
+        ordinary_step = np.where(certain_ordinary, 1.0, ordinary_step)
+        performance_step = np.where(certain_ordinary, 0.0, performance_step)
         ordinary_out = _scalar_or_array(
             ordinary_step,
             base_annual,
@@ -521,15 +582,22 @@ class DynamicLapseParams:
     ) -> tuple[float | Array, float | Array]:
         """Ordinary and performance cause probabilities for diagnostics."""
         if not self.enabled:
-            annual = np.asarray(base_annual, dtype=float)
-            ordinary = 1.0 - np.power(1.0 - annual, dt)
-            zero = np.zeros_like(ordinary)
+            ordinary = self._static_step_probability(
+                base_annual,
+                dt,
+                log_guarantee_moneyness,
+                premium,
+                performance_shortfall,
+            )
+            zero = np.zeros_like(np.asarray(ordinary, dtype=float))
             return (
+                ordinary,
                 _scalar_or_array(
-                    ordinary, base_annual, log_guarantee_moneyness, premium
-                ),
-                _scalar_or_array(
-                    zero, base_annual, log_guarantee_moneyness, premium
+                    zero,
+                    base_annual,
+                    log_guarantee_moneyness,
+                    premium,
+                    performance_shortfall,
                 ),
             )
         return self._cause_step_probabilities(
@@ -551,15 +619,22 @@ class DynamicLapseParams:
     ) -> tuple[float | Array, float | Array]:
         """Ordinary and performance cause probabilities for diagnostics."""
         if not self.enabled:
-            annual = np.asarray(base_annual, dtype=float)
-            ordinary = 1.0 - np.power(1.0 - annual, dt)
-            zero = np.zeros_like(ordinary)
+            ordinary = self._static_step_probability(
+                base_annual,
+                dt,
+                log_iv_over_surrender,
+                premium,
+                performance_shortfall,
+            )
+            zero = np.zeros_like(np.asarray(ordinary, dtype=float))
             return (
+                ordinary,
                 _scalar_or_array(
-                    ordinary, base_annual, log_iv_over_surrender, premium
-                ),
-                _scalar_or_array(
-                    zero, base_annual, log_iv_over_surrender, premium
+                    zero,
+                    base_annual,
+                    log_iv_over_surrender,
+                    premium,
+                    performance_shortfall,
                 ),
             )
         return self._cause_step_probabilities(
@@ -591,21 +666,25 @@ class IncomeTakeUp:
     which is re-evaluated from current market state and premium at each policy
     anniversary.  ``hazard`` retains the legacy market-independent draw and
     ``deterministic`` retains a fixed ``PolicySpec.income_start_year`` for
-    contract-mechanics tests.
+    contract-mechanics tests.  ``force_by_year`` is an optional legacy
+    behavioural probability-one band; contractual automatic commencement is
+    enforced separately by the projection.
     """
 
     mode: str = "deterministic"
     hazard: Sequence[float] = (0.0, 0.10, 0.15, 0.20, 0.25, 0.30, 0.30, 0.30)
-    force_by_year: int = 15
+    force_by_year: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("deterministic", "hazard", "dynamic"):
             raise ValueError(
                 "IncomeTakeUp.mode must be 'deterministic', 'hazard' or 'dynamic'.")
-        if isinstance(self.force_by_year, bool) \
-                or not isinstance(self.force_by_year, (int, np.integer)) \
-                or self.force_by_year < 1:
-            raise ValueError("force_by_year must be a positive integer.")
+        if self.force_by_year is not None and (
+            isinstance(self.force_by_year, bool)
+            or not isinstance(self.force_by_year, (int, np.integer))
+            or self.force_by_year < 1
+        ):
+            raise ValueError("force_by_year must be None or a positive integer.")
         hazard = tuple(float(x) for x in self.hazard)
         values = np.asarray(hazard, dtype=float)
         if not np.all(np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
@@ -615,7 +694,11 @@ class IncomeTakeUp:
     def probability(self, policy_year: int) -> float:
         if self.mode == "deterministic":
             raise RuntimeError("Deterministic take-up is handled by projection.")
-        if policy_year >= self.force_by_year:
+        if isinstance(policy_year, bool) \
+                or not isinstance(policy_year, (int, np.integer)) \
+                or policy_year < 1:
+            raise ValueError("policy_year must be a positive integer.")
+        if self.force_by_year is not None and policy_year >= self.force_by_year:
             return 1.0
         seq = list(self.hazard)
         return float(seq[min(policy_year - 1, len(seq) - 1)]) if seq else 0.0
@@ -683,14 +766,9 @@ class DynamicTakeUpParams:
             if prospective_annual_income is None
             else prospective_annual_income
         )
-        base_probability = np.asarray(self.function.annual_probability(
-            base_annual,
-            log_guarantee_moneyness,
-            premium,
-        ), dtype=float)
         base, m, paid, av, income, reference_return, credited_return, gap = (
             np.broadcast_arrays(
-                np.asarray(base_probability, dtype=float),
+                np.asarray(base_annual, dtype=float),
                 np.asarray(log_guarantee_moneyness, dtype=float),
                 np.asarray(premium, dtype=float),
                 np.asarray(account, dtype=float),
@@ -700,13 +778,14 @@ class DynamicTakeUpParams:
                 np.asarray(performance_gap, dtype=float),
             )
         )
-        del m  # already represented by ``base_probability`` above
         if (
-            np.any(paid <= 0.0)
+            np.any((base < 0.0) | (base > 1.0))
+            or np.any(paid <= 0.0)
             or np.any(av < 0.0)
             or np.any(income < 0.0)
             or not all(np.all(np.isfinite(value)) for value in (
-                base, paid, av, income, reference_return, credited_return, gap
+                base, m, paid, av, income,
+                reference_return, credited_return, gap,
             ))
         ):
             raise ValueError("Dynamic take-up states must be finite and non-negative where required.")
@@ -719,14 +798,22 @@ class DynamicTakeUpParams:
         reference_return = np.clip(reference_return, -1.0, 1.0)
         credited_return = np.clip(credited_return, -1.0, 1.0)
         gap = np.clip(gap, 0.0, 1.0)
-        eta = (
+        extra_eta = (
             self.beta_log_account_value * log_av
             + self.beta_prospective_income_ratio * income_ratio
             + self.beta_reference_return * reference_return
             + self.beta_credited_return * credited_return
             + self.beta_performance_gap * gap
         )
-        relative = np.exp(np.clip(eta, -50.0, 50.0))
+        core_eta = np.asarray(
+            self.function.log_multiplier(m, paid), dtype=float
+        )
+        relative = np.exp(np.clip(core_eta + extra_eta, -50.0, 50.0))
+        relative = np.clip(
+            relative,
+            self.function.multiplier_floor,
+            self.function.multiplier_cap,
+        )
         safe_base = np.minimum(base, 1.0 - 1.0e-15)
         adjusted = -np.expm1(np.log1p(-safe_base) * relative)
         adjusted = np.clip(
@@ -735,9 +822,9 @@ class DynamicTakeUpParams:
             self.function.annual_cap,
         )
         adjusted = np.where(
-            np.asarray(base_annual, dtype=float) <= 0.0,
+            base <= 0.0,
             0.0,
-            np.where(np.asarray(base_annual, dtype=float) >= 1.0, 1.0, adjusted),
+            np.where(base >= 1.0, 1.0, adjusted),
         )
         return _scalar_or_array(
             np.asarray(adjusted, dtype=float),
@@ -779,16 +866,16 @@ class WithdrawalBehaviour:
 def _default_free_withdrawal_function() -> FractionalLogitFunction:
     return FractionalLogitFunction(
         beta_moneyness=0.50, beta_log_premium=-0.25,
-        beta_interaction=-0.10, beta_mva=-2.0,
+        beta_interaction=-0.10, beta_mva=0.0,
         moneyness_transform="positive_part",
     )
 
 
 def _default_excess_withdrawal_function() -> FractionalLogitFunction:
     return FractionalLogitFunction(
-        beta_moneyness=0.50, beta_log_premium=-0.25,
+        beta_moneyness=-0.50, beta_log_premium=-0.25,
         beta_interaction=-0.10, beta_mva=-2.0,
-        moneyness_transform="positive_part",
+        moneyness_transform="signed",
     )
 
 
@@ -825,8 +912,12 @@ class DynamicWithdrawalParams:
         return self.free.odds_multiplier(np.log(ratio), ref)
 
     def mva_multiplier(self, mva_factor):
-        f = np.maximum(np.asarray(mva_factor, dtype=float), 0.0)
-        return np.exp(np.clip(self.free.beta_mva * f, -50.0, 0.0))
+        """Legacy diagnostic for the active excess-withdrawal MVA effect."""
+        f = np.asarray(mva_factor, dtype=float)
+        if not np.all(np.isfinite(f)):
+            raise ValueError("MVA factors must be finite.")
+        f = np.clip(f, 0.0, 1.0)
+        return np.exp(np.clip(self.excess.beta_mva * f, -50.0, 50.0))
 
 
 @dataclass(frozen=True)
@@ -838,7 +929,7 @@ class BehaviourModel:
     defaults so isolated contractual tests need no repository file I/O.
     """
 
-    regime: str = "dynamic"                 # "static" | "dynamic"
+    regime: str = "static"                  # "static" | "dynamic"
     lapse: LapseAssumptions = field(default_factory=LapseAssumptions)
     dynamic: DynamicLapseParams = field(default_factory=DynamicLapseParams)
     take_up: IncomeTakeUp = field(default_factory=IncomeTakeUp)
@@ -903,6 +994,9 @@ class BehaviourModel:
             self,
             lapse=replace(self.lapse, income_phase=0.0),
             dynamic=replace(self.dynamic, enabled=False),
+            dynamic_withdrawals=replace(
+                self.dynamic_withdrawals, enabled=False
+            ),
             withdrawals=WithdrawalBehaviour(
                 free_utilisation=0.0,
                 excess_rate=0.0,

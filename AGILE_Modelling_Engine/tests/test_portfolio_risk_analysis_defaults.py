@@ -1,5 +1,6 @@
 """Static contracts for the portfolio-risk runner's default scope."""
 
+import csv
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from portfolio_simulations.run_portfolio_risk_analysis import (
     DEFAULT_BEHAVIOUR_MODELS,
     DEFAULT_CREDITING_CAP_RATES,
     DEFAULT_MAX_WORKERS,
+    DEFAULT_MODEL_POINTS_PATH,
     DEFAULT_RISK_SCOPE,
     DEFAULT_STRESS_SCENARIOS,
     ScenarioJob,
@@ -22,17 +24,19 @@ from portfolio_simulations.run_portfolio_risk_analysis import (
 )
 
 
-def test_reduced_default_is_one_base_cap_behaviour_analysis_only():
+def test_default_is_four_base_cap_v11_behaviour_analysis_only():
     args = parse_args([])
 
-    assert DEFAULT_CREDITING_CAP_RATES == (0.06,)
-    assert args.crediting_rates == [0.06]
+    assert DEFAULT_CREDITING_CAP_RATES == (0.04, 0.06, 0.12, 0.20)
+    assert args.crediting_rates == [0.04, 0.06, 0.12, 0.20]
     assert args.baseline_rate == 0.06
     assert DEFAULT_MAX_WORKERS == 1
     assert args.max_workers == 1
     assert args.no_stress_analysis is True
     assert args.no_plots is True
     assert args.scenario_plots is False
+    assert args.log_level == "INFO"
+    assert args.model_points == DEFAULT_MODEL_POINTS_PATH
     assert DEFAULT_RISK_SCOPE == ("lapse",)
     assert DEFAULT_STRESS_SCENARIOS == (
         "interest_up",
@@ -45,6 +49,17 @@ def test_reduced_default_is_one_base_cap_behaviour_analysis_only():
         STRESS_DEFINITIONS[stress_id]["risk_category"]
         for stress_id in DEFAULT_STRESS_SCENARIOS
     } == {"interest_rate", "longevity"}
+
+
+def test_default_uses_only_first_model_point_of_four_point_proxy():
+    with DEFAULT_MODEL_POINTS_PATH.open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert [row["model_point_id"] for row in rows] == ["ALT4-01"]
+    assert [float(row["contract_weight"]) for row in rows] == [1.0]
+    assert [float(row["premium_volume_weight"]) for row in rows] == [1.0]
 
 
 def test_full_stress_and_plot_outputs_are_explicit_opt_ins():
@@ -118,9 +133,21 @@ def test_default_commands_require_dynamic_functions_and_lsmc():
     assert DEFAULT_BEHAVIOUR_MODELS == ("dynamic_functions", "lsmc")
     assert dynamic[dynamic.index("--income-election-mode") + 1] == "dynamic"
     assert dynamic[dynamic.index("--post-income-behaviour") + 1] == "dynamic"
+    assert dynamic[dynamic.index("--model-points") + 1] == str(
+        DEFAULT_MODEL_POINTS_PATH.resolve()
+    )
     assert dynamic_benchmarks == ()
     assert "--no-dynamic-benchmark" in lsmc
     assert "--no-factorial-benchmarks" in lsmc
+    assert args.training_seed_count == 1
+    assert args.lsmc_income_action_set == "continue_full"
+    assert lsmc[lsmc.index("--training-seed-count") + 1] == "1"
+    assert lsmc[lsmc.index("--lsmc-income-action-set") + 1] == (
+        "continue_full"
+    )
+    assert lsmc[lsmc.index("--model-points") + 1] == str(
+        DEFAULT_MODEL_POINTS_PATH.resolve()
+    )
     assert lsmc[lsmc.index("--train-seed-2") + 1] == str(args.train_seed_2)
     assert lsmc[lsmc.index("--train-seed-3") + 1] == str(args.train_seed_3)
     assert len({

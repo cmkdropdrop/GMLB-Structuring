@@ -38,6 +38,13 @@ Grafikerstellung ausdrücklich abgeschaltet werden:
 python portfolio_simulations/run_portfolio_valuation.py --no-plots
 ```
 
+Pfadanzahlen und Seeds werden standardmäßig aus
+`../../input_MC_analysis/portfolio_analysis.csv` gelesen. Die Datei enthält
+getrennte Rollen für Evaluation, LSMC-Training und LSMC-Validierung. Wie viele
+der nummerierten LSMC-Trainings-Seed-Sätze tatsächlich aktiv sind, bestimmt das
+aufrufende Skript und nicht die CSV. Explizite Kommandozeilenwerte für
+Pfadanzahlen oder Seeds bleiben als Overrides verfügbar.
+
 ## Crediting-Rate-Szenarien
 
 `run_crediting_rate_scenarios.py` ruft den Portfolio-Runner für mehrere

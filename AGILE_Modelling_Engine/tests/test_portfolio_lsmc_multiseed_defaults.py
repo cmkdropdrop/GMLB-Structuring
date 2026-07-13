@@ -1,43 +1,44 @@
-"""Static CLI contracts for the three-seed optimal-behaviour runner."""
+"""Static CLI contracts for streamlined and replicated LSMC runs."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 
-from portfolio_simulations.run_portfolio_valuation_lsmc import parse_args
+from agile_engine.projection import IncomeActionType
+from portfolio_simulations.run_portfolio_valuation_lsmc import (
+    _FixedIncomeActionPolicy,
+    parse_args,
+)
 
 
-def test_lsmc_runner_declares_exactly_three_distinct_training_seed_triplets():
+def test_lsmc_runner_defaults_to_one_seed_and_continue_full_only():
     args = parse_args([])
-    triplets = (
-        (
-            args.train_seed,
-            args.train_take_up_seed,
-            args.train_mortality_seed,
-        ),
-        (
-            args.train_seed_2,
-            args.train_take_up_seed_2,
-            args.train_mortality_seed_2,
-        ),
-        (
-            args.train_seed_3,
-            args.train_take_up_seed_3,
-            args.train_mortality_seed_3,
-        ),
+
+    assert args.training_seed_count == 1
+    assert args.lsmc_income_action_set == "continue_full"
+    assert len({args.train_seed, args.validation_seed, args.seed}) == 3
+
+
+def test_fixed_full_withdrawal_benchmark_preserves_complete_action_values():
+    policy = _FixedIncomeActionPolicy("full_first")
+    context = SimpleNamespace(
+        n_paths=3,
+        full_withdrawal_eligible=np.asarray([False, True, True]),
     )
 
-    assert len(triplets) == 3
-    assert len(set(triplets)) == 3
-    assert len({item[0] for item in triplets} | {
-        args.validation_seed, args.seed,
-    }) == 5
-    assert len({item[1] for item in triplets} | {
-        args.validation_take_up_seed, args.take_up_seed,
-    }) == 5
-    assert len({item[2] for item in triplets} | {
-        args.validation_mortality_seed, args.mortality_seed,
-    }) == 5
+    decision = policy.choose_income_action(context=context)
+
+    np.testing.assert_array_equal(
+        decision.action_type,
+        np.asarray([
+            IncomeActionType.CONTINUE.value,
+            IncomeActionType.FULL_WITHDRAWAL.value,
+            IncomeActionType.FULL_WITHDRAWAL.value,
+        ]),
+    )
 
 
 @pytest.mark.parametrize(
@@ -77,3 +78,16 @@ def test_lsmc_runner_accepts_explicit_second_and_third_seed_triplets():
         args.train_take_up_seed_3,
         args.train_mortality_seed_3,
     ) == (52001, 52002, 52003)
+    assert args.training_seed_count == 3
+    assert args.lsmc_income_action_set == "continue_partial_full"
+
+
+def test_lsmc_runner_accepts_explicit_streamlined_mode_with_legacy_seed_values():
+    args = parse_args([
+        "--train-seed-2", "51001",
+        "--training-seed-count", "1",
+        "--lsmc-income-action-set", "continue_full",
+    ])
+
+    assert args.training_seed_count == 1
+    assert args.lsmc_income_action_set == "continue_full"

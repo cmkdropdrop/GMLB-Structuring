@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="430" viewBox="0 0 780 430" role="img" aria-labelledby="title desc">
+  <title id="title">Income-Election-Wahrscheinlichkeit über der Garantie-Moneyness</title>
+  <desc id="desc">Base-Annahme in Policy Year 6. Die Election-Wahrscheinlichkeit steigt mit dem Verhältnis aus Garantiebarwert und Investment Value. Ein sichtbarer Crediting-Gap von 0,10 verschiebt die Kurve nach oben. Beide Kurven erreichen den Base-Cap von 50 Prozent.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .grid { stroke: #d9dee7; stroke-width: 1; }
+    .axis { stroke: #273142; stroke-width: 1.5; }
+    .tick { fill: #273142; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .label { fill: #172033; font: 15px system-ui, -apple-system, "Segoe UI", sans-serif; font-weight: 600; }
+    .note { fill: #4b5565; font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .blue { fill: none; stroke: #1769aa; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+    .orange { fill: none; stroke: #d55e00; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; stroke-dasharray: 9 5; }
+  </style>
+  <rect class="bg" width="100%" height="100%"/>
+
+  <text x="85" y="21" class="note">Base · Policy Year 6 · Bruttoprämie AUD 100.000</text>
+  <line x1="430" y1="17" x2="462" y2="17" class="blue"/>
+  <text x="470" y="21" class="tick">Gap = 0</text>
+  <line x1="560" y1="17" x2="592" y2="17" class="orange"/>
+  <text x="600" y="21" class="tick">Gap = 0,10</text>
+
+  <g>
+    <line x1="85" y1="350" x2="720" y2="350" class="grid"/>
+    <line x1="85" y1="292.7" x2="720" y2="292.7" class="grid"/>
+    <line x1="85" y1="235.5" x2="720" y2="235.5" class="grid"/>
+    <line x1="85" y1="178.2" x2="720" y2="178.2" class="grid"/>
+    <line x1="85" y1="120.9" x2="720" y2="120.9" class="grid"/>
+    <line x1="85" y1="63.6" x2="720" y2="63.6" class="grid"/>
+    <line x1="85" y1="35" x2="85" y2="350" class="axis"/>
+    <line x1="85" y1="350" x2="720" y2="350" class="axis"/>
+  </g>
+
+  <g text-anchor="end">
+    <text x="75" y="355" class="tick">0 %</text>
+    <text x="75" y="297.7" class="tick">10 %</text>
+    <text x="75" y="240.5" class="tick">20 %</text>
+    <text x="75" y="183.2" class="tick">30 %</text>
+    <text x="75" y="125.9" class="tick">40 %</text>
+    <text x="75" y="68.6" class="tick">50 %</text>
+  </g>
+  <g text-anchor="middle">
+    <line x1="85" y1="350" x2="85" y2="356" class="axis"/>
+    <line x1="296.7" y1="350" x2="296.7" y2="356" class="axis"/>
+    <line x1="508.3" y1="350" x2="508.3" y2="356" class="axis"/>
+    <line x1="720" y1="350" x2="720" y2="356" class="axis"/>
+    <text x="85" y="376" class="tick">0,5</text>
+    <text x="296.7" y="376" class="tick">1,0</text>
+    <text x="508.3" y="376" class="tick">1,5</text>
+    <text x="720" y="376" class="tick">2,0</text>
+  </g>
+
+  <polyline class="blue" points="85.0,337.4 106.2,331.6 127.3,324.1 148.5,314.7 169.7,303.0 190.8,288.9 212.0,272.2 233.2,252.7 254.3,230.5 275.5,205.6 296.7,178.2 317.8,148.5 339.0,117.0 360.2,84.2 381.3,63.6 402.5,63.6 423.7,63.6 444.8,63.6 466.0,63.6 487.2,63.6 508.3,63.6 529.5,63.6 550.7,63.6 571.8,63.6 593.0,63.6 614.2,63.6 635.3,63.6 656.5,63.6 677.7,63.6 698.8,63.6 720.0,63.6"/>
+  <polyline class="orange" points="85.0,331.3 106.2,322.8 127.3,311.8 148.5,298.1 169.7,281.3 190.8,261.3 212.0,237.8 233.2,211.1 254.3,181.2 275.5,148.6 296.7,113.7 317.8,77.2 339.0,63.6 360.2,63.6 381.3,63.6 402.5,63.6 423.7,63.6 444.8,63.6 466.0,63.6 487.2,63.6 508.3,63.6 529.5,63.6 550.7,63.6 571.8,63.6 593.0,63.6 614.2,63.6 635.3,63.6 656.5,63.6 677.7,63.6 698.8,63.6 720.0,63.6"/>
+
+  <text x="402.5" y="407" text-anchor="middle" class="label">Garantie-Moneyness G / A</text>
+  <text x="21" y="192.5" text-anchor="middle" transform="rotate(-90 21 192.5)" class="label">Election-Wahrscheinlichkeit p.a.</text>
+  <text x="650" y="53" class="note">Base-Cap 50 %</text>
+</svg>

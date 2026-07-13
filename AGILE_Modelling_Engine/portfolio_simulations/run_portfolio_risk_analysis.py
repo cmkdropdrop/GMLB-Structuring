@@ -3,17 +3,18 @@
 For every requested scenario Maximum Return, this orchestrator calls both
 ``run_portfolio_valuation.py`` (statistical/dynamic policyholder behaviour) and
 ``run_portfolio_valuation_lsmc.py`` (annual fitted Income Election followed by
-monthly Continue/Partial/Full-Withdrawal lower-bound decisions evaluated out
-of sample).
+monthly Continue/Full-Withdrawal lower-bound decisions evaluated out of
+sample).
 Only the complete V11 policies are retained for the risk comparison: Dynamic
 Election plus Dynamic post-Election Behaviour, and optimal LSMC Election plus
 optimal monthly LSMC Income actions.  Counterfactual V00/V01/V10 Dynamic runs
 and Behaviour-effect decompositions are deliberately omitted.
 
-The deliberately reduced default is one contractual 6% Cap on the base market
-scenario with the complete Dynamic and LSMC V11 policies, but without
-counterfactual Behaviour arms, shock-and-revalue stresses or plots.  This makes
-Lapse/Behaviour the default risk scope.  Interest up,
+The default compares 4%, 6%, 12% and 15% Caps on the base market scenario with
+the complete Dynamic and LSMC V11 policies for the first model point of the
+four-point proxy, but without counterfactual Behaviour arms,
+shock-and-revalue stresses or plots.  This makes Lapse/Behaviour the default
+risk scope.  Interest up,
 interest down and Longevity remain the preselected one-factor stress set when
 stress analysis is explicitly enabled.  Other research stresses remain
 available only when explicitly selected.  The portfolio runners deliberately
@@ -47,6 +48,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,9 +56,17 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 if __package__:
+    from ._mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from ._run_layout import behaviour_benchmark_directories
     from ._run_logging import format_run_log_line, log_to_console
 else:
+    from _mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
     from _run_layout import behaviour_benchmark_directories
     from _run_logging import format_run_log_line, log_to_console
 
@@ -71,7 +81,7 @@ DEFAULT_MODEL_PARAMETERS_PATH = DEFAULT_MARKET_DATA_DIRECTORY / "model_parameter
 DEFAULT_MODEL_POINTS_PATH = (
     REPOSITORY_ROOT
     / "input_model_points_policyholders"
-    / "model_points_policyholders_4_point_proxy.csv"
+    / "model_points_policyholders_1_point_proxy.csv"
 )
 DEFAULT_COST_ASSUMPTIONS_PATH = (
     REPOSITORY_ROOT / "input_cost_assumptions" / "cost_assumptions.csv")
@@ -80,12 +90,13 @@ DYNAMIC_PORTFOLIO_RUNNER = SCRIPT_DIRECTORY / "run_portfolio_valuation.py"
 LSMC_PORTFOLIO_RUNNER = SCRIPT_DIRECTORY / "run_portfolio_valuation_lsmc.py"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "output" / "portfolio_risk_analysis"
 RUN_DIRECTORY_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
-DEFAULT_CREDITING_CAP_RATES = (0.06,)
+DEFAULT_CREDITING_CAP_RATES = (0.04, 0.06, 0.12, 0.15)
 DEFAULT_BASELINE_RATE = 0.06
 CONTRACTUAL_MINIMUM_CREDITING_CAP_RATE = 0.0025
 MINIMUM_LSMC_TRAINING_PATHS = 60
 AUTO_WORKER_MEMORY_FRACTION = 0.65
 DEFAULT_MAX_WORKERS = 1
+AVAILABLE_LSMC_TRAINING_SEED_SETS = 3
 AUTO_WORKER_MAXIMUM = 16
 AUTO_WORKER_FIXED_BYTES = 1_342_177_280  # 1.25 GiB process/projection overhead
 # Includes the added Election, phase-exposure and cause-specific Behaviour
@@ -95,6 +106,7 @@ AUTO_WORKER_SAFETY_MULTIPLIER = 1.25
 AUTO_WORKER_MINIMUM_MEMORY_RESERVE_BYTES = 2 * 1024 ** 3
 DEFAULT_HORIZON_MONTHS_FALLBACK = 70 * 12
 DEFAULT_PROJECTION_MAX_AGE = 115.0
+CHILD_HEARTBEAT_SECONDS = 30.0
 WINDOWS_LEGACY_MAX_PATH_CHARS = 259
 RECONCILIATION_FILE_NAME = "portfolio_aggregation_reconciliation.csv"
 LONGEST_SCENARIO_PLOT_RELATIVE_PATH = (
@@ -372,6 +384,18 @@ def _parse_max_workers(text: str) -> Optional[int]:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    mc_inputs = load_mc_analysis_inputs()
+    evaluation_input = require_mc_samples(
+        mc_inputs, "evaluation", 1
+    )[0]
+    training_inputs = require_mc_samples(
+        mc_inputs,
+        "lsmc_training",
+        AVAILABLE_LSMC_TRAINING_SEED_SETS,
+    )
+    validation_input = require_mc_samples(
+        mc_inputs, "lsmc_validation", 1
+    )[0]
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -393,24 +417,86 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_BASELINE_RATE,
         help="comparison baseline; automatically added to the scenario set",
     )
-    parser.add_argument("--n-paths", type=int, default=2_000)
-    parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--take-up-seed", type=int, default=97)
-    parser.add_argument("--mortality-seed", type=int, default=197)
-    parser.add_argument("--n-train", type=int, default=4_000)
-    parser.add_argument("--train-seed", type=int, default=12026)
-    parser.add_argument("--train-take-up-seed", type=int, default=10097)
-    parser.add_argument("--train-mortality-seed", type=int, default=10197)
-    parser.add_argument("--train-seed-2", type=int, default=32026)
-    parser.add_argument("--train-take-up-seed-2", type=int, default=30097)
-    parser.add_argument("--train-mortality-seed-2", type=int, default=30197)
-    parser.add_argument("--train-seed-3", type=int, default=42026)
-    parser.add_argument("--train-take-up-seed-3", type=int, default=40097)
-    parser.add_argument("--train-mortality-seed-3", type=int, default=40197)
-    parser.add_argument("--n-validation", type=int, default=2_000)
-    parser.add_argument("--validation-seed", type=int, default=22026)
-    parser.add_argument("--validation-take-up-seed", type=int, default=20097)
-    parser.add_argument("--validation-mortality-seed", type=int, default=20197)
+    parser.add_argument(
+        "--n-paths", type=int, default=evaluation_input.n_paths
+    )
+    parser.add_argument(
+        "--seed", type=int, default=evaluation_input.market_seed
+    )
+    parser.add_argument(
+        "--take-up-seed", type=int, default=evaluation_input.take_up_seed
+    )
+    parser.add_argument(
+        "--mortality-seed", type=int, default=evaluation_input.mortality_seed
+    )
+    parser.add_argument(
+        "--n-train", type=int, default=training_inputs[0].n_paths
+    )
+    parser.add_argument(
+        "--train-seed", type=int, default=training_inputs[0].market_seed
+    )
+    parser.add_argument(
+        "--train-take-up-seed",
+        type=int,
+        default=training_inputs[0].take_up_seed,
+    )
+    parser.add_argument(
+        "--train-mortality-seed",
+        type=int,
+        default=training_inputs[0].mortality_seed,
+    )
+    parser.add_argument(
+        "--train-seed-2", type=int, default=training_inputs[1].market_seed
+    )
+    parser.add_argument(
+        "--train-take-up-seed-2",
+        type=int,
+        default=training_inputs[1].take_up_seed,
+    )
+    parser.add_argument(
+        "--train-mortality-seed-2",
+        type=int,
+        default=training_inputs[1].mortality_seed,
+    )
+    parser.add_argument(
+        "--train-seed-3", type=int, default=training_inputs[2].market_seed
+    )
+    parser.add_argument(
+        "--train-take-up-seed-3",
+        type=int,
+        default=training_inputs[2].take_up_seed,
+    )
+    parser.add_argument(
+        "--train-mortality-seed-3",
+        type=int,
+        default=training_inputs[2].mortality_seed,
+    )
+    parser.add_argument(
+        "--training-seed-count",
+        type=int,
+        choices=(1, 3),
+        default=1,
+        help=(
+            "number of independently fitted LSMC training policies; the "
+            "default uses one seed for the streamlined baseline"
+        ),
+    )
+    parser.add_argument(
+        "--n-validation", type=int, default=validation_input.n_paths
+    )
+    parser.add_argument(
+        "--validation-seed", type=int, default=validation_input.market_seed
+    )
+    parser.add_argument(
+        "--validation-take-up-seed",
+        type=int,
+        default=validation_input.take_up_seed,
+    )
+    parser.add_argument(
+        "--validation-mortality-seed",
+        type=int,
+        default=validation_input.mortality_seed,
+    )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--hedge-cap-leg-mode",
@@ -422,6 +508,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--lsmc-folds", type=int, default=5)
+    parser.add_argument(
+        "--lsmc-income-action-set",
+        choices=("continue_full", "continue_partial_full"),
+        default="continue_full",
+        help=(
+            "monthly optimal Income actions; the default permits only "
+            "Continue or contract-terminating Full Withdrawal"
+        ),
+    )
     parser.add_argument(
         "--lsmc-ridge",
         type=float,
@@ -435,7 +530,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--portfolio-contract-count", type=float, default=None)
     parser.add_argument("--profitability-materiality-bp", type=float, default=1.0)
-    parser.add_argument("--model-points", type=Path, default=None)
+    parser.add_argument(
+        "--model-points",
+        type=Path,
+        default=DEFAULT_MODEL_POINTS_PATH,
+        help=(
+            "policyholder model-point CSV; the default contains only the "
+            "first model point (ALT4-01) of the four-point proxy"
+        ),
+    )
     parser.add_argument("--cost-assumptions", type=Path, default=None)
     parser.add_argument("--cost-assumption-set", default=None)
     parser.add_argument("--dynamic-behaviour", type=Path, default=None)
@@ -536,7 +639,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        default="WARNING",
+        default="INFO",
     )
     args = parser.parse_args(argv)
     args.stress_scenarios = list(dict.fromkeys(args.stress_scenarios))
@@ -582,37 +685,42 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.n_validation <= 0:
         parser.error("--n-validation must be positive")
     market_seeds = (
-        args.train_seed,
-        args.train_seed_2,
-        args.train_seed_3,
+        *(
+            args.train_seed, args.train_seed_2, args.train_seed_3
+        )[:args.training_seed_count],
         args.validation_seed,
         args.seed,
     )
     take_up_seeds = (
-        args.train_take_up_seed,
-        args.train_take_up_seed_2,
-        args.train_take_up_seed_3,
+        *(
+            args.train_take_up_seed,
+            args.train_take_up_seed_2,
+            args.train_take_up_seed_3,
+        )[:args.training_seed_count],
         args.validation_take_up_seed,
         args.take_up_seed,
     )
     mortality_seeds = (
-        args.train_mortality_seed,
-        args.train_mortality_seed_2,
-        args.train_mortality_seed_3,
+        *(
+            args.train_mortality_seed,
+            args.train_mortality_seed_2,
+            args.train_mortality_seed_3,
+        )[:args.training_seed_count],
         args.validation_mortality_seed,
         args.mortality_seed,
     )
-    if len(set(market_seeds)) != 5:
+    expected_seed_count = args.training_seed_count + 2
+    if len(set(market_seeds)) != expected_seed_count:
         parser.error(
-            "all three training, validation and evaluation market seeds must differ"
+            "all active training, validation and evaluation market seeds must differ"
         )
-    if len(set(take_up_seeds)) != 5:
+    if len(set(take_up_seeds)) != expected_seed_count:
         parser.error(
-            "all three training, validation and evaluation take-up seeds must differ"
+            "all active training, validation and evaluation take-up seeds must differ"
         )
-    if len(set(mortality_seeds)) != 5:
+    if len(set(mortality_seeds)) != expected_seed_count:
         parser.error(
-            "all three training, validation and evaluation mortality seeds must differ"
+            "all active training, validation and evaluation mortality seeds must differ"
         )
     for name in ("lsmc_ridge", "exercise_buffer_rmse_multiplier"):
         value = float(getattr(args, name))
@@ -642,6 +750,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def _rate_key(rate: float) -> float:
     return round(float(rate), 12)
+
+
+def _model_point_ids(path: Path) -> tuple[str, ...]:
+    """Read model-point identifiers for an explicit run-scope log entry."""
+    resolved = path.expanduser().resolve()
+    with resolved.open("r", encoding="utf-8-sig", newline="") as handle:
+        identifiers = tuple(
+            str(row.get("model_point_id", "")).strip()
+            for row in csv.DictReader(handle)
+        )
+    if not identifiers or any(not identifier for identifier in identifiers):
+        raise ValueError(
+            f"Model-point input must contain non-empty model_point_id values: "
+            f"{resolved}"
+        )
+    return identifiers
 
 
 def _create_timestamped_run_directory(
@@ -768,6 +892,7 @@ def _lsmc_command(
         "--train-seed-3", str(args.train_seed_3),
         "--train-take-up-seed-3", str(args.train_take_up_seed_3),
         "--train-mortality-seed-3", str(args.train_mortality_seed_3),
+        "--training-seed-count", str(args.training_seed_count),
         "--n-validation", str(args.n_validation),
         "--validation-seed", str(args.validation_seed),
         "--validation-take-up-seed", str(args.validation_take_up_seed),
@@ -775,6 +900,7 @@ def _lsmc_command(
         "--heston-substeps", str(args.heston_substeps),
         "--hedge-cap-leg-mode", args.hedge_cap_leg_mode,
         "--lsmc-folds", str(args.lsmc_folds),
+        "--lsmc-income-action-set", args.lsmc_income_action_set,
         "--lsmc-ridge", str(args.lsmc_ridge),
         "--exercise-buffer-rmse-multiplier",
         str(args.exercise_buffer_rmse_multiplier),
@@ -1208,6 +1334,17 @@ def _format_gib(value: Optional[int]) -> str:
     return f"{value / 1024 ** 3:.2f} GiB"
 
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds_part = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {seconds_part:02d}s"
+    if minutes:
+        return f"{minutes:d}m {seconds_part:02d}s"
+    return f"{seconds_part:d}s"
+
+
 def _child_environment(blas_threads: int, output: Path) -> dict[str, str]:
     """Build an isolated, non-oversubscribed child-process environment."""
     environment = os.environ.copy()
@@ -1239,7 +1376,7 @@ def _run_logged_command(
     *,
     blas_threads: int,
 ) -> None:
-    """Execute one child with an invalidated completion marker and own log."""
+    """Execute one child, persist its output and emit periodic heartbeats."""
     output.mkdir(parents=True, exist_ok=True)
     completion_manifest = output / "run_manifest.json"
     try:
@@ -1248,6 +1385,13 @@ def _run_logged_command(
         pass
     log_path = output / "orchestrator_console.log"
     environment = _child_environment(blas_threads, output)
+    runner_name = (
+        Path(str(command[1])).stem
+        if len(command) > 1
+        else Path(str(command[0])).stem
+    )
+    started = time.perf_counter()
+    process: Optional[subprocess.Popen[str]] = None
     with log_path.open("w", encoding="utf-8", newline="") as log_handle:
         log_handle.write(format_run_log_line(
             "Command: " + subprocess.list2cmdline(list(command))
@@ -1259,53 +1403,77 @@ def _run_logged_command(
         log_handle.write("\n\n")
         log_handle.flush()
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 list(command),
-                check=False,
                 cwd=str(ENGINE_ROOT),
                 env=environment,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,
             )
+            while True:
+                try:
+                    return_code = process.wait(
+                        timeout=CHILD_HEARTBEAT_SECONDS
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    log_to_console(
+                        f"AKTIV | {runner_name} | Laufzeit "
+                        f"{_format_duration(time.perf_counter() - started)} | "
+                        f"Details: {log_path}"
+                    )
         except OSError as exc:
             raise RuntimeError(
                 f"Could not start valuation command; see {log_path}"
             ) from exc
-    if completed.returncode != 0:
+        except BaseException:
+            if process is not None and process.poll() is None:
+                process.terminate()
+            raise
+    if return_code != 0:
         raise RuntimeError(
-            "Valuation command failed with exit code "
-            f"{completed.returncode}; see {log_path}"
+            f"{runner_name} failed with exit code {return_code}; "
+            f"see {log_path}"
         )
 
 
 def _execute_scenario_job(job: ScenarioJob, blas_threads: int) -> None:
     """Run the full Dynamic V11 and LSMC V11 pair in one worker."""
+    job_started = time.perf_counter()
+    dynamic_started = time.perf_counter()
+    log_to_console(
+        f"START 1/2 | {job.label} | Dynamic V11 | "
+        f"Output: {job.dynamic_output}"
+    )
     _run_logged_command(
         job.dynamic_command,
         job.dynamic_output,
         blas_threads=blas_threads,
     )
-    benchmark_directories = tuple(
-        _dynamic_benchmark_directories(job.dynamic_output).values()
-        if job.dynamic_benchmark_commands
-        else ()
+    log_to_console(
+        f"FERTIG 1/2 | {job.label} | Dynamic V11 | Laufzeit "
+        f"{_format_duration(time.perf_counter() - dynamic_started)}"
     )
-    if len(benchmark_directories) != len(job.dynamic_benchmark_commands):
-        raise ValueError("Dynamic benchmark command/output counts differ.")
-    for command, benchmark_output in zip(
-        job.dynamic_benchmark_commands,
-        benchmark_directories,
-    ):
-        _run_logged_command(
-            command,
-            benchmark_output,
-            blas_threads=blas_threads,
-        )
+    if job.dynamic_benchmark_commands:
+        raise ValueError("V11-only jobs must not contain Dynamic benchmarks.")
+    lsmc_started = time.perf_counter()
+    log_to_console(
+        f"START 2/2 | {job.label} | LSMC V11: Training, Validierung, "
+        f"Evaluation | Output: {job.lsmc_output}"
+    )
     _run_logged_command(
         job.lsmc_command,
         job.lsmc_output,
         blas_threads=blas_threads,
+    )
+    log_to_console(
+        f"FERTIG 2/2 | {job.label} | LSMC V11 | Laufzeit "
+        f"{_format_duration(time.perf_counter() - lsmc_started)}"
+    )
+    log_to_console(
+        f"SZENARIO FERTIG | {job.label} | Gesamtlaufzeit "
+        f"{_format_duration(time.perf_counter() - job_started)}"
     )
 
 
@@ -1333,9 +1501,10 @@ def _run_pending_jobs(
     )
     if effective_workers == 1:
         failures: list[str] = []
+        phase_started = time.perf_counter()
         for index, job in enumerate(pending, start=1):
             log_to_console(
-                f"[{phase_label} {index}/{len(pending)}] Run {job.label}"
+                f"SZENARIO {index}/{len(pending)} START | {job.label}"
             )
             try:
                 _execute_scenario_job(job, worker_plan.blas_threads_per_child)
@@ -1345,13 +1514,23 @@ def _run_pending_jobs(
                     f"[{phase_label} {index}/{len(pending)}] FAILED {job.label}",
                     level="ERROR",
                 )
+            else:
+                log_to_console(
+                    f"FORTSCHRITT {index}/{len(pending)} | {job.label} "
+                    "erfolgreich abgeschlossen"
+                )
         if failures:
             raise RuntimeError(
                 "One or more scenario cells failed; no aggregate report was "
                 "created:\n" + "\n".join(failures)
             )
+        log_to_console(
+            f"BEWERTUNGSGITTER FERTIG | {len(pending)} Szenarien | Laufzeit "
+            f"{_format_duration(time.perf_counter() - phase_started)}"
+        )
         return
 
+    phase_started = time.perf_counter()
     executor = ThreadPoolExecutor(
         max_workers=effective_workers,
         thread_name_prefix="portfolio-scenario",
@@ -1389,6 +1568,10 @@ def _run_pending_jobs(
             "One or more scenario cells failed; no aggregate report was "
             "created:\n" + "\n".join(failures)
         )
+    log_to_console(
+        f"BEWERTUNGSGITTER FERTIG | {len(pending)} Szenarien | Laufzeit "
+        f"{_format_duration(time.perf_counter() - phase_started)}"
+    )
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -1879,21 +2062,29 @@ def _lsmc_diagnostic_metrics(
 ) -> dict[str, object]:
     if not action_rows or not diagnostic_rows:
         raise ValueError("LSMC action and regression diagnostics must be non-empty.")
+    settings = manifest.get("lsmc_settings")
+    if not isinstance(settings, Mapping):
+        raise ValueError("LSMC manifest has no lsmc_settings object.")
+    training_seed_count = int(_as_float(
+        settings.get("training_seed_count"), "training_seed_count"
+    ))
+    expected_seed_indices = set(range(1, training_seed_count + 1))
+    allow_partial = _as_bool(settings.get("allow_partial_withdrawal", True))
     action_seed_indices: set[int] = set()
     for row in action_rows:
         seed_index = int(_as_float(
             row.get("training_seed_index"),
             "action training_seed_index",
         ))
-        if seed_index not in (1, 2, 3):
+        if seed_index not in expected_seed_indices:
             raise ValueError("LSMC action summary has an unknown training seed.")
         action_seed_indices.add(seed_index)
         if _as_bool(row.get("primary_training_seed")) is not (seed_index == 1):
             raise ValueError(
                 "LSMC action summary has an inconsistent primary flag."
             )
-    if action_seed_indices != {1, 2, 3}:
-        raise ValueError("LSMC action summary does not cover all three seeds.")
+    if action_seed_indices != expected_seed_indices:
+        raise ValueError("LSMC action summary does not cover all active seeds.")
     action_rows = [
         row for row in action_rows
         if _as_bool(row.get("primary_training_seed"))
@@ -1999,14 +2190,13 @@ def _lsmc_diagnostic_metrics(
             "full_withdrawal",
         )
     }
-    if any(not rows for rows in diagnostic_groups.values()):
+    required_diagnostics = {"income_election", "full_withdrawal"}
+    if allow_partial:
+        required_diagnostics.add("partial_withdrawal")
+    if any(not diagnostic_groups[action] for action in required_diagnostics):
         raise ValueError(
-            "LSMC diagnostics must cover Election, Partial Withdrawal and "
-            "Full Withdrawal."
+            "LSMC diagnostics do not cover every enabled optimal action."
         )
-    settings = manifest.get("lsmc_settings")
-    if not isinstance(settings, Mapping):
-        raise ValueError("LSMC manifest has no lsmc_settings object.")
     unique_fits = int(_as_float(
         settings.get("unique_policy_fits"), "unique_policy_fits"))
     fallback_fits = int(_first_float(
@@ -2093,7 +2283,7 @@ def _lsmc_diagnostic_metrics(
             f"{prefix}_regression_count": len(rows),
             f"{prefix}_regression_accepted_count": group_accepted,
             f"{prefix}_regression_accepted_share": (
-                group_accepted / len(rows)
+                group_accepted / len(rows) if rows else 0.0
             ),
             f"{prefix}_numerical_diagnostic_count": len(group_r_squared),
             f"{prefix}_oof_r_squared_median": (
@@ -2396,7 +2586,7 @@ _LSMC_VALIDATION_COMPONENTS = {
 def _expected_lsmc_training_seed_triplets(
     args: argparse.Namespace,
 ) -> tuple[dict[str, object], ...]:
-    return (
+    available = (
         {
             "seed_index": 1,
             "market_seed": args.train_seed,
@@ -2419,9 +2609,10 @@ def _expected_lsmc_training_seed_triplets(
             "primary": False,
         },
     )
+    return available[:args.training_seed_count]
 
 
-def _validate_three_seed_gate_set(
+def _validate_lsmc_gate_set(
     gates: object,
     *,
     label: str,
@@ -2444,14 +2635,14 @@ def _validate_three_seed_gate_set(
         )
 
 
-def _validate_three_seed_lsmc_evidence(
+def _validate_lsmc_seed_evidence(
     directory: Path,
     manifest: Mapping[str, object],
     validation_manifest: Mapping[str, object],
     *,
     expected_args: argparse.Namespace,
-) -> tuple[str, str, str]:
-    """Validate the immutable three-fit acceptance and evaluation evidence."""
+) -> tuple[str, ...]:
+    """Validate every active fit's acceptance and evaluation evidence."""
 
     lsmc_settings = manifest.get("lsmc_settings")
     validation_settings = manifest.get("validation_settings")
@@ -2460,15 +2651,16 @@ def _validate_three_seed_lsmc_evidence(
         isinstance(item, Mapping)
         for item in (lsmc_settings, validation_settings, evaluation_settings)
     ):
-        raise ValueError("LSMC three-seed settings are incomplete.")
+        raise ValueError("LSMC seed settings are incomplete.")
     assert isinstance(lsmc_settings, Mapping)
     assert isinstance(validation_settings, Mapping)
     assert isinstance(evaluation_settings, Mapping)
 
     expected_triplets = _expected_lsmc_training_seed_triplets(expected_args)
+    expected_seed_count = len(expected_triplets)
     triplets = lsmc_settings.get("training_seed_triplets")
-    if not isinstance(triplets, list) or len(triplets) != 3:
-        raise ValueError("LSMC manifest must contain exactly three seed triplets.")
+    if not isinstance(triplets, list) or len(triplets) != expected_seed_count:
+        raise ValueError("LSMC manifest has the wrong active seed-triplet count.")
     for index, (actual, expected) in enumerate(
         zip(triplets, expected_triplets), start=1
     ):
@@ -2489,9 +2681,9 @@ def _validate_three_seed_lsmc_evidence(
     )
     if not isinstance(training_fingerprints_raw, list) or len(
         training_fingerprints_raw
-    ) != 3:
+    ) != expected_seed_count:
         raise ValueError(
-            "LSMC manifest must contain exactly three training fingerprints."
+            "LSMC manifest has the wrong training-fingerprint count."
         )
     training_fingerprints = tuple(
         str(value).strip() for value in training_fingerprints_raw
@@ -2507,10 +2699,11 @@ def _validate_three_seed_lsmc_evidence(
         validation_fingerprint,
         evaluation_fingerprint,
     }
-    if "" in all_fingerprints or len(set(training_fingerprints)) != 3 \
-            or len(all_fingerprints) != 5:
+    if "" in all_fingerprints \
+            or len(set(training_fingerprints)) != expected_seed_count \
+            or len(all_fingerprints) != expected_seed_count + 2:
         raise ValueError(
-            "All three training, validation and evaluation fingerprints must differ."
+            "All active training, validation and evaluation fingerprints must differ."
         )
     if str(lsmc_settings.get("training_scenario_fingerprint", "")).strip() \
             != training_fingerprints[0]:
@@ -2519,7 +2712,7 @@ def _validate_three_seed_lsmc_evidence(
         )
     if int(_as_float(
         lsmc_settings.get("training_seed_count"), "training_seed_count"
-    )) != 3 or int(_as_float(
+    )) != expected_seed_count or int(_as_float(
         lsmc_settings.get("primary_training_seed_index"),
         "primary_training_seed_index",
     )) != 1:
@@ -2533,14 +2726,15 @@ def _validate_three_seed_lsmc_evidence(
         raise ValueError("LSMC primary seed-selection rule is not predeclared.")
 
     gates_by_seed = validation_settings.get("gates_by_training_seed")
-    if not isinstance(gates_by_seed, Mapping) or set(gates_by_seed) != {
-        "training_seed_1",
-        "training_seed_2",
-        "training_seed_3",
-    }:
+    expected_gate_keys = {
+        f"training_seed_{index}"
+        for index in range(1, expected_seed_count + 1)
+    }
+    if not isinstance(gates_by_seed, Mapping) \
+            or set(gates_by_seed) != expected_gate_keys:
         raise ValueError("LSMC manifest has no complete gates-by-seed mapping.")
-    for index in range(1, 4):
-        _validate_three_seed_gate_set(
+    for index in range(1, expected_seed_count + 1):
+        _validate_lsmc_gate_set(
             gates_by_seed[f"training_seed_{index}"],
             label=f"LSMC manifest training seed {index}",
         )
@@ -2556,8 +2750,8 @@ def _validate_three_seed_lsmc_evidence(
     if int(_as_float(
         validation_manifest.get("training_seed_count"),
         "validation training_seed_count",
-    )) != 3:
-        raise ValueError("Validation manifest does not evidence three seed fits.")
+    )) != expected_seed_count:
+        raise ValueError("Validation manifest has the wrong active seed count.")
     if validation_manifest.get("seed_selection_using_evaluation") is not False:
         raise ValueError("Validation manifest permits evaluation-based selection.")
     if int(_as_float(
@@ -2566,10 +2760,11 @@ def _validate_three_seed_lsmc_evidence(
     )) != 1:
         raise ValueError("Validation manifest does not predeclare seed 1.")
     top_level_gates = validation_manifest.get("gates")
-    if not isinstance(top_level_gates, list) or len(top_level_gates) != 9:
-        raise ValueError("Validation manifest must contain exactly nine gates.")
+    if not isinstance(top_level_gates, list) \
+            or len(top_level_gates) != 3 * expected_seed_count:
+        raise ValueError("Validation manifest has the wrong gate count.")
     top_level_groups: dict[int, list[Mapping[str, object]]] = {
-        1: [], 2: [], 3: []
+        index: [] for index in range(1, expected_seed_count + 1)
     }
     for gate in top_level_gates:
         if not isinstance(gate, Mapping) or not _as_bool(gate.get("valid")):
@@ -2581,7 +2776,7 @@ def _validate_three_seed_lsmc_evidence(
             raise ValueError("Validation gate refers to an unknown training seed.")
         top_level_groups[seed_index].append(gate)
     for index, gates in top_level_groups.items():
-        _validate_three_seed_gate_set(
+        _validate_lsmc_gate_set(
             gates,
             label=f"Validation manifest top-level seed {index}",
         )
@@ -2604,8 +2799,9 @@ def _validate_three_seed_lsmc_evidence(
                     )
 
     training_runs = validation_manifest.get("training_runs")
-    if not isinstance(training_runs, list) or len(training_runs) != 3:
-        raise ValueError("Validation manifest must contain exactly three runs.")
+    if not isinstance(training_runs, list) \
+            or len(training_runs) != expected_seed_count:
+        raise ValueError("Validation manifest has the wrong training-run count.")
     for index, (run, expected, fingerprint) in enumerate(
         zip(training_runs, expected_triplets, training_fingerprints), start=1
     ):
@@ -2624,7 +2820,7 @@ def _validate_three_seed_lsmc_evidence(
             raise ValueError(
                 f"Validation training run {index} changed its fingerprint."
             )
-        _validate_three_seed_gate_set(
+        _validate_lsmc_gate_set(
             run.get("gates"),
             label=f"Validation training run {index}",
         )
@@ -2633,15 +2829,16 @@ def _validate_three_seed_lsmc_evidence(
     evaluation_fingerprints = evaluation_settings.get(
         "multi_seed_evaluation_scenario_fingerprints"
     )
-    if not isinstance(final_evaluations, list) or len(final_evaluations) != 3:
-        raise ValueError("LSMC manifest must report three final evaluations.")
+    if not isinstance(final_evaluations, list) \
+            or len(final_evaluations) != expected_seed_count:
+        raise ValueError("LSMC manifest has the wrong final-evaluation count.")
     if not isinstance(evaluation_fingerprints, list) or len(
         evaluation_fingerprints
-    ) != 3 or any(
+    ) != expected_seed_count or any(
         str(value).strip() != evaluation_fingerprint
         for value in evaluation_fingerprints
     ):
-        raise ValueError("The three LSMC fits do not share one final evaluation.")
+        raise ValueError("The active LSMC fits do not share one final evaluation.")
     if evaluation_settings.get("training_seed_selected_using_evaluation") is not False:
         raise ValueError("Final evaluation was used to select a training seed.")
     for index, (row, expected, fingerprint) in enumerate(
@@ -2679,8 +2876,8 @@ def _validate_three_seed_lsmc_evidence(
     report_rows = _read_csv(
         directory / "lsmc_multi_seed_validation_evaluation.csv"
     )
-    if len(report_rows) != 3:
-        raise ValueError("Multi-seed CSV must contain exactly three rows.")
+    if len(report_rows) != expected_seed_count:
+        raise ValueError("Seed-evidence CSV has the wrong row count.")
     for index, (row, expected, fingerprint) in enumerate(
         zip(report_rows, expected_triplets, training_fingerprints), start=1
     ):
@@ -2805,12 +3002,11 @@ def _validate_behaviour_manifest(
     else:
         if not {
             "continue",
-            "partial_withdrawal",
             "full_withdrawal",
         }.issubset(actions):
             raise ValueError(
                 f"{label} does not expose monthly CONTINUE | "
-                "PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL in Income."
+                "FULL_WITHDRAWAL in Income."
             )
 
     joint = str(
@@ -3419,7 +3615,7 @@ def _load_scenario_result(
         )
     if not isinstance(lsmc_settings, Mapping):
         raise ValueError("LSMC manifest has no lsmc_settings object.")
-    training_fingerprints = _validate_three_seed_lsmc_evidence(
+    training_fingerprints = _validate_lsmc_seed_evidence(
         lsmc_output,
         lsmc_manifest,
         lsmc_validation_manifest,
@@ -3460,9 +3656,9 @@ def _load_scenario_result(
         *training_fingerprints,
         validation_fingerprint,
         evaluation_fingerprint,
-    }) != 5:
+    }) != args.training_seed_count + 2:
         raise ValueError(
-            "All three LSMC training, validation and evaluation scenarios "
+            "All active LSMC training, validation and evaluation scenarios "
             "must differ."
         )
     _require_close(
@@ -3530,28 +3726,35 @@ def _load_scenario_result(
         ))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(
-            "LSMC summary has no valid three-seed JSON evidence."
+            "LSMC summary has no valid training-seed JSON evidence."
         ) from exc
     if summary_training_fingerprints != training_fingerprints:
-        raise ValueError("LSMC summary changed the three training fingerprints.")
+        raise ValueError("LSMC summary changed the training fingerprints.")
     if summary_seed_triplets != list(
         _expected_lsmc_training_seed_triplets(args)
     ):
-        raise ValueError("LSMC summary changed the three training seed triplets.")
+        raise ValueError("LSMC summary changed the training seed triplets.")
     if int(_as_float(
         lsmc_summary.get("lsmc_training_seed_count"),
         "lsmc_training_seed_count",
-    )) != 3 or not _as_bool(
-        lsmc_summary.get("lsmc_validation_all_three_seeds_valid")
+    )) != args.training_seed_count or not _as_bool(
+        lsmc_summary.get("lsmc_validation_all_active_seeds_valid")
     ) or not _as_bool(
-        lsmc_summary.get("lsmc_final_evaluation_all_three_seeds_reported")
+        lsmc_summary.get("lsmc_final_evaluation_all_active_seeds_reported")
     ):
-        raise ValueError("LSMC summary has incomplete three-seed evidence.")
+        raise ValueError("LSMC summary has incomplete training-seed evidence.")
     _require_close(
         _as_float(lsmc_settings.get("n_folds"), "n_folds"),
         float(args.lsmc_folds),
         "LSMC n_folds",
     )
+    if str(lsmc_settings.get("income_action_set")) \
+            != args.lsmc_income_action_set:
+        raise ValueError("LSMC Income action set differs from the requested mode.")
+    expected_partial = args.lsmc_income_action_set == "continue_partial_full"
+    if _as_bool(lsmc_settings.get("allow_partial_withdrawal")) \
+            is not expected_partial:
+        raise ValueError("LSMC Partial-Withdrawal setting is inconsistent.")
     _require_close(
         _as_float(lsmc_settings.get("ridge"), "ridge"),
         float(args.lsmc_ridge),
@@ -3647,7 +3850,7 @@ def _load_scenario_result(
             diagnostic.get("training_seed_index"),
             "diagnostic training_seed_index",
         ))
-        if seed_index not in (1, 2, 3):
+        if seed_index not in set(range(1, args.training_seed_count + 1)):
             raise ValueError("LSMC regression diagnostic has an unknown seed.")
         diagnostic_seed_indices.add(seed_index)
         if str(diagnostic.get("training_scenario_fingerprint")) != (
@@ -3662,8 +3865,8 @@ def _load_scenario_result(
             raise ValueError(
                 "LSMC regression diagnostic has an inconsistent primary flag."
             )
-    if diagnostic_seed_indices != {1, 2, 3}:
-        raise ValueError("LSMC diagnostics do not cover all three training seeds.")
+    if diagnostic_seed_indices != set(range(1, args.training_seed_count + 1)):
+        raise ValueError("LSMC diagnostics do not cover all active training seeds.")
     lsmc_diagnostics = _lsmc_diagnostic_metrics(
         action_rows,
         diagnostic_rows,
@@ -3686,12 +3889,18 @@ def _load_scenario_result(
             list(training_fingerprints)
         ),
         "training_scenario_fingerprint_1": training_fingerprints[0],
-        "training_scenario_fingerprint_2": training_fingerprints[1],
-        "training_scenario_fingerprint_3": training_fingerprints[2],
+        "training_scenario_fingerprint_2": (
+            training_fingerprints[1] if len(training_fingerprints) > 1 else ""
+        ),
+        "training_scenario_fingerprint_3": (
+            training_fingerprints[2] if len(training_fingerprints) > 2 else ""
+        ),
         "training_seed_triplets_json": json.dumps(
             list(_expected_lsmc_training_seed_triplets(args)),
             sort_keys=True,
         ),
+        "training_seed_count": args.training_seed_count,
+        "lsmc_income_action_set": args.lsmc_income_action_set,
         "primary_training_seed_index": 1,
         "every_training_seed_passes_validation": True,
         "evaluation_used_for_training_seed_selection": False,
@@ -4230,12 +4439,13 @@ def _validate_scenario_grid(
         ("training_scenario_fingerprint", "LSMC training scenario set"),
         (
             "training_scenario_fingerprints_json",
-            "all three LSMC training scenario sets",
+            "all active LSMC training scenario sets",
         ),
         ("training_scenario_fingerprint_1", "LSMC training scenario set 1"),
         ("training_scenario_fingerprint_2", "LSMC training scenario set 2"),
         ("training_scenario_fingerprint_3", "LSMC training scenario set 3"),
-        ("training_seed_triplets_json", "three LSMC training seed triplets"),
+        ("training_seed_triplets_json", "active LSMC training seed triplets"),
+        ("training_seed_count", "active LSMC training-seed count"),
         ("validation_scenario_fingerprint", "LSMC validation scenario set"),
         ("source_metadata_fingerprint", "source inputs"),
         ("engine_version", "engine version"),
@@ -4252,18 +4462,22 @@ def _validate_scenario_grid(
             "cap/stress combination must be refitted."
         )
     for row in rows:
-        training_fingerprints = (
+        training_seed_count = int(row["training_seed_count"])
+        scalar_training_fingerprints = (
             str(row["training_scenario_fingerprint_1"]),
             str(row["training_scenario_fingerprint_2"]),
             str(row["training_scenario_fingerprint_3"]),
         )
+        training_fingerprints = scalar_training_fingerprints[
+            :training_seed_count
+        ]
         try:
             encoded_training_fingerprints = tuple(json.loads(str(
                 row["training_scenario_fingerprints_json"]
             )))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError(
-                f"{label} has malformed three-seed fingerprint evidence."
+                f"{label} has malformed training-seed fingerprint evidence."
             ) from exc
         if encoded_training_fingerprints != training_fingerprints:
             raise ValueError(
@@ -4277,15 +4491,15 @@ def _validate_scenario_grid(
             str(row["evaluation_scenario_fingerprint"]),
             *training_fingerprints,
             str(row["validation_scenario_fingerprint"]),
-        }) != 5:
+        }) != training_seed_count + 2:
             raise ValueError(
-                f"{label} all three LSMC training, validation and evaluation "
+                f"{label} all active LSMC training, validation and evaluation "
                 "samples must differ."
             )
         if int(row["primary_training_seed_index"]) != 1 or not _as_bool(
             row["every_training_seed_passes_validation"]
         ) or _as_bool(row["evaluation_used_for_training_seed_selection"]):
-            raise ValueError(f"{label} violates the three-seed acceptance rule.")
+            raise ValueError(f"{label} violates the seed-acceptance rule.")
 
 
 STRESS_DELTA_METRICS = (
@@ -4951,6 +5165,9 @@ def _write_report(
         == _rate_key(baseline_rate)
     )
     basis = str(baseline["valuation_basis"])
+    full_only_lsmc = (
+        str(baseline.get("lsmc_income_action_set")) == "continue_full"
+    )
     monetary_description = (
         "absolute Portfoliowerte"
         if basis == "absolute_portfolio"
@@ -5431,8 +5648,13 @@ def _write_report(
             "Post-Election-Lapse-/Withdrawal-Annahmen einerseits und eine "
             "gemeinsam gefittete LSMC-Policy andererseits. In der "
             "Growth-Phase entscheidet LSMC zwischen WAIT und START_INCOME, in "
-            "der Income-Phase monatlich zwischen CONTINUE, PARTIAL_WITHDRAWAL "
-            "und FULL_WITHDRAWAL. Es ist "
+            "der Income-Phase monatlich zwischen "
+            + (
+                "CONTINUE und FULL_WITHDRAWAL (Lapse). "
+                if full_only_lsmc
+                else "CONTINUE, PARTIAL_WITHDRAWAL und FULL_WITHDRAWAL. "
+            )
+            + "Es ist "
             "deshalb nicht als isolierter Effekt einer einzelnen Rate zu lesen."
         ),
         "",
@@ -5448,7 +5670,7 @@ def _write_report(
         (
             "Berichtet werden ausschließlich die vollständigen V11-Policies; "
             "V00/V01/V10 und die Zerlegung in Election-, Post-Election- und "
-            "Interaktionseffekte entfallen. Rohe Election- sowie Partial-/"
+            "Interaktionseffekte entfallen. Rohe Election- sowie "
             "Full-Withdrawal-Action-Raten sind über Modellpunkt-/Pfad-/"
             "Entscheidungsereignisse ungewichtet und keine portfolio-gewichteten "
             "Take-up- oder Surrender-Raten."
@@ -5493,8 +5715,14 @@ def _write_report(
         ),
         (
             "- Die LSMC-Policy ist ein konservativer Lower Bound mit jährlichem "
-            "WAIT/START_INCOME in Growth und monatlichem CONTINUE/"
-            "PARTIAL_WITHDRAWAL/FULL_WITHDRAWAL in Income. "
+            "WAIT/START_INCOME in Growth und monatlichem "
+            + (
+                "CONTINUE/FULL_WITHDRAWAL in Income; Partial Withdrawal ist "
+                "aus dem optimalen Aktionsset ausgeschlossen. "
+                if full_only_lsmc
+                else "CONTINUE/PARTIAL_WITHDRAWAL/FULL_WITHDRAWAL in Income. "
+            )
+            +
             "Der Lower Bound gilt für den Policyholder-Wert und ist kein "
             "konservativer Upper Bound für Versichererkosten."
         ),
@@ -5518,10 +5746,13 @@ def _write_report(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    run_started = time.perf_counter()
+    model_points_path = args.model_points.expanduser().resolve()
+    model_point_ids = _model_point_ids(model_points_path)
     output_root, output, run_id, run_created_at_utc = (
         _create_timestamped_run_directory(args.output)
     )
-    log_to_console(f"Risk-analysis run directory: {output}")
+    log_to_console(f"RUN START | ID {run_id} | Output: {output}")
     rates = sorted({
         _rate_key(rate)
         for rate in (*args.crediting_rates, args.baseline_rate)
@@ -5530,13 +5761,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if len(rate_directories) != len(rates):
         raise ValueError("Crediting-cap rates map to non-unique scenario paths.")
     log_to_console(
-        "Portfolio valuation-exposure analysis caps: "
+        "CAPS | "
         + ", ".join(f"{100.0 * rate:.2f}%" for rate in rates)
+        + f" | Vergleichsbasis {100.0 * args.baseline_rate:.2f}%"
     )
     log_to_console(
-        "Default behaviour comparison per cap/stress cell: Dynamic functions "
-        "(dynamic Income Election and dynamic post-Election behaviour) versus "
-        "LSMC; both valuations are required."
+        "BEHAVIOUR | Pro Szenario nur Dynamic V11 und LSMC V11; "
+        "keine V00/V01/V10-Effektzerlegung."
+    )
+    log_to_console(
+        f"MODELLPOINTS | {len(model_point_ids)} verwendet | "
+        f"IDs: {', '.join(model_point_ids)} | Eingabe: {model_points_path}"
+    )
+    log_to_console(
+        "RECHENUMFANG | "
+        f"Dynamic: {args.n_paths} Evaluationspfade; "
+        f"LSMC: {args.training_seed_count} × {args.n_train} Trainingspfade, "
+        f"{args.n_validation} Validierungspfade und "
+        f"{args.n_paths} Evaluationspfade."
     )
 
     all_jobs: list[ScenarioJob] = []
@@ -5699,6 +5941,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"estimated peak {_format_gib(worker_plan.estimated_worker_bytes)} "
         "per worker)."
     )
+    log_to_console(
+        "RUN-PLAN | "
+        f"{len(all_jobs)} Cap-/Stress-Szenarien, "
+        f"{2 * worker_plan.pending_job_count} neue V11-Child-Runs, "
+        f"{worker_plan.reused_job_count} wiederverwendete Szenarien, "
+        f"Stresses {'aktiv' if not args.no_stress_analysis else 'aus'}, "
+        f"Plots {'aktiv' if not args.no_plots else 'aus'}, "
+        f"Heartbeat alle {int(CHILD_HEARTBEAT_SECONDS)} Sekunden."
+    )
     if (
         worker_plan.available_memory_bytes is None
         and worker_plan.pending_job_count > 0
@@ -5732,6 +5983,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # keeps explicitly requested multi-cell grids efficient when callers raise
     # the worker count above the reduced serial default.
     _run_pending_jobs(all_jobs, worker_plan, phase_label="valuation grid")
+    log_to_console(
+        "VALIDIERUNG START | Runner-Manifeste, Input-Fingerprints, "
+        "Aggregationsabstimmungen und LSMC-Gates werden geprüft."
+    )
     validated_results_by_sequence: dict[
         int,
         tuple[dict[str, object], list[dict[str, object]]],
@@ -5741,9 +5996,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for sequence, row in validated_stress_reuse_rows.items()
     })
     cell_validation_failures: list[str] = []
-    for job in all_jobs:
+    for validation_index, job in enumerate(all_jobs, start=1):
         if job.sequence in validated_results_by_sequence:
+            log_to_console(
+                f"VALIDIERUNG {validation_index}/{len(all_jobs)} | "
+                f"{job.label} | bereits vollständig validiert"
+            )
             continue
+        log_to_console(
+            f"VALIDIERUNG {validation_index}/{len(all_jobs)} START | "
+            f"{job.label}"
+        )
         try:
             validated_results_by_sequence[job.sequence] = _load_scenario_result(
                 args,
@@ -5757,17 +6020,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"{job.label}: {type(exc).__name__}: "
                 + " ".join(str(exc).split())
             )
+        else:
+            log_to_console(
+                f"VALIDIERUNG {validation_index}/{len(all_jobs)} OK | "
+                f"{job.label}"
+            )
     if cell_validation_failures:
         raise RuntimeError(
             "One or more scenario cells failed validation; no aggregate "
             "report was created:\n" + "\n".join(cell_validation_failures)
         )
+    log_to_console("VALIDIERUNG FERTIG | Alle Szenarien sind konsistent.")
 
     rows: list[dict[str, object]] = []
     model_point_rows: list[dict[str, object]] = []
     for index, job in enumerate(base_jobs, start=1):
         log_to_console(
-            f"[base validation {index}/{len(base_jobs)}] {job.label}"
+            f"BASISERGEBNIS {index}/{len(base_jobs)} ÜBERNEHMEN | {job.label}"
         )
         scenario_row, scenario_model_points = validated_results_by_sequence[
             job.sequence
@@ -5788,7 +6057,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     if len(training_fingerprint_triplets) != 1:
         raise ValueError(
-            "Base scenarios do not share the same three training samples."
+            "Base scenarios do not share the same active training samples."
         )
     common_training_fingerprints = tuple(json.loads(
         next(iter(training_fingerprint_triplets))
@@ -5814,8 +6083,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             stress_group_jobs = stress_jobs_by_id[stress_id]
             for index, job in enumerate(stress_group_jobs, start=1):
                 log_to_console(
-                    f"[stress validation {index}/{len(stress_group_jobs)}] "
-                    f"{job.label}"
+                    f"STRESSERGEBNIS {index}/{len(stress_group_jobs)} "
+                    f"ÜBERNEHMEN | {job.label}"
                 )
                 stress_row, _stress_model_points = (
                     validated_results_by_sequence[job.sequence]
@@ -5882,6 +6151,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cap/stress cells. Every cell must be refitted independently."
         )
 
+    log_to_console(
+        "AGGREGATION START | V11-Vergleich, Cap-Sensitivitäten, "
+        "Modelpoint-Konzentration und optionale Stressverluste."
+    )
     _add_baseline_deltas(rows, args.baseline_rate)
     sensitivity_rows = _build_sensitivity_rows(rows, args.baseline_rate)
     decomposition_rows: list[dict[str, object]] = []
@@ -5901,6 +6174,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stress_csv = output / "portfolio_stress_losses_by_crediting_cap.csv"
     report_path = output / "portfolio_risk_report.md"
     manifest_path = output / "analysis_manifest.json"
+    log_to_console(f"OUTPUT START | Ergebnisdateien werden nach {output} geschrieben.")
     _write_csv(risk_csv, rows)
     _write_csv(sensitivity_csv, sensitivity_rows)
     if decomposition_rows:
@@ -5961,15 +6235,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "post_election_lapse_and_withdrawal"
             ),
             "lsmc_behaviour": (
-                "annual_election_and_monthly_continue_partial_full_"
-                "cross_fitted_lower_bound"
+                "annual_election_and_monthly_"
+                + (
+                    "continue_partial_full"
+                    if args.lsmc_income_action_set == "continue_partial_full"
+                    else "continue_full_lapse"
+                )
+                + "_cross_fitted_lower_bound"
             ),
             "income_election_action_set": ["WAIT", "START_INCOME"],
-            "post_income_action_set": [
-                "CONTINUE",
-                "PARTIAL_WITHDRAWAL",
-                "FULL_WITHDRAWAL",
-            ],
+            "post_income_action_set": (
+                ["CONTINUE", "PARTIAL_WITHDRAWAL", "FULL_WITHDRAWAL"]
+                if args.lsmc_income_action_set == "continue_partial_full"
+                else ["CONTINUE", "FULL_WITHDRAWAL"]
+            ),
             "income_election_decision_grid": {
                 "income_election": "policy_anniversaries",
                 "income_actions": "monthly",
@@ -6018,6 +6297,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "behaviour_models_compared": list(DEFAULT_BEHAVIOUR_MODELS),
             "separate_dynamic_full_policy_run_required": True,
             "lsmc_internal_dynamic_benchmark_disabled_to_avoid_duplicate": True,
+            "lsmc_internal_v10_continue_validation_control_retained": True,
+            "lsmc_v00_v01_factorial_outputs_disabled": True,
             "parallel_schedule_changes_random_seeds": False,
             "one_factor_shock_and_revalue": not args.no_stress_analysis,
             "default_risk_scope": list(DEFAULT_RISK_SCOPE),
@@ -6043,6 +6324,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "train_seed_3": args.train_seed_3,
             "train_take_up_seed_3": args.train_take_up_seed_3,
             "train_mortality_seed_3": args.train_mortality_seed_3,
+            "training_seed_count": args.training_seed_count,
             "training_seed_triplets": list(
                 _expected_lsmc_training_seed_triplets(args)
             ),
@@ -6057,10 +6339,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "heston_substeps": args.heston_substeps,
             "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
             "lsmc_folds": args.lsmc_folds,
+            "lsmc_income_action_set": args.lsmc_income_action_set,
             "lsmc_ridge": args.lsmc_ridge,
             "exercise_buffer_rmse_multiplier": (
                 args.exercise_buffer_rmse_multiplier),
             "portfolio_contract_count": args.portfolio_contract_count,
+            "model_points": {
+                "source_path": str(model_points_path),
+                "count": len(model_point_ids),
+                "ids": list(model_point_ids),
+            },
             "profitability_materiality_bp": args.profitability_materiality_bp,
             "stress_analysis_requested": not args.no_stress_analysis,
             "stress_scenarios": (
@@ -6096,7 +6384,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 iter(source_fingerprints)),
             "common_engine_version": next(iter(engine_versions)),
             "training_validation_evaluation_are_distinct": True,
-            "all_three_training_validation_evaluation_are_distinct": True,
+            "all_active_training_validation_evaluation_are_distinct": True,
             "every_training_seed_passes_election_income_combined": True,
             "primary_training_seed_index": 1,
             "evaluation_used_for_training_seed_selection": False,
@@ -6187,10 +6475,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "No catastrophe, FX, credit-spread or correlation stress.",
             "Results are before Risk Margin and gross of reinsurance.",
             "Mortality is illustrative and not an approved production basis.",
-            "LSMC uses annual WAIT/START_INCOME decisions and monthly "
-            "CONTINUE/PARTIAL_WITHDRAWAL/FULL_WITHDRAWAL Income actions.",
+            (
+                "LSMC uses annual WAIT/START_INCOME decisions and monthly "
+                + (
+                    "CONTINUE/PARTIAL_WITHDRAWAL/FULL_WITHDRAWAL Income actions."
+                    if args.lsmc_income_action_set == "continue_partial_full"
+                    else "CONTINUE/FULL_WITHDRAWAL Income actions; Partial "
+                    "Withdrawal is excluded from the optimal action set."
+                )
+            ),
             "Income is forced no later than the first policy anniversary after primary age 100 for an eligible surviving contract.",
-            "The LSMC Election, Partial- and Full-Withdrawal action diagnostics are unweighted fit diagnostics, not portfolio-weighted take-up or surrender rates.",
+            "The LSMC Election and enabled Income-action diagnostics are "
+            "unweighted fit diagnostics, not portfolio-weighted take-up or "
+            "surrender rates.",
             "Non-6% caps are non-contractual design sensitivities.",
             "Caps below 0.25% are technical sensitivities outside the contractual minimum.",
             "Crediting-cap variants hold all other terms fixed and are not budget-neutral repricings.",
@@ -6253,6 +6550,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log_to_console(f"Stress-loss CSV: {stress_csv}")
     log_to_console(f"Report: {report_path}")
     log_to_console(f"Manifest: {manifest_path}")
+    log_to_console(
+        f"RUN FERTIG | ID {run_id} | Gesamtlaufzeit "
+        f"{_format_duration(time.perf_counter() - run_started)} | "
+        f"Output: {output}"
+    )
     return 0
 
 
