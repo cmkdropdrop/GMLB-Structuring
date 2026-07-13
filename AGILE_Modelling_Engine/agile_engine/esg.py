@@ -213,7 +213,7 @@ class ScenarioSet:
     seed: int = 2026
     substeps: Optional[int] = None
     content_fingerprint: str = field(init=False, repr=False)
-    _derived_cache: dict[tuple[object, ...], Array] = field(
+    _derived_cache: dict[tuple[object, ...], object] = field(
         init=False, repr=False, compare=False)
     # Internal simulators transfer exclusive ownership of freshly allocated
     # arrays and can avoid a second multi-GB copy.  External construction keeps
@@ -227,7 +227,17 @@ class ScenarioSet:
             raise ValueError("Scenario seed must be a non-negative integer.")
         if not isinstance(self._copy_inputs, (bool, np.bool_)):
             raise ValueError("_copy_inputs must be boolean.")
-        times = np.array(self.times, dtype=float, copy=bool(self._copy_inputs))
+        copy_inputs = bool(self._copy_inputs)
+
+        def snapshot(value: object) -> Array:
+            # ``subok=True`` preserves a read-only ``numpy.memmap`` returned by
+            # the scenario cache.  Normal external construction still takes a
+            # defensive base-ndarray copy.
+            return np.array(
+                value, dtype=float, copy=copy_inputs, subok=not copy_inputs,
+            )
+
+        times = snapshot(self.times)
         if times.ndim != 1 or len(times) < 2 or not np.all(np.isfinite(times)) \
                 or not np.isclose(times[0], 0.0):
             raise ValueError("Scenario times must be a finite one-dimensional grid from zero.")
@@ -235,7 +245,7 @@ class ScenarioSet:
                 or not np.allclose(np.diff(times), self.dt, rtol=0.0, atol=1e-12) \
                 or not np.isclose(self.dt, 1.0 / STEPS_PER_YEAR):
             raise ValueError("Scenario grid must be uniform and monthly.")
-        levels = {Index(k): np.array(v, dtype=float, copy=bool(self._copy_inputs))
+        levels = {Index(k): snapshot(v)
                   for k, v in self.index_levels.items()}
         if set(levels) != set(Index):
             raise ValueError("Scenario levels are required for both indices.")
@@ -250,8 +260,8 @@ class ScenarioSet:
                 raise ValueError("Index levels must be finite and strictly positive.")
             if not np.allclose(values[:, 0], 1.0, rtol=0.0, atol=1e-12):
                 raise ValueError("Index levels must be normalised to 1 at time zero.")
-        short_rate = np.array(self.short_rate, dtype=float, copy=bool(self._copy_inputs))
-        discount = np.array(self.discount, dtype=float, copy=bool(self._copy_inputs))
+        short_rate = snapshot(self.short_rate)
+        discount = snapshot(self.discount)
         for name, arr in (("short_rate", short_rate), ("discount", discount)):
             if arr.shape != shape or not np.all(np.isfinite(arr)):
                 raise ValueError(f"{name} must be finite and match the scenario shape.")
@@ -260,7 +270,7 @@ class ScenarioSet:
             raise ValueError("Discount factors must be strictly positive.")
         variance = None
         if self.variance is not None:
-            variance = {Index(k): np.array(v, dtype=float, copy=bool(self._copy_inputs))
+            variance = {Index(k): snapshot(v)
                         for k, v in self.variance.items()}
             if set(variance) != set(Index):
                 raise ValueError("Variance paths are required for both indices.")
@@ -314,6 +324,94 @@ class ScenarioSet:
     @property
     def n_steps(self) -> int:
         return len(self.times) - 1
+
+    @classmethod
+    def from_storage(
+        cls,
+        *,
+        config: ESGConfig,
+        measure: Measure,
+        dt: float,
+        times: Array,
+        index_levels: Dict[Index, Array],
+        short_rate: Array,
+        discount: Array,
+        variance: Optional[Dict[Index, Array]],
+        stochastic_rates: bool,
+        model_name: str,
+        seed: int,
+        substeps: Optional[int],
+    ) -> "ScenarioSet":
+        """Restore validated immutable arrays without duplicating storage.
+
+        This constructor is intended for trusted array containers such as
+        read-only ``.npy`` memory maps.  It skips only defensive copying; the
+        complete shape, finiteness, model-state and fingerprint validation in
+        :meth:`__post_init__` still runs.
+        """
+        return cls(
+            config=config,
+            measure=measure,
+            dt=dt,
+            times=times,
+            index_levels=index_levels,
+            short_rate=short_rate,
+            discount=discount,
+            variance=variance,
+            stochastic_rates=stochastic_rates,
+            model_name=model_name,
+            seed=seed,
+            substeps=substeps,
+            _copy_inputs=False,
+        )
+
+    @property
+    def hedge_price_surface(self) -> Optional[object]:
+        """The strictly scenario-bound annual hedge surface, if attached."""
+        return self._derived_cache.get(("hedge_price_surface",))
+
+    @property
+    def market_cache_key(self) -> Optional[str]:
+        """Exact market-cache key this set was restored from, if any."""
+        value = self._derived_cache.get(("market_cache_key",))
+        return None if value is None else str(value)
+
+    @property
+    def market_variant(self) -> Optional[str]:
+        """Pre-applied market variant recorded by the market cache, if any."""
+        value = self._derived_cache.get(("market_variant",))
+        return None if value is None else str(value)
+
+    def bind_market_cache_identity(self, cache_key: str, market_variant: str) -> None:
+        """Record the immutable cache provenance of a restored scenario set."""
+        if not str(cache_key).strip() or not str(market_variant).strip():
+            raise ValueError("Market-cache key and variant must not be empty.")
+        values = {
+            ("market_cache_key",): str(cache_key),
+            ("market_variant",): str(market_variant),
+        }
+        for key, value in values.items():
+            existing = self._derived_cache.get(key)
+            if existing is not None and existing != value:
+                raise ValueError("ScenarioSet already has different market-cache provenance.")
+            self._derived_cache[key] = value
+
+    def bind_hedge_price_surface(self, surface: object) -> None:
+        """Attach one validated hedge surface without changing market content.
+
+        Derived pricing data are deliberately excluded from the market-path
+        fingerprint.  The surface performs the reverse validation against this
+        exact path count, order, horizon and fingerprint before it is stored.
+        """
+        validator = getattr(surface, "validate_against", None)
+        if validator is None or not callable(validator):
+            raise TypeError("Hedge price surface must provide validate_against().")
+        validator(self)
+        key = ("hedge_price_surface",)
+        existing = self._derived_cache.get(key)
+        if existing is not None and existing is not surface:
+            raise ValueError("ScenarioSet already has a different hedge surface.")
+        self._derived_cache[key] = surface
 
     def money_market_accumulation(self, start_step: int, end_step: int) -> Array:
         """Pathwise accumulation of the continuously rolled AUD overnight account.

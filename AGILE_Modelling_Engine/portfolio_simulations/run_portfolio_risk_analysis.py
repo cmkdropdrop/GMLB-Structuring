@@ -12,9 +12,10 @@ and Behaviour-effect decompositions are deliberately omitted.
 
 The default compares 4%, 6%, 12% and 15% Caps on the base market scenario with
 the complete Dynamic and LSMC V11 policies for the first model point of the
-four-point proxy, but without counterfactual Behaviour arms,
-shock-and-revalue stresses or plots.  This makes Lapse/Behaviour the default
-risk scope.  Interest up,
+four-point proxy, but without counterfactual Behaviour arms or
+shock-and-revalue stresses.  Aggregate risk-analysis plots are produced by
+default; the more numerous child-scenario plots remain opt-in.  This makes
+Lapse/Behaviour the default risk scope.  Interest up,
 interest down and Longevity remain the preselected one-factor stress set when
 stress analysis is explicitly enabled.  Other research stresses remain
 available only when explicitly selected.  The portfolio runners deliberately
@@ -498,6 +499,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=validation_input.mortality_seed,
     )
     parser.add_argument("--heston-substeps", type=int, default=4)
+    parser.add_argument("--market-cache-root", type=Path, default=None)
+    parser.add_argument("--hedge-cache-root", type=Path, default=None)
+    parser.add_argument(
+        "--hedge-pricing-method",
+        choices=("mc_conditional", "moment_matched_bs"),
+        default="mc_conditional",
+    )
+    parser.add_argument("--require-market-cache", action="store_true")
+    parser.add_argument("--require-hedge-cache", action="store_true")
     parser.add_argument(
         "--hedge-cap-leg-mode",
         choices=("sold", "not_sold"),
@@ -617,7 +627,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--plots",
         dest="no_plots",
         action="store_false",
-        help="create the aggregate risk-analysis figures",
+        help="create the aggregate risk-analysis figures (default)",
     )
     plot_toggle.add_argument(
         "--no-plots",
@@ -625,7 +635,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="write CSV/report/manifest outputs without analysis figures",
     )
-    parser.set_defaults(no_plots=True)
+    parser.set_defaults(no_plots=False)
     parser.add_argument(
         "--output",
         type=Path,
@@ -809,6 +819,13 @@ def _append_shared_inputs(command: list[str], args: argparse.Namespace) -> None:
         command, "--behaviour-assumption-set", args.behaviour_assumption_set)
     _optional_argument(command, "--zero-curve", args.zero_curve)
     _optional_argument(command, "--model-parameters", args.model_parameters)
+    _optional_argument(command, "--market-cache-root", args.market_cache_root)
+    _optional_argument(command, "--hedge-cache-root", args.hedge_cache_root)
+    command.extend(("--hedge-pricing-method", args.hedge_pricing_method))
+    if args.require_market_cache:
+        command.append("--require-market-cache")
+    if args.require_hedge_cache:
+        command.append("--require-hedge-cache")
 
 
 def _dynamic_command(
@@ -4872,6 +4889,77 @@ def _create_plots(
         finish(fig, policy_year_path)
         figure_paths["policy_year_behaviour_profile"] = str(policy_year_path)
 
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), sharex=True)
+    profitability_panels = (
+        (
+            axes[0, 0], "insurer_net_present_value_before_risk_margin_aud",
+            "Simplified CSM / insurer NPV before Risk Margin", True,
+        ),
+        (axes[0, 1], "pv_future_fees_aud", "Future fee income", False),
+        (axes[1, 0], "pv_guarantee_claims_aud", "Guarantee claims", False),
+        (
+            axes[1, 1], "pv_hedge_costs_aud",
+            "Total call-spread / hedge costs", False,
+        ),
+    )
+    for axis, field, title, zero_line in profitability_panels:
+        plot_method_lines(axis, field, zero_line=zero_line)
+        axis.set_title(title, loc="left")
+        axis.set_ylabel("AUD")
+        axis.yaxis.set_major_formatter(FuncFormatter(_aud_axis))
+
+    other_income_axis = axes[0, 2]
+    for method in ("dynamic", "lsmc"):
+        other_income_axis.plot(
+            caps,
+            [
+                float(row.get(f"{method}_pv_money_market_income_aud") or 0.0)
+                + float(row.get(f"{method}_pv_hedge_gain_aud") or 0.0)
+                for row in rows
+            ],
+            marker="o",
+            linewidth=2.0,
+            color=colours[method],
+            label=labels[method],
+        )
+    other_income_axis.axvline(
+        baseline_percent, color="#9ca3af", linestyle="--"
+    )
+    other_income_axis.set_title(
+        "Other income: money market + hedge gain", loc="left"
+    )
+    other_income_axis.set_ylabel("AUD")
+    other_income_axis.yaxis.set_major_formatter(FuncFormatter(_aud_axis))
+    other_income_axis.grid(alpha=0.25)
+
+    gap_axis = axes[1, 2]
+    behaviour_gaps = [
+        float(row["dynamic_insurer_net_present_value_before_risk_margin_aud"])
+        - float(row["lsmc_insurer_net_present_value_before_risk_margin_aud"])
+        for row in rows
+    ]
+    gap_axis.bar(caps, behaviour_gaps, width=0.55, color="#bb3e03")
+    gap_axis.axhline(0.0, color="#1f2937", linewidth=0.8)
+    gap_axis.axvline(baseline_percent, color="#9ca3af", linestyle="--")
+    gap_axis.set_title(
+        "Behaviour-model gap (Dynamic minus LSMC)", loc="left"
+    )
+    gap_axis.set_ylabel("AUD; positive = LSMC more adverse")
+    gap_axis.yaxis.set_major_formatter(FuncFormatter(_aud_axis))
+    gap_axis.grid(axis="y", alpha=0.25)
+
+    axes[0, 0].legend()
+    for axis in axes[1, :]:
+        axis.set_xlabel("Scenario Maximum Return / Crediting Cap (%)")
+    fig.suptitle(
+        "Simplified CSM and insurer value drivers by crediting cap"
+    )
+    profitability_path = (
+        output / "05_csm_and_value_drivers_by_crediting_cap.png"
+    )
+    finish(fig, profitability_path)
+    figure_paths["csm_and_value_drivers"] = str(profitability_path)
+
     if behaviour_decomposition_rows:
         selected_metric = "insurer_net_present_value_before_risk_margin_aud"
         fig, axes = plt.subplots(2, 1, figsize=(13.0, 9.5), sharex=True)
@@ -4931,7 +5019,7 @@ def _create_plots(
         fig.suptitle(
             "2x2 Election / post-Election Behaviour decomposition of insurer NPV"
         )
-        factorial_path = output / "05_behaviour_factorial_decomposition.png"
+        factorial_path = output / "06_behaviour_factorial_decomposition.png"
         finish(fig, factorial_path)
         figure_paths["behaviour_factorial_decomposition"] = str(factorial_path)
 
@@ -4968,7 +5056,7 @@ def _create_plots(
     fig.suptitle(
         "Model-point heterogeneity and concentration (not a pathwise VaR/CTE)"
     )
-    model_point_path = output / "06_model_point_risk_by_crediting_cap.png"
+    model_point_path = output / "07_model_point_risk_by_crediting_cap.png"
     finish(fig, model_point_path)
     figure_paths["model_point_risk"] = str(model_point_path)
 
@@ -5033,7 +5121,7 @@ def _create_plots(
     for axis in axes[1, :]:
         axis.set_xlabel("Scenario Maximum Return / Crediting Cap (%)")
     fig.suptitle("LSMC model-risk diagnostics by crediting cap")
-    quality_path = output / "07_lsmc_model_risk_diagnostics.png"
+    quality_path = output / "08_lsmc_model_risk_diagnostics.png"
     finish(fig, quality_path)
     figure_paths["lsmc_model_risk_diagnostics"] = str(quality_path)
 
@@ -5081,7 +5169,7 @@ def _create_plots(
         fig.suptitle(
             "One-factor shock-and-revalue loss by crediting cap and behaviour method"
         )
-        stress_path = output / "06_stress_loss_by_crediting_cap.png"
+        stress_path = output / "09_stress_loss_by_crediting_cap.png"
         finish(fig, stress_path)
         figure_paths["stress_loss_by_crediting_cap"] = str(stress_path)
 
@@ -5138,7 +5226,7 @@ def _create_plots(
                 shrink=0.85,
             )
         fig.suptitle("Risk-driver / crediting-cap stress-loss heatmap")
-        heatmap_path = output / "07_stress_loss_heatmap.png"
+        heatmap_path = output / "10_stress_loss_heatmap.png"
         finish(fig, heatmap_path)
         figure_paths["stress_loss_heatmap"] = str(heatmap_path)
 

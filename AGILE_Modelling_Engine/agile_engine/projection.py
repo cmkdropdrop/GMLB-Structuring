@@ -1732,6 +1732,11 @@ class ProjectionConfig:
     #: It is an insurer cost only and never reduces customer Reference-Fund
     #: return or the contractual option payoff path.
     hedge_reference_management_fee: float = 0.003
+    #: Annual hedge purchase-price method.  ``mc_conditional`` requires an
+    #: exact path-aligned :class:`HedgePriceSurface` bound to the ScenarioSet;
+    #: ``moment_matched_bs`` is the explicit legacy fallback.  The intra-year
+    #: customer DVA mark remains moment matched under both choices.
+    hedge_pricing_method: str = "moment_matched_bs"
     #: The standard strategy sells the cap call.  ``NOT_SOLD`` buys the
     #: uncapped positive-return call and retains its payoff above the cap.
     hedge_cap_leg_mode: HedgeCapLegMode = HedgeCapLegMode.SOLD
@@ -1780,6 +1785,12 @@ class ProjectionConfig:
             )
         if self.max_age <= 0.0:
             raise ValueError("Projection max_age must be positive.")
+        if self.hedge_pricing_method not in (
+                "mc_conditional", "moment_matched_bs"):
+            raise ValueError(
+                "hedge_pricing_method must be 'mc_conditional' or "
+                "'moment_matched_bs'."
+            )
         try:
             object.__setattr__(
                 self,
@@ -1805,7 +1816,8 @@ CASHFLOW_KEYS = (
     "surrender_benefits", "partial_withdrawals", "terminal_closeout",
     "fees_product", "fees_lip", "crediting_margin", "money_market_income",
     "hedge_gain", "mva_retained", "aps_retained", "hedge_costs",
-    "hedge_option_fair_value_costs", "hedge_option_markup_costs",
+    "hedge_option_fair_value_costs", "hedge_option_fair_value_bs_proxy",
+    "hedge_option_markup_costs",
     "hedge_management_fee_costs", "hedge_execution_costs",
     "contract_financing_margin", "expenses",
 )
@@ -2236,6 +2248,19 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         n_steps = horizon_steps
 
     reference_spec = product.reference_fund
+    hedge_price_surface = scenarios.hedge_price_surface
+    if config.hedge_pricing_method == "mc_conditional":
+        if hedge_price_surface is None:
+            raise ValueError(
+                "mc_conditional hedge pricing requires an exact validated "
+                "HedgePriceSurface bound to the ScenarioSet."
+            )
+        if config.hedge_cap_leg_mode != HedgeCapLegMode.SOLD:
+            raise ValueError(
+                "mc_conditional currently prices the standard sold-cap call "
+                "spread only; use moment_matched_bs for an uncapped long call."
+            )
+        hedge_price_surface.validate_against(scenarios)
     reference_fund_level = scenarios.monthly_rebalanced_reference_fund_index(
         equity_index=reference_spec.equity_index,
         equity_weight=reference_spec.equity_weight,
@@ -2999,6 +3024,12 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     def reference_hedge_option_value(
             step: int, volatility_spread: float = 0.0) -> Array:
         """Fair one-year insurer hedge value on the complete Reference Fund."""
+        if config.hedge_pricing_method == "mc_conditional" \
+                and volatility_spread == 0.0:
+            return np.asarray(hedge_price_surface.price_for(
+                step,
+                reference_spec.cap(step // STEPS_PER_YEAR),
+            ))
         r_cc = scenarios.forward_zero_cc(step, 1.0)
         sigma = scenarios.reference_fund_effective_vol(
             step,
@@ -3031,6 +3062,27 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         active = phase < Phase.TERMINATED.value
         fair_rate = np.maximum(reference_hedge_option_value(step, 0.0), 0.0)
         fair_cost = iv_frame * fair_rate
+        if config.hedge_pricing_method == "mc_conditional":
+            r_cc = scenarios.forward_zero_cc(step, 1.0)
+            sigma = scenarios.reference_fund_effective_vol(
+                step,
+                horizon=1.0,
+                equity_index=reference_spec.equity_index,
+                equity_weight=reference_spec.equity_weight,
+                bond_tenor=reference_spec.bond_tenor_years,
+            )
+            bs_proxy_rate = np.asarray(hedge_option_package_value(
+                1.0,
+                reference_spec.cap(step // STEPS_PER_YEAR),
+                1.0,
+                r_cc,
+                0.0,
+                sigma,
+                config.hedge_cap_leg_mode,
+            ))
+        else:
+            bs_proxy_rate = fair_rate
+        bs_proxy_cost = iv_frame * np.maximum(bs_proxy_rate, 0.0)
         markup_cost = fair_cost * config.option_fair_value_markup
         management_cost = (
             iv_frame * config.hedge_reference_management_fee
@@ -3039,7 +3091,7 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             spread_quote = reference_hedge_option_value(
                 step, config.hedge_vol_spread,
             )
-            execution_cost = iv_frame * np.abs(spread_quote - fair_rate)
+            execution_cost = iv_frame * np.abs(spread_quote - bs_proxy_rate)
         else:
             execution_cost = np.zeros(n_paths)
 
@@ -3054,6 +3106,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             weighted = w * np.where(active, amount, 0.0)
             cfs[key][:, step] += weighted
             aggregate += weighted
+        cfs["hedge_option_fair_value_bs_proxy"][:, step] += (
+            w * np.where(active, bs_proxy_cost, 0.0)
+        )
         cfs["hedge_costs"][:, step] += aggregate
 
     def restart_dva_period(step: int) -> None:

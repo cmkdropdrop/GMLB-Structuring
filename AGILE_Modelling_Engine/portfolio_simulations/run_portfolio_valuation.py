@@ -71,6 +71,12 @@ from agile_engine.portfolio_stresses import (  # noqa: E402
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "portfolio_valuation"
 )
+DEFAULT_MARKET_CACHE_ROOT = (
+    Path(__file__).resolve().parent / "cache" / "q_market_paths"
+)
+DEFAULT_HEDGE_CACHE_ROOT = (
+    Path(__file__).resolve().parent / "cache" / "q_hedge_prices"
+)
 LOGGER_NAME = "agile_engine.portfolio_runner"
 
 
@@ -256,6 +262,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
+        "--market-cache-root", type=Path, default=DEFAULT_MARKET_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-cache-root", type=Path, default=DEFAULT_HEDGE_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-pricing-method",
+        choices=("mc_conditional", "moment_matched_bs"),
+        default="mc_conditional",
+    )
+    parser.add_argument("--require-market-cache", action="store_true")
+    parser.add_argument("--require-hedge-cache", action="store_true")
+    parser.add_argument(
         "--hedge-cap-leg-mode",
         choices=tuple(mode.value for mode in HedgeCapLegMode),
         default=HedgeCapLegMode.SOLD.value,
@@ -393,6 +412,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("all seeds must be non-negative")
     if args.heston_substeps <= 0:
         parser.error("--heston-substeps must be positive")
+    if args.hedge_pricing_method == "mc_conditional" \
+            and args.hedge_cap_leg_mode != HedgeCapLegMode.SOLD.value:
+        parser.error(
+            "mc_conditional supports the standard sold-cap call spread only"
+        )
     if args.crediting_cap_rate is not None and (
         not math.isfinite(args.crediting_cap_rate)
         or not 0.0 <= args.crediting_cap_rate <= 1.0
@@ -1225,6 +1249,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mortality_seed=args.mortality_seed,
             force_pathwise_joint_life=True,
             hedge_cap_leg_mode=HedgeCapLegMode(args.hedge_cap_leg_mode),
+            hedge_pricing_method=args.hedge_pricing_method,
         )
         costs = load_cost_assumptions(
             args.cost_assumptions,
@@ -1334,6 +1359,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             horizon_years=None,
             projection=costs.projection,
             real_world_model="hull_white_bs",
+            market_cache_root=str(args.market_cache_root),
+            market_curve_sha256=market.source_sha256["curve"],
+            market_model_parameters_sha256=(
+                market.source_sha256["model_parameters"]
+            ),
+            market_variant=(
+                stress.stress_id
+                if stress.stress_id in {
+                    "interest_up", "interest_down", "equity_level_down",
+                    "equity_volatility_up",
+                }
+                else "base"
+            ),
+            require_market_cache=args.require_market_cache,
+            hedge_cache_root=str(args.hedge_cache_root),
+            hedge_cap_grid=(
+                float(costs.product.reference_fund.effective_maximum_return),
+            ),
+            hedge_equity_allocation=equity_allocation.equity_weight,
+            hedge_equity_index=costs.product.reference_fund.equity_index,
+            hedge_allocation_input_sha256=equity_allocation.source_sha256,
+            require_hedge_cache=args.require_hedge_cache,
         )
 
         logger.info(
@@ -1382,6 +1429,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "post_income_behaviour": args.post_income_behaviour,
             "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
             "scenario_fingerprint": result.scenario_fingerprint,
+            "hedge_pricing_method": args.hedge_pricing_method,
         })
         model_point_rows = result.model_point_rows()
         if len(model_point_rows) != model_point_count:
@@ -1461,6 +1509,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "modelled.",
             "Intra-year DVA is a moment-matched Black-Scholes proxy on the "
             "complete reference fund; COS is not used.",
+            "Annual new-issue call-spread fair values use the selected "
+            f"{args.hedge_pricing_method} method; no nested MC is used.",
             "Dynamic take-up, lapse and withdrawal inputs are uncalibrated "
             "Behaviour proxies rather than a fully calibrated forecast.",
             "The five-year government-bond sleeve and monthly rebalancing to "
@@ -1493,6 +1543,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "valuation_measure": "risk_neutral",
                 "market_model": "heston_hull_white",
                 "simulation": "plain_monte_carlo",
+                "market_cache_key": summary.get("market_cache_key"),
+                "scenario_fingerprint": summary.get("scenario_fingerprint"),
+                "hedge_cache_key": summary.get("hedge_cache_key"),
+                "hedge_price_surface_fingerprint": summary.get(
+                    "hedge_price_surface_fingerprint"
+                ),
+                "hedge_pricing_method": args.hedge_pricing_method,
+                "hedge_training_scenario_fingerprint": summary.get(
+                    "hedge_training_scenario_fingerprint"
+                ),
+                "hedge_cross_fit_folds": summary.get("hedge_cross_fit_folds"),
+                "hedge_cap_grid": summary.get("hedge_cap_grid"),
+                "hedge_equity_allocation": summary.get(
+                    "hedge_equity_allocation"
+                ),
+                "dva_mark_method": "moment_matched_bs",
+                "nested_mc_used": False,
                 "shared_market_scenarios_across_model_points": True,
                 "model_points_valued_separately_before_aggregation": True,
                 "income_take_up": (
@@ -1664,6 +1731,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "hedge_vol_spread": (
                     result_settings.projection.hedge_vol_spread
                 ),
+                "hedge_pricing_method": (
+                    result_settings.projection.hedge_pricing_method
+                ),
+                "market_cache_root": str(args.market_cache_root),
+                "hedge_cache_root": str(args.hedge_cache_root),
+                "require_market_cache": args.require_market_cache,
+                "require_hedge_cache": args.require_hedge_cache,
                 "crediting_margin_enabled": (
                     result_settings.projection.crediting_margin_enabled
                 ),

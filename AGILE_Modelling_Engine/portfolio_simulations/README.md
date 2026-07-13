@@ -19,6 +19,10 @@ getrennt als Hedge gebucht; Kunden-AV, Crediting und Claims bleiben unverändert
 
 Aus `AGILE_Modelling_Engine`:
 
+Der Befehl setzt für den Default `mc_conditional` einen zuvor exakt passend
+erzeugten Hedgepreis-Cache voraus; der Precompute-Ablauf steht im folgenden
+Abschnitt.
+
 ```powershell
 python portfolio_simulations/run_portfolio_valuation.py
 ```
@@ -50,6 +54,57 @@ Die Aktienquote des Reference Fund wird aus
 wird immer als `1 - equity_weight` abgeleitet. Der mitgelieferte Basiswert ist
 30 % Aktien / 70 % Bonds; die Allokation ist eine Produkteingabe und kein
 kalibrierter Marktparameter.
+
+## Wiederverwendbare Q-Markt- und Hedge-Caches
+
+Der Standard `mc_conditional` bewertet die jährlich neu gekaufte einjährige
+Call-Spread-Hedgeposition aus einem vorab berechneten Cache. Nur
+`precompute_q_market_and_hedge_cache.py` schreibt Cache-Einträge; alle
+Bewertungs-, Behaviour- und Optimierungsrunner sind reine Leser. Ein Beispiel
+für den gelieferten 4-Point-Default mit 6 % Cap ist:
+
+```powershell
+python portfolio_simulations/precompute_q_market_and_hedge_cache.py `
+  --horizon-years 53 --n-paths 2000 --seed 2026 --cap-grid 0.06
+python portfolio_simulations/run_portfolio_valuation.py `
+  --require-market-cache --require-hedge-cache
+```
+
+Horizont, Pfadzahl, Seed und Cap-Grid müssen zum jeweiligen Consumer exakt
+passen. Training, Validierung und Evaluation benötigen wegen ihrer
+unterschiedlichen Seeds und Pfadzahlen eigene Einträge. Dasselbe gilt für jede
+Marktstress-Variante. Der Key bindet außerdem Kurven- und Parameter-Hashes,
+ESG-Konfiguration, Heston-Substeps, Aktienallokation samt Datei-Hash sowie die
+Cross-Fit-Einstellungen. Es gibt keine unscharfe Cache-Suche und ein
+existierender inkonsistenter Eintrag wird nie überschrieben.
+
+Ohne `--cap-grid` verwendet der Precompute-Runner das vollständige
+Optimierungsgrid 0,25 %, 1 %, 2 %, ..., 20 %. Der schnelle LSMC-Grid und
+Fixed-Cap-Läufe müssen ihr jeweils exaktes Grid ausdrücklich angeben.
+
+Die großen Markt- und Preisarrays liegen getrennt als read-only memory-mapped
+`.npy`-Dateien unter `portfolio_simulations/cache/q_market_paths` und
+`portfolio_simulations/cache/q_hedge_prices`; Manifeste und Content-
+Fingerprints werden beim Laden erneut geprüft. Diese Verzeichnisse sind nicht
+für Git bestimmt.
+
+Für jedes Anniversary und jeden Cap-Punkt schätzt ein fold-excluding
+Ridge-Modell den bedingten Barwert des im Folgejahr realisierten vollständigen
+Reference-Fund-Call-Spreads. Features sind ausschließlich der zum Anniversary
+bekannte Zustand: Heston-Varianz, Short Rate, ein- und fünfjähriger Zero Rate
+und Vertragsjahr. Nach der Schätzung werden Nichtnegativität, Cap-Monotonie,
+der Nullwert bei Cap null und eine diskontierte Payoff-Obergrenze erzwungen.
+Es gibt weder Look-ahead über den Folgejahres-Payoff des eigenen Pfads noch
+nested Monte Carlo.
+
+Die Hedgekosten werden damit jährlich am jeweiligen Anniversary neu bewertet;
+es wird kein kompletter Forward-Start-Strip bei Vertragsbeginn gekauft. Der
+unterjährige DVA bleibt davon getrennt ein moment-matched Black-Scholes-Proxy.
+Der entsprechende BS-Hedgewert wird bei `mc_conditional` nur als diagnostischer
+Proxy ausgegeben und nicht zusätzlich als Kosten gebucht. Als ausdrücklich
+gewählter Fallback steht
+`--hedge-pricing-method moment_matched_bs` zur Verfügung; dafür ist kein
+Hedgepreis-Cache erforderlich.
 
 ## Crediting-Rate-Szenarien
 
@@ -540,6 +595,13 @@ Markdown-Bericht und auditiertes Manifest ausgegeben:
 python portfolio_simulations/run_portfolio_risk_analysis.py
 ```
 
+Die aggregierten Risiko-, Behaviour-, LSMC-Diagnostik- und CSM-/Werttreiber-
+Grafiken werden standardmäßig unter `figures/` erzeugt. `--no-plots`
+deaktiviert diese Analyseplots ausdrücklich. Mit `--scenario-plots` können
+zusätzlich die Standardgrafiken jedes einzelnen Dynamic-/LSMC-Child-Laufs
+angefordert werden; sie bleiben wegen der großen Dateimenge standardmäßig
+deaktiviert.
+
 Je Cap und Ansatz werden unter anderem mean/median/p10/p90 des Income-
 Startjahrs, Election-Anteile je Policy Year, verbleibende Growth-Exposures,
 Forced-Election-Anteil, mittlere Growth-Dauer, Ordinary-/Performance-/Total-
@@ -718,6 +780,10 @@ Einstieg und delegiert bei direkter Ausfuehrung an diesen kanonischen Runner.
 - Der unterjährige DVA ist ein moment-matched Black-Scholes-Proxy auf den
   vollständigen Reference Fund. Cap und Floor werden nicht getrennt auf Equity-
   und Bond-Sleeve angewandt.
+- Die jährlichen Conditional-MC-Hedgewerte sind cross-fitted
+  Regressionsschätzungen aus simulierten Einjahres-Payoffs und keine
+  ausführbaren Marktquotes. Unterschiedliche Seeds, Stressvarianten,
+  Allokationen oder Cap-Grids sind getrennte Cache-Einträge.
 - Bond Term Premium, Credit Spreads, Ausfälle, Ratingmigrationen,
   Inflation-Linked Bonds, eine separate FX-Schicht, Transaktionskosten und
   kundenbezogene fondsinterne Gebühren fehlen. Die separate fixe 0,30%-Fee auf

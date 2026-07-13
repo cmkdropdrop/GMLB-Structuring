@@ -65,6 +65,7 @@ from agile_engine import (  # noqa: E402
     ReferenceFundSpec,
     ValuationSettings,
     __version__ as ENGINE_VERSION,
+    bind_cached_hedge_prices,
     load_cost_assumptions,
     load_dynamic_behaviour_assumptions,
     load_equity_allocation,
@@ -118,6 +119,12 @@ else:
 
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "portfolio_valuation_lsmc"
+)
+DEFAULT_MARKET_CACHE_ROOT = (
+    Path(__file__).resolve().parent / "cache" / "q_market_paths"
+)
+DEFAULT_HEDGE_CACHE_ROOT = (
+    Path(__file__).resolve().parent / "cache" / "q_hedge_prices"
 )
 AVAILABLE_LSMC_TRAINING_SEED_SETS = 3
 
@@ -250,6 +257,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
+        "--market-cache-root", type=Path, default=DEFAULT_MARKET_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-cache-root", type=Path, default=DEFAULT_HEDGE_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-pricing-method",
+        choices=("mc_conditional", "moment_matched_bs"),
+        default="mc_conditional",
+    )
+    parser.add_argument("--require-market-cache", action="store_true")
+    parser.add_argument("--require-hedge-cache", action="store_true")
+    parser.add_argument(
         "--hedge-cap-leg-mode",
         choices=tuple(mode.value for mode in HedgeCapLegMode),
         default=HedgeCapLegMode.SOLD.value,
@@ -337,6 +357,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.lsmc_folds < 2:
         parser.error("--lsmc-folds must be at least two")
+    if args.hedge_pricing_method == "mc_conditional" \
+            and args.hedge_cap_leg_mode != HedgeCapLegMode.SOLD.value:
+        parser.error(
+            "mc_conditional supports the standard sold-cap call spread only"
+        )
     seed_names = (
         "seed",
         "take_up_seed",
@@ -966,6 +991,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mortality_seed=args.mortality_seed,
             force_pathwise_joint_life=True,
             hedge_cap_leg_mode=HedgeCapLegMode(args.hedge_cap_leg_mode),
+            hedge_pricing_method=args.hedge_pricing_method,
         )
         costs = load_cost_assumptions(
             args.cost_assumptions,
@@ -997,6 +1023,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             costs.expenses,
         )
         scenario_transform = portfolio_scenario_transform(stress)
+        cache_settings = {
+            "market_cache_root": str(args.market_cache_root),
+            "market_curve_sha256": market.source_sha256["curve"],
+            "market_model_parameters_sha256": (
+                market.source_sha256["model_parameters"]
+            ),
+            "market_variant": (
+                stress.stress_id
+                if stress.stress_id in {
+                    "interest_up", "interest_down", "equity_level_down",
+                    "equity_volatility_up",
+                }
+                else "base"
+            ),
+            "require_market_cache": args.require_market_cache,
+            "hedge_cache_root": str(args.hedge_cache_root),
+            "hedge_cap_grid": (
+                float(costs.product.reference_fund.effective_maximum_return),
+            ),
+            "hedge_equity_allocation": equity_allocation.equity_weight,
+            "hedge_equity_index": costs.product.reference_fund.equity_index,
+            "hedge_allocation_input_sha256": equity_allocation.source_sha256,
+            "require_hedge_cache": args.require_hedge_cache,
+        }
         evaluation_settings = ValuationSettings(
             model="heston_hull_white",
             n_paths=args.n_paths,
@@ -1012,6 +1062,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 force_pathwise_joint_life=True,
             ),
             real_world_model="hull_white_bs",
+            **cache_settings,
         )
         horizon_basis = replace(evaluation_settings, horizon_years=None)
         common_horizon = max(
@@ -1070,6 +1121,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 horizon_years=common_horizon,
                 projection=training_projection_i,
                 real_world_model="hull_white_bs",
+                **cache_settings,
             )
             logger.info(
                 "LSMC-Trainingssample %d/%d | market=%d | take-up=%d | "
@@ -1086,8 +1138,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 measure=Measure.RISK_NEUTRAL,
                 horizon_years=common_horizon,
             )
-            if scenario_transform is not None:
+            training_transform_already_cached = (
+                training_scenarios_i.market_cache_key is not None
+                and cache_settings["market_variant"] != "base"
+                and training_scenarios_i.market_variant
+                == cache_settings["market_variant"]
+            )
+            if scenario_transform is not None and not training_transform_already_cached:
                 training_scenarios_i = scenario_transform(training_scenarios_i)
+            training_scenarios_i = bind_cached_hedge_prices(
+                training_scenarios_i, training_settings_i
+            )
             training_projections.append(training_projection_i)
             training_scenarios_by_seed.append(training_scenarios_i)
         training_projection = training_projections[0]
@@ -1226,6 +1287,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             horizon_years=common_horizon,
             projection=validation_projection,
             real_world_model="hull_white_bs",
+            **cache_settings,
         )
         logger.info(
             "[3/8] Eingefrorene LSMC-Policy auf getrennten "
@@ -1239,8 +1301,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             measure=Measure.RISK_NEUTRAL,
             horizon_years=common_horizon,
         )
-        if scenario_transform is not None:
+        validation_transform_already_cached = (
+            validation_scenarios.market_cache_key is not None
+            and cache_settings["market_variant"] != "base"
+            and validation_scenarios.market_variant
+            == cache_settings["market_variant"]
+        )
+        if scenario_transform is not None and not validation_transform_already_cached:
             validation_scenarios = scenario_transform(validation_scenarios)
+        validation_scenarios = bind_cached_hedge_prices(
+            validation_scenarios, validation_settings
+        )
         if validation_scenarios.content_fingerprint in set(
             training_scenario_fingerprints
         ):
@@ -2722,6 +2793,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "valuation_measure": "risk_neutral",
                 "market_model": "heston_hull_white",
                 "simulation": "plain_monte_carlo",
+                "market_cache_keys": {
+                    "training": [
+                        (
+                            scenario.hedge_price_surface.spec.market_cache_key
+                            if scenario.hedge_price_surface is not None else None
+                        )
+                        for scenario in training_scenarios_by_seed
+                    ],
+                    "validation": (
+                        validation_scenarios.hedge_price_surface.spec.market_cache_key
+                        if validation_scenarios.hedge_price_surface is not None
+                        else None
+                    ),
+                    "evaluation": lsmc_summary.get("market_cache_key"),
+                },
+                "scenario_fingerprints": {
+                    "training": list(training_scenario_fingerprints),
+                    "validation": validation_scenarios.content_fingerprint,
+                    "evaluation": lsmc_result.scenario_fingerprint,
+                },
+                "hedge_cache_keys": {
+                    "training": [
+                        (
+                            scenario.hedge_price_surface.hedge_cache_key
+                            if scenario.hedge_price_surface is not None else None
+                        )
+                        for scenario in training_scenarios_by_seed
+                    ],
+                    "validation": (
+                        validation_scenarios.hedge_price_surface.hedge_cache_key
+                        if validation_scenarios.hedge_price_surface is not None
+                        else None
+                    ),
+                    "evaluation": lsmc_summary.get("hedge_cache_key"),
+                },
+                "hedge_price_surface_fingerprints": {
+                    "training": [
+                        (
+                            scenario.hedge_price_surface.price_surface_fingerprint
+                            if scenario.hedge_price_surface is not None else None
+                        )
+                        for scenario in training_scenarios_by_seed
+                    ],
+                    "validation": (
+                        validation_scenarios.hedge_price_surface.price_surface_fingerprint
+                        if validation_scenarios.hedge_price_surface is not None
+                        else None
+                    ),
+                    "evaluation": lsmc_summary.get(
+                        "hedge_price_surface_fingerprint"
+                    ),
+                },
+                "hedge_pricing_method": args.hedge_pricing_method,
+                "hedge_training_scenario_fingerprints": [
+                    (
+                        scenario.hedge_price_surface.spec.training_scenario_fingerprint
+                        if scenario.hedge_price_surface is not None else None
+                    )
+                    for scenario in training_scenarios_by_seed
+                ],
+                "hedge_cross_fit_folds": (
+                    training_scenarios.hedge_price_surface.spec.cross_fit_folds
+                    if training_scenarios.hedge_price_surface is not None
+                    else None
+                ),
+                "hedge_cap_grid": list(cache_settings["hedge_cap_grid"]),
+                "hedge_equity_allocation": equity_allocation.equity_weight,
+                "dva_mark_method": "moment_matched_bs",
+                "nested_mc_used": False,
                 "lsmc_used": True,
                 "lsmc_objective": "maximise_policyholder_cashflow_pv",
                 "lsmc_action_set": {
@@ -3148,6 +3288,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "the CSV-configured target allocation, "
                 "absence of bond term premium and other fixed proxy assumptions "
                 "remain unchanged from the dynamic benchmark.",
+                "The intra-year DVA mark remains a moment-matched BS proxy; "
+                "annual new-issue hedge fair values use the selected pricing "
+                "method without nested Monte Carlo.",
                 (
                     "The fitted-Election/Continue rollout is retained only as "
                     "an internal final-sample validation control; it is not a "

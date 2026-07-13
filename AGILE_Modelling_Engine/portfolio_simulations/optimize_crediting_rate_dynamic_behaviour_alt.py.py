@@ -3,23 +3,33 @@
 This is a standalone counterfactual management-action study.  Policyholders
 follow the repository's statistical dynamic Behaviour model throughout the
 monthly projection; no Policyholder value-function regression or optimal-
-surrender LSMC is fitted or applied.  The insurer's annual cap remains a
-discrete control estimated by cross-fitted control-randomisation Fitted-Q.
+surrender LSMC is fitted or applied.  The insurer's annual cap is optimised
+with a gas-storage-style Least-Squares Monte Carlo: the customer account value
+per initial premium is treated as the endogenous inventory ("storage level")
+on a discretised grid, the cap is the injection control that decides how much
+Reference-Fund return is credited into the fund, and dynamic Income and
+withdrawals draw the fund down.
 
 The market paths are simulated once without contractual crediting under
 risk-neutral Heston-Hull-White.  Exploratory cap paths then drive the existing
-generic monthly contract projector.  A cross-fitted Fitted-Q backward pass
-estimates, for every anniversary and admissible cap,
+generic monthly contract projector.  A backward pass on the account-value
+inventory grid (Boogert & de Jong, 2008; Carmona & Ludkovski, 2010) estimates,
+for every anniversary, admissible cap and grid node,
 
     E[PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)
-      + optimal continuation value | information at the cap-setting time].
+      + continuation value at the resulting account value
+      | information at the cap-setting time].
 
-The signed quantity is the repository's market-consistent insurer net value
-before Risk Margin and is used here as an approximate New Business CSM proxy.
-The optimisation selects the cap with the largest proxy value after the
-projector has applied dynamic Income lapse and withdrawal behaviour.  Income
-Election is also left in the loaded dynamic Behaviour mode, subject to the
-existing contractual eligibility and forced-start gates.
+The continuation value is fitted by a separate regression on the exogenous
+market/portfolio state per grid node and interpolated across nodes; the
+inter-node delta V(A_{k+1}) - V(A_k) is the discrete marginal value of account
+value (the storage shadow price) that determines the optimal cap.  The signed
+objective is the repository's market-consistent insurer net value before Risk
+Margin and is used here as an approximate New Business CSM proxy.  The
+optimisation selects, at each account-value node, the cap with the largest
+proxy value after the projector has applied dynamic Income lapse and withdrawal
+behaviour.  Income Election is also left in the loaded dynamic Behaviour mode,
+subject to the existing contractual eligibility and forced-start gates.
 
 The admissible action grid is ``{0.25%, 1%, 2%, ..., 20%}``, matching the
 documented Guaranteed Minimum Cap while replacing the case study's fixed 6%
@@ -50,15 +60,23 @@ and headless Matplotlib diagnostics below ``plots/`` while reporting concise
 progress to the console.  Merely importing it has no side effects.
 """
 
-# Algorithmic correction: 2026-07-13 16:16:45 CEST (Europe/Zurich).
-# Changed: recursive cross-fitting is now outer-fold-pure; CSM is derived from
-# bounded insurer-component fits; training, fixed-cap selection, adaptive
-# validation and final evaluation use distinct market and projector-RNG sample
-# namespaces; unstable actions are masked locally and retain the preselected
-# fixed-cap fallback instead of disabling the whole adaptive candidate.
-# Removed/replaced: the recursively leaky single-continuation chain, the
-# fold-zero pseudo-holdout interpretation and reuse of the fixed-selection
-# sample for the adaptive-policy confidence gate.
+# Algorithmic change: 2026-07-13 (Europe/Zurich).
+# The insurer-cap backward induction (_backward_induction) was rewritten from a
+# flat cross-fitted control-randomisation Fitted-Q into a gas-storage-style
+# Least-Squares Monte Carlo (Boogert & de Jong, 2008; Carmona & Ludkovski,
+# 2010).  The customer account value per initial premium is now an explicit
+# endogenous inventory discretised onto an adaptive grid (the "Gitter"); the
+# continuation value is fitted per grid node on the exogenous state and
+# interpolated across nodes, and the inter-node delta V(A_{k+1}) - V(A_k) -- the
+# discrete marginal value of account value / storage shadow price -- drives the
+# optimal cap.  For a counterfactual cap the one-step insurer reward and the
+# account-value transition are empirical ridge regressions evaluated at the
+# forced grid node (crediting with fees, mortality, income and withdrawals is
+# not closed-form).  The recursion still emits, per active policy year, a
+# deployable per-cap RegressionPolicyYear Q-function so the unchanged causal
+# monthly-projection rollout, plots and JSON payload keep working.  The previous
+# outer-fold-pure single-continuation chain is replaced by the inventory-grid
+# value function; per-cap out-of-fold diagnostics are still reported.
 
 from __future__ import annotations
 
@@ -888,10 +906,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="control-randomisation paths (default gives 200 paths/action/year)",
     )
     parser.add_argument(
-        "--benchmark-paths", type=int, default=500,
+        "--benchmark-paths", type=int, default=150,
         help=(
             "paths in each independent fixed-cap selection, adaptive-policy "
-            "validation and final evaluation sample"
+            "validation and final evaluation sample; this is the dominant "
+            "runtime lever (fixed-cap benchmarks and the causal rollouts scale "
+            "~linearly with it) -- raise to ~500 for a final run, lower to ~50 "
+            "for fast iteration"
         ),
     )
     parser.add_argument(
@@ -918,6 +939,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--portfolio-contract-count", type=float, default=None,
         help="optional absolute contract count; otherwise PVs are normalised",
+    )
+    parser.add_argument(
+        "--inventory-nodes", type=int, default=25,
+        help=(
+            "number of account-value inventory grid nodes (the gas-storage "
+            "Gitter) used by the backward induction"
+        ),
+    )
+    parser.add_argument(
+        "--inventory-quantile-clip", type=float, default=0.005,
+        help=(
+            "lower/upper quantile clip when placing the account-value grid "
+            "nodes on the pooled in-force fund distribution"
+        ),
     )
     parser.add_argument(
         "--log-level", choices=("DEBUG", "INFO", "WARNING"), default="INFO",
@@ -963,6 +998,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--ridge must be finite and strictly positive")
     if not 0.0 <= args.persistent_exploration_fraction < 1.0:
         parser.error("--persistent-exploration-fraction must be in [0, 1)")
+    if args.inventory_nodes < 3:
+        parser.error("--inventory-nodes must be at least three")
+    if not 0.0 <= args.inventory_quantile_clip < 0.5:
+        parser.error("--inventory-quantile-clip must be in [0, 0.5)")
     if (args.portfolio_contract_count is not None
             and (not np.isfinite(args.portfolio_contract_count)
                  or args.portfolio_contract_count <= 0.0)):
@@ -6090,6 +6129,219 @@ def _coupled_backward_induction(
     )
 
 
+# ============================================================================
+# Gas-storage-style account-value inventory grid (Gitter) helpers
+# ============================================================================
+#
+# The insurer cap recursion below values the annual crediting cap with the
+# regression-Monte-Carlo method used to value gas storage contracts
+# (Boogert & de Jong, 2008; Carmona & Ludkovski, 2010).  The customer account
+# value per initial premium is the endogenous inventory ("storage level").
+# It is discretised onto an adaptive grid; the cap is the injection control
+# governing how much reference-fund return is credited into the fund (the
+# injected volume), while dynamic income and withdrawals draw it down.  The
+# continuation value is fitted per grid node on the exogenous state and looked
+# up at the resulting account value by interpolation, whose inter-node delta
+# V(A_{k+1}) - V(A_k) is the discrete marginal value of account value (the
+# storage shadow price) that drives the optimal cap.
+
+ACCOUNT_VALUE_INVENTORY_FEATURE = "account_value_per_initial_premium"
+
+
+def _inventory_feature_index(feature_names: Sequence[str]) -> int:
+    """Return the column of the endogenous account-value inventory state."""
+    names = tuple(feature_names)
+    if ACCOUNT_VALUE_INVENTORY_FEATURE not in names:
+        raise ValueError(
+            "Gas-storage backward induction requires the "
+            f"'{ACCOUNT_VALUE_INVENTORY_FEATURE}' inventory state feature."
+        )
+    return names.index(ACCOUNT_VALUE_INVENTORY_FEATURE)
+
+
+def _exogenous_feature_layout(
+    feature_names: Sequence[str], inventory_index: int
+) -> tuple[tuple[str, ...], IntArray]:
+    """Split off the exogenous state the per-node value function regresses on.
+
+    In the storage analogy the account value is the single controllable
+    inventory dimension carried by the grid-node index; every other state
+    variable is the exogenous ("price") factor on which the continuation value
+    is regressed, separately per node (Boogert & de Jong, 2008).
+    """
+    columns = [i for i in range(len(feature_names)) if i != inventory_index]
+    exogenous_names = tuple(feature_names[i] for i in columns)
+    return exogenous_names, np.asarray(columns, dtype=np.int64)
+
+
+def _account_value_grid(
+    account_value: Array,
+    n_nodes: int,
+    quantile_clip: float,
+) -> Array:
+    """Build the strictly increasing account-value inventory grid (Gitter).
+
+    Nodes are placed on empirical quantiles of the pooled in-force account
+    value, so the grid concentrates where the fund density is highest (adaptive
+    spacing).  The observed extremes and the unit initial account value are
+    always bracketed so a transitioned level never falls outside the
+    interpolation range by design.
+    """
+    if n_nodes < 3:
+        raise ValueError("The account-value grid needs at least three nodes.")
+    if not 0.0 <= quantile_clip < 0.5:
+        raise ValueError("quantile_clip must lie in [0, 0.5).")
+    pooled = np.asarray(account_value, dtype=float)
+    pooled = pooled[np.isfinite(pooled)]
+    if pooled.size == 0:
+        raise RuntimeError("No active account-value observations for the grid.")
+    probabilities = np.linspace(quantile_clip, 1.0 - quantile_clip, n_nodes)
+    nodes = np.quantile(pooled, probabilities)
+    nodes = np.concatenate((
+        nodes, [float(np.min(pooled)), float(np.max(pooled)), 1.0]
+    ))
+    nodes = np.unique(np.round(nodes, 12))
+    span = max(float(nodes[-1] - nodes[0]), 1.0e-6)
+    minimum_gap = 1.0e-4 * span
+    cleaned = [float(nodes[0])]
+    for value in nodes[1:]:
+        if value - cleaned[-1] >= minimum_gap:
+            cleaned.append(float(value))
+    if len(cleaned) < 3:
+        cleaned = list(np.linspace(nodes[0], nodes[-1] + minimum_gap, 3))
+    return np.asarray(cleaned, dtype=float)
+
+
+def _grid_continuation_lookup(
+    node_values: Array,
+    grid: Array,
+    query: Array,
+) -> tuple[Array, Array]:
+    """Piecewise-linear interpolation of a per-node value function.
+
+    ``node_values`` holds, for every path, the continuation value already
+    evaluated at each grid node (shape ``(n_paths, n_nodes, n_outputs)``).  For
+    a transitioned account value ``query`` per path we locate the bracketing
+    nodes and interpolate using the **delta between the two neighbouring
+    states**, ``node_values[:, k + 1] - node_values[:, k]`` (Boogert & de Jong,
+    2008, Eqs. 26-28).  That inter-node delta is the discrete marginal value of
+    account value -- the storage shadow price -- and is what turns the
+    continuation surface into an optimal-control signal.  Queries outside the
+    grid clamp to the boundary nodes.  The signed inter-node delta actually
+    used is returned alongside the interpolated value for diagnostics.
+    """
+    grid = np.asarray(grid, dtype=float)
+    n_nodes = grid.shape[0]
+    clamped = np.clip(np.asarray(query, dtype=float), grid[0], grid[-1])
+    lower_index = np.searchsorted(grid, clamped, side="right") - 1
+    lower_index = np.clip(lower_index, 0, n_nodes - 2)
+    upper_index = lower_index + 1
+    lower_edge = grid[lower_index]
+    upper_edge = grid[upper_index]
+    weight = (clamped - lower_edge) / np.maximum(upper_edge - lower_edge, 1.0e-300)
+    lower_values = np.take_along_axis(
+        node_values, lower_index[:, None, None], axis=1
+    )[:, 0, :]
+    upper_values = np.take_along_axis(
+        node_values, upper_index[:, None, None], axis=1
+    )[:, 0, :]
+    inter_state_delta = upper_values - lower_values
+    interpolated = lower_values + weight[:, None] * inter_state_delta
+    return interpolated, inter_state_delta
+
+
+def _force_inventory(raw_state: Array, inventory_index: int, level: float) -> Array:
+    """Return a copy of the state with the account-value column set to ``level``.
+
+    Evaluating the reward and transition regressions at a forced grid node is
+    the storage-method device that maps a continuous, control-affected account
+    value onto the discrete inventory levels of the grid; the squared and
+    interacted basis terms in the design matrix update consistently.
+    """
+    forced = np.array(raw_state, dtype=float, copy=True)
+    forced[:, inventory_index] = level
+    return forced
+
+
+@dataclass(frozen=True)
+class _GridYearValue:
+    """Per-node continuation value function fitted at one decision time."""
+
+    exogenous_mean: Array
+    exogenous_scale: Array
+    node_coefficients: Array  # (n_nodes, basis_z, 9) component value functions
+
+
+def _fit_grid_continuation(
+    exogenous_state: Array,
+    node_targets: Array,
+    exogenous_names: Sequence[str],
+    ridge: float,
+) -> _GridYearValue:
+    """Regress the optimal value at each grid node on the exogenous state.
+
+    One ridge regression is fitted per inventory node (Boogert & de Jong,
+    2008): the account-value dependence is carried by the node index while the
+    exogenous market/portfolio factors enter through the basis.  Boogert & de
+    Jong found a joint price-inventory basis numerically unsatisfactory and
+    recommend exactly this separate-regression-per-level scheme.
+    """
+    nonlinear, interactions, _ = _basis_specification(exogenous_names)
+    mean, scale = _raw_scaling(exogenous_state)
+    design = _design_matrix(exogenous_state, mean, scale, nonlinear, interactions)
+    n_nodes = node_targets.shape[1]
+    n_components = node_targets.shape[2]
+    coefficients = np.zeros((n_nodes, design.shape[1], n_components), dtype=float)
+    for node in range(n_nodes):
+        coefficients[node] = _ridge_fit_multioutput(
+            design, node_targets[:, node, :], ridge
+        )
+    return _GridYearValue(mean, scale, coefficients)
+
+
+def _evaluate_grid_continuation(
+    value: _GridYearValue,
+    exogenous_state: Array,
+    exogenous_names: Sequence[str],
+) -> Array:
+    """Evaluate every node's continuation value for one exogenous state matrix."""
+    nonlinear, interactions, _ = _basis_specification(exogenous_names)
+    design = _design_matrix(
+        exogenous_state, value.exogenous_mean, value.exogenous_scale,
+        nonlinear, interactions,
+    )
+    # (n_paths, basis) x (n_nodes, basis, 9) -> (n_paths, n_nodes, 9)
+    return np.einsum("pb,kbo->pko", design, value.node_coefficients)
+
+
+def _kfold_oof_csm_diagnostics(
+    design: Array, target_csm: Array, folds: int, ridge: float, seed: int
+) -> tuple[float, float]:
+    """Return (out-of-fold RMSE, out-of-fold R^2) for one cap's CSM value."""
+    n = design.shape[0]
+    variance = float(np.var(target_csm))
+    if n < 2 * folds:
+        beta = _ridge_fit_multioutput(design, target_csm[:, None], ridge)[:, 0]
+        residual = target_csm - design @ beta
+        rmse = float(np.sqrt(np.mean(residual ** 2)))
+        return rmse, (1.0 - rmse * rmse / variance if variance > 1.0e-20 else 1.0)
+    rng = np.random.default_rng(seed)
+    fold_of = rng.permutation(np.resize(np.arange(folds), n))
+    prediction = np.empty(n, dtype=float)
+    for fold in range(folds):
+        test = fold_of == fold
+        train = ~test
+        beta = _ridge_fit_multioutput(design[train], target_csm[train, None], ridge)
+        prediction[test] = design[test] @ beta[:, 0]
+    residual = target_csm - prediction
+    rmse = float(np.sqrt(np.mean(residual ** 2)))
+    return rmse, (1.0 - rmse * rmse / variance if variance > 1.0e-20 else 1.0)
+
+
+# ============================================================================
+# Rewritten backward induction -- gas-storage inventory grid + inter-node delta
+# ============================================================================
+
 def _backward_induction(
     data: PortfolioPathData,
     action_indices: IntArray,
@@ -6097,18 +6349,53 @@ def _backward_induction(
     folds: int,
     ridge: float,
     seed: int,
+    inventory_nodes: int = 25,
+    inventory_quantile_clip: float = 0.005,
 ) -> BackwardResult:
-    """Outer-fold-pure Fitted-Q recursion for the insurer cap control.
+    """Gas-storage-style account-value grid backward induction for the cap.
 
-    Every outer fold owns a complete future-value chain trained without that
-    fold.  Therefore a path used to diagnose year ``y`` cannot influence its
-    own target indirectly through a regression fitted at year ``y + 1``.  A
-    separate full-sample chain supplies the frozen deployment coefficients.
+    This recursion mirrors the regression-Monte-Carlo method used to value gas
+    storage contracts (Boogert & de Jong, 2008, *Gas Storage Valuation Using a
+    Monte Carlo Method*; Carmona & Ludkovski, 2010, *Valuation of energy
+    storage: an optimal switching approach*).  The customer account value per
+    initial premium is the endogenous inventory (the "storage level"),
+    discretised onto an adaptive grid ``A_0 < ... < A_K`` (the ``Gitter``).  The
+    annual crediting cap is the injection control: it governs how much
+    reference-fund return is credited into the fund (the injected volume), while
+    dynamic income and withdrawals draw the fund down.
 
-    The regressions fit the nine auditable insurer components, bound only
-    numerical extrapolation outside the observed component envelope and derive
-    CSM from those components.  The objective remains the signed New Business
-    CSM proxy used throughout this study.
+    The value function is carried **on the account-value grid**: after year
+    ``y + 1`` it is stored as one ridge regression on the exogenous
+    market/portfolio state per grid node (Boogert & de Jong: a separate
+    regression per storage level).  At year ``y`` and each grid node the optimal
+    cap maximises the one-step insurer reward plus the continuation value looked
+    up at the *resulting* account value; the account-value transition per cap is
+    an empirical ridge regression (crediting with fees, mortality, dynamic
+    income and withdrawals is not closed-form, unlike the analytic gas
+    ``v -> v + dv`` transition), and the continuation is the grid value function
+    **interpolated** at that resulting level.  The interpolation uses the delta
+    between neighbouring nodes ``V(A_{k+1}) - V(A_k)`` -- the discrete marginal
+    value of account value (the storage shadow price ``dV/dA``) -- which is what
+    makes the continuation sensitive to where the fund lands and therefore what
+    drives the optimal cap.  Piecewise-linear interpolation with boundary
+    clamping keeps the continuation bounded, so the backward recursion is a
+    contraction and stays numerically stable over the full lifetime horizon.
+
+    To avoid a look-ahead / Jensen bias, the continuation entering the per-cap
+    maximisation is the **conditional expectation given the current-year state**,
+    ``E[V_{k+1}(node, X_{k+1}) | X_k]``, estimated by regressing the realised
+    next-year node values onto the current exogenous state (the regress-later
+    device).  Thus the cap is chosen from current-state-measurable continuations
+    only, not from the realised next-year market state.  The reported first-year
+    value uses the direct realised-action estimator (a Monte Carlo average with
+    no maximisation, hence unbiased) with the realised grid continuation.
+
+    For downstream deployment the recursion emits, per active policy year, a
+    :class:`RegressionPolicyYear` whose per-cap Q-function
+    ``design(x) @ coefficients[a]`` reproduces the grid-optimal value at each
+    path's own account value, so the unchanged causal monthly-projection
+    rollout, plots and JSON payload continue to work.  Per-cap out-of-fold
+    diagnostics are reported.
     """
     if data.raw_states is None:
         raise ValueError("Backward induction requires recorded state paths.")
@@ -6117,70 +6404,78 @@ def _backward_induction(
     n_paths, n_years = data.new_business_csm_proxy.shape
     if action_indices.shape != (n_paths, n_years):
         raise ValueError("Action indices and projected rewards are inconsistent.")
-    LOGGER.info(
-        "Outer-fold-pure backward induction | %d years | %d actions | "
-        "%d paths | %d folds plus deployment chain",
-        n_years,
-        len(ACTION_CAPS),
-        n_paths,
-        folds,
+    feature_names = tuple(data.state_feature_names)
+    raw_states = np.asarray(data.raw_states, dtype=float)
+    if raw_states.shape[0] != n_paths or raw_states.shape[1] < n_years + 1:
+        raise ValueError("Recorded state paths are shape-inconsistent.")
+    exposure = np.asarray(data.inforce_exposure, dtype=float)
+    inventory_index = _inventory_feature_index(feature_names)
+    exogenous_names, exogenous_columns = _exogenous_feature_layout(
+        feature_names, inventory_index
+    )
+    account_value = raw_states[:, :, inventory_index]  # (n_paths, n_years + 1)
+    exogenous_nonlinear, exogenous_interactions, _ = _basis_specification(
+        exogenous_names
     )
 
-    rng = np.random.default_rng(seed)
-    # One complete market/control trajectory always remains in one fold.  The
-    # first action is stratified because the time-zero state is common across
-    # paths and its direct action means require every cap in every outer fold.
-    fold_ids = np.full(n_paths, -1, dtype=np.int64)
-    for action in range(len(ACTION_CAPS)):
-        action_rows = np.flatnonzero(action_indices[:, 0] == action)
-        assigned = np.resize(np.arange(folds, dtype=np.int64), len(action_rows))
-        fold_ids[action_rows] = rng.permutation(assigned)
-    if np.any(fold_ids < 0) or set(np.unique(fold_ids)) != set(range(folds)):
-        raise RuntimeError("Complete-path outer-fold assignment is incomplete.")
+    nonlinear_full, interactions_full, basis_names_full = _basis_specification(
+        feature_names
+    )
+    minimum_training_count = max(30, 3 * len(basis_names_full))
+    n_actions = len(ACTION_CAPS)
 
-    _, _, basis_names = _basis_specification(data.state_feature_names)
-    minimum_training_count = max(30, 3 * len(basis_names))
-    for year in range(1, n_years):
-        for action, cap in enumerate(ACTION_CAPS):
-            for fold in range(folds):
-                count = int(np.count_nonzero(
-                    (action_indices[:, year] == action) & (fold_ids != fold)
-                ))
-                if count < minimum_training_count:
-                    raise ValueError(
-                        "Too few outer-fold training paths for policy year "
-                        f"{year + 1}, cap {cap:.4%}, fold {fold}: "
-                        f"{count} < {minimum_training_count}. Increase --n-paths."
-                    )
+    # Component reward tensor: index 0 is CSM, 1..9 the auditable components.
+    immediate = _portfolio_continue_component_tensor(data)  # (n_paths, n_years, 10)
 
-    # Columns: CSM proxy plus the nine signed/unsigned insurer components in
-    # the stable public output order used by _fit_outer_leader_model().
-    immediate = _portfolio_continue_component_tensor(data)
-    deployment_chain = folds
-    continuations = np.zeros((folds + 1, n_paths, 10), dtype=float)
+    active_year_indices = [
+        year for year in range(n_years) if np.any(exposure[:, year] > 0.0)
+    ]
+    if not active_year_indices:
+        raise RuntimeError(
+            "The control-randomisation portfolio has no active policy year."
+        )
+    last_active = active_year_indices[-1]
+    active_set = set(active_year_indices)
+
+    LOGGER.info(
+        "Gas-storage account-value grid backward induction | %d years | "
+        "%d caps | %d paths | %d requested inventory nodes",
+        n_years, n_actions, n_paths, inventory_nodes,
+    )
+
+    # Inventory grid pooled over all active decision times where the fund is in
+    # force, so node density follows the realised account-value distribution.
+    pooled_av = np.concatenate([
+        account_value[exposure[:, year] > 0.0, year]
+        for year in active_year_indices
+    ])
+    grid = _account_value_grid(pooled_av, inventory_nodes, inventory_quantile_clip)
+    n_nodes = grid.shape[0]
+    LOGGER.info(
+        "Account-value inventory grid | %d nodes | span [%.4f, %.4f] per premium",
+        n_nodes, float(grid[0]), float(grid[-1]),
+    )
+
+    year_values: dict[int, _GridYearValue] = {}
     policy_years: list[RegressionPolicyYear] = []
     regression_rows: list[dict[str, object]] = []
     policy_year_rows: list[dict[str, object]] = []
     first_year_action_rows: list[dict[str, object]] = []
-    active_policy_years: list[int] = []
     numerical_reasons: set[str] = set()
     first_cap = float("nan")
     first_outputs = np.zeros(10)
     first_se = float("nan")
-    rows_index = np.arange(n_paths)
 
     for year in range(n_years - 1, -1, -1):
-        if year == n_years - 1 or year == 0 or (year + 1) % 5 == 0:
-            LOGGER.info(
-                "Outer-fold-pure backward induction | policy year %d/%d",
-                year + 1,
-                n_years,
-            )
-        year_exposure = np.asarray(data.inforce_exposure[:, year], dtype=float)
+        year_exposure = exposure[:, year]
         if not np.any(year_exposure > 0.0):
             residual_magnitude = max(
                 float(np.max(np.abs(immediate[:, year, :]))),
-                float(np.max(np.abs(continuations))),
+                max(
+                    (float(np.max(np.abs(v.node_coefficients)))
+                     for v in year_values.values()),
+                    default=0.0,
+                ),
             )
             materiality = 1.0e-8 * data.representative_initial_premium
             if residual_magnitude > materiality:
@@ -6189,64 +6484,110 @@ def _backward_induction(
                     "objective magnitude %.6g. Refusing to discard a material "
                     "continuation value." % (year + 1, residual_magnitude)
                 )
-            continuations.fill(0.0)
             LOGGER.debug(
-                "Outer-fold-pure backward induction | policy year %d "
-                "economically inactive; no cap regression fitted.",
+                "Gas-storage backward induction | policy year %d inactive.",
                 year + 1,
             )
             continue
 
-        active_policy_years.append(year + 1)
+        if year == last_active or year == 0 or (year + 1) % 5 == 0:
+            LOGGER.info(
+                "Gas-storage backward induction | policy year %d/%d",
+                year + 1, n_years,
+            )
+
+        raw_year = raw_states[:, year, :]
+        exogenous_year = raw_year[:, exogenous_columns]
         observed = action_indices[:, year]
+        mean_full, scale_full = _raw_scaling(raw_year)
+        design_own = _design_matrix(
+            raw_year, mean_full, scale_full, nonlinear_full, interactions_full
+        )
+        has_continuation = (year + 1) in active_set
+
+        # Grid value function at the realised next-year exogenous state: this is
+        # the direct sample used by the unbiased year-0 estimator and the basis
+        # for the conditional expectation used by the year>0 Bellman maximum.
+        if has_continuation:
+            node_next_realised = _evaluate_grid_continuation(
+                year_values[year + 1],
+                raw_states[:, year + 1, exogenous_columns],
+                exogenous_names,
+            )  # (n_paths, n_nodes, 9)
+        else:
+            node_next_realised = np.zeros((n_paths, n_nodes, 9))
+
+        # One reward (9 components) and one account-value transition regression
+        # per cap, on the paths that explored that cap this year.
+        reward_beta = np.zeros((n_actions, design_own.shape[1], 9))
+        transition_beta = np.zeros((n_actions, design_own.shape[1]))
+        deployable = np.ones(n_actions, dtype=bool)
+        action_counts = np.zeros(n_actions, dtype=np.int64)
+        for action in range(n_actions):
+            selected = observed == action
+            count = int(np.count_nonzero(selected))
+            action_counts[action] = count
+            if count < minimum_training_count:
+                deployable[action] = False
+                numerical_reasons.add(
+                    f"policy_year_{year + 1}::cap_{ACTION_CAPS[action]:.6f}"
+                    f"_support_{count}_below_{minimum_training_count}"
+                )
+                if count == 0:
+                    raise ValueError(
+                        "Too few training paths for policy year "
+                        f"{year + 1}, cap {ACTION_CAPS[action]:.4%}: {count}. "
+                        "Increase --n-paths."
+                    )
+            design_sel = design_own[selected]
+            reward_beta[action] = _ridge_fit_multioutput(
+                design_sel, immediate[selected, year, 1:], ridge
+            )
+            if has_continuation:
+                transition_beta[action] = _ridge_fit_multioutput(
+                    design_sel,
+                    account_value[selected, year + 1][:, None],
+                    ridge,
+                )[:, 0]
 
         if year == 0:
-            # The time-zero state is common.  Use the actually randomised cap
-            # cell and a fold-pure future target for every path; no regression
-            # is needed for this decision.  Independent validation later owns
-            # the deploy/fallback decision, so there is no pseudo holdout fold.
-            oof_targets = np.zeros((n_paths, 10), dtype=float)
-            for fold in range(folds):
-                held_out = fold_ids == fold
-                oof_targets[held_out] = (
-                    immediate[held_out, year, :]
-                    + continuations[fold, held_out, :]
+            # Common initial state: report the optimal first cap and its value
+            # from the direct realised-action estimator (a Monte Carlo average,
+            # so unbiased) with the realised grid continuation, matching the
+            # first-year row schema exactly.
+            realised_value = immediate[:, 0, 1:].copy()
+            if has_continuation:
+                realised_continuation, _ = _grid_continuation_lookup(
+                    node_next_realised, grid, account_value[:, 1]
                 )
-            oof_targets[:, 0] = _csm_from_component_values(oof_targets[:, 1:])
-            action_values = np.zeros((len(ACTION_CAPS), 10), dtype=float)
-            action_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
-            action_counts = np.zeros(len(ACTION_CAPS), dtype=np.int64)
-            for action, cap in enumerate(ACTION_CAPS):
-                selected = observed == action
-                count = int(np.count_nonzero(selected))
-                if count == 0:
+                realised_value = realised_value + realised_continuation
+            realised_csm = _csm_from_component_values(realised_value)
+            action_values = np.zeros((n_actions, 10))
+            action_standard_errors = np.zeros(n_actions)
+            for action in range(n_actions):
+                sel = observed == action
+                if not np.any(sel):
                     raise RuntimeError(
-                        f"First-year outer-fold coverage is missing for cap {cap}."
+                        f"First-year coverage missing for cap {ACTION_CAPS[action]}."
                     )
-                action_counts[action] = count
-                action_values[action] = np.mean(oof_targets[selected], axis=0)
-                action_standard_errors[action] = _standard_error(
-                    oof_targets[selected, 0]
-                )
+                mean_components = np.mean(realised_value[sel], axis=0)
+                action_values[action] = _with_derived_csm(mean_components[None, :])[0]
+                action_standard_errors[action] = _standard_error(realised_csm[sel])
             chosen_action = int(_lower_cap_argmax(action_values[:, 0]))
             first_cap = float(ACTION_CAPS[chosen_action])
             first_outputs = action_values[chosen_action]
             first_se = float(action_standard_errors[chosen_action])
             LOGGER.info(
-                "First-year outer-fold-pure Bellman diagnostic | cap %.2f%% | "
+                "First-year gas-storage Bellman diagnostic | cap %.2f%% | "
                 "Q-CSM %.2f | SE %.2f",
-                100.0 * first_cap,
-                first_outputs[0],
-                first_se,
+                100.0 * first_cap, first_outputs[0], first_se,
             )
             for action, cap in enumerate(ACTION_CAPS):
                 values = action_values[action]
                 first_year_action_rows.append({
                     "cap": float(cap),
                     "cap_percent": 100.0 * float(cap),
-                    "selection_estimated_q_new_business_csm_proxy": float(
-                        values[0]
-                    ),
+                    "selection_estimated_q_new_business_csm_proxy": float(values[0]),
                     "selection_standard_error_new_business_csm_proxy": float(
                         action_standard_errors[action]
                     ),
@@ -6267,27 +6608,26 @@ def _backward_induction(
                     ),
                     "selection_path_count": int(action_counts[action]),
                     "holdout_path_count": int(action_counts[action]),
-                    "observed_control_action_path_count": int(
-                        action_counts[action]
-                    ),
+                    "observed_control_action_path_count": int(action_counts[action]),
                     "selection_value_semantics": (
-                        "complete-path outer-fold-pure direct action target"
+                        "direct realised-action target with gas-storage grid "
+                        "continuation"
                     ),
                     "holdout_value_semantics": (
-                        "legacy output alias of the same outer-fold-pure target; "
-                        "deployment is decided on the independent validation sample"
+                        "alias of the direct realised-action target; deployment is "
+                        "decided on the independent validation sample"
                     ),
                     "economically_active": True,
                     "is_optimal_first_year_cap": action == chosen_action,
-                    "outer_fold_pure": True,
+                    "outer_fold_pure": False,
                     "csm_derived_from_components": True,
                 })
             first_policy = _constant_first_year_policy(
                 year=0,
-                raw_state=data.raw_states[:, 0, :],
+                raw_state=raw_states[:, 0, :],
                 action_values=action_values,
                 action_standard_errors=action_standard_errors,
-                feature_names=data.state_feature_names,
+                feature_names=feature_names,
                 numerically_stable=True,
             )
             policy_years.append(first_policy)
@@ -6301,202 +6641,176 @@ def _backward_induction(
                 "p90_selected_cap": first_cap,
                 "economically_active": True,
                 "mean_inforce_exposure": float(np.mean(year_exposure)),
-                "outer_fold_pure": True,
+                "outer_fold_pure": False,
             })
             continue
 
-        chain_fits: list[_OuterLeaderFit] = []
-        chain_targets: list[Array] = []
-        for chain in range(folds + 1):
-            train_mask = (
-                fold_ids != chain
-                if chain < folds
-                else np.ones(n_paths, dtype=bool)
+        # Conditional expectation of the node values given the current-year
+        # state (regress-later): removes the look-ahead / Jensen bias while
+        # keeping the bounded grid interpolation that makes the recursion stable.
+        if has_continuation:
+            mean_exogenous, scale_exogenous = _raw_scaling(exogenous_year)
+            design_exogenous = _design_matrix(
+                exogenous_year, mean_exogenous, scale_exogenous,
+                exogenous_nonlinear, exogenous_interactions,
             )
-            targets = immediate[:, year, :] + continuations[chain]
-            targets[:, 0] = _csm_from_component_values(targets[:, 1:])
-            fit = _fit_outer_leader_model(
-                year=year,
-                raw_state=data.raw_states[:, year, :],
-                targets=targets,
-                observed_actions=observed,
-                train_mask=train_mask,
-                ridge=ridge,
-                feature_names=data.state_feature_names,
+            conditional_beta = _ridge_fit_multioutput(
+                design_exogenous,
+                node_next_realised.reshape(n_paths, n_nodes * 9),
+                ridge,
             )
-            chain_fits.append(fit)
-            chain_targets.append(targets)
-            if np.any(fit.action_deployable_mask):
-                chosen_chain_action = _masked_lower_cap_argmax(
-                    fit.predictions[:, :, 0],
-                    fit.action_deployable_mask,
-                    axis=1,
-                )
-            else:
-                # The independently selected fixed fallback is not known yet.
-                # Use the guaranteed-minimum cap only to close the diagnostic
-                # Bellman recursion; the direct candidate later uses the actual
-                # best-fixed cap and is independently validated.
-                chosen_chain_action = np.zeros(n_paths, dtype=np.int64)
-            continuations[chain] = fit.predictions[
-                rows_index, chosen_chain_action
-            ]
-
-        oof = np.zeros((n_paths, len(ACTION_CAPS), 10), dtype=float)
-        for fold in range(folds):
-            held_out = fold_ids == fold
-            oof[held_out] = chain_fits[fold].predictions[held_out]
-        if not np.all(np.isfinite(oof)):
-            raise RuntimeError("Outer-fold insurer Q predictions are non-finite.")
-
-        year_reasons = {
-            f"outer_fold_{fold}::{reason}"
-            for fold, fit in enumerate(chain_fits[:folds])
-            for reason in fit.instability_reasons
-        }
-        year_reasons.update(
-            f"deployment::{reason}"
-            for reason in chain_fits[deployment_chain].instability_reasons
-        )
-        numerical_reasons.update(
-            f"policy_year_{year + 1}::{reason}" for reason in year_reasons
-        )
-
-        action_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
-        diagnostics: list[dict[str, object]] = []
-        deployment_fit = chain_fits[deployment_chain]
-        deployable_mask = np.logical_and.reduce([
-            fit.action_deployable_mask for fit in chain_fits
-        ])
-        action_mask_reasons: list[tuple[str, ...]] = []
-        for action in range(len(ACTION_CAPS)):
-            reasons_for_action = {
-                f"outer_fold_{fold}::{reason}"
-                for fold, fit in enumerate(chain_fits[:folds])
-                for reason in fit.action_instability_reasons[action]
-            }
-            reasons_for_action.update(
-                f"deployment::{reason}"
-                for reason in deployment_fit.action_instability_reasons[action]
-            )
-            action_mask_reasons.append(tuple(sorted(reasons_for_action)))
-        for action, cap in enumerate(ACTION_CAPS):
-            residual_parts: list[Array] = []
-            target_parts: list[Array] = []
-            for fold in range(folds):
-                selected = (fold_ids == fold) & (observed == action)
-                if np.any(selected):
-                    residual_parts.append(
-                        chain_targets[fold][selected, 0]
-                        - oof[selected, action, 0]
-                    )
-                    target_parts.append(chain_targets[fold][selected, 0])
-            residual = np.concatenate(residual_parts)
-            observed_target = np.concatenate(target_parts)
-            rmse = float(np.sqrt(np.mean(residual * residual)))
-            variance = float(np.var(observed_target))
-            action_standard_errors[action] = (
-                rmse / np.sqrt(max(observed_target.size, 1))
-                if np.isfinite(rmse)
-                else float(np.finfo(np.float64).max)
-            )
-            diagnostics.append({
-                "policy_year": year + 1,
-                "cap": float(cap),
-                "observed_path_count": int(observed_target.size),
-                "basis_dimension": int(
-                    deployment_fit.policy.coefficients.shape[1]
-                ),
-                "ridge_multiplier": float(ridge),
-                "out_of_fold_rmse_new_business_csm_proxy": rmse,
-                "out_of_fold_r_squared_new_business_csm_proxy": (
-                    1.0 - rmse * rmse / variance
-                    if variance > 1.0e-20 else 1.0
-                ),
-                "in_sample_component_clip_fraction": float(
-                    deployment_fit.clip_fractions[action]
-                ),
-                "maximum_fold_component_clip_fraction": float(max(
-                    fit.clip_fractions[action] for fit in chain_fits[:folds]
-                )),
-                "counterfactual_component_clip_fraction": float(
-                    deployment_fit.counterfactual_clip_fractions[action]
-                ),
-                "maximum_fold_counterfactual_component_clip_fraction": float(
-                    max(
-                        fit.counterfactual_clip_fractions[action]
-                        for fit in chain_fits[:folds]
-                    )
-                ),
-                "action_mask_in_support_clip_threshold": 0.20,
-                "regularized_normal_matrix_condition_number": float(
-                    deployment_fit.conditions[action]
-                ),
-                "design_condition_number": float(
-                    deployment_fit.conditions[action]
-                ),
-                "deployable_for_frozen_policy": bool(
-                    deployable_mask[action]
-                ),
-                "action_fit_mask_reasons": "|".join(
-                    action_mask_reasons[action]
-                ),
-                "csm_derived_from_components": True,
-                "outer_fold_pure": True,
-            })
-
-        fitted_policy = replace(
-            deployment_fit.policy,
-            action_value_standard_error=action_standard_errors,
-            numerically_stable=not year_reasons,
-            action_deployable_mask=deployable_mask,
-        )
-        if np.any(deployable_mask):
-            chosen = _masked_lower_cap_argmax(
-                oof[:, :, 0],
-                deployable_mask,
-                axis=1,
+            node_next = (design_exogenous @ conditional_beta).reshape(
+                n_paths, n_nodes, 9
             )
         else:
-            chosen = np.zeros(n_paths, dtype=np.int64)
-        selected_caps = ACTION_CAPS[chosen]
-        LOGGER.debug(
-            "Outer-fold-pure backward induction | year %d | mean selected "
-            "cap %.3f%% | mean maximum Q-CSM %.2f",
-            year + 1,
-            100.0 * float(np.mean(selected_caps)),
-            float(np.mean(oof[rows_index, chosen, 0])),
+            node_next = np.zeros((n_paths, n_nodes, 9))
+
+        # Value iteration across the inventory grid: at each forced node the
+        # optimal cap maximises reward + interpolated (bounded) continuation.
+        node_value_target = np.zeros((n_paths, n_nodes, 9))
+        for node, level in enumerate(grid):
+            forced = _force_inventory(raw_year, inventory_index, float(level))
+            design_node = _design_matrix(
+                forced, mean_full, scale_full, nonlinear_full, interactions_full
+            )
+            reward_node = np.einsum("pb,abo->pao", design_node, reward_beta)
+            if has_continuation:
+                next_level = np.einsum("pb,ab->pa", design_node, transition_beta)
+                continuation_node = np.empty((n_paths, n_actions, 9))
+                for action in range(n_actions):
+                    continuation_node[:, action, :], _ = _grid_continuation_lookup(
+                        node_next, grid, next_level[:, action]
+                    )
+            else:
+                continuation_node = np.zeros((n_paths, n_actions, 9))
+            q_node = reward_node + continuation_node
+            csm_node = _csm_from_component_values(q_node)  # (n_paths, n_actions)
+            if not np.all(np.isfinite(csm_node)):
+                raise RuntimeError(
+                    f"Non-finite node Q values at policy year {year + 1}."
+                )
+            best = (
+                _masked_lower_cap_argmax(csm_node, deployable, axis=1)
+                if np.any(deployable) else np.zeros(n_paths, dtype=np.int64)
+            )
+            node_value_target[:, node, :] = np.take_along_axis(
+                q_node, best[:, None, None], axis=1
+            )[:, 0, :]
+        year_values[year] = _fit_grid_continuation(
+            exogenous_year, node_value_target, exogenous_names, ridge
         )
+        node_csm_curve = _csm_from_component_values(np.mean(node_value_target, axis=0))
+        marginal_value = np.diff(node_csm_curve) / np.maximum(np.diff(grid), 1.0e-12)
+        LOGGER.debug(
+            "Policy year %d | inventory marginal value dV/dA in [%.3f, %.3f] | "
+            "mean %.3f (per unit account value)",
+            year + 1, float(np.min(marginal_value)),
+            float(np.max(marginal_value)), float(np.mean(marginal_value)),
+        )
+
+        # Deployable per-cap Q-function at each path's own account value.
+        reward_own = np.einsum("pb,abo->pao", design_own, reward_beta)
+        if has_continuation:
+            next_level_own = np.einsum("pb,ab->pa", design_own, transition_beta)
+            continuation_own = np.empty((n_paths, n_actions, 9))
+            for action in range(n_actions):
+                continuation_own[:, action, :], _ = _grid_continuation_lookup(
+                    node_next, grid, next_level_own[:, action]
+                )
+        else:
+            continuation_own = np.zeros((n_paths, n_actions, 9))
+        q_own = reward_own + continuation_own  # (n_paths, n_actions, 9)
+        csm_own = _csm_from_component_values(q_own)  # (n_paths, n_actions)
+
+        # Project the (interpolation-nonlinear) per-cap Q onto the deployment
+        # basis; CSM (output 0) follows by linearity of the component rows.
+        q_flat = q_own.reshape(n_paths, n_actions * 9)
+        beta_flat = _ridge_fit_multioutput(design_own, q_flat, ridge)
+        deploy_component_beta = np.transpose(
+            beta_flat.reshape(design_own.shape[1], n_actions, 9), (1, 0, 2)
+        )  # (n_actions, basis, 9)
+        deploy_coefficients = _component_regression_coefficients(deploy_component_beta)
+        if not np.all(np.isfinite(deploy_coefficients)):
+            raise RuntimeError(
+                f"Non-finite deployment coefficients at policy year {year + 1}."
+            )
+
+        action_standard_errors = np.zeros(n_actions)
+        chosen = (
+            _masked_lower_cap_argmax(csm_own, deployable, axis=1)
+            if np.any(deployable) else np.zeros(n_paths, dtype=np.int64)
+        )
+        selected_caps = ACTION_CAPS[chosen]
         mean_cap = float(np.mean(selected_caps))
         quantiles = np.quantile(selected_caps, (0.10, 0.50, 0.90))
         mean_inforce = float(np.mean(year_exposure))
         for action, cap in enumerate(ACTION_CAPS):
-            fraction = float(np.mean(chosen == action))
-            diagnostics[action]["selected_fraction_cross_fitted"] = fraction
-            diagnostics[action]["economically_active"] = True
+            sel = observed == action
+            design_sel = design_own[sel]
+            target_csm = csm_own[sel, action]
+            fitted_csm = design_sel @ deploy_coefficients[action, :, 0]
+            residual = target_csm - fitted_csm
+            rmse = float(np.sqrt(np.mean(residual ** 2))) if residual.size else 0.0
+            action_standard_errors[action] = rmse / np.sqrt(max(residual.size, 1))
+            oof_rmse, oof_r2 = _kfold_oof_csm_diagnostics(
+                design_sel, target_csm, folds, ridge, seed + action + 101 * year
+            )
+            condition = _condition_number(design_sel, ridge)
+            regression_rows.append({
+                "policy_year": year + 1,
+                "cap": float(cap),
+                "observed_path_count": int(action_counts[action]),
+                "basis_dimension": int(design_own.shape[1]),
+                "ridge_multiplier": float(ridge),
+                "out_of_fold_rmse_new_business_csm_proxy": float(oof_rmse),
+                "out_of_fold_r_squared_new_business_csm_proxy": float(oof_r2),
+                "in_sample_component_clip_fraction": 0.0,
+                "maximum_fold_component_clip_fraction": 0.0,
+                "counterfactual_component_clip_fraction": 0.0,
+                "maximum_fold_counterfactual_component_clip_fraction": 0.0,
+                "action_mask_in_support_clip_threshold": 0.20,
+                "regularized_normal_matrix_condition_number": float(condition),
+                "design_condition_number": float(condition),
+                "deployable_for_frozen_policy": bool(deployable[action]),
+                "action_fit_mask_reasons": "" if deployable[action] else (
+                    f"support_{action_counts[action]}_below_{minimum_training_count}"
+                ),
+                "csm_derived_from_components": True,
+                "outer_fold_pure": False,
+                "selected_fraction_cross_fitted": float(np.mean(chosen == action)),
+                "economically_active": True,
+            })
             policy_year_rows.append({
                 "policy_year": year + 1,
                 "cap": float(cap),
-                "selected_fraction": fraction,
+                "selected_fraction": float(np.mean(chosen == action)),
                 "mean_selected_cap": mean_cap,
                 "p10_selected_cap": float(quantiles[0]),
                 "median_selected_cap": float(quantiles[1]),
                 "p90_selected_cap": float(quantiles[2]),
                 "economically_active": True,
                 "mean_inforce_exposure": mean_inforce,
-                "outer_fold_pure": True,
+                "outer_fold_pure": False,
             })
-        regression_rows.extend(diagnostics)
-        policy_years.append(fitted_policy)
+
+        policy_years.append(RegressionPolicyYear(
+            year=year,
+            raw_mean=mean_full,
+            raw_scale=scale_full,
+            coefficients=deploy_coefficients,
+            action_caps=ACTION_CAPS.copy(),
+            action_value_standard_error=action_standard_errors,
+            numerically_stable=bool(np.all(deployable)),
+            action_deployable_mask=deployable,
+        ))
 
     policy_years.sort(key=lambda item: item.year)
-    active_policy_years.sort()
+    active_policy_years = sorted(year + 1 for year in active_year_indices)
     if not active_policy_years or active_policy_years[0] != 1:
         raise RuntimeError(
             "The control-randomisation portfolio has no active first policy year."
         )
-    expected_active_years = list(range(1, active_policy_years[-1] + 1))
-    if active_policy_years != expected_active_years:
+    if active_policy_years != list(range(1, active_policy_years[-1] + 1)):
         raise RuntimeError(
             "In-force exposure becomes positive after an inactive policy year; "
             "the economic policy horizon is not contiguous."
@@ -8941,13 +9255,15 @@ def main() -> None:
             "the full lifetime horizon | maximum absolute=%.6g",
             training_closeout_max_abs,
         )
-    with _logged_stage("Run outer-fold-pure Fitted-Q backward induction"):
+    with _logged_stage("Run gas-storage account-value grid backward induction"):
         backward = _backward_induction(
             training_data,
             action_indices,
             folds=args.cross_fit_folds,
             ridge=args.ridge,
             seed=args.seed + 130_363,
+            inventory_nodes=args.inventory_nodes,
+            inventory_quantile_clip=args.inventory_quantile_clip,
         )
     LOGGER.info(
         "Backward diagnostic | first-year cap=%.2f%% | outer-fold OOF Bellman value=%.2f | "

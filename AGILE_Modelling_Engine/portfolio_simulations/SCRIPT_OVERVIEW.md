@@ -252,6 +252,11 @@ Die wichtigsten Analyseoutputs unter `output/portfolio_risk_analysis` sind:
 - vollständige Child-Ergebnisse und je Child ein
   `orchestrator_console.log`.
 
+Die aggregierten Analysegrafiken einschließlich einer direkten CSM-/NPV-
+Werttreiberansicht sind im Standardlauf aktiviert. `--no-plots` schaltet sie
+explizit ab; `--scenario-plots` aktiviert bei Bedarf zusätzlich die wesentlich
+zahlreicheren Grafiken der einzelnen Child-Bewertungen.
+
 Das Skript vergleicht Erwartungsbarwerte und Modellpunktkennzahlen. Es erzeugt
 keine pfadweise Verlustverteilung und weist daher weder VaR/CTE noch Economic
 Capital, Risk Margin oder eine regulatorische Stressaggregation aus.

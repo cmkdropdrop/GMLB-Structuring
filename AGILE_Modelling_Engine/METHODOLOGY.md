@@ -460,13 +460,55 @@ risk-neutral model: there is no bond term premium or separate market price of
 rate risk. Results must be labelled simplified Real-World projections with
 fixed proxy assumptions.
 
-## 11. Intra-year DVA and hedge-package proxy
+### 10.4 Reusable risk-neutral market paths
+
+Large risk-neutral Heston-Hull-White path sets may be created once by
+`portfolio_simulations/precompute_q_market_and_hedge_cache.py` and reused by
+valuation, behaviour and optimisation runners. The cache key is an exact hash
+of the risk-neutral measure and model, ESG configuration, Australian curve and
+model-parameter file hashes, horizon, path count, seed, monthly grid, Heston
+substeps and named market variant. A different seed, stress, horizon or input
+file therefore has a different entry; no nearest-match cache lookup is used.
+
+Each scenario component is stored as a separate non-pickled `.npy` array and
+loaded read-only by memory map. The manifest and reconstructed scenario content
+fingerprint are revalidated before use. Only the explicit precompute runner may
+write cache entries. Valuation and optimisation code only reads an exact entry,
+may simulate a missing market entry when that is explicitly permitted, and
+never silently overwrites an existing mismatch.
+
+## 11. Annual hedge pricing and intra-year DVA
 
 Annual realised credit uses the simulated complete Reference Fund directly.
-The intra-year DVA and annual package-value calculations require a conditional
-value for a non-lognormal equity/bond mixture. The active generic path uses a
-transparent moment-matched Black-Scholes proxy on the **whole** Reference Fund,
-not separate option values for its sleeves.
+The default annual hedge purchase cost is a conditional Monte Carlo value of
+the one-year call spread on that **whole** fund. It is not a sum of separately
+priced equity and bond options. At each anniversary and cap-grid point the
+cache contains the pathwise conditional value
+
+```text
+E_Q[D(t,t+1) * (max(R_fund, 0) - max(R_fund - Cap, 0)) | state_t].
+```
+
+The regression state is limited to information available at that anniversary:
+current Global-Equity Heston variance, short rate, one- and five-year
+Hull-White zero rates and policy year. Fold-excluding Ridge predictions provide
+the value for each path, so a path's realised next-year payoff is never used in
+its own fitted target. Non-negativity, zero value at a zero cap, monotonicity in
+the cap and a discounted-payoff upper bound are enforced after prediction.
+The resulting hedge-price cache is keyed separately by the exact market cache,
+scenario and training fingerprints, path count, horizon, equity index and
+allocation plus allocation-file hash, five-year rolling-bond convention,
+monthly rebalancing, cap grid, fold definition, seed and Ridge setting.
+
+This is a one-year price recomputed conditionally at each anniversary. It is
+not a full multi-year forward-start strip bought at issue and it does not use
+nested Monte Carlo. All model points using the same market/allocation/cap-grid
+configuration share the same surface. `moment_matched_bs` remains an explicit
+annual hedge-pricing fallback; it is not the default conditional-MC method.
+
+The intra-year DVA still requires a mark between anniversaries. That separate
+customer-liability mark uses a transparent moment-matched Black-Scholes proxy
+on the whole Reference Fund.
 
 The equity volatility is the BS volatility or conditional expected Heston
 variance. The rolling bond's local diffusion magnitude is the Hull-White
@@ -529,14 +571,14 @@ effect rather than label: a capped positive-return payoff requires a sold cap
 **Call**. Selling a Put at that strike would create a different downside payoff
 and would not remove the insurer's upside above the cap.
 
-This is **moment matching**, not a calibration to mixed-fund option quotes and
-not exact Heston-Hull-White pricing of the full fund distribution. It does not
-introduce a new volatility input, but it suppresses higher moments, stochastic
-volatility skew and some dynamic dependence. The portfolio path therefore sets
-and enforces `ProjectionConfig.heston_cos=False`. COS utilities retained for
-legacy equity options are not used. LSMC does not replace or recalibrate this
-intra-year valuation proxy; it consumes the resulting current state only at
-its contractual decision times.
+The DVA mark is **moment matching**, not a calibration to mixed-fund option
+quotes. It does not introduce a new volatility input, but it suppresses higher
+moments, stochastic-volatility skew and some dynamic dependence. The annual
+conditional-MC hedge values retain the simulated one-year distribution but are
+still regression estimates rather than executable market quotes. The portfolio
+path sets and enforces `ProjectionConfig.heston_cos=False`; retained COS
+utilities for legacy equity options are unused. LSMC neither replaces nor
+recalibrates the DVA proxy or the annual hedge-pricing regression.
 
 ## 12. Cashflow and valuation definitions
 
@@ -718,8 +760,10 @@ The active implementation remains a research baseline. Material limits are:
    rebalancing and no credit, inflation or transaction-cost model.
 2. The fixed 6% cap is a product convention, not an observed cap calibrated to
    executable mixed-fund hedge quotes.
-3. The DVA and hedge package use whole-fund moment matching and require
-   validation against an administrative formula and market quotes.
+3. The intra-year DVA uses whole-fund moment matching. Annual conditional-MC
+   hedge prices use cross-fitted regressions on simulated one-year payoffs.
+   Both remain proxies requiring validation against the administrative formula
+   and executable market quotes.
 4. The 0.30% hedge-reference management fee is a fixed annual notional-cost
    proxy. It does not reduce the customer Reference-Fund return or the option
    payoff path. No separate hedge-fund NAV or fee term structure is calibrated.

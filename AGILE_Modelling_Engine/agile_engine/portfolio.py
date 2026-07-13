@@ -24,7 +24,9 @@ from .mortality import MortalityTable
 from .pricing import (
     ValuationResult,
     ValuationSettings,
+    bind_cached_hedge_prices,
     build_scenarios,
+    market_cache_spec_for,
     resolve_horizon,
     value_contract,
 )
@@ -49,6 +51,7 @@ _MONETARY_METRICS = (
     "pv_money_market_income_aud",
     "pv_hedge_gain_aud",
     "pv_hedge_option_fair_value_costs_aud",
+    "pv_hedge_option_fair_value_bs_proxy_aud",
     "pv_hedge_option_markup_costs_aud",
     "pv_hedge_management_fee_costs_aud",
     "pv_hedge_execution_costs_aud",
@@ -590,7 +593,12 @@ def _portfolio_settings_and_scenarios(
         measure=Measure.RISK_NEUTRAL,
         horizon_years=common_horizon,
     )
-    if scenario_transform is not None:
+    transform_already_cached = (
+        scenarios.market_cache_key is not None
+        and common_settings.market_variant != "base"
+        and scenarios.market_variant == common_settings.market_variant
+    )
+    if scenario_transform is not None and not transform_already_cached:
         if not callable(scenario_transform):
             raise TypeError("scenario_transform must be callable or None.")
         protected = {
@@ -638,6 +646,7 @@ def _portfolio_settings_and_scenarios(
                 + "."
             )
         scenarios = transformed
+    scenarios = bind_cached_hedge_prices(scenarios, common_settings)
     return common_settings, scenarios
 
 
@@ -686,6 +695,9 @@ def _valuation_metrics(
         "pv_hedge_gain_aud": pv["hedge_gain"],
         "pv_hedge_option_fair_value_costs_aud": (
             pv["hedge_option_fair_value_costs"]
+        ),
+        "pv_hedge_option_fair_value_bs_proxy_aud": (
+            pv["hedge_option_fair_value_bs_proxy"]
         ),
         "pv_hedge_option_markup_costs_aud": pv["hedge_option_markup_costs"],
         "pv_hedge_management_fee_costs_aud": (
@@ -1941,6 +1953,44 @@ def value_policyholder_portfolio(
         "n_paths": int(common_settings.n_paths),
         "seed": int(common_settings.seed),
         "heston_substeps": int(common_settings.heston_substeps),
+        "market_cache_key": (
+            market_cache_spec_for(
+                scenarios.config,
+                common_settings,
+                float(scenarios.times[-1]),
+            ).cache_key
+            if common_settings.market_cache_root is not None else None
+        ),
+        "scenario_fingerprint": scenarios.content_fingerprint,
+        "hedge_cache_key": (
+            scenarios.hedge_price_surface.hedge_cache_key
+            if scenarios.hedge_price_surface is not None else None
+        ),
+        "hedge_price_surface_fingerprint": (
+            scenarios.hedge_price_surface.price_surface_fingerprint
+            if scenarios.hedge_price_surface is not None else None
+        ),
+        "hedge_pricing_method": (
+            common_settings.projection.hedge_pricing_method
+        ),
+        "hedge_training_scenario_fingerprint": (
+            scenarios.hedge_price_surface.spec.training_scenario_fingerprint
+            if scenarios.hedge_price_surface is not None else None
+        ),
+        "hedge_cross_fit_folds": (
+            scenarios.hedge_price_surface.spec.cross_fit_folds
+            if scenarios.hedge_price_surface is not None else None
+        ),
+        "hedge_cap_grid": (
+            list(scenarios.hedge_price_surface.cap_grid)
+            if scenarios.hedge_price_surface is not None else []
+        ),
+        "hedge_equity_allocation": (
+            scenarios.hedge_price_surface.spec.equity_allocation
+            if scenarios.hedge_price_surface is not None else None
+        ),
+        "dva_mark_method": "moment_matched_bs",
+        "nested_mc_used": False,
         "record_paths": bool(common_settings.projection.record_paths),
         "heston_cos": bool(common_settings.projection.heston_cos),
         "lsmc_used": (

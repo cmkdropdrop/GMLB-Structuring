@@ -95,6 +95,15 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--seed", type=int, default=evaluation_input.market_seed
     )
     parser.add_argument("--heston-substeps", type=int, default=4)
+    parser.add_argument("--market-cache-root", type=Path, default=None)
+    parser.add_argument("--hedge-cache-root", type=Path, default=None)
+    parser.add_argument(
+        "--hedge-pricing-method",
+        choices=("mc_conditional", "moment_matched_bs"),
+        default="mc_conditional",
+    )
+    parser.add_argument("--require-market-cache", action="store_true")
+    parser.add_argument("--require-hedge-cache", action="store_true")
     parser.add_argument(
         "--hedge-cap-leg-mode",
         choices=HEDGE_CAP_LEG_MODES,
@@ -222,6 +231,8 @@ def _portfolio_command(
         str(args.heston_substeps),
         "--hedge-cap-leg-mode",
         args.hedge_cap_leg_mode,
+        "--hedge-pricing-method",
+        args.hedge_pricing_method,
         "--profitability-materiality-bp",
         str(args.profitability_materiality_bp),
         "--log-level",
@@ -241,6 +252,12 @@ def _portfolio_command(
     )
     _optional_argument(command, "--zero-curve", args.zero_curve)
     _optional_argument(command, "--model-parameters", args.model_parameters)
+    _optional_argument(command, "--market-cache-root", args.market_cache_root)
+    _optional_argument(command, "--hedge-cache-root", args.hedge_cache_root)
+    if args.require_market_cache:
+        command.append("--require-market-cache")
+    if args.require_hedge_cache:
+        command.append("--require-hedge-cache")
     return command
 
 

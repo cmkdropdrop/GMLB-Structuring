@@ -41,6 +41,8 @@ ENV/
 # Generated model and analysis outputs
 /AGILE_Modelling_Engine/examples/output/
 /AGILE_Modelling_Engine/portfolio_simulations/output/
+/AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths/
+/AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices/
 /_review_work/runner_workaround_reproduction/
 
 # Research paper collections and derived paper code

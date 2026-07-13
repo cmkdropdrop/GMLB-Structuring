@@ -105,13 +105,15 @@ from agile_engine import (  # noqa: E402
     ReferenceFundSpec,
     ScenarioSet,
     SpouseDeathElection,
+    ValuationSettings,
     __version__ as ENGINE_VERSION,
+    bind_cached_hedge_prices,
+    build_scenarios,
     load_cost_assumptions,
     load_dynamic_behaviour_assumptions,
     load_equity_allocation,
     load_market_assumptions,
     load_policyholder_model_points,
-    simulate,
 )
 from agile_engine.behavior import BehaviourModel  # noqa: E402
 from agile_engine.model_points import (  # noqa: E402
@@ -181,6 +183,12 @@ FOLLOWER_PRE_CAP_FEATURE_NAMES = (
 )
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "crediting_cap_dynamic_behaviour"
+)
+DEFAULT_MARKET_CACHE_ROOT = (
+    Path(__file__).resolve().parent / "cache" / "q_market_paths"
+)
+DEFAULT_HEDGE_CACHE_ROOT = (
+    Path(__file__).resolve().parent / "cache" / "q_hedge_prices"
 )
 LOGGER = logging.getLogger("crediting_cap_dynamic_behaviour")
 
@@ -903,6 +911,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--heston-substeps", type=int, default=4)
+    parser.add_argument(
+        "--market-cache-root", type=Path, default=DEFAULT_MARKET_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-cache-root", type=Path, default=DEFAULT_HEDGE_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-pricing-method",
+        choices=("mc_conditional", "moment_matched_bs"),
+        default="mc_conditional",
+    )
+    parser.add_argument("--require-market-cache", action="store_true")
+    parser.add_argument("--require-hedge-cache", action="store_true")
     parser.add_argument("--cross-fit-folds", type=int, default=5)
     parser.add_argument(
         "--ridge", type=float, default=1.0e-4,
@@ -2562,7 +2583,7 @@ def _repeat_scenarios(scenarios: ScenarioSet, repeats: int) -> ScenarioSet:
             index: repeated(values)
             for index, values in scenarios.variance.items()
         }
-    return ScenarioSet(
+    repeated_scenarios = ScenarioSet(
         config=scenarios.config,
         measure=scenarios.measure,
         dt=scenarios.dt,
@@ -2580,6 +2601,13 @@ def _repeat_scenarios(scenarios: ScenarioSet, repeats: int) -> ScenarioSet:
         substeps=scenarios.substeps,
         _copy_inputs=False,
     )
+    if scenarios.hedge_price_surface is not None:
+        repeated_scenarios.bind_hedge_price_surface(
+            scenarios.hedge_price_surface.repeat_paths(
+                repeats, repeated_scenarios
+            )
+        )
+    return repeated_scenarios
 
 
 def _slice_scenarios(
@@ -2600,7 +2628,7 @@ def _slice_scenarios(
             index: sliced(values)
             for index, values in scenarios.variance.items()
         }
-    return ScenarioSet(
+    sliced_scenarios = ScenarioSet(
         config=scenarios.config,
         measure=scenarios.measure,
         dt=scenarios.dt,
@@ -2618,6 +2646,13 @@ def _slice_scenarios(
         substeps=scenarios.substeps,
         _copy_inputs=False,
     )
+    if scenarios.hedge_price_surface is not None:
+        sliced_scenarios.bind_hedge_price_surface(
+            scenarios.hedge_price_surface.slice_paths(
+                start, stop, sliced_scenarios
+            )
+        )
+    return sliced_scenarios
 
 
 def _truncate_scenarios(
@@ -2638,7 +2673,7 @@ def _truncate_scenarios(
             index: truncated(values)
             for index, values in scenarios.variance.items()
         }
-    return ScenarioSet(
+    truncated_scenarios = ScenarioSet(
         config=scenarios.config,
         measure=scenarios.measure,
         dt=scenarios.dt,
@@ -2656,6 +2691,13 @@ def _truncate_scenarios(
         substeps=scenarios.substeps,
         _copy_inputs=False,
     )
+    if scenarios.hedge_price_surface is not None:
+        truncated_scenarios.bind_hedge_price_surface(
+            scenarios.hedge_price_surface.horizon_prefix(
+                stop_step, truncated_scenarios
+            )
+        )
+    return truncated_scenarios
 
 
 @dataclass(frozen=True)
@@ -8749,6 +8791,9 @@ def main() -> None:
         "terminal_closeout_validation": (
             "fail if material under the required full lifetime horizon"
         ),
+        "hedge_pricing_method": args.hedge_pricing_method,
+        "dva_mark_method": "moment_matched_bs",
+        "nested_mc_used": False,
     }
 
     horizon_years = _projection_horizon_years(model_points, terminal_age=120.0)
@@ -8764,6 +8809,7 @@ def main() -> None:
         record_paths=True,
         heston_cos=False,
         force_pathwise_joint_life=True,
+        hedge_pricing_method=args.hedge_pricing_method,
     )
     projection_configs = _projection_configs_by_sample(projection_config)
     training_projection_config = projection_configs["training"]
@@ -8852,16 +8898,37 @@ def main() -> None:
     for treatment in treatment_rows:
         LOGGER.debug("Model-point treatment | %s", treatment)
 
-    with _logged_stage("Simulate training Q Heston-Hull-White scenarios"):
-        training_scenarios = simulate(
-            "heston_hull_white",
-            market.esg,
-            horizon_years,
-            args.n_paths,
-            measure=Measure.RISK_NEUTRAL,
-            seed=args.seed,
-            substeps=args.heston_substeps,
+    def cached_q_scenarios(path_count: int, market_seed: int) -> ScenarioSet:
+        settings = ValuationSettings(
+            model="heston_hull_white",
+            n_paths=path_count,
+            seed=market_seed,
+            heston_substeps=args.heston_substeps,
+            horizon_years=horizon_years,
+            projection=projection_config,
+            market_cache_root=str(args.market_cache_root),
+            market_curve_sha256=market.source_sha256["curve"],
+            market_model_parameters_sha256=(
+                market.source_sha256["model_parameters"]
+            ),
+            require_market_cache=args.require_market_cache,
+            hedge_cache_root=str(args.hedge_cache_root),
+            hedge_cap_grid=tuple(float(cap) for cap in ACTION_CAPS),
+            hedge_equity_allocation=equity_allocation.equity_weight,
+            hedge_equity_index=costs.product.reference_fund.equity_index,
+            hedge_allocation_input_sha256=equity_allocation.source_sha256,
+            require_hedge_cache=args.require_hedge_cache,
         )
+        scenarios = build_scenarios(
+            market.esg,
+            settings,
+            measure=Measure.RISK_NEUTRAL,
+            horizon_years=horizon_years,
+        )
+        return bind_cached_hedge_prices(scenarios, settings)
+
+    with _logged_stage("Load training Q Heston-Hull-White cache"):
+        training_scenarios = cached_q_scenarios(args.n_paths, args.seed)
     LOGGER.debug(
         "Training scenarios | fingerprint=%s | paths=%d | steps=%d",
         training_scenarios.content_fingerprint,
@@ -9010,15 +9077,9 @@ def main() -> None:
             float(np.min(oof_r2)),
         )
 
-    with _logged_stage("Simulate benchmark Q Heston-Hull-White scenarios"):
-        benchmark_scenarios = simulate(
-            "heston_hull_white",
-            market.esg,
-            horizon_years,
-            3 * args.benchmark_paths,
-            measure=Measure.RISK_NEUTRAL,
-            seed=args.seed + 1,
-            substeps=args.heston_substeps,
+    with _logged_stage("Load benchmark Q Heston-Hull-White cache"):
+        benchmark_scenarios = cached_q_scenarios(
+            3 * args.benchmark_paths, args.seed + 1
         )
     LOGGER.debug(
         "Benchmark scenarios | fingerprint=%s | paths=%d | steps=%d",
@@ -9047,6 +9108,57 @@ def main() -> None:
         "fixed_cap_selection": fixed_selection_scenarios.content_fingerprint,
         "validation": validation_scenarios.content_fingerprint,
         "evaluation": evaluation_scenarios.content_fingerprint,
+    }
+    cache_audit = {
+        "market_cache_keys": {
+            "training": (
+                training_scenarios.hedge_price_surface.spec.market_cache_key
+                if training_scenarios.hedge_price_surface is not None else None
+            ),
+            "benchmark_master": (
+                benchmark_scenarios.hedge_price_surface.spec.market_cache_key
+                if benchmark_scenarios.hedge_price_surface is not None else None
+            ),
+        },
+        "hedge_cache_keys": {
+            "training": (
+                training_scenarios.hedge_price_surface.hedge_cache_key
+                if training_scenarios.hedge_price_surface is not None else None
+            ),
+            "benchmark_master": (
+                benchmark_scenarios.hedge_price_surface.hedge_cache_key
+                if benchmark_scenarios.hedge_price_surface is not None else None
+            ),
+        },
+        "hedge_price_surface_fingerprints": {
+            "training": (
+                training_scenarios.hedge_price_surface.price_surface_fingerprint
+                if training_scenarios.hedge_price_surface is not None else None
+            ),
+            "benchmark_master": (
+                benchmark_scenarios.hedge_price_surface.price_surface_fingerprint
+                if benchmark_scenarios.hedge_price_surface is not None else None
+            ),
+        },
+        "hedge_training_scenario_fingerprints": {
+            "training": (
+                training_scenarios.hedge_price_surface.spec.training_scenario_fingerprint
+                if training_scenarios.hedge_price_surface is not None else None
+            ),
+            "benchmark_master": (
+                benchmark_scenarios.hedge_price_surface.spec.training_scenario_fingerprint
+                if benchmark_scenarios.hedge_price_surface is not None else None
+            ),
+        },
+        "hedge_pricing_method": args.hedge_pricing_method,
+        "cross_fit_folds": (
+            training_scenarios.hedge_price_surface.spec.cross_fit_folds
+            if training_scenarios.hedge_price_surface is not None else None
+        ),
+        "cap_grid": ACTION_CAPS.tolist(),
+        "equity_allocation": equity_allocation.equity_weight,
+        "dva_mark_method": "moment_matched_bs",
+        "nested_mc_used": False,
     }
     if len(set(market_sample_fingerprints.values())) != 4:
         raise RuntimeError(
@@ -10029,6 +10141,7 @@ def main() -> None:
         "policyholder_lsmc_training_signature_fallback_count": 0,
         "policyholder_lsmc_training_cap_schedule_fingerprint": None,
         "market_scenario_fingerprints": market_sample_fingerprints,
+        "market_and_hedge_cache": cache_audit,
         "full_stochastic_sample_fingerprints": (
             full_stochastic_sample_fingerprints
         ),
@@ -10225,6 +10338,7 @@ def main() -> None:
             "model_point_projection_treatments.csv"
         ),
         "portfolio_application": projection_semantics,
+        "market_and_hedge_cache": cache_audit,
         "economic_policy_horizon": {
             "economically_active_policy_years": list(
                 backward.economically_active_policy_years

@@ -1509,7 +1509,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
     ``argv`` is retained for callers which imported the legacy runner's
     ``main`` function.  The canonical runner currently parses ``sys.argv``
     directly, so a supplied argument sequence is installed only for the
-    duration of that call and is restored afterwards.
+    duration of that call and is restored afterwards.  This unchanged-argv
+    delegation also exposes the canonical market-cache, hedge-cache and
+    hedge-pricing CLI switches without duplicating their implementation here.
     """
     log_to_console(
         "NOTICE: run_lsmc_crediting_cap.py is the separate Stackelberg cap-"

@@ -27,10 +27,23 @@ from scipy.optimize import brentq
 from .behavior import BehaviourModel
 from .esg import ESGConfig, Measure, ScenarioSet, simulate
 from .mortality import MortalityTable
-from .product import (IndexLinkedLifetimeIncomeProduct, ExpenseAssumptions,
-                      FeeSpec, PolicySpec)
+from .product import (Index, IndexLinkedLifetimeIncomeProduct,
+                      ExpenseAssumptions, FeeSpec, PolicySpec)
 from .projection import ProjectionConfig, ProjectionResult, project
 from ._provenance import assumption_fingerprint
+from .forward_start_hedge_pricing import (
+    DEFAULT_HEDGE_CROSS_FIT_FOLDS,
+    DEFAULT_HEDGE_CROSS_FIT_SEED,
+    DEFAULT_HEDGE_RIDGE,
+    HedgePriceCacheMismatchError,
+    HedgePriceCacheSpec,
+    load_hedge_price_surface,
+)
+from .scenario_cache import (
+    ScenarioCacheNotFoundError,
+    ScenarioCacheSpec,
+    load_scenario_set,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +68,21 @@ class ValuationSettings:
     #: Simplified real-world baseline used by profitability projections.  It
     #: is deliberately separate from the risk-neutral valuation model.
     real_world_model: str = "hull_white_bs"
+    #: Optional read-only cache inputs.  Valuation code never writes here.
+    market_cache_root: Optional[str] = None
+    market_curve_sha256: Optional[str] = None
+    market_model_parameters_sha256: Optional[str] = None
+    market_variant: str = "base"
+    require_market_cache: bool = False
+    hedge_cache_root: Optional[str] = None
+    hedge_cap_grid: tuple[float, ...] = ()
+    hedge_equity_allocation: Optional[float] = None
+    hedge_equity_index: Index = Index.GLOBAL_EQUITY
+    hedge_allocation_input_sha256: Optional[str] = None
+    hedge_cross_fit_folds: int = DEFAULT_HEDGE_CROSS_FIT_FOLDS
+    hedge_cross_fit_seed: int = DEFAULT_HEDGE_CROSS_FIT_SEED
+    hedge_ridge: float = DEFAULT_HEDGE_RIDGE
+    require_hedge_cache: bool = False
 
     def __post_init__(self) -> None:
         if self.model not in ("black_scholes", "heston", "hull_white_bs",
@@ -81,6 +109,61 @@ class ValuationSettings:
                 raise ValueError("horizon_years must be positive and finite.")
             if abs(h * 12.0 - round(h * 12.0)) > 1e-9:
                 raise ValueError("horizon_years must fall on the monthly grid.")
+        for name in ("require_market_cache", "require_hedge_cache"):
+            if not isinstance(getattr(self, name), (bool, np.bool_)):
+                raise ValueError(f"{name} must be boolean.")
+        if self.require_market_cache and self.market_cache_root is None:
+            raise ValueError("require_market_cache needs market_cache_root.")
+        if self.market_cache_root is not None:
+            for name in (
+                "market_curve_sha256", "market_model_parameters_sha256",
+            ):
+                value = getattr(self, name)
+                if value is None or len(str(value)) != 64:
+                    raise ValueError(
+                        f"{name} is required for exact market-cache lookup."
+                    )
+        object.__setattr__(self, "hedge_equity_index", Index(self.hedge_equity_index))
+        caps = tuple(float(value) for value in self.hedge_cap_grid)
+        if caps and (
+            any(not np.isfinite(value) or value < 0.0 for value in caps)
+            or any(right <= left for left, right in zip(caps, caps[1:]))
+        ):
+            raise ValueError("hedge_cap_grid must be strictly increasing.")
+        object.__setattr__(self, "hedge_cap_grid", caps)
+        needs_hedge = (
+            self.projection.hedge_pricing_method == "mc_conditional"
+            or self.require_hedge_cache
+        )
+        if needs_hedge:
+            if self.hedge_cache_root is None or not caps:
+                raise ValueError(
+                    "Conditional/required hedge pricing needs hedge_cache_root "
+                    "and hedge_cap_grid."
+                )
+            if self.hedge_equity_allocation is None \
+                    or self.hedge_allocation_input_sha256 is None:
+                raise ValueError(
+                    "Conditional/required hedge pricing needs exact allocation "
+                    "and allocation-input hash."
+                )
+            if self.market_cache_root is None:
+                raise ValueError(
+                    "Conditional hedge pricing requires exact market-cache metadata."
+                )
+        if self.hedge_equity_allocation is not None and (
+            not np.isfinite(self.hedge_equity_allocation)
+            or not 0.0 <= self.hedge_equity_allocation <= 1.0
+        ):
+            raise ValueError("hedge_equity_allocation must be in [0, 1].")
+        if isinstance(self.hedge_cross_fit_folds, bool) \
+                or self.hedge_cross_fit_folds < 2:
+            raise ValueError("hedge_cross_fit_folds must be at least two.")
+        if isinstance(self.hedge_cross_fit_seed, bool) \
+                or self.hedge_cross_fit_seed < 0:
+            raise ValueError("hedge_cross_fit_seed must be non-negative.")
+        if not np.isfinite(self.hedge_ridge) or self.hedge_ridge < 0.0:
+            raise ValueError("hedge_ridge must be finite and non-negative.")
 
 
 def resolve_horizon(settings: ValuationSettings, policy: PolicySpec) -> float:
@@ -120,11 +203,122 @@ class ValuationResult:
 # Valuation
 # ---------------------------------------------------------------------------
 
+def market_cache_spec_for(
+        esg_config: ESGConfig, settings: ValuationSettings,
+        horizon_years: float) -> ScenarioCacheSpec:
+    """Build the exact market-cache specification for valuation settings."""
+    if settings.market_curve_sha256 is None \
+            or settings.market_model_parameters_sha256 is None:
+        raise ValueError("Market source hashes are required for cache lookup.")
+    return ScenarioCacheSpec.from_inputs(
+        esg_config,
+        australian_curve_sha256=settings.market_curve_sha256,
+        model_parameters_sha256=settings.market_model_parameters_sha256,
+        horizon_years=horizon_years,
+        n_paths=settings.n_paths,
+        seed=settings.seed,
+        heston_substeps=settings.heston_substeps,
+        market_variant=settings.market_variant,
+    )
+
+
+def bind_cached_hedge_prices(
+        scenarios: ScenarioSet, settings: ValuationSettings) -> ScenarioSet:
+    """Load and bind the exact annual surface when the method requires it."""
+    needs_hedge = (
+        settings.projection.hedge_pricing_method == "mc_conditional"
+        or settings.require_hedge_cache
+    )
+    if scenarios.hedge_price_surface is not None:
+        scenarios.hedge_price_surface.validate_against(
+            scenarios,
+            settings.hedge_cap_grid or None,
+        )
+        if needs_hedge:
+            spec = scenarios.hedge_price_surface.spec
+            mismatches: list[str] = []
+            if spec.equity_index != settings.hedge_equity_index:
+                mismatches.append("equity_index")
+            if not np.isclose(
+                spec.equity_allocation,
+                settings.hedge_equity_allocation,
+                rtol=0.0,
+                atol=1.0e-15,
+            ):
+                mismatches.append("equity_allocation")
+            if spec.allocation_input_sha256 \
+                    != settings.hedge_allocation_input_sha256:
+                mismatches.append("allocation_input_sha256")
+            if spec.cross_fit_folds != settings.hedge_cross_fit_folds:
+                mismatches.append("cross_fit_folds")
+            if spec.cross_fit_seed != settings.hedge_cross_fit_seed:
+                mismatches.append("cross_fit_seed")
+            if not np.isclose(
+                spec.ridge, settings.hedge_ridge, rtol=0.0, atol=0.0,
+            ):
+                mismatches.append("ridge")
+            if mismatches:
+                raise HedgePriceCacheMismatchError(
+                    "Bound hedge surface conflicts with valuation settings: "
+                    + ", ".join(mismatches)
+                    + "."
+                )
+        return scenarios
+    if not needs_hedge:
+        return scenarios
+    if settings.hedge_cache_root is None \
+            or settings.hedge_equity_allocation is None \
+            or settings.hedge_allocation_input_sha256 is None:
+        raise ValueError("Exact hedge-cache metadata is incomplete.")
+    market_spec = market_cache_spec_for(
+        scenarios.config, settings, float(scenarios.times[-1])
+    )
+    spec = HedgePriceCacheSpec(
+        market_cache_key=market_spec.cache_key,
+        scenario_fingerprint=scenarios.content_fingerprint,
+        n_paths=scenarios.n_paths,
+        horizon_years=float(scenarios.times[-1]),
+        equity_index=settings.hedge_equity_index,
+        equity_allocation=float(settings.hedge_equity_allocation),
+        allocation_input_sha256=settings.hedge_allocation_input_sha256,
+        cap_grid=settings.hedge_cap_grid,
+        training_scenario_fingerprint=scenarios.content_fingerprint,
+        cross_fit_folds=settings.hedge_cross_fit_folds,
+        cross_fit_seed=settings.hedge_cross_fit_seed,
+        ridge=settings.hedge_ridge,
+    )
+    surface = load_hedge_price_surface(
+        settings.hedge_cache_root, spec, scenarios, mmap_mode="r"
+    )
+    scenarios.bind_hedge_price_surface(surface)
+    return scenarios
+
+
 def build_scenarios(esg_config: ESGConfig, settings: ValuationSettings,
                     measure: Measure = Measure.RISK_NEUTRAL,
                     horizon_years: Optional[float] = None) -> ScenarioSet:
     horizon = horizon_years if horizon_years is not None else \
         (settings.horizon_years if settings.horizon_years is not None else 45.0)
+    if settings.market_cache_root is not None:
+        if measure != Measure.RISK_NEUTRAL \
+                or settings.model != "heston_hull_white":
+            if settings.require_market_cache:
+                raise ValueError(
+                    "Reusable market cache supports only risk-neutral "
+                    "heston_hull_white scenarios."
+                )
+        else:
+            spec = market_cache_spec_for(esg_config, settings, float(horizon))
+            try:
+                return load_scenario_set(
+                    settings.market_cache_root,
+                    spec,
+                    esg_config,
+                    mmap_mode="r",
+                )
+            except ScenarioCacheNotFoundError:
+                if settings.require_market_cache:
+                    raise
     kwargs = ({"substeps": settings.heston_substeps}
               if settings.model in ("heston", "heston_hull_white") else {})
     return simulate(settings.model, esg_config, horizon,
@@ -208,6 +402,8 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
         if not np.isclose(scenarios.times[-1], expected_horizon,
                           rtol=0.0, atol=1e-12):
             raise ValueError("Supplied scenarios do not match the resolved valuation horizon.")
+
+    scenarios = bind_cached_hedge_prices(scenarios, settings)
 
     # Dividend yield is market data, but older APIs also carried a duplicate
     # product-level copy.  Reject divergence instead of silently valuing the

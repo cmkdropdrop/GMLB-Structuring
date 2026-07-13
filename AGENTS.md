@@ -12,6 +12,46 @@ Basismodell nicht verlangt werden.
 Für die marktkonsistente Bewertung soll standardmäßig das
 Heston-Hull-White-Modell unter dem risikoneutralen Maß verwendet werden.
 
+## Verbindliche Cache-Quelle für Q-Pfade und Optionspreise
+
+Für reguläre marktkonsistente Bewertungen und Optimierungen dürfen
+risikoneutrale Kapitalmarktpfade, monatliche pfadweise Discountfaktoren und die
+daraus abgeleiteten Referenzfonds-Pfade ausschließlich aus einem exakt
+passenden, validierten Marktpfad-Cache unter
+`AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths` geladen
+werden. Jährliche MC-basierte Preise der jeweils neu gestarteten Call-Spreads
+dürfen ausschließlich aus dem zugehörigen, pfadkongruenten Hedgepreis-Cache
+unter `AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices`
+stammen.
+
+Nur
+`AGILE_Modelling_Engine/portfolio_simulations/precompute_q_market_and_hedge_cache.py`
+darf diese Cache-Einträge erzeugen oder schreiben. Bewertungs-, Behaviour- und
+Optimierungsrunner sind reine Cache-Leser und dürfen fehlende oder
+inkonsistente Q-Pfade beziehungsweise Hedgepreise nicht selbst neu simulieren,
+neu schätzen, überschreiben oder durch einen nur ungefähr passenden Cache
+ersetzen. Operative Aufrufe sollen deshalb die exakte Cache-Verwendung mit
+`--require-market-cache` und bei `mc_conditional` zusätzlich mit
+`--require-hedge-cache` erzwingen.
+
+Ein anderer Seed, eine andere Pfadzahl, ein anderer Horizont, geänderte
+Markteingaben oder ein Marktstress benötigen einen eigenen Marktcache. Ein
+anderes Cap-Grid oder eine andere Aktienallokation benötigt einen eigenen
+Hedgepreis-Cache, darf aber denselben passenden Marktcache verwenden.
+Mortality-, Longevity-, Expense- oder andere nicht-marktbezogene Stresse dürfen
+den Marktcache-Key nicht verändern.
+
+Wird `mc_conditional` verlangt, muss ein exakt passender Hedgepreis-Cache
+vorliegen; ein stiller Rückfall auf Black-Scholes ist unzulässig. Der bestehende
+Moment-Matching-Ansatz darf nur nach ausdrücklicher Wahl von
+`moment_matched_bs` verwendet und muss als Fallback beziehungsweise Proxy
+gekennzeichnet werden. Der unterjährige DVA-Mark bleibt davon getrennt vorerst
+`moment_matched_bs`.
+
+Diese Cache-Pflicht betrifft marktkonsistente Q-Bewertungen. Kleine
+synthetische Unit-Tests sowie die ausdrücklich als vereinfacht gekennzeichneten
+Real-World-Projektionen fallen nicht darunter.
+
 ## Vereinfachte Real-World-Projektionen
 
 Real-World-Projektionen sollen standardmäßig mit dem
