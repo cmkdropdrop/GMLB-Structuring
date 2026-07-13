@@ -50,6 +50,112 @@ def test_proportional_hazard_is_anchored_and_aggregates_exactly():
     assert function.annual_probability(0.0, 0.3, 200_000.0) == 0.0
 
 
+def test_loaded_income_lapse_shortfall_response_is_ordered_low_base_high():
+    """The versioned proxy bands increase lapse for the same economic state."""
+    fixed_base_lapse = 0.005
+    fixed_moneyness = 0.0
+    fixed_premium = 100_000.0
+    shortfall = 0.10
+
+    probabilities = []
+    for value_basis in ("low", "base", "high"):
+        dynamic = load_dynamic_behaviour_assumptions(
+            value_basis=value_basis
+        ).behaviour.dynamic
+        without_shortfall = dynamic.income_probability(
+            fixed_base_lapse,
+            fixed_moneyness,
+            fixed_premium,
+            1.0,
+            performance_shortfall=0.0,
+        )
+        with_shortfall = dynamic.income_probability(
+            fixed_base_lapse,
+            fixed_moneyness,
+            fixed_premium,
+            1.0,
+            performance_shortfall=shortfall,
+        )
+        assert without_shortfall == pytest.approx(fixed_base_lapse)
+        assert with_shortfall > without_shortfall
+        probabilities.append(with_shortfall)
+
+    assert probabilities[0] < probabilities[1] < probabilities[2]
+
+
+def test_competing_performance_risk_is_separate_from_ordinary_base_lapse():
+    dynamic = load_dynamic_behaviour_assumptions().behaviour.dynamic
+    no_gap = dynamic.income_probability(
+        0.0, 0.0, 100_000.0, 1.0, performance_shortfall=0.0
+    )
+    gap = dynamic.income_probability(
+        0.0, 0.0, 100_000.0, 1.0, performance_shortfall=0.10
+    )
+    assert no_gap == 0.0
+    assert gap > 0.04
+
+
+def test_competing_lapse_causes_reconcile_and_aggregate_over_twelve_months():
+    dynamic = load_dynamic_behaviour_assumptions().behaviour.dynamic
+    ordinary_month, performance_month = dynamic.income_cause_probabilities(
+        0.005,
+        0.0,
+        100_000.0,
+        1.0 / 12.0,
+        performance_shortfall=0.10,
+    )
+    annual = dynamic.income_probability(
+        0.005, 0.0, 100_000.0, 1.0, performance_shortfall=0.10
+    )
+    assert ordinary_month > 0.0
+    assert performance_month > 0.0
+    assert 1.0 - (1.0 - ordinary_month - performance_month) ** 12 \
+        == pytest.approx(annual)
+
+
+def test_performance_lapse_deadband_clip_and_lapse_scaling():
+    behaviour = load_dynamic_behaviour_assumptions().behaviour
+    dynamic = behaviour.dynamic
+    at_deadband = dynamic.income_probability(
+        0.0, 0.0, 100_000.0, 1.0, performance_shortfall=0.02
+    )
+    clipped = dynamic.income_probability(
+        0.0, 0.0, 100_000.0, 1.0, performance_shortfall=0.32
+    )
+    beyond_clip = dynamic.income_probability(
+        0.0, 0.0, 100_000.0, 1.0, performance_shortfall=3.00
+    )
+    assert at_deadband == 0.0
+    assert clipped == pytest.approx(beyond_clip)
+
+    zero_stress = behaviour.scaled_lapses(0.0)
+    assert zero_stress.dynamic.income_probability(
+        0.0, 0.0, 100_000.0, 1.0, performance_shortfall=0.30
+    ) == 0.0
+    assert behaviour.scaled_lapses(1.5).dynamic.performance.excess_hazard_cap \
+        == pytest.approx(1.5 * dynamic.performance.excess_hazard_cap)
+
+
+def test_signed_moneyness_and_common_retention_have_expected_directions():
+    dynamic = load_dynamic_behaviour_assumptions().behaviour.dynamic
+    ordinary_otm = dynamic.income_probability(
+        0.005, -0.40, 100_000.0, 1.0, performance_shortfall=0.0
+    )
+    ordinary_atm = dynamic.income_probability(
+        0.005, 0.0, 100_000.0, 1.0, performance_shortfall=0.0
+    )
+    gap_atm = dynamic.income_probability(
+        0.005, 0.0, 100_000.0, 1.0, performance_shortfall=0.10
+    )
+    gap_itm = dynamic.income_probability(
+        0.005, np.log(2.0), 100_000.0, 1.0,
+        performance_shortfall=0.10,
+    )
+    assert ordinary_otm > ordinary_atm
+    assert gap_atm > ordinary_atm
+    assert gap_itm < gap_atm
+
+
 def test_take_up_hazard_uses_market_and_gross_premium_covariates():
     function = DynamicHazardFunction(
         beta_moneyness=4.0,
@@ -64,6 +170,54 @@ def test_take_up_hazard_uses_market_and_gross_premium_covariates():
     reference = function.annual_probability(base, 0.0, 100_000.0)
     assert function.annual_probability(base, 0.2, 100_000.0) > reference
     assert function.annual_probability(base, 0.0, 200_000.0) > reference
+
+
+def test_loaded_take_up_uses_only_current_anniversary_state_covariates():
+    take_up = load_dynamic_behaviour_assumptions().behaviour.dynamic_take_up
+    common = dict(
+        base_annual=0.10,
+        log_guarantee_moneyness=0.0,
+        premium=100_000.0,
+        account_value=100_000.0,
+        prospective_annual_income=8_000.0,
+        previous_reference_return=0.06,
+        previous_credited_return=0.04,
+        performance_gap=0.02,
+    )
+    reference = take_up.probability(**common)
+    higher_account = take_up.probability(
+        **{**common, "account_value": 120_000.0}
+    )
+    higher_income = take_up.probability(
+        **{**common, "prospective_annual_income": 10_000.0}
+    )
+    different_visible_returns = take_up.probability(
+        **{
+            **common,
+            "previous_reference_return": 0.12,
+            "previous_credited_return": 0.02,
+            "performance_gap": 0.10,
+        }
+    )
+
+    assert higher_account != pytest.approx(reference)
+    assert higher_income != pytest.approx(reference)
+    assert different_visible_returns != pytest.approx(reference)
+    assert take_up.probability(**{**common, "base_annual": 0.0}) == 0.0
+    assert take_up.probability(**{**common, "base_annual": 1.0}) == 1.0
+
+
+def test_continue_benchmark_preserves_dynamic_election_but_removes_income_exit():
+    behaviour = load_dynamic_behaviour_assumptions().behaviour
+    benchmark = behaviour.without_post_election_behaviour()
+
+    assert benchmark.take_up == behaviour.take_up
+    assert benchmark.dynamic_take_up == behaviour.dynamic_take_up
+    assert benchmark.use_dynamic_take_up
+    assert benchmark.lapse.income_phase == 0.0
+    assert not benchmark.dynamic.enabled
+    assert benchmark.withdrawals.free_utilisation == 0.0
+    assert benchmark.withdrawals.excess_rate == 0.0
 
 
 def test_fractional_logit_uses_market_premium_and_mva():

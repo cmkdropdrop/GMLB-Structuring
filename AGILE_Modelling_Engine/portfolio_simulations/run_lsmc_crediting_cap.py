@@ -1,4 +1,10 @@
-"""LSMC-Optimierung des jaehrlichen Crediting-Rate-Caps (Storage-Stil).
+"""DEPRECATED research implementation of annual Crediting-Cap control.
+
+When this file is executed it delegates to the canonical, monthly-engine-based
+``optimize_crediting_rate_lsmc.py`` runner.  The legacy annual approximation
+below is retained only for audit history and must not be used for results.
+
+LSMC-Optimierung des jaehrlichen Crediting-Rate-Caps (Storage-Stil).
 
 Fragestellung
 -------------
@@ -1162,7 +1168,7 @@ def _create_plots(
 # Hauptprogramm
 # ---------------------------------------------------------------------------
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def _legacy_main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -1485,6 +1491,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception:
         logger.exception("LSMC-Crediting-Cap-Run fehlgeschlagen")
         return 1
+
+
+def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
+    """Delegate all supported entry points to the canonical monthly runner.
+
+    ``argv`` is retained for callers which imported the legacy runner's
+    ``main`` function.  The canonical runner currently parses ``sys.argv``
+    directly, so a supplied argument sequence is installed only for the
+    duration of that call and is restored afterwards.
+    """
+    if __package__:
+        from .optimize_crediting_rate_lsmc import main as canonical_main
+    else:
+        from optimize_crediting_rate_lsmc import main as canonical_main
+
+    if argv is None:
+        return canonical_main()
+
+    previous_argv = sys.argv
+    try:
+        sys.argv = [previous_argv[0], *(str(value) for value in argv)]
+        return canonical_main()
+    finally:
+        sys.argv = previous_argv
 
 
 if __name__ == "__main__":

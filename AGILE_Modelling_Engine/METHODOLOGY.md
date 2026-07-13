@@ -293,22 +293,24 @@ The generic product applies the following eligibility gates:
 
 - Growth lapse/full surrender is always zero;
 - free, partial and excess withdrawals are always zero in Growth;
-- Income Take-up is evaluated only at Policy Anniversaries. In the portfolio
-  workflow, the explicit model-point `income_start_year` overrides the loaded
-  dynamic Take-up hazard and is applied deterministically;
+- Income Take-up is evaluated only at Policy Anniversaries after Credit,
+  fee posting and the mortality decrement for the elapsed interval. The
+  Dynamic portfolio workflow uses the loaded state-dependent hazard;
+  `income_start_year` is used only by the explicit deterministic benchmark;
 - Income lapse/full withdrawal and Income Excess Withdrawal may use the loaded
   dynamic assumptions. Income lapse remains possible while the guarantee is
   in force after Account Value exhaustion; and
-- the contractual automatic start after age 100 is separate from any earlier
-  behaviour-model `force_by_year` assumption.
+- the contractual automatic start after age 100 is separate from the 100-%
+  statistical baseline band historically named `force_by_year` in the
+  Behaviour input. Only the former is reported as a forced contractual start.
 
-The core projection currently rejects Spouse Income with dynamic or hazard-
-based Election. Until pre-Election spouse eligibility is carried as an
-explicit state, Spouse model points require the deterministic effective
-Election anniversary used by the portfolio workflow. It also rejects dynamic
-lapse/withdrawal responses for a Continue-Income Joint-Life core call; the
-portfolio wrapper supplies the documented state-independent static joint
-branch and retains dynamic behaviour only for its Single-Life fallback.
+For state-dependent Spouse Income, Primary and Spouse life statuses are drawn
+and retained separately on each market path. A path on which the Spouse dies
+before Election uses the Single-Life fallback rate; after a valid Joint-Life
+Election, `p11`, `p10` and `p01` paths retain their own observable state. This
+avoids applying a nonlinear Behaviour function to a survivor-state average.
+The deterministic benchmark continues to use the historical expected spouse-
+survival split so its former Election mechanics remain reproducible.
 
 Every shipped behavioural value is labelled `uncalibrated_proxy`. The cited
 literature motivates functional form only and does not calibrate the numerical
@@ -480,10 +482,10 @@ large enough for all model-point horizons, reuses it for all model points and
 optional fee solves, projects sequentially and retains scalar output. This is
 plain Monte Carlo with common random numbers; it uses neither COS nor LSMC.
 
-For the delivered Joint-Life New-Business points, `income_start_year` is a
-fixed Election input, subject to the earlier contractual automatic-start
+Only in the deterministic validation benchmark is `income_start_year` a fixed
+Election input, subject to the earlier contractual automatic-start
 anniversary. Let `s_2(T)` be spouse survival from issue to that effective
-anniversary under the same reconciled monthly mortality basis. The model-point
+anniversary under the same reconciled monthly mortality basis. Its model-point
 value is
 
 ```text
@@ -491,15 +493,12 @@ V_joint_point = s_2(T) * V(both alive at Election)
               + (1 - s_2(T)) * V(Single-Life fallback).
 ```
 
-Both conditional projections have identical pre-Election cashflows, so the
-convex combination retains those cashflows once. In the Continue-Income joint
-branch, Income lapse and Excess Withdrawal use the loaded state-independent
-static base rates; the Single-Life fallback remains dynamic. This prevents the
-former invalid application of a nonlinear behaviour response to a conditional
-mean survivor-state annuity factor. `p11`, `p10` and `p01` are still not carried
-as separate Account-Value cohorts, so dynamic Joint-Life behaviour is not
-claimed. Lives are independent; this is not a general couple-state model for
-dynamic Election dates, divorce/removal or common shocks.
+Both conditional benchmark projections have identical pre-Election cashflows,
+so the convex combination retains those cashflows once. Dynamic and optimal
+main runs do not use this fixed-date mixture: they use separate pathwise life
+statuses at every Election and later Behaviour decision. Lives remain
+independent; this is not a general couple-state model for divorce/removal or
+common mortality shocks.
 
 Every model point is valued before any portfolio weighting. The result keeps
 three distinct layers:

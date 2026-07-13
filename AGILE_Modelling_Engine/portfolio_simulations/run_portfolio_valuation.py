@@ -46,6 +46,12 @@ from agile_engine import (  # noqa: E402
     load_policyholder_model_points,
     value_policyholder_portfolio,
 )
+from agile_engine.portfolio_stresses import (  # noqa: E402
+    PORTFOLIO_STRESS_CHOICES,
+    apply_portfolio_input_stress,
+    get_portfolio_stress,
+    portfolio_scenario_transform,
+)
 
 
 DEFAULT_OUTPUT_DIRECTORY = (
@@ -228,6 +234,49 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
+        "--income-election-mode",
+        choices=("dynamic", "deterministic"),
+        default="dynamic",
+        help=(
+            "dynamic re-evaluates statistical take-up at every eligible "
+            "Anniversary; deterministic is the explicit backwards-compatible "
+            "model-point benchmark"
+        ),
+    )
+    parser.add_argument(
+        "--post-income-behaviour",
+        choices=("dynamic", "continue"),
+        default="dynamic",
+        help=(
+            "dynamic retains statistical Income lapse/withdrawal; continue "
+            "removes voluntary post-Election exits for behaviour decomposition"
+        ),
+    )
+    parser.add_argument(
+        "--take-up-seed",
+        type=int,
+        default=97,
+        help="independent common-random-number seed for Dynamic Election",
+    )
+    parser.add_argument(
+        "--mortality-seed",
+        type=int,
+        default=197,
+        help=(
+            "independent life-status seed used only where pathwise Joint-Life "
+            "states are required by Dynamic Election"
+        ),
+    )
+    parser.add_argument(
+        "--stress-scenario",
+        choices=PORTFOLIO_STRESS_CHOICES,
+        default="base",
+        help=(
+            "shared market/life/expense revaluation scenario; default base "
+            "preserves the contractual valuation"
+        ),
+    )
+    parser.add_argument(
         "--crediting-cap-rate",
         type=float,
         default=None,
@@ -308,8 +357,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     if args.n_paths <= 0:
         parser.error("--n-paths must be positive")
-    if args.seed < 0:
-        parser.error("--seed must be non-negative")
+    if args.seed < 0 or args.take_up_seed < 0 or args.mortality_seed < 0:
+        parser.error("all seeds must be non-negative")
     if args.heston_substeps <= 0:
         parser.error("--heston-substeps must be positive")
     if args.crediting_cap_rate is not None and (
@@ -934,6 +983,28 @@ def _result_attribute(result: object, name: str, fallback: object = None) -> obj
     return getattr(result, name, fallback)
 
 
+def _select_portfolio_behaviour(
+    loaded: object,
+    *,
+    income_election_mode: str,
+    post_income_behaviour: str,
+) -> object:
+    """Apply explicit benchmark switches without altering the loaded source."""
+    if income_election_mode not in ("dynamic", "deterministic"):
+        raise ValueError("Unsupported Income-Election mode.")
+    if post_income_behaviour not in ("dynamic", "continue"):
+        raise ValueError("Unsupported post-Income Behaviour mode.")
+    selected = loaded
+    if income_election_mode == "deterministic":
+        selected = replace(
+            selected,
+            take_up=replace(selected.take_up, mode="deterministic"),
+        )
+    if post_income_behaviour == "continue":
+        selected = selected.without_post_election_behaviour()
+    return selected
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     output = args.output.expanduser().resolve()
@@ -943,6 +1014,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         logger.info("[1/6] Portfolio-Run gestartet | Output: %s", output)
+        stress = get_portfolio_stress(args.stress_scenario)
+        stress_audit = stress.audit_dict(
+            applied_to_training=False,
+            applied_to_evaluation=True,
+        )
+        logger.info(
+            "Stress-Szenario | %s | %s",
+            stress.stress_id,
+            stress.label,
+        )
         logger.info("[2/6] Markt-, Kosten-, Behaviour- und Modellpunktdaten laden")
         market = load_market_assumptions(args.zero_curve, args.model_parameters)
         generic_base_product = IndexLinkedLifetimeIncomeProduct(
@@ -958,6 +1039,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         portfolio_projection = ProjectionConfig(
             record_paths=False,
             heston_cos=False,
+            take_up_seed=args.take_up_seed,
+            mortality_seed=args.mortality_seed,
         )
         costs = load_cost_assumptions(
             args.cost_assumptions,
@@ -971,15 +1054,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             assumption_set_id=args.behaviour_assumption_set,
             value_basis="base",
         )
-        # The explicit model-point Income start takes precedence for this
-        # portfolio. The behaviour files remain the source for lapse and
-        # withdrawal dynamics and retain full provenance.
-        portfolio_behaviour = replace(
+        portfolio_behaviour = _select_portfolio_behaviour(
             behaviour_assumptions.behaviour,
-            take_up=replace(
-                behaviour_assumptions.behaviour.take_up,
-                mode="deterministic",
-            ),
+            income_election_mode=args.income_election_mode,
+            post_income_behaviour=args.post_income_behaviour,
         )
         model_points = load_policyholder_model_points(
             args.model_points,
@@ -1006,7 +1084,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             model_points.contract_weight_sum,
             model_points.premium_volume_weight_sum,
         )
-        if joint_continue_income_count:
+        if joint_continue_income_count and args.income_election_mode == "dynamic":
+            logger.info(
+                "%d Continue-Income-Joint-Life-Modellpunkte: Primary- und "
+                "Spouse-Lebensstatus werden auf denselben Marktpfaden separat "
+                "gezogen; Election und spätere Behaviour-Funktionen werden "
+                "auf dem jeweils tatsächlich sichtbaren Lebensstatus "
+                "ausgewertet.",
+                joint_continue_income_count,
+            )
+        elif joint_continue_income_count:
             logger.warning(
                 "%d Continue-Income-Joint-Life-Modellpunkte: Der bedingt "
                 "gemeinsame Zweig verwendet die aus den CSVs geladenen "
@@ -1016,7 +1103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "p11/p10/p01-Zustand angewandt.",
                 joint_continue_income_count,
             )
-        if automatic_start_override_count:
+        if automatic_start_override_count and args.income_election_mode == "deterministic":
             logger.info(
                 "%d Modellpunkte starten wegen des vertraglichen "
                 "Automatic-Age-Backstops früher als income_start_year; der "
@@ -1056,6 +1143,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Explicitly illustrative research mortality, not a governed Australian
         # insured-lives production basis.
         mortality = MortalityTable.gompertz_makeham()
+        stressed_esg, mortality, stressed_expenses = apply_portfolio_input_stress(
+            stress,
+            market.esg,
+            mortality,
+            costs.expenses,
+        )
+        scenario_transform = portfolio_scenario_transform(stress)
         settings = ValuationSettings(
             model="heston_hull_white",
             n_paths=args.n_paths,
@@ -1076,10 +1170,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = value_policyholder_portfolio(
             costs.product,
             model_points,
-            market.esg,
+            stressed_esg,
             mortality,
             portfolio_behaviour,
-            costs.expenses,
+            stressed_expenses,
             settings=settings,
             portfolio_contract_count=args.portfolio_contract_count,
             calculate_fair_lip=args.fair_lip,
@@ -1094,6 +1188,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             fair_fee_maximum_upper_rate=args.fair_fee_maximum_upper,
             fair_fee_tolerance=args.fair_fee_tolerance,
             progress_callback=_make_progress_callback(logger),
+            scenario_transform=scenario_transform,
         )
 
         summary = result.summary_dict()
@@ -1104,6 +1199,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "yield_curve_id": market.curve_id,
             "cost_assumption_set_id": costs.assumption_set_id,
             "behaviour_assumption_set_id": behaviour_assumptions.assumption_set_id,
+            "stress_scenario_id": stress.stress_id,
+            "income_election_mode": args.income_election_mode,
+            "take_up_seed": args.take_up_seed,
+            "mortality_seed": args.mortality_seed,
+            "post_income_behaviour": args.post_income_behaviour,
         })
         model_point_rows = result.model_point_rows()
         if len(model_point_rows) != model_point_count:
@@ -1176,21 +1276,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model_limitations = [
             "Research valuation gross of reinsurance.",
             "Mortality is illustrative and not an approved production basis.",
-            "Spouse survival to the deterministic Election anniversary and "
-            "the Single-Life fallback are modelled under independent lives; "
+            "Joint-Life mortality uses independent Primary/Spouse life-status "
+            "draws for state-dependent Election and post-Election Behaviour; "
             "divorce, removal, common shocks and legal eligibility changes "
             "are not modelled.",
-            "For Continue-Income Joint Life, the conditional joint branch uses "
-            "state-independent static CSV base lapse/withdrawal assumptions; "
-            "the Single-Life fallback remains dynamic. Separate p11, p10 and "
-            "p01 account-value cohorts are not yet projected, so dynamic "
-            "Joint-Life coefficients are deliberately not applied to that "
-            "conditional joint branch.",
             "Intra-year DVA is a moment-matched Black-Scholes proxy on the "
             "complete reference fund; COS is not used.",
-            "Dynamic lapse and withdrawal inputs are uncalibrated proxies; "
-            "the effective deterministic model-point Income start, including "
-            "the automatic-age backstop, overrides dynamic take-up.",
+            "Dynamic take-up, lapse and withdrawal inputs are uncalibrated "
+            "Behaviour proxies rather than a fully calibrated forecast.",
             "The five-year government-bond sleeve and fixed 50/50 monthly "
             "rebalancing are product-model proxy conventions.",
             "No bond term premium, credit spreads, defaults, FX layer, "
@@ -1208,6 +1301,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "runtime_seconds": runtime,
             "engine_version": ENGINE_VERSION,
+            "stress_scenario": stress_audit,
             "reporting": {
                 "plots_requested": not args.no_plots,
                 "matplotlib_version": matplotlib_version,
@@ -1220,19 +1314,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "shared_market_scenarios_across_model_points": True,
                 "model_points_valued_separately_before_aggregation": True,
                 "income_take_up": (
-                    "deterministic_effective_model_point_income_start_year_"
-                    "including_automatic_age_backstop"
+                    "dynamic_state_dependent_at_eligible_policy_anniversaries"
+                    if args.income_election_mode == "dynamic"
+                    else "deterministic_effective_model_point_income_start_"
+                    "year_including_automatic_age_backstop"
                 ),
                 "spouse_election_eligibility": (
                     "spouse_survival_to_election_with_single_life_fallback"
                 ),
                 "joint_life_behaviour": (
-                    "continue_income_joint_branch_uses_static_csv_base_rates;"
-                    "single_life_fallback_remains_dynamic;"
-                    "no_separate_p11_p10_p01_account_cohorts"
+                    "pathwise_primary_and_spouse_life_statuses_with_separate_"
+                    "state_dependent_decisions"
+                    if args.income_election_mode == "dynamic"
+                    else "deterministic_spouse_survival_weighted_joint_and_"
+                    "single_life_fallback_benchmark"
                 ),
                 "income_lapse_after_account_value_exhaustion": (
                     "remains_active_while_income_guarantee_is_in_force"
+                    if args.post_income_behaviour == "dynamic"
+                    else "disabled_continue_benchmark"
                 ),
                 "monthly_mortality": (
                     "annual_q_anchored_at_policy_anniversary_then_constant_"
@@ -1243,6 +1343,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "cos_used": False,
                 "lsmc_used": False,
                 "record_state_paths": False,
+                "income_election_action_set": (
+                    ["wait", "start_income_now"]
+                    if args.income_election_mode == "dynamic"
+                    else ["scheduled_model_point_start"]
+                ),
+                "income_election_decision_grid": "policy_anniversaries_only",
+                "post_income_action_set": (
+                    ["continue", "statistical_full_withdrawal"]
+                    if args.post_income_behaviour == "dynamic"
+                    else ["continue"]
+                ),
+                "minimum_income_start": "first_policy_anniversary",
+                "forced_income_start": (
+                    "first_policy_anniversary_after_primary_attains_age_100"
+                ),
                 "intra_year_dva": (
                     "moment_matched_black_scholes_proxy_on_complete_reference_fund"
                 ),
@@ -1332,6 +1447,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "horizon_years": result_settings.horizon_years,
                 "record_paths": result_settings.projection.record_paths,
                 "heston_cos": result_settings.projection.heston_cos,
+                "income_election_mode": args.income_election_mode,
+                "take_up_seed": args.take_up_seed,
+                "mortality_seed": args.mortality_seed,
+                "post_income_behaviour": args.post_income_behaviour,
                 "fair_lip_per_model_point_requested": args.fair_lip,
                 "commercial_break_even_lip_per_model_point_requested": (
                     args.commercial_break_even_lip
@@ -1354,17 +1473,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     **behaviour_assumptions.source_metadata(),
                     "portfolio_application": {
                         "income_take_up": (
-                            "overridden_by_deterministic_model_point_"
-                            "effective_income_start_year"
+                            "state_dependent_from_loaded_csv_at_each_eligible_"
+                            "anniversary"
+                            if args.income_election_mode == "dynamic"
+                            else "explicit_deterministic_model_point_benchmark"
                         ),
                         "single_life_and_lump_sum_spouse": (
                             "dynamic_income_lapse_and_withdrawal_coefficients"
                         ),
-                        "continue_income_joint_branch": (
-                            "static_state_independent_csv_base_rates"
-                        ),
-                        "continue_income_single_life_fallback": (
-                            "dynamic_income_lapse_and_withdrawal_coefficients"
+                        "joint_life": (
+                            "pathwise_separate_life_statuses"
+                            if args.income_election_mode == "dynamic"
+                            else "legacy_spouse_survival_weighted_benchmark"
                         ),
                         "growth_lapse_and_withdrawals": (
                             "loaded_for_provenance_but_product_gate_forces_zero"

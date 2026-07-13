@@ -16,6 +16,7 @@ from typing import Callable, Mapping, Optional
 import numpy as np
 from scipy.optimize import brentq
 
+from ._provenance import assumption_fingerprint
 from .behavior import BehaviourModel
 from .esg import ESGConfig, Measure, ScenarioSet
 from .model_points import PolicyholderModelPoint, PolicyholderModelPointSet
@@ -28,7 +29,7 @@ from .pricing import (
     value_contract,
 )
 from .product import (ExpenseAssumptions, IndexLinkedLifetimeIncomeProduct,
-                      SpouseDeathElection)
+                      PolicySpec, SpouseDeathElection)
 from .projection import ProjectionConfig
 
 
@@ -328,6 +329,7 @@ def _portfolio_settings_and_scenarios(
     model_points: PolicyholderModelPointSet,
     esg_config: ESGConfig,
     settings: ValuationSettings,
+    scenario_transform: Optional[Callable[[ScenarioSet], ScenarioSet]] = None,
 ) -> tuple[ValuationSettings, ScenarioSet]:
     horizon_basis = replace(settings, horizon_years=None)
     required_horizon = max(
@@ -351,6 +353,54 @@ def _portfolio_settings_and_scenarios(
         measure=Measure.RISK_NEUTRAL,
         horizon_years=common_horizon,
     )
+    if scenario_transform is not None:
+        if not callable(scenario_transform):
+            raise TypeError("scenario_transform must be callable or None.")
+        protected = {
+            "config_fingerprint": assumption_fingerprint(scenarios.config),
+            "measure": scenarios.measure,
+            "model_name": scenarios.model_name,
+            "seed": scenarios.seed,
+            "dt": scenarios.dt,
+            "times": np.array(scenarios.times, copy=True),
+            "n_paths": scenarios.n_paths,
+            "n_steps": scenarios.n_steps,
+            "stochastic_rates": scenarios.stochastic_rates,
+            "substeps": scenarios.substeps,
+        }
+        transformed = scenario_transform(scenarios)
+        if not isinstance(transformed, ScenarioSet):
+            raise TypeError("scenario_transform must return a ScenarioSet.")
+        unchanged_attributes = {
+            "config": (
+                assumption_fingerprint(transformed.config)
+                == protected["config_fingerprint"]
+            ),
+            "measure": transformed.measure == protected["measure"],
+            "model_name": transformed.model_name == protected["model_name"],
+            "seed": transformed.seed == protected["seed"],
+            "dt": transformed.dt == protected["dt"],
+            "time_grid": np.array_equal(transformed.times, protected["times"]),
+            "path_grid_shape": (
+                transformed.n_paths == protected["n_paths"]
+                and transformed.n_steps == protected["n_steps"]
+            ),
+            "stochastic_rates": (
+                transformed.stochastic_rates == protected["stochastic_rates"]
+            ),
+            "substeps": transformed.substeps == protected["substeps"],
+        }
+        changed = [
+            name for name, unchanged in unchanged_attributes.items()
+            if not unchanged
+        ]
+        if changed:
+            raise ValueError(
+                "scenario_transform changed protected ScenarioSet attributes: "
+                + ", ".join(changed)
+                + "."
+            )
+        scenarios = transformed
     return common_settings, scenarios
 
 
@@ -494,6 +544,7 @@ def _value_model_point(
     expenses: Optional[ExpenseAssumptions],
     settings: ValuationSettings,
     scenarios: ScenarioSet,
+    surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
 ) -> _ScalarValuation:
     """Value a model point, including the pre-Election spouse-life split."""
     joint_behaviour = behaviour
@@ -519,6 +570,11 @@ def _value_model_point(
         expenses=expenses,
         settings=settings,
         scenarios=scenarios,
+        surrender_policy=(
+            None
+            if surrender_policy_factory is None
+            else surrender_policy_factory(model_point.policy)
+        ),
     ))
     if not model_point.policy.spouse:
         return joint_or_single
@@ -545,6 +601,11 @@ def _value_model_point(
         expenses=expenses,
         settings=settings,
         scenarios=scenarios,
+        surrender_policy=(
+            None
+            if surrender_policy_factory is None
+            else surrender_policy_factory(fallback_point.policy)
+        ),
     ))
     return _combine_joint_and_single_fallback(
         joint_or_single,
@@ -829,6 +890,8 @@ def value_policyholder_portfolio(
     fair_fee_tolerance: float = 1.0e-6,
     profitability_materiality_bp: float = 1.0,
     progress_callback: Optional[Callable[[PortfolioProgress], None]] = None,
+    surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
+    scenario_transform: Optional[Callable[[ScenarioSet], ScenarioSet]] = None,
 ) -> PortfolioValuationResult:
     """Value all model points under one shared risk-neutral scenario set.
 
@@ -838,6 +901,10 @@ def value_policyholder_portfolio(
     values or an explicit ``portfolio_contract_count`` provide the represented
     contract count.  ``premium_volume_weight`` remains a reconciliation control
     and is never applied as a second PV weight.
+
+    ``scenario_transform`` may change path values after the shared scenario set
+    is generated, but it may not change the market configuration, measure,
+    model, seed, monthly grid or path dimensions.
     """
     total_model_points = len(model_points.model_points)
     if total_model_points == 0:
@@ -875,6 +942,11 @@ def value_policyholder_portfolio(
     )
     if any(not isinstance(value, bool) for value in fair_fee_switches):
         raise ValueError("Fair-fee switches must be boolean.")
+    if surrender_policy_factory is not None and any(fair_fee_switches):
+        raise ValueError(
+            "Fair-fee solves with LSMC require refitting the exercise policy "
+            "at every fee candidate and are not supported by this entry point."
+        )
     if (
         isinstance(profitability_materiality_bp, bool)
         or not isfinite(profitability_materiality_bp)
@@ -986,7 +1058,10 @@ def value_policyholder_portfolio(
 
     notify("scenario_generation_started", 0)
     common_settings, scenarios = _portfolio_settings_and_scenarios(
-        model_points, esg_config, valuation_settings
+        model_points,
+        esg_config,
+        valuation_settings,
+        scenario_transform=scenario_transform,
     )
     notify(
         "scenario_generation_completed",
@@ -1020,6 +1095,7 @@ def value_policyholder_portfolio(
             expenses=expenses,
             settings=common_settings,
             scenarios=scenarios,
+            surrender_policy_factory=surrender_policy_factory,
         )
         metrics = _valuation_metrics(
             valuation,
@@ -1030,8 +1106,11 @@ def value_policyholder_portfolio(
         metrics["effective_income_start_year"] = (
             point.policy.effective_income_start_year(product)
         )
-        metrics["behaviour_treatment"] = _model_point_behaviour_treatment(
-            point, behaviour)
+        metrics["behaviour_treatment"] = (
+            "lsmc_optimal_income_full_withdrawal"
+            if surrender_policy_factory is not None
+            else _model_point_behaviour_treatment(point, behaviour)
+        )
         metrics["spouse_survival_to_income_election"] = (
             _spouse_survival_to_election(point, product, mortality)
             if point.policy.spouse else None
@@ -1317,7 +1396,7 @@ def value_policyholder_portfolio(
         "heston_substeps": int(common_settings.heston_substeps),
         "record_paths": bool(common_settings.projection.record_paths),
         "heston_cos": bool(common_settings.projection.heston_cos),
-        "lsmc_used": False,
+        "lsmc_used": surrender_policy_factory is not None,
         "income_take_up_mode": behaviour.take_up.mode,
         "income_take_up_source": (
             "effective_model_point_income_start_year_with_automatic_age_backstop"
@@ -1336,6 +1415,9 @@ def value_policyholder_portfolio(
             "independent_lives" if has_joint_life else "not_applicable"
         ),
         "joint_life_behaviour_treatment": (
+            "joint_and_single_fallback_branches_use_separately_fitted_lsmc_policies"
+            if joint_continue_income_count and surrender_policy_factory is not None
+            else
             "joint_branch_static_base_single_fallback_dynamic_for_continue_income"
             if joint_continue_income_count
             and (behaviour.use_dynamic or behaviour.use_dynamic_withdrawals)

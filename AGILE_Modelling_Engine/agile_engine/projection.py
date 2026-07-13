@@ -23,11 +23,13 @@ Monthly event order (documented convention)
 4. expected death decrement for the interval just ended under its
    pre-Election coverage state and post-fee death benefit (no MVA),
 5. current-Anniversary dynamic Income take-up by surviving contracts,
-6. lifetime income payment to lives surviving to the payment date (monthly,
+6. Anniversary only: announcement of the next crediting-year cap and restart
+   of its DVA/hedge period; the old cap has already been used in step 2,
+7. lifetime income payment to lives surviving to the payment date (monthly,
    in arrears; the first payment falls one month after income election, PDS
    section 13); shortfall beyond Account Value is a Guarantee Claim,
-7. dynamically modelled Income-phase Excess/Partial Withdrawals, and
-8. Income-phase lapse / Full Withdrawal after event-driven fee posting and MVA.
+8. dynamically modelled Income-phase Excess/Partial Withdrawals, and
+9. Income-phase lapse / Full Withdrawal after event-driven fee posting and MVA.
 
 Daily Value Adjustment modelling proxy (PDS section 7)
 -------------------------------------------------------
@@ -53,7 +55,9 @@ from __future__ import annotations
 from calendar import isleap
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
-from typing import Dict, Optional
+from inspect import signature
+from types import MappingProxyType
+from typing import Dict, Mapping, Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -69,6 +73,315 @@ from .product import (IndexLinkedLifetimeIncomeProduct, ExpenseAssumptions, Fund
                       Protection, SpouseDeathElection, INCOME_PHASE_OPTION)
 
 Array = NDArray[np.float64]
+
+
+@dataclass(frozen=True)
+class SurrenderDecisionContext:
+    """Observable state at the contractual Full-Withdrawal event point.
+
+    Context-aware research policies receive this object instead of the full
+    :class:`~agile_engine.esg.ScenarioSet`.  Every path array is defensively
+    copied and marked read-only so a policy cannot mutate projector state.  In
+    particular, the context contains no future market paths, discount factors,
+    insurer hedge P&L or backing-asset information.
+
+    ``announced_cap`` is the cap for the crediting year which starts at this
+    event point.  At an Anniversary, ``previous_*`` describes the crediting
+    year which has just ended under its old cap.
+    """
+
+    step: int
+    time: float
+    is_anniversary: bool
+    policy_year: int
+    duration_years: float
+    phase: NDArray[np.int8]
+    account_value: Array
+    surrender_value: Array
+    locked_annual_income: Array
+    guarantee_pv: Array
+    guarantee_moneyness: Array
+    guarantee_log_moneyness: Array
+    short_rate: Array
+    zero_rate_5y: Array
+    heston_variance: Array
+    announced_cap: Array
+    previous_reference_return: Array
+    previous_credited_return: Array
+    performance_gap: Array
+    inforce_weight: Array
+    just_elected: NDArray[np.bool_]
+    full_withdrawal_eligible: NDArray[np.bool_]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.step, bool) or int(self.step) != self.step or self.step < 0:
+            raise ValueError("Surrender decision step must be a non-negative integer.")
+        if (
+            isinstance(self.policy_year, bool)
+            or int(self.policy_year) != self.policy_year
+            or self.policy_year < 0
+        ):
+            raise ValueError("Surrender policy year must be a non-negative integer.")
+        if not np.isfinite(self.time) or not np.isfinite(self.duration_years):
+            raise ValueError("Surrender decision time and duration must be finite.")
+        if not isinstance(self.is_anniversary, (bool, np.bool_)):
+            raise ValueError("is_anniversary must be boolean.")
+
+        array_dtypes: dict[str, object] = {
+            "phase": np.int8,
+            "account_value": float,
+            "surrender_value": float,
+            "locked_annual_income": float,
+            "guarantee_pv": float,
+            "guarantee_moneyness": float,
+            "guarantee_log_moneyness": float,
+            "short_rate": float,
+            "zero_rate_5y": float,
+            "heston_variance": float,
+            "announced_cap": float,
+            "previous_reference_return": float,
+            "previous_credited_return": float,
+            "performance_gap": float,
+            "inforce_weight": float,
+            "just_elected": bool,
+            "full_withdrawal_eligible": bool,
+        }
+        expected_shape: Optional[tuple[int, ...]] = None
+        for name, dtype in array_dtypes.items():
+            value = np.array(getattr(self, name), dtype=dtype, copy=True)
+            if value.ndim != 1:
+                raise ValueError(f"Surrender context {name} must be one-dimensional.")
+            if expected_shape is None:
+                expected_shape = value.shape
+            elif value.shape != expected_shape:
+                raise ValueError("Surrender context arrays must share one path shape.")
+            if dtype not in (bool, np.int8):
+                cap_with_uncapped_sentinel = name == "announced_cap"
+                valid = (
+                    np.all(~np.isnan(value) & (value >= 0.0))
+                    if cap_with_uncapped_sentinel
+                    else np.all(np.isfinite(value))
+                )
+                if not valid:
+                    raise ValueError(f"Surrender context {name} is invalid.")
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    @property
+    def n_paths(self) -> int:
+        """Number of scenario paths represented by the context."""
+        return int(self.account_value.shape[0])
+
+
+@dataclass(frozen=True)
+class IncomeElectionDecisionContext:
+    """Read-only state at an admissible Income-Election Anniversary.
+
+    The context is assembled after the old crediting-year return, regular fee
+    posting and the mortality decrement for the interval just ended, and
+    before the next crediting period is announced.  It deliberately contains
+    no future market path, future discount factor, hedge result or backing-
+    asset information.  A combined research policy may therefore implement
+    ``start_income_mask(*, context=...)`` without receiving the full scenario
+    set.
+
+    ``forced_election`` contains contractual product gates only.  In
+    particular, a Behaviour assumption whose annual take-up probability is
+    one is still a behavioural election and is not re-labelled as forced.
+    """
+
+    step: int
+    time: float
+    is_anniversary: bool
+    policy_year: int
+    duration_years: float
+    phase: NDArray[np.int8]
+    account_value: Array
+    prospective_locked_annual_income: Array
+    prospective_income_rate: Array
+    guarantee_pv: Array
+    guarantee_moneyness: Array
+    guarantee_log_moneyness: Array
+    short_rate: Array
+    zero_rate_5y: Array
+    heston_variance: Array
+    previous_cap: Array
+    previous_reference_return: Array
+    previous_credited_return: Array
+    performance_gap: Array
+    inforce_weight: Array
+    voluntary_election_eligible: NDArray[np.bool_]
+    forced_election: NDArray[np.bool_]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.step, bool) or int(self.step) != self.step or self.step < 0:
+            raise ValueError(
+                "Income-Election decision step must be a non-negative integer."
+            )
+        if (
+            isinstance(self.policy_year, bool)
+            or int(self.policy_year) != self.policy_year
+            or self.policy_year < 0
+        ):
+            raise ValueError(
+                "Income-Election policy year must be a non-negative integer."
+            )
+        if not np.isfinite(self.time) or not np.isfinite(self.duration_years):
+            raise ValueError(
+                "Income-Election decision time and duration must be finite."
+            )
+        if not isinstance(self.is_anniversary, (bool, np.bool_)):
+            raise ValueError("is_anniversary must be boolean.")
+
+        array_dtypes: dict[str, object] = {
+            "phase": np.int8,
+            "account_value": float,
+            "prospective_locked_annual_income": float,
+            "prospective_income_rate": float,
+            "guarantee_pv": float,
+            "guarantee_moneyness": float,
+            "guarantee_log_moneyness": float,
+            "short_rate": float,
+            "zero_rate_5y": float,
+            "heston_variance": float,
+            "previous_cap": float,
+            "previous_reference_return": float,
+            "previous_credited_return": float,
+            "performance_gap": float,
+            "inforce_weight": float,
+            "voluntary_election_eligible": bool,
+            "forced_election": bool,
+        }
+        expected_shape: Optional[tuple[int, ...]] = None
+        for name, dtype in array_dtypes.items():
+            value = np.array(getattr(self, name), dtype=dtype, copy=True)
+            if value.ndim != 1:
+                raise ValueError(
+                    f"Income-Election context {name} must be one-dimensional."
+                )
+            if expected_shape is None:
+                expected_shape = value.shape
+            elif value.shape != expected_shape:
+                raise ValueError(
+                    "Income-Election context arrays must share one path shape."
+                )
+            if dtype not in (bool, np.int8):
+                valid = (
+                    np.all(~np.isnan(value) & (value >= 0.0))
+                    if name == "previous_cap"
+                    else np.all(np.isfinite(value))
+                )
+                if not valid:
+                    raise ValueError(
+                        f"Income-Election context {name} is invalid."
+                    )
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    @property
+    def n_paths(self) -> int:
+        """Number of scenario paths represented by the context."""
+        return int(self.account_value.shape[0])
+
+
+@dataclass(frozen=True)
+class CreditingCapDecisionContext:
+    """Observable portfolio building block immediately before a new cap.
+
+    The callback is an observer, not a product-control mechanism.  It records
+    the state after old-cap crediting, fee posting, mortality and Income
+    Election, but before the new cap starts the hedge/DVA period.  Aggregating
+    these per-policy contexts with ``contract_weight`` gives the leader state
+    without allowing the current cap to leak into its own decision.
+    """
+
+    step: int
+    time: float
+    policy_year: int
+    phase: NDArray[np.int8]
+    account_value: Array
+    surrender_value: Array
+    locked_annual_income: Array
+    guarantee_pv: Array
+    guarantee_moneyness: Array
+    guarantee_log_moneyness: Array
+    short_rate: Array
+    zero_rate_5y: Array
+    heston_variance: Array
+    previous_cap: Array
+    previous_reference_return: Array
+    previous_credited_return: Array
+    performance_gap: Array
+    inforce_weight: Array
+    just_elected: NDArray[np.bool_]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.step, bool) or int(self.step) != self.step or self.step < 0:
+            raise ValueError("Crediting-cap decision step must be non-negative.")
+        if (
+            isinstance(self.policy_year, bool)
+            or int(self.policy_year) != self.policy_year
+            or self.policy_year < 0
+        ):
+            raise ValueError("Crediting-cap policy year must be non-negative.")
+        if not np.isfinite(self.time):
+            raise ValueError("Crediting-cap decision time must be finite.")
+        array_dtypes: dict[str, object] = {
+            "phase": np.int8,
+            "account_value": float,
+            "surrender_value": float,
+            "locked_annual_income": float,
+            "guarantee_pv": float,
+            "guarantee_moneyness": float,
+            "guarantee_log_moneyness": float,
+            "short_rate": float,
+            "zero_rate_5y": float,
+            "heston_variance": float,
+            "previous_cap": float,
+            "previous_reference_return": float,
+            "previous_credited_return": float,
+            "performance_gap": float,
+            "inforce_weight": float,
+            "just_elected": bool,
+        }
+        expected_shape: Optional[tuple[int, ...]] = None
+        for name, dtype in array_dtypes.items():
+            value = np.array(getattr(self, name), dtype=dtype, copy=True)
+            if value.ndim != 1:
+                raise ValueError(f"Crediting-cap context {name} must be one-dimensional.")
+            if expected_shape is None:
+                expected_shape = value.shape
+            elif value.shape != expected_shape:
+                raise ValueError("Crediting-cap context arrays must share one shape.")
+            if dtype not in (bool, np.int8):
+                cap_with_uncapped_sentinel = name == "previous_cap"
+                valid = (
+                    np.all(~np.isnan(value) & (value >= 0.0))
+                    if cap_with_uncapped_sentinel
+                    else np.all(np.isfinite(value))
+                )
+                if not valid:
+                    raise ValueError(f"Crediting-cap context {name} is invalid.")
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    @property
+    def n_paths(self) -> int:
+        return int(self.account_value.shape[0])
+
+
+def _context_aware_surrender_policy(policy: object) -> bool:
+    """Return whether a hook explicitly opts into the safe context API."""
+    method = getattr(policy, "surrender_mask", None)
+    if method is None:
+        raise TypeError("surrender_policy must provide a surrender_mask method.")
+    try:
+        return "context" in signature(method).parameters
+    except (TypeError, ValueError):
+        # Some extension callables do not expose a Python signature.  Preserve
+        # their historical keyword API rather than guessing that they support
+        # the new context contract.
+        return False
 
 
 def _fractional_year_to_date(value: float) -> date:
@@ -149,6 +462,11 @@ class ProjectionConfig:
     crediting_margin_enabled: bool = True
     #: independent, reproducible RNG seed for stochastic income take-up.
     take_up_seed: int = 97
+    #: independent, reproducible mortality seed used only when a pathwise life
+    #: status is required for Dynamic/Policy-controlled Joint-Life Election.
+    #: The deterministic benchmark retains the historical expected-decrement
+    #: implementation and therefore does not consume this seed.
+    mortality_seed: int = 193
     #: Legacy four-equity-option switch.  The generic mixed reference fund is
     #: always valued with a joint-model moment-matched BS proxy and never with
     #: COS.  Portfolio valuation also sets this flag explicitly to ``False``.
@@ -165,10 +483,12 @@ class ProjectionConfig:
                      "heston_cos"):
             if not isinstance(getattr(self, name), (bool, np.bool_)):
                 raise ValueError(f"{name} must be boolean.")
-        if isinstance(self.take_up_seed, bool) \
-                or not isinstance(self.take_up_seed, (int, np.integer)) \
-                or self.take_up_seed < 0:
-            raise ValueError("take_up_seed must be a non-negative integer.")
+        for name in ("take_up_seed", "mortality_seed"):
+            value = getattr(self, name)
+            if isinstance(value, bool) \
+                    or not isinstance(value, (int, np.integer)) \
+                    or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
 
 
 CASHFLOW_KEYS = (
@@ -177,6 +497,74 @@ CASHFLOW_KEYS = (
     "fees_product", "fees_lip", "crediting_margin", "mva_retained",
     "aps_retained", "hedge_costs", "expenses",
 )
+
+
+@dataclass(frozen=True)
+class SurrenderActionValueContext:
+    """Read-only cashflow values at the Full-Withdrawal action boundary.
+
+    ``decision_context`` is the exact customer-observable context passed to a
+    context-aware ``surrender_policy`` at this event point.  The two cashflow
+    mappings are an observer-only accounting surface:
+
+    * ``post_cap_common_cashflows`` contains cashflows at the current grid
+      point from the most recent cap-decision boundary through immediately
+      before the Policyholder action.  At an Anniversary this excludes every
+      old-cap, fee, mortality and Election cashflow which preceded the new-cap
+      announcement.
+    * ``full_withdrawal_post_action_cashflows`` contains the exact
+      probability-weighted settlement and midpoint expense which would be
+      booked if every currently eligible path chose ``FULL_WITHDRAWAL``.
+
+    It contains no ScenarioSet, future market path, backing-asset or hedge-P&L
+    surface.  All arrays and both mappings are defensively copied and made
+    read-only.  This context is passed only to ``surrender_decision_observer``;
+    it is never passed to the Policyholder policy.
+    """
+
+    decision_context: SurrenderDecisionContext
+    post_cap_common_cashflows: Mapping[str, Array]
+    full_withdrawal_post_action_cashflows: Mapping[str, Array]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision_context, SurrenderDecisionContext):
+            raise TypeError(
+                "decision_context must be an exact SurrenderDecisionContext."
+            )
+
+        for field_name in (
+            "post_cap_common_cashflows",
+            "full_withdrawal_post_action_cashflows",
+        ):
+            supplied = getattr(self, field_name)
+            if set(supplied) != set(CASHFLOW_KEYS):
+                raise ValueError(
+                    f"{field_name} must contain exactly the canonical cashflow keys."
+                )
+            snapshot: dict[str, Array] = {}
+            for key in CASHFLOW_KEYS:
+                value = np.array(supplied[key], dtype=float, copy=True)
+                if value.shape != (self.decision_context.n_paths,):
+                    raise ValueError(
+                        f"{field_name}[{key!r}] must have one value per path."
+                    )
+                if not np.all(np.isfinite(value)):
+                    raise ValueError(
+                        f"{field_name}[{key!r}] must contain finite values."
+                    )
+                value.setflags(write=False)
+                snapshot[key] = value
+            object.__setattr__(
+                self, field_name, MappingProxyType(snapshot)
+            )
+
+    @property
+    def n_paths(self) -> int:
+        return self.decision_context.n_paths
+
+    @property
+    def step(self) -> int:
+        return self.decision_context.step
 
 
 @dataclass
@@ -195,11 +583,26 @@ class ProjectionResult:
     scenarios: ScenarioSet
     cashflows: Dict[str, Array]
     inforce: Array                 # in-force weight after decrements at t
+    lapse_events: Array            # probability mass exiting by full surrender
     iv_paths: Optional[Array]      # legacy alias storage for Account Value
     income_paths: Optional[Array]  # annual income in payment
     phase_paths: Optional[Array]
     survival_primary: Array        # deterministic survival of the life insured
     horizon_years: float
+    ordinary_lapse_events: Optional[Array] = None
+    performance_lapse_events: Optional[Array] = None
+    ordinary_lapse_probabilities: Optional[Array] = None
+    performance_lapse_probabilities: Optional[Array] = None
+    total_lapse_probabilities: Optional[Array] = None
+    eligible_growth_exposure: Optional[Array] = None
+    income_take_up_probability: Optional[Array] = None
+    income_election_events: Optional[Array] = None
+    forced_income_election_events: Optional[Array] = None
+    growth_exposure: Optional[Array] = None
+    income_exposure: Optional[Array] = None
+    post_cap_cashflows: Optional[Dict[str, Array]] = None
+    post_cap_lapse_events: Optional[Array] = None
+    post_surrender_cashflows: Optional[Dict[str, Array]] = None
 
     @property
     def account_value_paths(self) -> Optional[Array]:
@@ -325,20 +728,59 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             scenarios: ScenarioSet,
             behaviour: BehaviourModel, mortality: MortalityTable,
             expenses: Optional[ExpenseAssumptions] = None,
-            config: ProjectionConfig = ProjectionConfig()) -> ProjectionResult:
-    """Run the monthly projection over all scenario paths."""
+            config: ProjectionConfig = ProjectionConfig(),
+            surrender_policy: Optional[object] = None,
+            income_election_policy: Optional[object] = None,
+            cap_decision_observer: Optional[object] = None,
+            surrender_decision_observer: Optional[object] = None,
+            ) -> ProjectionResult:
+    """Run the monthly projection over all scenario paths.
+
+    ``surrender_policy`` is an optional research hook for an independently
+    fitted, pathwise exercise rule.  New hooks implement
+    ``surrender_mask(*, context: SurrenderDecisionContext)`` and therefore see
+    only customer-observable state at the existing Full-Withdrawal event point.
+    The historical keyword signature remains supported for repository
+    compatibility.  The hook is deliberately separate from
+    :class:`BehaviourModel`: statistical behaviour remains the production
+    regime, while an optimal-policy rollout must still pass through this exact
+    monthly cashflow engine.  When supplied, it replaces the statistical lapse
+    probability; all fees, MVA, mortality and accounting order stay unchanged.
+
+    ``income_election_policy`` is the corresponding safe hook at the annual
+    Growth-phase action boundary.  A hook implements
+    ``start_income_mask(*, context: IncomeElectionDecisionContext)``.  Missing
+    or unusable voluntary decisions conservatively mean WAIT; the contractual
+    minimum-duration and automatic-age gates remain owned by the product, and
+    a contractual forced start always overrides the hook.
+
+    ``cap_decision_observer`` is a read-only research observer.  Its
+    ``observe_cap_decision(*, context: CreditingCapDecisionContext)`` method is
+    called at issue and at every Anniversary after old-cap crediting, fee
+    posting, mortality and Income Election, but before the next cap starts a
+    new DVA/hedge period.  It cannot alter the product state or choose a cap.
+
+    ``surrender_decision_observer`` is called immediately before the existing
+    Full-Withdrawal action.  Its
+    ``observe_surrender_decision(*, context: SurrenderActionValueContext)``
+    method sees the exact Policyholder decision context, post-cap common
+    current-step cashflows and the exact counterfactual FULL_WITHDRAWAL
+    settlement/expense cashflows.  The richer action-value context is never
+    passed to ``surrender_policy`` and cannot alter the action or product state.
+    """
 
     policy.validate_against(product)
-    if policy.spouse and behaviour.take_up.mode != "deterministic":
-        raise ValueError(
-            "Spouse Income requires deterministic Income Election until "
-            "pre-Election spouse eligibility is represented for path-dependent "
-            "take-up."
-        )
+    take_up = behaviour.take_up
+    policy_controlled_election = income_election_policy is not None
+    pathwise_joint_life = bool(
+        policy.spouse
+        and (take_up.mode != "deterministic" or policy_controlled_election)
+    )
     if (
         policy.spouse
         and policy.spouse_death_election == SpouseDeathElection.CONTINUE_INCOME
         and (behaviour.use_dynamic or behaviour.use_dynamic_withdrawals)
+        and not pathwise_joint_life
     ):
         raise ValueError(
             "Continue-Income Joint Life requires state-independent static "
@@ -391,16 +833,17 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             raise ValueError("Policy time must fall on the monthly projection grid.")
         return step_i
 
-    take_up = behaviour.take_up
-    dynamic_take_up = take_up.mode == "dynamic"
+    dynamic_take_up = (
+        take_up.mode == "dynamic" and not policy_controlled_election
+    )
     take_up_draws = None
-    if take_up.mode == "deterministic":
+    if take_up.mode == "deterministic" and not policy_controlled_election:
         effective_income_start_year = policy.effective_income_start_year(product)
         income_step = np.full(
             n_paths,
             policy_time_to_step(effective_income_start_year),
         )
-    elif take_up.mode == "hazard":
+    elif take_up.mode == "hazard" and not policy_controlled_election:
         rng = np.random.default_rng(config.take_up_seed)
         income_step = np.full(n_paths, int(take_up.force_by_year) * STEPS_PER_YEAR)
         u = rng.random((n_paths, take_up.force_by_year + 1))
@@ -408,7 +851,7 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             p = take_up.probability(y)
             newly = (income_step == take_up.force_by_year * STEPS_PER_YEAR) & (u[:, y] < p)
             income_step[newly] = y * STEPS_PER_YEAR
-    else:
+    elif dynamic_take_up:
         # Dynamic take-up is deliberately not pre-simulated at issue.  One
         # common-random-number draw per path and policy year is stored, while
         # the annual probability itself is evaluated from the market state at
@@ -417,6 +860,12 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         draw_years = max(int(np.ceil(n_steps / STEPS_PER_YEAR)) + 1,
                          int(take_up.force_by_year) + 1)
         take_up_draws = rng.random((n_paths, draw_years))
+        income_step = np.full(n_paths, np.iinfo(np.int32).max, dtype=np.int64)
+    else:
+        # A Policy-controlled Election has no model-point scheduled date.  The
+        # object is queried only at eligible Anniversaries below; missing or
+        # unstable voluntary actions therefore remain WAIT until a contractual
+        # product force applies.
         income_step = np.full(n_paths, np.iinfo(np.int32).max, dtype=np.int64)
 
     min_income_step = product.min_years_before_income * STEPS_PER_YEAR
@@ -463,6 +912,19 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     # the election month: payments are monthly in arrears, the first one falls
     # one month after the Lifetime Income Commencement Date (PDS section 13).
     w = np.ones(n_paths)                          # in-force probability weight
+    # Dynamic/Policy-controlled Joint-Life Election cannot apply a nonlinear
+    # response to a mortality-state-averaged p11/p10/p01 value.  For that case
+    # only, simulate the Primary/Spouse life status explicitly with a separate
+    # reproducible seed.  The deterministic benchmark continues to use the
+    # historical expected-decrement joint/single fallback in the portfolio
+    # layer and therefore remains unchanged.
+    primary_alive = np.ones(n_paths, dtype=bool)
+    spouse_alive = np.ones(n_paths, dtype=bool)
+    joint_income_cover = np.zeros(n_paths, dtype=bool)
+    mortality_rng = (
+        np.random.default_rng(config.mortality_seed)
+        if pathwise_joint_life else None
+    )
     complete_growth_years = np.zeros(n_paths, dtype=np.int32)
     free_wd_used = np.zeros(n_paths)
     # The PDS imposes a second, cumulative limit in each Growth-Phase
@@ -484,12 +946,38 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     joint_surv_spouse = np.ones(n_paths)
 
     cfs: Dict[str, Array] = {k: np.zeros((n_paths, n_steps + 1)) for k in CASHFLOW_KEYS}
+    # Anniversary timestamps contain events on both sides of the new-cap
+    # announcement.  This auxiliary ledger records only the cashflow portion
+    # after that boundary, without changing the canonical cashflow buckets.
+    post_cap_cfs: Dict[str, Array] = {
+        key: np.zeros((n_paths, n_steps + 1)) for key in CASHFLOW_KEYS
+    }
+    post_cap_lapse_events = np.zeros((n_paths, n_steps + 1))
+    # Cashflows strictly after the Policyholder Full-Withdrawal decision
+    # boundary.  This ledger is populated on every monthly event point so a
+    # discounted annual interval can be split exactly at its action timestamp.
+    post_surrender_cfs: Dict[str, Array] = {
+        key: np.zeros((n_paths, n_steps + 1)) for key in CASHFLOW_KEYS
+    }
     cfs["premium"][:, 0] = P0
     # A promotional commencement bonus becomes part of IV/fee/withdrawal bases
     # but is funded by the insurer and therefore an acquisition outflow.
     cfs["expenses"][:, 0] = policy.bonus_interest_amount
 
     inforce = np.ones((n_paths, n_steps + 1))
+    lapse_events = np.zeros((n_paths, n_steps + 1))
+    ordinary_lapse_events = np.zeros((n_paths, n_steps + 1))
+    performance_lapse_events = np.zeros((n_paths, n_steps + 1))
+    ordinary_lapse_probabilities = np.zeros((n_paths, n_steps + 1))
+    performance_lapse_probabilities = np.zeros((n_paths, n_steps + 1))
+    total_lapse_probabilities = np.zeros((n_paths, n_steps + 1))
+    eligible_growth_exposure = np.zeros((n_paths, n_steps + 1))
+    income_take_up_probability = np.zeros((n_paths, n_steps + 1))
+    income_election_events = np.zeros((n_paths, n_steps + 1))
+    forced_income_election_events = np.zeros((n_paths, n_steps + 1))
+    growth_exposure = np.zeros((n_paths, n_steps + 1))
+    income_exposure = np.zeros((n_paths, n_steps + 1))
+    growth_exposure[:, 0] = 1.0
     iv_paths = np.zeros((n_paths, n_steps + 1)) if config.record_paths else None
     income_paths = np.zeros((n_paths, n_steps + 1)) if config.record_paths else None
     phase_paths = np.zeros((n_paths, n_steps + 1), dtype=np.int8) if config.record_paths else None
@@ -512,6 +1000,13 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     # anniversary-start snapshots for crediting
     anniv_reference_level = reference_fund_level[:, 0].copy()
     anniv_step = 0
+    # Trailing realised reference-fund performance not passed through to the
+    # customer.  It is zero at issue and updated only after annual crediting,
+    # so the behaviour model never sees future market performance.
+    previous_reference_return = np.zeros(n_paths)
+    previous_credited_return = np.zeros(n_paths)
+    performance_shortfall = np.zeros(n_paths)
+    previous_cap = np.zeros(n_paths)
 
     z_issue_cache: Dict[int, float] = {}
 
@@ -591,23 +1086,69 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         """Pathwise annuity factor under the market state at ``step``."""
         age_now = policy.age + t
         z10 = scenarios.forward_zero_cc(step, 10.0)
-        if (policy.spouse
-                and policy.spouse_death_election == SpouseDeathElection.CONTINUE_INCOME
-                and policy.spouse_age is not None):
+        if policy.spouse and policy.spouse_age is not None:
             spouse_age_now = policy.spouse_age + t
             spouse_sex = policy.spouse_sex or policy.sex
             common = dict(
                 years_from_base=mortality_issue_offset + t,
                 projection_duration_start=t,
             )
-            both_alive = np.asarray(mortality.annuity_factor(
-                age_now, policy.sex, z10,
-                joint_age=spouse_age_now, joint_sex=spouse_sex,
-                **common), dtype=float)
             primary_only = np.asarray(mortality.annuity_factor(
                 age_now, policy.sex, z10, **common), dtype=float)
             spouse_only = np.asarray(mortality.annuity_factor(
                 spouse_age_now, spouse_sex, z10, **common), dtype=float)
+            if (
+                policy.spouse_death_election
+                == SpouseDeathElection.CONTINUE_INCOME
+            ):
+                both_alive = np.asarray(mortality.annuity_factor(
+                    age_now, policy.sex, z10,
+                    joint_age=spouse_age_now, joint_sex=spouse_sex,
+                    **common), dtype=float)
+            else:
+                # Under a Lump-Sum election the income stream remains exposed
+                # to Primary-Life mortality even though the lower Spouse rate
+                # is locked while both lives are eligible.
+                both_alive = primary_only
+
+            if pathwise_joint_life:
+                primary_component = np.where(primary_alive, primary_only, 0.0)
+                if (
+                    policy.spouse_death_election
+                    == SpouseDeathElection.CONTINUE_INCOME
+                ):
+                    joint_component = np.where(
+                        primary_alive & spouse_alive,
+                        both_alive,
+                        np.where(
+                            primary_alive,
+                            primary_only,
+                            np.where(spouse_alive, spouse_only, 0.0),
+                        ),
+                    )
+                else:
+                    joint_component = primary_component
+                growth_component = np.where(
+                    primary_alive & spouse_alive,
+                    both_alive,
+                    primary_component,
+                )
+                income_component = np.where(
+                    joint_income_cover,
+                    joint_component,
+                    primary_component,
+                )
+                return np.where(
+                    phase == Phase.INCOME.value,
+                    income_component,
+                    growth_component,
+                )
+
+            if (
+                policy.spouse_death_election
+                != SpouseDeathElection.CONTINUE_INCOME
+            ):
+                return primary_only
             p11 = joint_surv_primary * joint_surv_spouse
             p10 = joint_surv_primary * (1.0 - joint_surv_spouse)
             p01 = (1.0 - joint_surv_primary) * joint_surv_spouse
@@ -625,25 +1166,126 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             years_from_base=mortality_issue_offset + t,
             projection_duration_start=t), dtype=float)
 
-    def prospective_income_rate(t: float) -> float:
-        return product.income_rates.lifetime_income_rate(
+    def prospective_income_rate(t: float) -> Array:
+        """Income rate available now, respecting current Spouse eligibility."""
+        complete_years = int(np.floor(t + 1e-12))
+        if pathwise_joint_life:
+            joint_rate = product.income_rates.lifetime_income_rate(
+                policy.age, policy.sex, policy.income_type, True,
+                complete_years, policy.spouse_age, policy.spouse_sex,
+                policy.age_pension_plus)
+            single_rate = product.income_rates.lifetime_income_rate(
+                policy.age, policy.sex, policy.income_type, False,
+                complete_years, None, None, policy.age_pension_plus)
+            return np.where(
+                primary_alive & spouse_alive,
+                joint_rate,
+                single_rate,
+            ).astype(float)
+        rate = product.income_rates.lifetime_income_rate(
             policy.age, policy.sex, policy.income_type, policy.spouse,
-            int(np.floor(t + 1e-12)), policy.spouse_age, policy.spouse_sex,
+            complete_years, policy.spouse_age, policy.spouse_sex,
             policy.age_pension_plus)
+        return np.full(n_paths, float(rate))
+
+    def guarantee_pv_at(step: int, t: float) -> Array:
+        """Pathwise PV of the remaining contractual lifetime-income stream."""
+        af = annuity_factor_at(step, t)
+        growth_pv = iv * prospective_income_rate(t) * af
+        return np.maximum(np.where(
+            phase == Phase.INCOME.value,
+            income_annual * af,
+            growth_pv,
+        ), 0.0)
 
     def guarantee_log_moneyness(step: int, t: float,
                                 denominator: Array) -> Array:
         """Log PV(guaranteed income) divided by the relevant exit value."""
-        af = annuity_factor_at(step, t)
-        growth_pv = iv * prospective_income_rate(t) * af
-        guarantee_pv = np.where(phase == Phase.INCOME.value,
-                                income_annual * af, growth_pv)
+        guarantee_pv = guarantee_pv_at(step, t)
         ratio = np.divide(
             guarantee_pv, np.maximum(np.asarray(denominator, dtype=float), 1e-300),
             out=np.full(n_paths, np.exp(2.0)),
             where=np.asarray(denominator, dtype=float) > 1e-12,
         )
         return np.log(np.maximum(ratio, 1e-300))
+
+    def as_path_array(value: object, *, name: str) -> Array:
+        """Broadcast a scalar or validate a pathwise product quantity."""
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim == 0:
+            return np.full(n_paths, float(arr))
+        if arr.shape != (n_paths,):
+            raise ValueError(
+                f"{name} must be scalar or have one value per scenario path."
+            )
+        return arr.copy()
+
+    def observe_cap_decision(step: int, t: float) -> None:
+        """Expose the exact pre-leader-action state without mutating it."""
+        if cap_decision_observer is None:
+            return
+        method = getattr(cap_decision_observer, "observe_cap_decision", None)
+        if method is None or not callable(method):
+            raise TypeError(
+                "cap_decision_observer must provide an "
+                "observe_cap_decision method."
+            )
+
+        _, _, post_fee_av = fee_settlement(iv)
+        surrender_value, _ = _surrender_value(
+            product, policy, scenarios, step, t, post_fee_av,
+            free_wd_used, phase, aps_active, issue_zero, P0,
+        )
+        if policy.age_pension_plus:
+            mwv = _aps_max_withdrawal(
+                product, cas_base, t, cas_start_t, cas_le, cas_wd, aps_active,
+            )
+            surrender_value = np.where(
+                aps_active & (surrender_value > mwv), mwv, surrender_value,
+            )
+
+        guarantee_pv = guarantee_pv_at(step, t)
+        guarantee_ratio = np.divide(
+            guarantee_pv,
+            np.maximum(np.asarray(surrender_value, dtype=float), 1e-300),
+            out=np.full(n_paths, np.exp(2.0)),
+            where=np.asarray(surrender_value, dtype=float) > 1e-12,
+        )
+        guarantee_log_mny = np.log(np.maximum(guarantee_ratio, 1e-300))
+        if scenarios.variance is None:
+            heston_variance = np.zeros(n_paths)
+        else:
+            heston_variance = np.asarray(
+                scenarios.variance[reference_spec.equity_index][:, step],
+                dtype=float,
+            )
+        zero_rate_5y = as_path_array(
+            scenarios.zero_rate(step, 5.0), name="five-year zero rate",
+        )
+        context = CreditingCapDecisionContext(
+            step=int(step),
+            time=float(t),
+            policy_year=int(step // STEPS_PER_YEAR),
+            phase=phase,
+            account_value=iv,
+            surrender_value=surrender_value,
+            locked_annual_income=income_annual,
+            guarantee_pv=guarantee_pv,
+            guarantee_moneyness=np.exp(
+                np.clip(guarantee_log_mny, -50.0, 50.0)
+            ),
+            guarantee_log_moneyness=guarantee_log_mny,
+            short_rate=scenarios.short_rate[:, step],
+            zero_rate_5y=zero_rate_5y,
+            heston_variance=heston_variance,
+            previous_cap=previous_cap,
+            previous_reference_return=previous_reference_return,
+            previous_credited_return=previous_credited_return,
+            performance_gap=performance_shortfall,
+            inforce_weight=w,
+            just_elected=just_elected,
+        )
+        method(context=context)
 
     def current_mva_signal(step: int, t: float) -> Array:
         """Non-negative current MVA bite used as a withdrawal covariate."""
@@ -680,6 +1322,8 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     # remains annual until after dynamic scaling.
     income_lapse_prob = np.full(
         n_paths, 1.0 - (1.0 - dec.lapse_income_a) ** (1.0 / STEPS_PER_YEAR))
+    income_lapse_ordinary_prob = income_lapse_prob.copy()
+    income_lapse_performance_prob = np.zeros(n_paths)
 
     def reference_package_only(step: int, volatility_spread: float = 0.0) -> Array:
         """One-year Total-Protection package value on the whole fund."""
@@ -773,90 +1417,335 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     def income_lapse_probability_at(step: int, t: float,
                                     surrender_value: Array) -> Array:
         """Monthly income-phase lapse probability at a reset point."""
+        ordinary, performance = income_lapse_cause_probabilities_at(
+            step, t, surrender_value
+        )
+        return ordinary + performance
+
+    def income_lapse_cause_probabilities_at(
+        step: int,
+        t: float,
+        surrender_value: Array,
+    ) -> tuple[Array, Array]:
+        """Mutually exclusive monthly income-lapse cause probabilities."""
         log_mny = guarantee_log_moneyness(step, t, surrender_value)
         if behaviour.use_dynamic:
-            out = behaviour.dynamic.income_probability(
+            ordinary, performance = behaviour.dynamic.income_cause_probabilities(
                 dec.lapse_income_a, log_mny, gross_premium,
-                1.0 / STEPS_PER_YEAR)
-            return np.asarray(out, dtype=float)
-        return np.full(
+                1.0 / STEPS_PER_YEAR,
+                performance_shortfall=performance_shortfall)
+            return (
+                np.asarray(ordinary, dtype=float),
+                np.asarray(performance, dtype=float),
+            )
+        ordinary = np.full(
             n_paths,
             1.0 - (1.0 - dec.lapse_income_a) ** (1.0 / STEPS_PER_YEAR),
         )
+        return ordinary, np.zeros(n_paths)
 
-    def income_election_mask(step: int, t: float, growth: Array,
-                             is_anniversary: bool) -> Array:
-        """Paths electing income on this grid point.
+    def income_election_context(
+        step: int,
+        t: float,
+        eligible: NDArray[np.bool_],
+        forced: NDArray[np.bool_],
+    ) -> IncomeElectionDecisionContext:
+        """Build the exact post-mortality, pre-new-cap Election context."""
+        rate = prospective_income_rate(t)
+        prospective_income = np.maximum(iv, 0.0) * rate
+        guarantee_pv = np.maximum(prospective_income * annuity_factor_at(step, t), 0.0)
+        ratio = np.divide(
+            guarantee_pv,
+            np.maximum(np.asarray(iv, dtype=float), 1.0e-300),
+            out=np.full(n_paths, np.exp(2.0)),
+            where=np.asarray(iv, dtype=float) > 1.0e-12,
+        )
+        log_mny = np.log(np.maximum(ratio, 1.0e-300))
+        if scenarios.variance is None:
+            heston_variance = np.zeros(n_paths)
+        else:
+            heston_variance = np.asarray(
+                scenarios.variance[reference_spec.equity_index][:, step],
+                dtype=float,
+            )
+        return IncomeElectionDecisionContext(
+            step=int(step),
+            time=float(t),
+            is_anniversary=True,
+            policy_year=int(step // STEPS_PER_YEAR),
+            duration_years=float(t),
+            phase=phase,
+            account_value=iv,
+            prospective_locked_annual_income=prospective_income,
+            prospective_income_rate=rate,
+            guarantee_pv=guarantee_pv,
+            guarantee_moneyness=np.exp(np.clip(log_mny, -50.0, 50.0)),
+            guarantee_log_moneyness=log_mny,
+            short_rate=scenarios.short_rate[:, step],
+            zero_rate_5y=as_path_array(
+                scenarios.zero_rate(step, 5.0), name="five-year zero rate",
+            ),
+            heston_variance=heston_variance,
+            previous_cap=previous_cap,
+            previous_reference_return=previous_reference_return,
+            previous_credited_return=previous_credited_return,
+            performance_gap=performance_shortfall,
+            inforce_weight=w,
+            voluntary_election_eligible=eligible & ~forced,
+            forced_election=forced,
+        )
 
-        Dynamic take-up is an Anniversary decision based on the market state
-        then prevailing.  Deterministic and legacy hazard modes retain their
-        pre-scheduled dates for isolated contract-mechanics use.
+    def state_aware_dynamic_take_up_probability(
+        base_probability: float,
+        context: IncomeElectionDecisionContext,
+    ) -> Array:
+        """Call the configured take-up response with all observable state.
+
+        Existing three-covariate Behaviour objects remain supported.  A richer
+        versioned response can opt into any of the named state arguments below
+        without exposing a ScenarioSet or future path.  The Election
+        response receives Account Value, prospective locked income and the
+        completed-year return diagnostics explicitly; no composite sign is
+        hardcoded in the projector.
         """
-        eligible_growth = np.asarray(growth, dtype=bool) & (iv > 0.0)
-        required_step = np.minimum(income_step, aps_auto_income_step)
-        if not dynamic_take_up:
-            return eligible_growth & (step >= required_step)
-        if not is_anniversary or step < min_income_step:
+        method = behaviour.dynamic_take_up.probability
+        try:
+            value = method(
+                base_probability,
+                context.guarantee_log_moneyness,
+                gross_premium,
+                account_value=context.account_value,
+                prospective_annual_income=(
+                    context.prospective_locked_annual_income
+                ),
+                previous_reference_return=context.previous_reference_return,
+                previous_credited_return=context.previous_credited_return,
+                performance_gap=context.performance_gap,
+            )
+        except TypeError:
+            # Compatibility with extension callables whose signature cannot be
+            # inspected reliably.  This is the historical, fully current-state
+            # API; model/configuration errors outside this compatibility case
+            # continue to be validated by the Behaviour object itself.
+            value = method(
+                base_probability,
+                context.guarantee_log_moneyness,
+                gross_premium,
+            )
+        probability = np.asarray(value, dtype=float)
+        if probability.ndim == 0:
+            probability = np.full(n_paths, float(probability))
+        if probability.shape != (n_paths,) or not np.all(np.isfinite(probability)):
+            raise ValueError(
+                "Dynamic Income take-up must return one finite probability per path."
+            )
+        return np.clip(probability, 0.0, 1.0)
+
+    def conservative_policy_election_mask(
+        context: IncomeElectionDecisionContext,
+    ) -> NDArray[np.bool_]:
+        """Return a safe voluntary Policy action; missing/unstable means WAIT."""
+        if income_election_policy is None:
+            return np.zeros(n_paths, dtype=bool)
+        method = getattr(income_election_policy, "start_income_mask", None)
+        if method is None or not callable(method):
+            return np.zeros(n_paths, dtype=bool)
+        try:
+            decision = np.asarray(method(context=context))
+            if decision.shape != (n_paths,):
+                return np.zeros(n_paths, dtype=bool)
+            if np.issubdtype(decision.dtype, np.number) \
+                    and not np.all(np.isfinite(decision)):
+                return np.zeros(n_paths, dtype=bool)
+            return decision.astype(bool)
+        except Exception:
+            # An unavailable regression, rank/condition gate or other unstable
+            # voluntary action must never manufacture START_INCOME_NOW.  The
+            # contractual forced gate is applied independently below.
             return np.zeros(n_paths, dtype=bool)
 
-        policy_year = step // STEPS_PER_YEAR
-        forced = ((step >= age_100_force_step)
-                  | (policy_year >= take_up.force_by_year)
-                  | (step >= aps_auto_income_step))
-        base_probability = take_up.probability(policy_year)
-        if behaviour.use_dynamic_take_up:
-            log_mny = guarantee_log_moneyness(step, t, iv)
-            probability = np.asarray(behaviour.dynamic_take_up.probability(
-                base_probability, log_mny, gross_premium), dtype=float)
+    def income_election_decision(
+        step: int,
+        t: float,
+        growth: Array,
+        is_anniversary: bool,
+    ) -> tuple[NDArray[np.bool_], Array, Array, NDArray[np.bool_]]:
+        """Election mask, annual probability, eligible exposure and force."""
+        eligible = (
+            np.asarray(growth, dtype=bool)
+            & (iv > 0.0)
+            & (w > 0.0)
+        )
+        if not is_anniversary or step < min_income_step:
+            zero_b = np.zeros(n_paths, dtype=bool)
+            return zero_b, np.zeros(n_paths), eligible.astype(float), zero_b
+
+        # These are contractual product gates.  The Behaviour CSV's year-15
+        # p=1 band remains a behavioural probability-one decision and is not
+        # reported as a forced start.
+        forced = eligible & (
+            (step >= age_100_force_step)
+            | (step >= aps_auto_income_step)
+        )
+        context = income_election_context(step, t, eligible, forced)
+
+        if policy_controlled_election:
+            voluntary = conservative_policy_election_mask(context)
+            probability = voluntary.astype(float)
+        elif dynamic_take_up:
+            policy_year = step // STEPS_PER_YEAR
+            base_probability = take_up.probability(policy_year)
+            if behaviour.use_dynamic_take_up:
+                probability = state_aware_dynamic_take_up_probability(
+                    base_probability, context
+                )
+            else:
+                probability = np.full(n_paths, base_probability)
+            if take_up_draws is None:
+                raise RuntimeError("Dynamic take-up draws were not initialised.")
+            voluntary = take_up_draws[:, policy_year] < probability
         else:
-            probability = np.full(n_paths, base_probability)
-        draw = take_up_draws[:, policy_year]
-        return eligible_growth & (forced | (draw < probability))
+            required_step = np.minimum(income_step, aps_auto_income_step)
+            voluntary = step >= required_step
+            probability = np.asarray(voluntary, dtype=float)
+
+        probability = np.where(context.voluntary_election_eligible,
+                               probability, 0.0)
+        elect = eligible & (forced | voluntary)
+        total_probability = np.where(forced, 1.0, probability)
+        return elect, total_probability, eligible.astype(float), forced
 
     def elect_income(elect: Array, step: int, t: float) -> None:
         """Elect Lifetime Income using the current IV as commencement value."""
         nonlocal phase, income_annual, iv_frame
         nonlocal free_utilisation, excess_rate
-        nonlocal joint_surv_primary, joint_surv_spouse, income_lapse_prob
+        nonlocal joint_surv_primary, joint_surv_spouse, joint_income_cover
+        nonlocal income_lapse_prob
+        nonlocal income_lapse_ordinary_prob, income_lapse_performance_prob
 
         if not elect.any():
             return
 
-        complete_years = int(np.floor(t + 1e-12))
-        rate = product.income_rates.lifetime_income_rate(
-            policy.age, policy.sex, policy.income_type, policy.spouse,
-            complete_years, policy.spouse_age, policy.spouse_sex,
-            policy.age_pension_plus)
+        rate = prospective_income_rate(t)
         income_annual = np.where(elect, iv * rate, income_annual)
         iv_frame = np.where(elect, iv, iv_frame)
         phase = np.where(elect, Phase.INCOME.value, phase).astype(np.int8)
         just_elected[elect] = True
 
-        if policy.spouse and dec.q_spouse_m is not None:
+        if pathwise_joint_life:
+            joint_income_cover = np.where(
+                elect, primary_alive & spouse_alive, joint_income_cover
+            )
+        elif policy.spouse and dec.q_spouse_m is not None:
             joint_surv_primary = np.where(elect, 1.0, joint_surv_primary)
             joint_surv_spouse = np.where(elect, 1.0, joint_surv_spouse)
         free_utilisation, excess_rate = wd_dynamic_rates(step, t)
         election_surrender_value, _ = _surrender_value(
             product, policy, scenarios, step, t, iv, free_wd_used,
             phase, aps_active, issue_zero, P0)
-        income_lapse_prob = np.where(
-            phase == Phase.INCOME.value,
-            income_lapse_probability_at(step, t, election_surrender_value),
-            income_lapse_prob)
+        election_ordinary, election_performance = (
+            income_lapse_cause_probabilities_at(
+                step, t, election_surrender_value
+            )
+        )
+        income_mask = phase == Phase.INCOME.value
+        income_lapse_ordinary_prob = np.where(
+            income_mask, election_ordinary, income_lapse_ordinary_prob
+        )
+        income_lapse_performance_prob = np.where(
+            income_mask, election_performance, income_lapse_performance_prob
+        )
+        income_lapse_prob = (
+            income_lapse_ordinary_prob + income_lapse_performance_prob
+        )
 
     # APS may already commence at issue (for example a non-super policy whose
     # Life Insured is at or above Pension Age).
     activate_aps(aps_start_step <= 0, 0, 0.0)
+
+    # The first cap is selected at issue from state which is independent of
+    # that cap.  In particular this observer runs before hedge execution or
+    # the first DVA package is started.
+    observe_cap_decision(0, 0.0)
+    issue_pre_cap_cashflows = {
+        key: values[:, 0].copy() for key, values in cfs.items()
+    }
 
     # upfront crediting margin of the first policy year (see anniversary block)
     if config.dva_enabled and config.crediting_margin_enabled:
         pz0 = package_and_zcb(0, 1.0, phase)
         cfs["crediting_margin"][:, 0] += iv_frame * (1.0 - pz0)
     book_hedge_execution_cost(0)
+    for key in CASHFLOW_KEYS:
+        post_cap_cfs[key][:, 0] = (
+            cfs[key][:, 0] - issue_pre_cap_cashflows[key]
+        )
+
+    context_aware_surrender = (
+        False
+        if surrender_policy is None
+        else _context_aware_surrender_policy(surrender_policy)
+    )
+    anniversary_only_surrender = bool(
+        surrender_policy is not None
+        and getattr(surrender_policy, "anniversary_only", False)
+    )
+    if surrender_decision_observer is None:
+        surrender_observer_method = None
+        anniversary_only_surrender_observer = False
+    else:
+        surrender_observer_method = getattr(
+            surrender_decision_observer, "observe_surrender_decision", None
+        )
+        if surrender_observer_method is None or not callable(
+            surrender_observer_method
+        ):
+            raise TypeError(
+                "surrender_decision_observer must provide an "
+                "observe_surrender_decision method."
+            )
+        anniversary_only_surrender_observer = bool(
+            getattr(surrender_decision_observer, "anniversary_only", False)
+        )
+
+    def post_action_expense_cashflow(
+        interval_index: int,
+        month_start_weight: Array,
+        month_start_account_value: Array,
+        post_action_weight: Array,
+        post_action_account_value: Array,
+        alive_at_action_interval: NDArray[np.bool_],
+    ) -> Array:
+        """Exact midpoint maintenance expense for a post-action state."""
+        if exp_assum is None:
+            return np.zeros(n_paths)
+        if expense_inflation_factors is None:
+            raise RuntimeError("Expense inflation factors were not initialised.")
+        infl = float(expense_inflation_factors[interval_index])
+        exposure_weight = 0.5 * (
+            month_start_weight + post_action_weight
+        )
+        fixed_expense = (
+            exposure_weight
+            * exp_assum.maintenance_per_policy
+            * infl / STEPS_PER_YEAR
+        )
+        weighted_av_exposure = 0.5 * (
+            month_start_weight * month_start_account_value
+            + post_action_weight * np.maximum(post_action_account_value, 0.0)
+        )
+        variable_expense = (
+            weighted_av_exposure
+            * exp_assum.maintenance_pct_of_iv / STEPS_PER_YEAR
+        )
+        return np.where(
+            alive_at_action_interval, fixed_expense + variable_expense, 0.0
+        )
 
     # ------------------------------------------------------------------ #
     # main loop
     # ------------------------------------------------------------------ #
+    final_pre_surrender_cashflows: Optional[dict[str, Array]] = None
     for k in range(n_steps):
         step = k + 1
         t = times[step]
@@ -869,6 +1758,8 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         fee_base_for_interval = np.where(
             phase < Phase.TERMINATED.value, np.maximum(iv_frame, 0.0), 0.0)
         just_elected[:] = False
+        pre_cap_step_cashflows: Optional[dict[str, Array]] = None
+        pre_cap_step_lapse: Optional[Array] = None
         # Payments are in arrears; the Election month has no payment.  Fixed
         # Income remains nominally unchanged except after an Excess Withdrawal.
         income_for_current_payment = income_annual.copy()
@@ -876,6 +1767,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         # ---- anniversary crediting ------------------------------------ #
         if is_anniv:
             year_idx = anniv_step // STEPS_PER_YEAR  # caps of the period just ended
+            previous_cap = as_path_array(
+                reference_spec.cap(year_idx), name="previous crediting cap",
+            )
             fund_ratio = reference_fund_level[:, step] / np.maximum(
                 anniv_reference_level, 1e-300)
             credit = np.asarray(credited_return(
@@ -883,6 +1777,18 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 Protection.TOTAL,
                 reference_spec.cap(year_idx),
             ))
+            previous_reference_return = np.asarray(
+                fund_ratio - 1.0, dtype=float).copy()
+            previous_credited_return = np.asarray(credit, dtype=float).copy()
+            # Johansson-style performance-disappointment signal.  Both
+            # quantities are customer-observable returns for the period just
+            # ended; insurer backing assets and hedge P&L are deliberately not
+            # used.  The hazard function applies the versioned CSV clip.
+            performance_shortfall = np.maximum(
+                np.log(np.maximum(fund_ratio, 1.0e-300))
+                - np.log1p(np.maximum(credit, -1.0 + 1.0e-15)),
+                0.0,
+            )
             new_iv = np.where(
                 growth | income,
                 iv_frame * (1.0 + credit),
@@ -952,38 +1858,118 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         # Income is monthly in arrears and ceases on death.  The death benefit
         # is therefore based on the pre-payment IV, while only survivors to the
         # payment date receive this month's instalment.
-        q_m = np.full(n_paths, dec.q_primary_m[k])
-        if (policy.spouse and dec.q_spouse_m is not None
-                and policy.spouse_death_election == SpouseDeathElection.CONTINUE_INCOME):
-            # Joint cover starts at the election timestamp.  The mortality
-            # decrement for the interval ending at that timestamp remains a
-            # Primary-Life decrement; Last-Survivor mortality starts with the
-            # following monthly interval.
-            income_spouse = income_at_interval_start
-            if income_spouse.any():
-                s1 = joint_surv_primary
-                s2 = joint_surv_spouse
-                s_ls = s1 + s2 - s1 * s2
-                s1_next = s1 * (1.0 - dec.q_primary_m[k])
-                s2_next = s2 * (1.0 - dec.q_spouse_m[k])
-                s_ls_next = s1_next + s2_next - s1_next * s2_next
-                q_joint = 1.0 - s_ls_next / np.maximum(s_ls, 1e-300)
-                q_m = np.where(income_spouse, q_joint, q_m)
-                joint_surv_primary = np.where(income_spouse, s1_next, joint_surv_primary)
-                joint_surv_spouse = np.where(income_spouse, s2_next, joint_surv_spouse)
-        q_m = np.where(alive_mask, q_m, 0.0)
-        death_fee_product, death_fee_lip, death_post_fee_av = fee_settlement(iv)
-        death_ben = death_post_fee_av
-        if policy.age_pension_plus:
-            cap_db = _aps_death_cap(product, cas_base, t, cas_start_t, cas_le,
-                                    cas_wd, aps_active)
-            death_ben = np.where(aps_active, np.minimum(death_ben, cap_db), death_ben)
-            cfs["aps_retained"][:, step] += w * q_m * np.where(
-                aps_active, death_post_fee_av - death_ben, 0.0)
-        cfs["fees_product"][:, step] += w * q_m * death_fee_product
-        cfs["fees_lip"][:, step] += w * q_m * death_fee_lip
-        cfs["death_benefits"][:, step] += w * q_m * death_ben
-        w = w * (1.0 - q_m)
+        if pathwise_joint_life:
+            if mortality_rng is None or dec.q_spouse_m is None:
+                raise RuntimeError(
+                    "Pathwise Joint-Life mortality was not initialised."
+                )
+            primary_before = primary_alive.copy()
+            spouse_before = spouse_alive.copy()
+            primary_died = (
+                alive_mask
+                & primary_before
+                & (mortality_rng.random(n_paths) < dec.q_primary_m[k])
+            )
+            spouse_died = (
+                alive_mask
+                & spouse_before
+                & (mortality_rng.random(n_paths) < dec.q_spouse_m[k])
+            )
+            primary_alive = primary_before & ~primary_died
+            spouse_alive = spouse_before & ~spouse_died
+
+            growth_before_election = phase == Phase.GROWTH.value
+            income_before_election = income_at_interval_start
+            continue_joint = (
+                income_before_election
+                & joint_income_cover
+                & (
+                    policy.spouse_death_election
+                    == SpouseDeathElection.CONTINUE_INCOME
+                )
+            )
+            last_survivor_died = (
+                continue_joint & ~primary_alive & ~spouse_alive
+            )
+            primary_termination = (
+                (growth_before_election | (income_before_election & ~continue_joint))
+                & primary_died
+            )
+            terminating_death = alive_mask & (
+                last_survivor_died | primary_termination
+            )
+
+            death_fee_product, death_fee_lip, death_post_fee_av = fee_settlement(iv)
+            death_ben = death_post_fee_av
+            if policy.age_pension_plus:
+                cap_db = _aps_death_cap(
+                    product, cas_base, t, cas_start_t, cas_le,
+                    cas_wd, aps_active,
+                )
+                death_ben = np.where(
+                    aps_active, np.minimum(death_ben, cap_db), death_ben
+                )
+                cfs["aps_retained"][:, step] += w * terminating_death * np.where(
+                    aps_active, death_post_fee_av - death_ben, 0.0
+                )
+            cfs["fees_product"][:, step] += (
+                w * terminating_death * death_fee_product
+            )
+            cfs["fees_lip"][:, step] += w * terminating_death * death_fee_lip
+            cfs["death_benefits"][:, step] += w * terminating_death * death_ben
+
+            iv = np.where(terminating_death, 0.0, iv)
+            iv_frame = np.where(terminating_death, 0.0, iv_frame)
+            income_annual = np.where(terminating_death, 0.0, income_annual)
+            fee_product_accrued = np.where(
+                terminating_death, 0.0, fee_product_accrued
+            )
+            fee_lip_accrued = np.where(
+                terminating_death, 0.0, fee_lip_accrued
+            )
+            phase = np.where(
+                terminating_death, Phase.TERMINATED.value, phase
+            ).astype(np.int8)
+            w = np.where(terminating_death, 0.0, w)
+        else:
+            q_m = np.full(n_paths, dec.q_primary_m[k])
+            if (policy.spouse and dec.q_spouse_m is not None
+                    and policy.spouse_death_election == SpouseDeathElection.CONTINUE_INCOME):
+                # Joint cover starts at the election timestamp.  The mortality
+                # decrement for the interval ending at that timestamp remains a
+                # Primary-Life decrement; Last-Survivor mortality starts with
+                # the following monthly interval.
+                income_spouse = income_at_interval_start
+                if income_spouse.any():
+                    s1 = joint_surv_primary
+                    s2 = joint_surv_spouse
+                    s_ls = s1 + s2 - s1 * s2
+                    s1_next = s1 * (1.0 - dec.q_primary_m[k])
+                    s2_next = s2 * (1.0 - dec.q_spouse_m[k])
+                    s_ls_next = s1_next + s2_next - s1_next * s2_next
+                    q_joint = 1.0 - s_ls_next / np.maximum(s_ls, 1e-300)
+                    q_m = np.where(income_spouse, q_joint, q_m)
+                    joint_surv_primary = np.where(
+                        income_spouse, s1_next, joint_surv_primary
+                    )
+                    joint_surv_spouse = np.where(
+                        income_spouse, s2_next, joint_surv_spouse
+                    )
+            q_m = np.where(alive_mask, q_m, 0.0)
+            death_fee_product, death_fee_lip, death_post_fee_av = fee_settlement(iv)
+            death_ben = death_post_fee_av
+            if policy.age_pension_plus:
+                cap_db = _aps_death_cap(product, cas_base, t, cas_start_t, cas_le,
+                                        cas_wd, aps_active)
+                death_ben = np.where(
+                    aps_active, np.minimum(death_ben, cap_db), death_ben
+                )
+                cfs["aps_retained"][:, step] += w * q_m * np.where(
+                    aps_active, death_post_fee_av - death_ben, 0.0)
+            cfs["fees_product"][:, step] += w * q_m * death_fee_product
+            cfs["fees_lip"][:, step] += w * q_m * death_fee_lip
+            cfs["death_benefits"][:, step] += w * q_m * death_ben
+            w = w * (1.0 - q_m)
 
         # ---- income election / new crediting period ---------------------- #
         # Expected deaths in the interval ending at an Anniversary belong to
@@ -991,14 +1977,31 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         # only after that decrement; the next crediting/DVA period is therefore
         # funded only for survivors.  This removes the former hybrid in which
         # Primary mortality was combined with post-election DVA state.
+        growth_exposure[:, step] = w * (
+            phase == Phase.GROWTH.value
+        ).astype(float)
         if is_anniv:
             growth = phase == Phase.GROWTH.value
             if growth.any():
-                elect = income_election_mask(step, t, growth, True)
-                if (dynamic_take_up and policy.age_pension_plus
+                elect, take_up_probability, eligible, forced = (
+                    income_election_decision(step, t, growth, True)
+                )
+                eligible_growth_exposure[:, step] = w * eligible
+                income_take_up_probability[:, step] = take_up_probability
+                income_election_events[:, step] = w * elect.astype(float)
+                forced_income_election_events[:, step] = (
+                    w * (elect & forced).astype(float)
+                )
+                if ((dynamic_take_up or policy_controlled_election)
+                        and policy.age_pension_plus
                         and policy.funding_source == FundingSource.NON_SUPERANNUATION):
                     activate_aps(elect, step, t)
                 elect_income(elect, step, t)
+            pre_cap_step_cashflows = {
+                key: values[:, step].copy() for key, values in cfs.items()
+            }
+            pre_cap_step_lapse = lapse_events[:, step].copy()
+            observe_cap_decision(step, float(t))
             restart_dva_period(step)
             free_utilisation, excess_rate = wd_dynamic_rates(step, t)
 
@@ -1065,37 +2068,268 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 iv, np.maximum(sv, 1e-300), out=np.ones(n_paths), where=sv > 1e-12)
             exit_ratio = np.where((iv > 1e-12) & (sv <= 1e-12),
                                   np.exp(2.0), exit_ratio)
-            growth_lapse_prob = np.asarray(
-                behaviour.dynamic.growth_probability(
+            growth_ordinary_prob, growth_performance_prob = (
+                behaviour.dynamic.growth_cause_probabilities(
                     dec.lapse_growth_a[k], np.log(np.maximum(exit_ratio, 1e-300)),
-                    gross_premium, 1.0 / STEPS_PER_YEAR),
-                dtype=float,
+                    gross_premium, 1.0 / STEPS_PER_YEAR,
+                    performance_shortfall=performance_shortfall
+                )
             )
+            growth_ordinary_prob = np.asarray(growth_ordinary_prob, dtype=float)
+            growth_performance_prob = np.asarray(
+                growth_performance_prob, dtype=float
+            )
+            growth_lapse_prob = growth_ordinary_prob + growth_performance_prob
             i_mask = phase == Phase.INCOME.value
             if i_mask.any() and is_anniv:
-                income_lapse_prob = np.where(
+                anniversary_ordinary, anniversary_performance = (
+                    income_lapse_cause_probabilities_at(step, t, sv)
+                )
+                income_lapse_ordinary_prob = np.where(
+                    i_mask, anniversary_ordinary, income_lapse_ordinary_prob
+                )
+                income_lapse_performance_prob = np.where(
                     i_mask,
-                    income_lapse_probability_at(step, t, sv),
-                    income_lapse_prob,
+                    anniversary_performance,
+                    income_lapse_performance_prob,
+                )
+                income_lapse_prob = (
+                    income_lapse_ordinary_prob
+                    + income_lapse_performance_prob
                 )
         else:
-            growth_lapse_prob = np.full(n_paths, static_growth_lapse)
+            growth_ordinary_prob = np.full(n_paths, static_growth_lapse)
+            growth_performance_prob = np.zeros(n_paths)
+            growth_lapse_prob = growth_ordinary_prob
             income_lapse_prob = np.full(
                 n_paths,
                 1.0 - (1.0 - dec.lapse_income_a) ** (1.0 / STEPS_PER_YEAR),
             )
-        base_lapse = np.where(
-            phase == Phase.INCOME.value, income_lapse_prob,
-            np.where(phase == Phase.GROWTH.value, growth_lapse_prob, 0.0),
+            income_lapse_ordinary_prob = income_lapse_prob.copy()
+            income_lapse_performance_prob = np.zeros(n_paths)
+        ordinary_lapse = np.where(
+            phase == Phase.INCOME.value, income_lapse_ordinary_prob,
+            np.where(phase == Phase.GROWTH.value, growth_ordinary_prob, 0.0),
         )
-        if not product.allows_growth_surrender:
-            base_lapse = np.where(phase == Phase.INCOME.value,
-                                  base_lapse, 0.0)
-        lapse_eligible = alive_mask & (
-            (phase == Phase.INCOME.value)
-            | ((phase == Phase.GROWTH.value) & (iv > 0.0))
+        performance_lapse = np.where(
+            phase == Phase.INCOME.value, income_lapse_performance_prob,
+            np.where(
+                phase == Phase.GROWTH.value, growth_performance_prob, 0.0
+            ),
         )
-        base_lapse = np.where(lapse_eligible, base_lapse, 0.0)
+        # Exact action boundary: everything currently in ``cfs[:, step]`` is
+        # common to CONTINUE and FULL_WITHDRAWAL.  Settlement and midpoint
+        # expense are booked only after this snapshot.
+        pre_surrender_step_cashflows = {
+            key: values[:, step].copy() for key, values in cfs.items()
+        }
+        if step == n_steps:
+            final_pre_surrender_cashflows = pre_surrender_step_cashflows
+
+        external_lapse_eligible: Optional[NDArray[np.bool_]] = None
+        policy_action_point = bool(
+            surrender_policy is not None
+            and (not anniversary_only_surrender or is_anniv)
+        )
+        observer_action_point = bool(
+            surrender_observer_method is not None
+            and (not anniversary_only_surrender_observer or is_anniv)
+        )
+        decision_context: Optional[SurrenderDecisionContext] = None
+        if policy_action_point or observer_action_point:
+            guarantee_pv = guarantee_pv_at(step, t)
+            guarantee_ratio = np.divide(
+                guarantee_pv,
+                np.maximum(np.asarray(sv, dtype=float), 1e-300),
+                out=np.full(n_paths, np.exp(2.0)),
+                where=np.asarray(sv, dtype=float) > 1e-12,
+            )
+            guarantee_log_mny = np.log(np.maximum(guarantee_ratio, 1e-300))
+            guarantee_mny = np.exp(np.clip(guarantee_log_mny, -50.0, 50.0))
+            positive_income_guarantee = (
+                (phase == Phase.INCOME.value)
+                & (guarantee_pv > 1.0e-12 * gross_premium)
+            )
+            zero_exit_with_guarantee = (
+                (sv <= 1.0e-12 * gross_premium)
+                & positive_income_guarantee
+            )
+            # These contractual gates define the admissible action set for
+            # both an external policy and the observer's counterfactual value.
+            action_lapse_eligible = (
+                alive_mask
+                & (w > 0.0)
+                & (phase == Phase.INCOME.value)
+                & ~just_elected
+                & ~zero_exit_with_guarantee
+            )
+            if scenarios.variance is None:
+                heston_variance = np.zeros(n_paths)
+            else:
+                heston_variance = np.asarray(
+                    scenarios.variance[reference_spec.equity_index][:, step],
+                    dtype=float,
+                )
+            zero_rate_5y = as_path_array(
+                scenarios.zero_rate(step, 5.0), name="five-year zero rate",
+            )
+            decision_context = SurrenderDecisionContext(
+                step=int(step),
+                time=float(t),
+                is_anniversary=bool(is_anniv),
+                policy_year=int(step // STEPS_PER_YEAR),
+                duration_years=float(t),
+                phase=phase,
+                account_value=iv,
+                surrender_value=sv,
+                locked_annual_income=income_annual,
+                guarantee_pv=guarantee_pv,
+                guarantee_moneyness=guarantee_mny,
+                guarantee_log_moneyness=guarantee_log_mny,
+                short_rate=scenarios.short_rate[:, step],
+                zero_rate_5y=zero_rate_5y,
+                heston_variance=heston_variance,
+                announced_cap=as_path_array(
+                    reference_spec.cap(anniv_step // STEPS_PER_YEAR),
+                    name="announced crediting cap",
+                ),
+                previous_reference_return=previous_reference_return,
+                previous_credited_return=previous_credited_return,
+                performance_gap=performance_shortfall,
+                inforce_weight=w,
+                just_elected=just_elected,
+                full_withdrawal_eligible=action_lapse_eligible,
+            )
+
+            if observer_action_point:
+                if pre_cap_step_cashflows is None:
+                    post_cap_common = {
+                        key: values.copy()
+                        for key, values in pre_surrender_step_cashflows.items()
+                    }
+                else:
+                    post_cap_common = {
+                        key: (
+                            pre_surrender_step_cashflows[key]
+                            - pre_cap_step_cashflows[key]
+                        )
+                        for key in CASHFLOW_KEYS
+                    }
+                exercise = action_lapse_eligible.astype(float)
+                exercise_weight = w * exercise
+                full_post_weight = w * (1.0 - exercise)
+                full_action_cashflows = {
+                    key: np.zeros(n_paths) for key in CASHFLOW_KEYS
+                }
+                full_action_cashflows["fees_product"] = (
+                    exercise_weight * lapse_fee_product
+                )
+                full_action_cashflows["fees_lip"] = (
+                    exercise_weight * lapse_fee_lip
+                )
+                full_action_cashflows["surrender_benefits"] = (
+                    exercise_weight * sv
+                )
+                full_action_cashflows["mva_retained"] = (
+                    exercise_weight * mva_amt
+                )
+                full_action_cashflows["aps_retained"] = (
+                    exercise_weight * aps_forfeit
+                )
+                full_action_cashflows["expenses"] = (
+                    post_action_expense_cashflow(
+                        k,
+                        w_month_start,
+                        av_month_start,
+                        full_post_weight,
+                        iv,
+                        alive_mask,
+                    )
+                )
+                surrender_observer_method(context=SurrenderActionValueContext(
+                    decision_context=decision_context,
+                    post_cap_common_cashflows=post_cap_common,
+                    full_withdrawal_post_action_cashflows=(
+                        full_action_cashflows
+                    ),
+                ))
+
+        if surrender_policy is not None:
+            if not policy_action_point:
+                surrender_mask = np.zeros(n_paths, dtype=bool)
+                external_lapse_eligible = np.zeros(n_paths, dtype=bool)
+            else:
+                if decision_context is None:
+                    raise RuntimeError(
+                        "Surrender decision context was not initialised."
+                    )
+                external_lapse_eligible = (
+                    decision_context.full_withdrawal_eligible
+                )
+                if context_aware_surrender:
+                    decision = surrender_policy.surrender_mask(
+                        context=decision_context
+                    )
+                else:
+                    # Backward-compatible research hook.  New policies should
+                    # opt into ``context`` so future ScenarioSet arrays are not
+                    # in their information surface.
+                    decision = surrender_policy.surrender_mask(
+                        step=step,
+                        time=float(t),
+                        is_anniversary=bool(is_anniv),
+                        phase=phase,
+                        account_value=iv,
+                        annual_income=income_annual,
+                        surrender_value=sv,
+                        inforce_weight=w,
+                        scenarios=scenarios,
+                    )
+                surrender_mask = np.asarray(decision, dtype=bool)
+            if surrender_mask.shape != (n_paths,):
+                raise ValueError(
+                    "surrender_policy must return one boolean per scenario path."
+                )
+            ordinary_lapse = surrender_mask.astype(float)
+            performance_lapse = np.zeros(n_paths)
+        # Income Election and Full Surrender cannot occur on the same event
+        # timestamp.  Newly elected contracts first become lapse-eligible in
+        # the following monthly interval.
+        ordinary_lapse = np.where(just_elected, 0.0, ordinary_lapse)
+        performance_lapse = np.where(just_elected, 0.0, performance_lapse)
+        if surrender_policy is not None or not product.allows_growth_surrender:
+            ordinary_lapse = np.where(
+                phase == Phase.INCOME.value, ordinary_lapse, 0.0
+            )
+            performance_lapse = np.where(
+                phase == Phase.INCOME.value, performance_lapse, 0.0
+            )
+        # A customer cannot rationally exchange a strictly positive remaining
+        # lifetime-income guarantee for a zero surrender payment.  Ordinary
+        # and performance-driven full surrender therefore stop once the
+        # customer exit value is exhausted.
+        positive_exit_value = sv > 1.0e-12 * gross_premium
+        if surrender_policy is None:
+            lapse_eligible = alive_mask & positive_exit_value & (
+                (phase == Phase.INCOME.value)
+                | ((phase == Phase.GROWTH.value) & (iv > 0.0))
+            )
+        else:
+            if external_lapse_eligible is None:
+                raise RuntimeError("External surrender eligibility was not initialised.")
+            lapse_eligible = external_lapse_eligible
+        ordinary_lapse = np.where(lapse_eligible, ordinary_lapse, 0.0)
+        performance_lapse = np.where(lapse_eligible, performance_lapse, 0.0)
+        base_lapse = ordinary_lapse + performance_lapse
+        income_exposure[:, step] = w * (
+            phase == Phase.INCOME.value
+        ).astype(float)
+        ordinary_lapse_probabilities[:, step] = ordinary_lapse
+        performance_lapse_probabilities[:, step] = performance_lapse
+        total_lapse_probabilities[:, step] = base_lapse
+        lapse_events[:, step] = w * base_lapse
+        ordinary_lapse_events[:, step] = w * ordinary_lapse
+        performance_lapse_events[:, step] = w * performance_lapse
         cfs["fees_product"][:, step] += w * base_lapse * lapse_fee_product
         cfs["fees_lip"][:, step] += w * base_lapse * lapse_fee_lip
         cfs["surrender_benefits"][:, step] += w * base_lapse * sv
@@ -1109,23 +2343,14 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             # base date; an interval crossing that date is day-weighted.
             # Midpoint in-force exposure prorates terminating deaths and full
             # withdrawals within the monthly interval.
-            infl = float(expense_inflation_factors[k])
-            exposure_weight = 0.5 * (w_month_start + w)
-            fixed_expense = (
-                exposure_weight
-                * exp_assum.maintenance_per_policy
-                * infl / STEPS_PER_YEAR
+            cfs["expenses"][:, step] += post_action_expense_cashflow(
+                k,
+                w_month_start,
+                av_month_start,
+                w,
+                iv,
+                alive_mask,
             )
-            weighted_av_exposure = 0.5 * (
-                w_month_start * av_month_start
-                + w * np.maximum(iv, 0.0)
-            )
-            variable_expense = (
-                weighted_av_exposure
-                * exp_assum.maintenance_pct_of_iv / STEPS_PER_YEAR
-            )
-            cfs["expenses"][:, step] += np.where(
-                alive_mask, fixed_expense + variable_expense, 0.0)
 
         # Terminate exhausted Growth contracts and their in-force exposure.
         # Without a locked Income guarantee, zero Account Value has no
@@ -1139,6 +2364,22 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         fee_lip_accrued = np.where(exhausted_growth, 0.0, fee_lip_accrued)
 
         inforce[:, step] = w
+        if step < n_steps:
+            for key in CASHFLOW_KEYS:
+                post_surrender_cfs[key][:, step] = (
+                    cfs[key][:, step]
+                    - pre_surrender_step_cashflows[key]
+                )
+        if pre_cap_step_cashflows is not None:
+            for key in CASHFLOW_KEYS:
+                post_cap_cfs[key][:, step] = (
+                    cfs[key][:, step] - pre_cap_step_cashflows[key]
+                )
+            if pre_cap_step_lapse is None:
+                raise RuntimeError("Anniversary lapse boundary was not initialised.")
+            post_cap_lapse_events[:, step] = (
+                lapse_events[:, step] - pre_cap_step_lapse
+            )
         if iv_paths is not None:
             iv_paths[:, step] = iv
             income_paths[:, step] = income_annual
@@ -1166,6 +2407,12 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         residual_mask, Phase.TERMINATED.value, phase).astype(np.int8)
     w = np.where(residual_mask, 0.0, w)
     inforce[:, final] = w
+    if final_pre_surrender_cashflows is not None:
+        for key in CASHFLOW_KEYS:
+            post_surrender_cfs[key][:, final] = (
+                cfs[key][:, final]
+                - final_pre_surrender_cashflows[key]
+            )
     if iv_paths is not None:
         iv_paths[:, final] = iv
         income_paths[:, final] = income_annual
@@ -1174,11 +2421,56 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     return ProjectionResult(times=times[:n_steps + 1], scenarios=scenarios,
                             cashflows={k: v[:, :n_steps + 1] for k, v in cfs.items()},
                             inforce=inforce[:, :n_steps + 1],
+                            lapse_events=lapse_events[:, :n_steps + 1],
                             iv_paths=None if iv_paths is None else iv_paths[:, :n_steps + 1],
                             income_paths=None if income_paths is None else income_paths[:, :n_steps + 1],
                             phase_paths=None if phase_paths is None else phase_paths[:, :n_steps + 1],
                             survival_primary=dec.surv_primary,
-                            horizon_years=float(times[n_steps]))
+                            horizon_years=float(times[n_steps]),
+                            ordinary_lapse_events=(
+                                ordinary_lapse_events[:, :n_steps + 1]
+                            ),
+                            performance_lapse_events=(
+                                performance_lapse_events[:, :n_steps + 1]
+                            ),
+                            ordinary_lapse_probabilities=(
+                                ordinary_lapse_probabilities[:, :n_steps + 1]
+                            ),
+                            performance_lapse_probabilities=(
+                                performance_lapse_probabilities[:, :n_steps + 1]
+                            ),
+                            total_lapse_probabilities=(
+                                total_lapse_probabilities[:, :n_steps + 1]
+                            ),
+                            eligible_growth_exposure=(
+                                eligible_growth_exposure[:, :n_steps + 1]
+                            ),
+                            income_take_up_probability=(
+                                income_take_up_probability[:, :n_steps + 1]
+                            ),
+                            income_election_events=(
+                                income_election_events[:, :n_steps + 1]
+                            ),
+                            forced_income_election_events=(
+                                forced_income_election_events[:, :n_steps + 1]
+                            ),
+                            growth_exposure=(
+                                growth_exposure[:, :n_steps + 1]
+                            ),
+                            income_exposure=(
+                                income_exposure[:, :n_steps + 1]
+                            ),
+                            post_cap_cashflows={
+                                key: value[:, :n_steps + 1]
+                                for key, value in post_cap_cfs.items()
+                            },
+                            post_cap_lapse_events=(
+                                post_cap_lapse_events[:, :n_steps + 1]
+                            ),
+                            post_surrender_cashflows={
+                                key: value[:, :n_steps + 1]
+                                for key, value in post_surrender_cfs.items()
+                            })
 
 
 # ---------------------------------------------------------------------------

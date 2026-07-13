@@ -136,7 +136,10 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
                    behaviour: BehaviourModel,
                    expenses: Optional[ExpenseAssumptions] = None,
                    settings: ValuationSettings = ValuationSettings(),
-                   scenarios: Optional[ScenarioSet] = None) -> ValuationResult:
+                   scenarios: Optional[ScenarioSet] = None,
+                   surrender_policy: Optional[object] = None,
+                   income_election_policy: Optional[object] = None,
+                   ) -> ValuationResult:
     """Full risk-neutral valuation of one model point."""
     if scenarios is None:
         scenarios = build_scenarios(esg_config, settings, Measure.RISK_NEUTRAL,
@@ -173,7 +176,9 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
                              "use one consistent market-data basis.")
 
     res = project(product, policy, scenarios, behaviour, mortality,
-                  expenses=expenses, config=settings.projection)
+                  expenses=expenses, config=settings.projection,
+                  surrender_policy=surrender_policy,
+                  income_election_policy=income_election_policy)
     pv = res.pv_by_component()
 
     premium = pv["premium"]

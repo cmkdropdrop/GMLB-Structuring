@@ -31,6 +31,7 @@ from .behavior import (
     FractionalLogitFunction,
     IncomeTakeUp,
     LapseAssumptions,
+    PerformanceLapseFunction,
     WithdrawalBehaviour,
 )
 
@@ -112,6 +113,26 @@ _HAZARD_PARAMETER_UNITS = {
     "multiplier_cap": "dimensionless_multiplier",
 }
 
+_TAKE_UP_PARAMETER_UNITS = {
+    **_HAZARD_PARAMETER_UNITS,
+    "beta_log_account_value": "log_hazard_coefficient",
+    "beta_prospective_income_ratio": "log_hazard_coefficient_per_income_to_premium",
+    "beta_reference_return": "log_hazard_coefficient_per_return",
+    "beta_credited_return": "log_hazard_coefficient_per_return",
+    "beta_performance_gap": "log_hazard_coefficient_per_log_return_gap",
+}
+
+_PERFORMANCE_LAPSE_PARAMETER_UNITS = {
+    "retention_gamma": "per_natural_log_moneyness",
+    "retention_floor": "dimensionless_multiplier",
+    "shortfall_deadband": "natural_log_return_shortfall",
+    "shortfall_max": "natural_log_return_shortfall",
+    "excess_hazard_cap": "annual_integrated_hazard",
+    "excess_hazard_scale": "natural_log_return_shortfall",
+    "annual_probability_cap": "annual_conditional_probability",
+    "log_moneyness_max": "natural_log_ratio",
+}
+
 _FRACTIONAL_LOGIT_PARAMETER_UNITS = {
     "beta_moneyness": "log_odds_coefficient",
     "beta_log_premium": "log_odds_coefficient",
@@ -125,14 +146,17 @@ _COEFFICIENT_GROUP_SPEC = {
     ("shared", "all"): (
         "shared", "not_applicable", _SHARED_PARAMETER_UNITS),
     ("lapse", "growth"): (
-        "proportional_hazard_cloglog", "positive_part",
-        _HAZARD_PARAMETER_UNITS),
-    ("lapse", "income"): (
-        "proportional_hazard_cloglog", "positive_part",
-        _HAZARD_PARAMETER_UNITS),
-    ("income_take_up", "growth"): (
         "proportional_hazard_cloglog", "signed",
         _HAZARD_PARAMETER_UNITS),
+    ("lapse", "income"): (
+        "proportional_hazard_cloglog", "signed",
+        _HAZARD_PARAMETER_UNITS),
+    ("performance_lapse", "all"): (
+        "competing_risk_excess_hazard", "positive_part",
+        _PERFORMANCE_LAPSE_PARAMETER_UNITS),
+    ("income_take_up", "growth"): (
+        "proportional_hazard_cloglog", "signed",
+        _TAKE_UP_PARAMETER_UNITS),
     ("free_withdrawal_utilisation", "growth"): (
         "fractional_logit", "positive_part",
         _FRACTIONAL_LOGIT_PARAMETER_UNITS),
@@ -618,7 +642,6 @@ def _coefficient_values(rows: list[dict[str, object]], value_column: str
             "log_moneyness_min must be below log_moneyness_max.")
     if not shared["log_premium_min"] < shared["log_premium_max"]:
         raise ValueError("log_premium_min must be below log_premium_max.")
-
     for group in (
         ("lapse", "growth"), ("lapse", "income"),
         ("income_take_up", "growth"),
@@ -643,6 +666,17 @@ def _coefficient_values(rows: list[dict[str, object]], value_column: str
             raise ValueError(
                 f"Invalid fractional-logit output bounds for {group!r}."
             )
+    performance = result[("performance_lapse", "all")]
+    if not 0.0 <= performance["retention_floor"] <= 1.0:
+        raise ValueError("Performance-lapse retention_floor must lie in [0, 1].")
+    if not 0.0 <= performance["shortfall_deadband"] \
+            <= performance["shortfall_max"]:
+        raise ValueError("Invalid performance-lapse shortfall bounds.")
+    if performance["excess_hazard_cap"] < 0.0 \
+            or performance["excess_hazard_scale"] <= 0.0:
+        raise ValueError("Invalid performance-lapse hazard parameters.")
+    if not 0.0 < performance["annual_probability_cap"] <= 1.0:
+        raise ValueError("Invalid performance-lapse annual probability cap.")
     return result
 
 
@@ -735,6 +769,19 @@ def load_dynamic_behaviour_assumptions(
             beta_mva=0.0,
         )
 
+    def performance_lapse_function() -> PerformanceLapseFunction:
+        values = coefficient_values[("performance_lapse", "all")]
+        return PerformanceLapseFunction(
+            retention_gamma=values["retention_gamma"],
+            retention_floor=values["retention_floor"],
+            shortfall_deadband=values["shortfall_deadband"],
+            shortfall_max=values["shortfall_max"],
+            excess_hazard_cap=values["excess_hazard_cap"],
+            excess_hazard_scale=values["excess_hazard_scale"],
+            annual_probability_cap=values["annual_probability_cap"],
+            log_moneyness_max=values["log_moneyness_max"],
+        )
+
     def fractional_function(component: str, phase: str) -> FractionalLogitFunction:
         values = coefficient_values[(component, phase)]
         _, transform, _ = _COEFFICIENT_GROUP_SPEC[(component, phase)]
@@ -785,10 +832,26 @@ def load_dynamic_behaviour_assumptions(
         enabled=True,
         growth=hazard_function("lapse", "growth"),
         income=hazard_function("lapse", "income"),
+        performance=performance_lapse_function(),
     )
     configured_dynamic_take_up = DynamicTakeUpParams(
         enabled=True,
         function=hazard_function("income_take_up", "growth"),
+        beta_log_account_value=coefficient_values[
+            ("income_take_up", "growth")
+        ]["beta_log_account_value"],
+        beta_prospective_income_ratio=coefficient_values[
+            ("income_take_up", "growth")
+        ]["beta_prospective_income_ratio"],
+        beta_reference_return=coefficient_values[
+            ("income_take_up", "growth")
+        ]["beta_reference_return"],
+        beta_credited_return=coefficient_values[
+            ("income_take_up", "growth")
+        ]["beta_credited_return"],
+        beta_performance_gap=coefficient_values[
+            ("income_take_up", "growth")
+        ]["beta_performance_gap"],
     )
     configured_dynamic_withdrawals = DynamicWithdrawalParams(
         enabled=True,

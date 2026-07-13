@@ -322,6 +322,186 @@ Income-Lapse bleibt bei fortbestehender Income-Garantie auch nach Aufzehrung
 des Account Value aktiv. Der Surrender Benefit ist dann null; ein Lapse beendet
 aber die Garantie sowie künftige Garantieclaims und laufende Expenses.
 
+## Optimal-Behaviour-Portfoliobewertung mit LSMC
+
+`run_portfolio_valuation_lsmc.py` bewertet dasselbe generische Portfolio mit
+demselben Heston-Hull-White-Modell unter Q, denselben Markt-, Kosten-,
+Mortalitäts- und Produktannahmen sowie derselben Portfolioaggregation wie
+`run_portfolio_valuation.py`. Der modellpunktbezogene Income-Start bleibt wie
+im operativen Runner deterministisch. Ersetzt werden die dynamischen
+Income-Lapse- und Excess-Withdrawal-Proxys durch eine optimale jährliche
+LSMC-Entscheidung:
+
+```text
+CONTINUE | FULL_WITHDRAWAL
+```
+
+Growth-Surrender und Growth-Withdrawals bleiben vertraglich verboten. Eine
+partielle Income-Entnahme reduziert im generischen Nicht-APS-Produkt Account
+Value und Locked Income proportional. Am Anniversary nach Fee Posting ist ihr
+Kundenwert daher eine konvexe Kombination aus Continue und Full Withdrawal und
+kann keinen der beiden Endpunkte übertreffen. Sie wird deshalb ohne Verlust
+aus dem optimalen Aktionsgitter entfernt.
+
+Der Defaultlauf verwendet 4.000 unabhängige Trainingspfade und 2.000 davon
+getrennte Evaluationspfade:
+
+```powershell
+python portfolio_simulations/run_portfolio_valuation_lsmc.py
+```
+
+Die Backward-Induction verwendet fünfteilige Cross-Fits, standardisierte
+Zustände, Ridge-Regularisierung, ein Rang-/Konditions-Gate und standardmäßig
+einen konservativen OOF-RMSE-Puffer für eine Exercise-Entscheidung. Nur die auf dem
+Trainingssample eingefrorene Policy wird im unveränderten monatlichen
+Projektor out of sample bewertet. Unterperformt eine cross-fitted
+Modellpunkt-Policy bereits im Training die zulässige Continue-Policy, wird sie
+vor der Evaluation auf Continue zurückgesetzt. Es findet keine nachträgliche
+Policy-Auswahl auf den Evaluationspfaden statt.
+
+Die Ausübung wird auf Policy Anniversaries diskretisiert. Das entspricht dem
+Jahresraster des LSMC-Research-Ansatzes und liefert gegenüber einem feineren
+monatlichen oder täglichen vertraglichen Exercise-Raster eine konservative
+Lower-Bound-Policy; diese Diskretisierung ist keine beobachtete
+Verhaltensannahme.
+
+Der Runner rechnet standardmäßig zusätzlich:
+
+- den unveränderten Dynamic-Behaviour-Benchmark auf exakt demselben
+  Evaluationsszenariosatz;
+- einen Continue-Benchmark ohne freiwilligen Exit;
+- den LSMC-Out-of-sample-Rollout.
+
+Neben den vollständigen Portfolio- und Modellpunktergebnissen entstehen
+`comparison_summary.csv`, `model_point_comparison.csv`,
+`lsmc_vs_continue_summary.csv`, `lsmc_regression_diagnostics.csv` und
+`lsmc_action_summary.csv`. Das Manifest dokumentiert Training und Evaluation
+einschließlich separater Seeds und Szenario-Fingerprints. Mit
+`--no-dynamic-benchmark` kann nur der zusätzliche Originalvergleich
+abgeschaltet werden; der Continue-Benchmark bleibt als LSMC-Validierung aktiv.
+
+Fair-Fee-Solves sind in diesem Runner bewusst nicht freigeschaltet. Eine
+Gebührenänderung verändert die optimale Policy und würde deshalb bei jedem
+Root-Finder-Schritt ein neues LSMC-Training erfordern.
+
+### Sensitivität gegenüber dem Crediting Cap
+
+Der separate Szenario-Runner trainiert die optimale Policy für jedes Cap neu
+und bewertet alle Varianten mit Common Random Numbers auf einem vom Training
+getrennten Pfadsatz:
+
+```powershell
+python portfolio_simulations/run_lsmc_cap_behaviour_scenarios.py `
+  --cap-rates 4% 6% 12% 20% --no-dynamic-benchmark
+```
+
+Er erzeugt `lsmc_cap_behaviour_comparison.csv`, einen kompakten Markdown-Bericht,
+eine Grafik, ein Manifest sowie die vollständigen Einzelergebnisse je Cap. Der
+Report zerlegt die Änderung der Policyholder Benefits relativ zum Vergleichs-
+Cap in den mechanischen Effekt unter Continue und die zusätzliche Interaktion
+mit der LSMC-Verhaltensoption. Die ausgewiesene Exercise-Rate ist nur ein
+ungewichteter Diagnoseanteil über Modellpunkt-/Pfad-/Entscheidungsereignisse;
+sie ist keine portfoliogewichtete Surrender-Rate. Da die Portfolioausgabe kein
+pfadweises gepaartes Konfidenzintervall enthält, sollten Aussagen zur Stabilität
+der Verhaltensoptionalität zusätzlich mit unabhängigen Trainings- und
+Evaluations-Seeds repliziert werden.
+
+### Portfolio-Risikoanalyse über Caps und Behaviour-Ansätze
+
+`run_portfolio_risk_analysis.py` orchestriert für jedes Cap sowohl
+`run_portfolio_valuation.py` als auch `run_portfolio_valuation_lsmc.py` und
+ergänzt das Cap-Gitter um Markt-, biometrische und Expense-Einfaktorstresse.
+Die Ergebnisse werden als CSVs, Grafiken, Markdown-Bericht und auditiertes
+Manifest ausgegeben:
+
+```powershell
+python portfolio_simulations/run_portfolio_risk_analysis.py
+```
+
+Unabhängige Kombinationen aus Cap und Stress werden in einer gemeinsamen Queue
+standardmäßig mit bis zu 16 Workern parallel gerechnet. Dadurch bleiben die
+Worker nach den vier Basisfällen nicht ungenutzt, während auf das Stressgitter
+gewartet wird. BLAS/OpenMP ist je Child standardmäßig auf einen Thread begrenzt,
+damit die äußere Parallelisierung nicht durch verschachtelte Thread-Pools
+ausgebremst wird. Der optionale Sicherheitsmodus `--max-workers auto` leitet
+eine konservative Workerzahl aus den für den Prozess verfügbaren logischen CPUs,
+dem aktuell verfügbaren physischen RAM, Trainings-/Evaluationspfaden und dem aus
+den Modellpunktaltern geschätzten Projektionshorizont ab. Dabei bleiben mindestens
+35 % des verfügbaren RAM und mindestens 2 GiB als Reserve unberührt; ohne
+zuverlässige RAM-Erkennung wird nur ein Worker verwendet, und die Automatik
+startet höchstens 16 Worker. Dynamic und LSMC laufen innerhalb eines Workers
+nacheinander, weil LSMC den höheren Speicher-Peak hat. Passt nach der
+konservativen Schätzung nicht einmal ein Worker in das RAM-Budget, bleibt die
+bisherige serielle Ausführung als deutlich gewarnter Fallback erhalten.
+
+Eine konfigurierte Zahl überschreibt die konservative Automatik und wird im
+Manifest als mögliche RAM-Überschreitung gekennzeichnet. Für die RAM-begrenzte
+Automatik gilt beispielsweise:
+
+```powershell
+python portfolio_simulations/run_portfolio_risk_analysis.py `
+  --max-workers auto --blas-threads 1 --reuse-existing
+```
+
+Jeder Child-Prozess schreibt seine Konsole isoliert nach
+`orchestrator_console.log` im jeweiligen Szenarioverzeichnis. Die feste
+Jobreihenfolge, Seeds und Common-Random-Number-Logik bleiben unabhängig von der
+Completion-Reihenfolge erhalten. Eine GPU wird nicht automatisch verwendet;
+der numerische Stack besitzt derzeit kein kompatibles GPU-Backend.
+
+## Research-Runner fuer flexible Crediting-Caps
+
+Die kanonische Cap-Optimierung wird aus `AGILE_Modelling_Engine` gestartet:
+
+```powershell
+python portfolio_simulations/optimize_crediting_rate_lsmc.py
+```
+
+Sie ist kein American-Option-Stopping-Modell, sondern ein wiederholtes
+stochastisches Kontrollproblem im Gas-Storage-Stil. Das zulaessige Aktionsgitter
+ist `{0.25%, 1%, 2%, ..., 20%}`. Training, Auswahl des besten konstanten Caps
+und finale Bewertung verwenden getrennte Pfade. Der finale flexible CSM stammt
+ausschliesslich aus einem unabhaengigen Forward-Rollout durch denselben
+monatlichen Projector wie die Portfolio-Bewertung; Bellman-Werte werden nur als
+Regressionsdiagnostik gespeichert.
+
+Der Default nimmt die dokumentierte Cap-Setting-/Crediting-Margin als
+Hedge-Gewinn in die CSM-Proxy-Zielgroesse auf. `--no-hedge-gain` schaltet nur
+diesen Inflow aus; DVA und Hedge-Execution-Kosten bleiben davon getrennt. Ein
+blindes zusaetzliches Buchen von `max(Fundreturn - Cap, 0)` erfolgt nicht, weil
+dies die Call-Spread-/Crediting-Margin-Wirkung doppelt zaehlen wuerde.
+
+Das dynamische Income-Lapse-Modell enthält zusätzlich einen verzögerten,
+realisierten Performance-Gap: den positiven logarithmischen Abstand zwischen
+Reference-Fund- und tatsächlich gutgeschriebenem Jahresreturn. Er wird erst
+nach dem Annual Crediting beobachtet und kann deshalb keine künftige
+Marktperformance in die Cap-Entscheidung leaken. Logisch wird er als
+eigenständiger Cause-specific Excess-Hazard modelliert und mit dem gewöhnlichen
+Moneyness-Lapse-Hazard als konkurrierendes Risiko kombiniert. Dadurch bleibt
+die Performance-Reaktion auch bei einer kleinen 0,5-%-Basislapse materiell;
+eine wertvolle Garantie reduziert sie separat über einen Retention-Faktor.
+`--behaviour-value-basis low|base|high` wählt das unkalibrierte Proxy-Band,
+und `--no-performance-gap-behaviour` deaktiviert ausschließlich diesen
+Performance-Hazard. Growth Surrender bleibt gemäß Produktdesign strukturell
+verboten. Eine neu gewählte Income-Option kann nicht am selben Anniversary
+sofort wieder lapsen. Sobald der Surrender Value null ist, ist Full Surrender
+ebenfalls ausgeschlossen, weil eine positive laufende Garantie sonst ohne
+Gegenleistung aufgegeben würde.
+
+Die Hauptgrafik `plots/00_flexibility_value.png` vergleicht keine
+Regressionswerte, sondern direkt projizierte Werte fuer Null-Crediting, den auf
+einem separaten Sample gewaehlten besten fixen Cap und die flexible Politik.
+Der untere Teil zeigt das gepaarte Delta zum besten fixen Cap samt
+95%-Intervall. Der kompakte Entscheidungszustand fasst Markt-, Cap- und
+Crediting-Historie zusammen; er ist eine dokumentierte Proxy-State-Grenze und
+keine zusaetzliche Kalibrierung. Insbesondere enthält er den trailing
+Performance-Gap explizit, aber keine vollständige Garantie-Moneyness-Verteilung
+über alle Modellpunkt-Kohorten. Die Holdout-Prüfung verhindert dadurch falsche
+positive Deployments, kann aber einen echten adaptiven Zusatzwert übersehen.
+
+`run_lsmc_crediting_cap.py` ist nur noch ein veralteter Kompatibilitaets-
+Einstieg und delegiert bei direkter Ausfuehrung an diesen kanonischen Runner.
+
 ## Weitere Modellgrenzen
 
 - Der Maximum Return ist als Produkteigenschaft fest auf 6 % gesetzt und kein

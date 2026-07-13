@@ -2,9 +2,10 @@
 
 This is a standalone counterfactual management-action study.  It deliberately
 does not use the archived American-option-style ``agile_engine.lsmc`` module.
-Instead, it treats the annual cap as a repeated discrete control, in the same
-way that regression Monte Carlo for gas storage treats injection/withdrawal as
-a control that changes the future inventory state.
+Instead, it treats the annual cap as a repeated discrete Stackelberg control:
+the insurer announces a cap, each PolicySpec-signature Policyholder responds
+from a separate customer-value LSMC, and only then is the insurer value used
+to choose among caps.  The two objectives are never blended.
 
 The market paths are simulated once without contractual crediting under
 risk-neutral Heston-Hull-White.  Exploratory cap paths then drive the existing
@@ -17,27 +18,28 @@ estimates, for every anniversary and admissible cap,
 
 The signed quantity is the repository's market-consistent insurer net value
 before Risk Margin and is used here as an approximate New Business CSM proxy.
-The optimisation selects the cap with the largest proxy value.
+The optimisation selects the cap with the largest proxy value after the
+cap-aware customer best response.  ``--policyholder-behaviour`` retains
+reproducible ``dynamic`` and ``continue`` comparators; ``lsmc`` is the default.
 
-The action grid is the explicit research convention requested for this study:
-``{0.20%, 1%, 2%, ..., 20%}``.  It overrides the active case study's 0.25%
-guaranteed minimum and fixed 6% Maximum Return; no existing product or engine
-file is changed.  Fixed-cap checks distinguish zero crediting from uncapped
-positive-return crediting.
+The admissible action grid is ``{0.25%, 1%, 2%, ..., 20%}``, matching the
+documented Guaranteed Minimum Cap while replacing the case study's fixed 6%
+Maximum Return for this counterfactual.  Fixed-cap checks distinguish zero
+crediting from uncapped positive-return crediting.
 
 Important timing convention
 ---------------------------
-The management action is selected immediately after the anniversary state is
-known and applies to the following crediting year.  The optimisation therefore
-uses the administrative annual-crediting view with DVA disabled.  This makes
-every regression state strictly pre-action.  Collected Product/LIP Fees,
+The management action is selected after old-cap crediting, fee posting,
+mortality and Income Election and before the new DVA/hedge restart.  The
+optimisation uses a strictly pre-action market plus rich portfolio-exposure
+state; the newly announced cap is then observable to a same-Anniversary Full
+Withdrawal.  Collected Product/LIP Fees,
 Crediting and retained margins, Guarantee Claims, operating expenses and
 hedge-execution costs enter the CSM proxy with their insurer cashflow signs.
-Dynamic income-phase lapse and withdrawal assumptions are
-re-evaluated after cap-dependent Account-Value changes for Single-Life,
-Lump-Sum-Spouse and Single-Life fallback branches.  Consistent with the active
-Engine, a Continue-Income Joint-Life branch uses state-independent CSV base
-rates until separate p11/p10/p01 Account-Value cohorts are implemented.
+In LSMC mode statistical lapse and voluntary withdrawals are replaced by the
+customer-value Full-Withdrawal policy; they remain active only in the separate
+legacy dynamic comparator.  Full methodology and timing are documented in
+``CREDITING_CAP_STACKELBERG.md``.
 
 When explicitly run, the script writes CSV/JSON results, a DEBUG ``run.log``
 and headless Matplotlib diagnostics below ``plots/`` while reporting concise
@@ -48,16 +50,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import math
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from types import MappingProxyType
+from typing import Callable, Iterator, Mapping, Optional, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -99,15 +103,66 @@ from agile_engine.model_points import (  # noqa: E402
     PolicyholderModelPointSet,
 )
 from agile_engine.mortality import MAX_AGE as MORTALITY_TERMINAL_AGE  # noqa: E402
-from agile_engine.product import PolicySpec  # noqa: E402
+from agile_engine.product import Phase, PolicySpec  # noqa: E402
+from agile_engine.optimal_behaviour_lsmc import (  # noqa: E402
+    FEATURE_NAMES as POLICYHOLDER_FEATURE_NAMES,
+    OptimalBehaviourLSMCSettings,
+    OptimalSurrenderPolicy,
+    build_surrender_regression_features,
+    build_surrender_regression_features_from_arrays,
+    fit_optimal_surrender_policy,
+    fit_surrender_continuation_regression,
+    fit_surrender_continuation_policy,
+    no_voluntary_action_behaviour,
+)
 
 
 Array = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 STEPS_PER_YEAR = 12
 
-ACTION_CAPS = np.concatenate((np.array([0.002]), np.arange(0.01, 0.201, 0.01)))
+ACTION_CAPS = np.concatenate((np.array([0.0025]), np.arange(0.01, 0.201, 0.01)))
 OTHER_INSURER_FUNDED_BENEFIT_KEYS: tuple[str, ...] = ()
+CONTROL_STATE_FEATURE_NAMES = (
+    "zero_rate_5y",
+    "heston_variance_global",
+    "log_discount_to_time0",
+    "trailing_reference_fund_return",
+    "log_reference_fund_level",
+    "log_credited_index_proxy",
+    "previous_cap",
+    "average_historical_cap",
+    "average_excess_return_above_cap_proxy",
+    "trailing_performance_shortfall",
+)
+PORTFOLIO_CONTROL_STATE_FEATURE_NAMES = (
+    "short_rate",
+    "inforce_exposure",
+    "growth_exposure",
+    "income_exposure",
+    "account_value_per_initial_premium",
+    "surrender_value_per_initial_premium",
+    "locked_income_per_initial_premium",
+    "guarantee_pv_per_initial_premium",
+    "guarantee_moneyness_exposure",
+    "exhausted_income_exposure",
+)
+INSURER_COMPONENT_NAMES = (
+    "fees_product",
+    "fees_lip",
+    "crediting_margin",
+    "mva_retained",
+    "aps_retained",
+    "guarantee_claims",
+    "other_insurer_funded_benefits",
+    "expenses",
+    "hedge_costs",
+)
+NONNEGATIVE_INSURER_COMPONENT_INDICES = (1, 2, 4, 5, 6, 7, 8, 9)
+FOLLOWER_PRE_CAP_FEATURE_NAMES = (
+    *POLICYHOLDER_FEATURE_NAMES,
+    "previous_cap",
+)
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "crediting_cap_lsmc"
 )
@@ -200,6 +255,41 @@ class ProjectionBranch:
 
 
 @dataclass
+class SignatureDecisionYearPaths:
+    """Projector primitives for one follower decision and one signature.
+
+    Customer quantities are stored per surviving contract.  Insurer component
+    deltas and next-state exposure contributions already include the branch
+    probability and ``contract_weight`` exactly once.  Compact ``float32``
+    snapshots keep the full lifetime training problem memory-bounded; every
+    regression promotes its working slice back to ``float64``.
+    """
+
+    policy_year: int
+    decision_step: int
+    pre_cap_core: Array
+    after_cap_core: Array
+    phase: NDArray[np.int8]
+    just_elected: NDArray[np.bool_]
+    full_withdrawal_eligible: NDArray[np.bool_]
+    decision_discount_inforce: Array
+    next_decision_discount_inforce: Array
+    continue_policyholder_interval_pv: Array
+    full_withdrawal_value: Array
+    insurer_full_minus_continue_components: Array
+    next_portfolio_exposure_contribution: Array
+
+
+@dataclass
+class SignatureControlPaths:
+    """All fitted-control primitives for one economic PolicySpec signature."""
+
+    signature: tuple[object, ...]
+    policy: PolicySpec
+    decision_years: dict[int, SignatureDecisionYearPaths]
+
+
+@dataclass
 class PortfolioPathData:
     """Discounted insurer-margin paths used by the backward induction."""
 
@@ -212,10 +302,24 @@ class PortfolioPathData:
     aps_retained: Array
     expenses: Array
     hedge_costs: Array
+    income_paid: Array
+    death_benefits: Array
+    surrender_benefits: Array
+    partial_withdrawals: Array
     terminal_closeout: Array
+    lapse_events: Array
+    inforce_exposure: Array | None
     raw_states: Array | None
     state_feature_names: tuple[str, ...]
+    pre_action_states: Array | None
+    pre_action_state_feature_names: tuple[str, ...]
     representative_initial_premium: float
+    signature_control_paths: dict[
+        tuple[object, ...], SignatureControlPaths
+    ] = field(default_factory=dict)
+    policyholder_benefits_by_signature: dict[
+        tuple[object, ...], Array
+    ] = field(default_factory=dict)
 
     @property
     def new_business_csm_proxy(self) -> Array:
@@ -231,6 +335,60 @@ class PortfolioPathData:
             - self.hedge_costs
         )
 
+    @property
+    def policyholder_benefits(self) -> Array:
+        """All customer cashflows, excluding the sunk issue premium."""
+        return (
+            self.income_paid
+            + self.death_benefits
+            + self.surrender_benefits
+            + self.partial_withdrawals
+            + self.terminal_closeout
+        )
+
+
+class _CapDecisionStateCollector:
+    """Collect immutable pre-cap contexts from one projection branch."""
+
+    def __init__(self) -> None:
+        self.contexts: dict[int, object] = {}
+
+    def observe_cap_decision(self, *, context: object) -> None:
+        policy_year = int(getattr(context, "policy_year"))
+        if policy_year in self.contexts:
+            raise RuntimeError(
+                f"Duplicate cap-decision context for policy year {policy_year}."
+            )
+        self.contexts[policy_year] = context
+
+
+class _StackelbergPrimitiveCollector:
+    """Record safe customer states and separate insurer action primitives."""
+
+    anniversary_only = True
+
+    def __init__(self) -> None:
+        self.surrender_contexts: dict[int, object] = {}
+        self.action_value_contexts: dict[int, object] = {}
+
+    def surrender_mask(self, *, context: object) -> NDArray[np.bool_]:
+        year = int(getattr(context, "policy_year"))
+        if year in self.surrender_contexts:
+            raise RuntimeError(
+                f"Duplicate surrender context for policy year {year}."
+            )
+        self.surrender_contexts[year] = context
+        return np.zeros(int(getattr(context, "n_paths")), dtype=bool)
+
+    def observe_surrender_decision(self, *, context: object) -> None:
+        decision = getattr(context, "decision_context")
+        year = int(getattr(decision, "policy_year"))
+        if year in self.action_value_contexts:
+            raise RuntimeError(
+                f"Duplicate surrender action-value context for year {year}."
+            )
+        self.action_value_contexts[year] = context
+
 
 @dataclass(frozen=True)
 class RegressionPolicyYear:
@@ -239,6 +397,10 @@ class RegressionPolicyYear:
     raw_scale: Array
     coefficients: Array
     action_caps: Array
+    action_value_standard_error: Array
+    value_lower_bounds: Array | None = None
+    value_upper_bounds: Array | None = None
+    numerically_stable: bool = True
 
 
 @dataclass
@@ -262,6 +424,318 @@ class BackwardResult:
     reconciliation_gap: float
     economically_active_policy_years: tuple[int, ...]
     inactive_market_tail_year_count: int
+    numerically_stable: bool = True
+    numerical_fallback_reasons: tuple[str, ...] = ()
+    follower_regression_rows: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    follower_fit_set: object | None = None
+
+
+def _policy_signature(policy: PolicySpec) -> tuple[object, ...]:
+    """Canonical cache key for one separately optimised customer contract.
+
+    Joint-Life and Single-Life fallback contracts deliberately produce
+    different keys.  Product fields that change net premium, APS eligibility
+    or the customer cashflow state are included so a fitted best response is
+    never silently reused for an economically different contract.
+    """
+    return (
+        float(policy.age),
+        policy.sex.value,
+        float(policy.initial_investment),
+        float(policy.upfront_adviser_fee_pct),
+        float(policy.bonus_interest_pct),
+        int(round(policy.income_start_year)),
+        policy.income_type.value,
+        bool(policy.spouse),
+        None if policy.spouse_age is None else float(policy.spouse_age),
+        None if policy.spouse_sex is None else policy.spouse_sex.value,
+        policy.spouse_death_election.value,
+        bool(policy.age_pension_plus),
+        policy.funding_source.value,
+        policy.condition_of_release_year,
+        policy.aps_life_expectancy,
+        float(policy.commencement_year),
+    )
+
+
+_FOLLOWER_CORE_NAMES = (
+    "account_value",
+    "surrender_value",
+    "locked_annual_income",
+    "guarantee_pv",
+    "guarantee_log_moneyness",
+    "short_rate",
+    "zero_rate_5y",
+    "heston_variance",
+    "cap_history_value",
+    "previous_reference_return",
+    "previous_credited_return",
+    "performance_gap",
+    "inforce_weight",
+)
+
+
+def _compact_follower_core(
+    context: object,
+    *,
+    premium: float,
+    cap_attribute: str,
+) -> Array:
+    """Copy the minimum customer state needed to rebuild the public basis."""
+    if not np.isfinite(premium) or premium <= 0.0:
+        raise ValueError("Follower feature premium must be positive and finite.")
+    core = np.column_stack((
+        np.maximum(np.asarray(getattr(context, "account_value")), 0.0) / premium,
+        np.maximum(np.asarray(getattr(context, "surrender_value")), 0.0) / premium,
+        np.maximum(
+            np.asarray(getattr(context, "locked_annual_income")), 0.0
+        ) / premium,
+        np.maximum(np.asarray(getattr(context, "guarantee_pv")), 0.0) / premium,
+        np.asarray(getattr(context, "guarantee_log_moneyness"), dtype=float),
+        np.asarray(getattr(context, "short_rate"), dtype=float),
+        np.asarray(getattr(context, "zero_rate_5y"), dtype=float),
+        np.maximum(
+            np.asarray(getattr(context, "heston_variance"), dtype=float), 0.0
+        ),
+        np.asarray(getattr(context, cap_attribute), dtype=float),
+        np.asarray(getattr(context, "previous_reference_return"), dtype=float),
+        np.asarray(getattr(context, "previous_credited_return"), dtype=float),
+        np.maximum(
+            np.asarray(getattr(context, "performance_gap"), dtype=float), 0.0
+        ),
+        np.maximum(
+            np.asarray(getattr(context, "inforce_weight"), dtype=float), 0.0
+        ),
+    ))
+    if core.shape[1] != len(_FOLLOWER_CORE_NAMES):
+        raise RuntimeError("Compact follower state layout is inconsistent.")
+    if not np.all(np.isfinite(core)):
+        raise ValueError("Compact follower state contains non-finite values.")
+    return np.asarray(core, dtype=np.float32)
+
+
+def _follower_features_from_core(
+    core: Array,
+    *,
+    announced_cap: Array | float,
+    duration_years: float,
+    include_previous_cap: bool,
+) -> Array:
+    """Rebuild the adapted customer basis for a candidate announced cap."""
+    values = np.asarray(core, dtype=float)
+    if values.ndim != 2 or values.shape[1] != len(_FOLLOWER_CORE_NAMES):
+        raise ValueError("Follower core matrix has an invalid shape.")
+    cap = np.asarray(announced_cap, dtype=float)
+    if cap.ndim == 0:
+        cap = np.full(values.shape[0], float(cap))
+    if cap.shape != (values.shape[0],):
+        raise ValueError("Candidate cap must have one value per follower path.")
+    previous_cap = values[:, 8]
+    raw = build_surrender_regression_features_from_arrays(
+        account_value=values[:, 0],
+        surrender_value=values[:, 1],
+        locked_annual_income=values[:, 2],
+        guarantee_pv=values[:, 3],
+        guarantee_log_moneyness=values[:, 4],
+        short_rate=values[:, 5],
+        zero_rate_5y=values[:, 6],
+        heston_variance=values[:, 7],
+        duration_years=float(duration_years),
+        announced_cap=cap,
+        previous_reference_return=values[:, 9],
+        previous_credited_return=values[:, 10],
+        performance_gap=values[:, 11],
+        # Compact monetary values were already divided by premium.
+        premium=1.0,
+    )
+    if include_previous_cap:
+        raw = np.column_stack((raw, previous_cap))
+        expected = len(FOLLOWER_PRE_CAP_FEATURE_NAMES)
+    else:
+        expected = len(POLICYHOLDER_FEATURE_NAMES)
+    if raw.shape[1] != expected or not np.all(np.isfinite(raw)):
+        raise RuntimeError("Follower regression feature construction failed.")
+    return raw
+
+
+@dataclass
+class PolicyholderFitSet:
+    """Cap-aware follower policies fitted separately by PolicySpec signature."""
+
+    fits: dict[tuple[object, ...], object]
+    scenario_fingerprint: str
+    cap_schedule_fingerprint: str
+    validation_fallback_signatures: set[tuple[object, ...]] = field(
+        default_factory=set
+    )
+
+    def factory(self, policy: PolicySpec) -> object:
+        key = _policy_signature(policy)
+        if key not in self.fits:
+            raise KeyError("No cap-consistent LSMC fit exists for PolicySpec.")
+        policy = self.fits[key].policy
+        if key in self.validation_fallback_signatures:
+            return type(policy)(regressions={}, settings=policy.settings)
+        return policy
+
+    def training_factory(self, policy: PolicySpec) -> object:
+        """Return the complete-path out-of-fold policy for leader targets."""
+        key = _policy_signature(policy)
+        if key not in self.fits:
+            raise KeyError("No cap-consistent LSMC fit exists for PolicySpec.")
+        return self.fits[key].cross_fitted_training_policy
+
+    @property
+    def fallback_count(self) -> int:
+        training = {
+            signature
+            for signature, fit in self.fits.items()
+            if bool(fit.training_fallback_used)
+            or any(
+                not bool(diagnostic.regression_accepted_for_exercise)
+                for diagnostic in fit.diagnostics
+            )
+        }
+        return len(training | self.validation_fallback_signatures)
+
+    @property
+    def fallback_step_count(self) -> int:
+        count = 0
+        for signature, fit in self.fits.items():
+            rejected = {
+                int(diagnostic.decision_step)
+                for diagnostic in fit.diagnostics
+                if not bool(diagnostic.regression_accepted_for_exercise)
+            }
+            if signature in self.validation_fallback_signatures:
+                rejected.update(int(step) for step in fit.policy.regressions)
+                rejected.update(
+                    int(diagnostic.decision_step)
+                    for diagnostic in fit.diagnostics
+                )
+            count += len(rejected)
+        return count
+
+    @property
+    def signature_count(self) -> int:
+        return len(self.fits)
+
+
+@dataclass(frozen=True)
+class _FollowerDeploymentRegression:
+    """One frozen customer-continuation regression for forward rollout."""
+
+    premium: float
+    active_feature_indices: IntArray
+    centre: Array
+    scale: Array
+    coefficients: Array
+    condition_number: float
+    matrix_rank: int
+    oof_rmse_aud: float
+    stable: bool
+
+    def predict(self, context: object) -> Array:
+        raw = build_surrender_regression_features(context, self.premium)
+        active = self.active_feature_indices
+        design = np.column_stack((
+            np.ones(raw.shape[0]),
+            (raw[:, active] - self.centre) / self.scale,
+        ))
+        prediction = design @ self.coefficients * self.premium
+        return np.maximum(np.asarray(prediction, dtype=float), 0.0)
+
+
+@dataclass
+class CoupledOptimalSurrenderPolicy:
+    """Frozen follower best response from the coupled two-value recursion."""
+
+    regressions: Mapping[int, _FollowerDeploymentRegression]
+    settings: OptimalBehaviourLSMCSettings
+    evaluation_statistics: dict[int, dict[str, int]] = field(
+        default_factory=dict
+    )
+    anniversary_only: bool = field(default=True, init=False, repr=False)
+
+    def surrender_mask(self, *, context: object) -> NDArray[np.bool_]:
+        step = int(getattr(context, "step"))
+        n_paths = int(getattr(context, "n_paths"))
+        regression = self.regressions.get(step)
+        if (
+            regression is None
+            or not bool(getattr(context, "is_anniversary"))
+            or not regression.stable
+        ):
+            return np.zeros(n_paths, dtype=bool)
+        eligible = (
+            np.asarray(getattr(context, "full_withdrawal_eligible"), dtype=bool)
+            & (np.asarray(getattr(context, "phase")) == Phase.INCOME.value)
+            & (
+                np.asarray(getattr(context, "inforce_weight"), dtype=float)
+                > self.settings.minimum_inforce_weight
+            )
+        )
+        continuation = regression.predict(context)
+        buffer = (
+            self.settings.exercise_tolerance_aud
+            + self.settings.exercise_buffer_rmse_multiplier
+            * regression.oof_rmse_aud
+        )
+        exercise = eligible & (
+            np.asarray(getattr(context, "surrender_value"), dtype=float)
+            > continuation + buffer
+        )
+        stats = self.evaluation_statistics.setdefault(
+            step, {"eligible_path_count": 0, "exercise_path_count": 0}
+        )
+        stats["eligible_path_count"] += int(np.count_nonzero(eligible))
+        stats["exercise_path_count"] += int(np.count_nonzero(exercise))
+        return exercise
+
+
+@dataclass
+class CoupledPolicyholderFitSet:
+    """Signature-separated follower policies produced inside leader recursion."""
+
+    policies: dict[tuple[object, ...], object]
+    scenario_fingerprint: str
+    cap_schedule_fingerprint: str
+    fallback_signatures: set[tuple[object, ...]] = field(default_factory=set)
+    fallback_steps_by_signature: dict[
+        tuple[object, ...], tuple[int, ...]
+    ] = field(default_factory=dict)
+
+    def factory(self, policy: PolicySpec) -> object:
+        key = _policy_signature(policy)
+        if key not in self.policies:
+            raise KeyError("No coupled follower policy exists for PolicySpec.")
+        if key in self.fallback_signatures:
+            return CoupledOptimalSurrenderPolicy(
+                regressions={},
+                settings=getattr(self.policies[key], "settings"),
+            )
+        return self.policies[key]
+
+    @property
+    def fallback_count(self) -> int:
+        return len(
+            self.fallback_signatures
+            | {
+                signature
+                for signature, steps in self.fallback_steps_by_signature.items()
+                if steps
+            }
+        )
+
+    @property
+    def fallback_step_count(self) -> int:
+        return sum(len(steps) for steps in self.fallback_steps_by_signature.values())
+
+    @property
+    def signature_count(self) -> int:
+        return len(self.policies)
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
@@ -297,7 +771,23 @@ def _standard_error(values: Array) -> float:
     return float(np.std(values, ddof=1) / np.sqrt(values.size))
 
 
-def parse_args() -> argparse.Namespace:
+def _lower_cap_argmax(values: Array, axis: int = -1) -> IntArray:
+    """Return the smallest cap index within a numerical maximum tie.
+
+    The action grid is strictly increasing.  Treating values within a small
+    relative floating-point tolerance as tied makes the contractual lower-cap
+    tie-break explicit instead of depending on incidental BLAS rounding.
+    """
+    array = np.asarray(values, dtype=float)
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError("Cap action values must be finite and non-empty.")
+    maxima = np.max(array, axis=axis, keepdims=True)
+    tolerance = 1.0e-10 * np.maximum(1.0, np.abs(maxima))
+    tied = array >= maxima - tolerance
+    return np.asarray(np.argmax(tied, axis=axis), dtype=np.int64)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-points", type=Path,
@@ -317,6 +807,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--behaviour-assumption-set", default=None)
     parser.add_argument(
+        "--policyholder-behaviour",
+        choices=("lsmc", "dynamic", "continue"),
+        default="lsmc",
+        help=(
+            "policyholder response used by the cap control: coupled LSMC "
+            "best response (default), the existing statistical dynamic "
+            "Behaviour model, or the admissible always-Continue policy"
+        ),
+    )
+    parser.add_argument(
+        "--behaviour-value-basis",
+        choices=("low", "base", "high"),
+        default="base",
+        help=(
+            "dynamic Behaviour proxy sensitivity basis; base uses the central "
+            "performance-shortfall response"
+        ),
+    )
+    parser.add_argument(
+        "--performance-gap-behaviour",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "include the trailing reference-fund versus credited-return gap in "
+            "dynamic lapse hazards (default: enabled)"
+        ),
+    )
+    parser.add_argument(
         "--zero-curve", type=Path,
         default=DEFAULT_AUSTRALIAN_ZERO_CURVE_PATH,
     )
@@ -330,7 +848,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--benchmark-paths", type=int, default=500,
-        help="common-random-number paths per fixed-cap benchmark",
+        help=(
+            "paths in each independent fixed-cap selection and final evaluation "
+            "sample"
+        ),
     )
     parser.add_argument(
         "--benchmark-batch-size", type=int, default=4,
@@ -340,12 +861,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument("--cross-fit-folds", type=int, default=5)
     parser.add_argument(
+        "--policyholder-lsmc-folds",
+        type=int,
+        default=5,
+        help="complete-path cross-fitting folds for the follower value function",
+    )
+    parser.add_argument(
+        "--policyholder-lsmc-ridge",
+        type=float,
+        default=1.0e-6,
+    )
+    parser.add_argument(
+        "--policyholder-exercise-buffer-rmse-multiplier",
+        type=float,
+        default=0.25,
+        help="conservative follower Full-Withdrawal screen",
+    )
+    parser.add_argument(
         "--ridge", type=float, default=1.0e-4,
         help="dimensionless ridge multiplier for the regression normal matrix",
     )
     parser.add_argument(
-        "--persistent-exploration-fraction", type=float, default=0.0,
-        help="fraction of paths assigned a constant exploratory cap history",
+        "--persistent-exploration-fraction", type=float, default=0.5,
+        help=(
+            "fraction of paths assigned a constant exploratory cap history "
+            "to cover low/high endogenous credited-index states"
+        ),
+    )
+    parser.add_argument(
+        "--hedge-gain",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "include the engine's cap-setting/crediting margin in CSM "
+            "(default: enabled; disable with --no-hedge-gain)"
+        ),
     )
     parser.add_argument(
         "--portfolio-contract-count", type=float, default=None,
@@ -371,7 +921,7 @@ def parse_args() -> argparse.Namespace:
         "--output", type=Path, default=DEFAULT_OUTPUT_DIRECTORY,
         help="output directory",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.n_paths <= 0 or args.benchmark_paths <= 0:
         parser.error("--n-paths and --benchmark-paths must be positive")
@@ -385,18 +935,43 @@ def parse_args() -> argparse.Namespace:
         parser.error("seed must be non-negative and Heston substeps positive")
     if args.cross_fit_folds < 3:
         parser.error("--cross-fit-folds must be at least three")
-    if not np.isfinite(args.ridge) or args.ridge < 0.0:
-        parser.error("--ridge must be finite and non-negative")
+    if args.policyholder_lsmc_folds < 2:
+        parser.error("--policyholder-lsmc-folds must be at least two")
+    if not np.isfinite(args.ridge) or args.ridge <= 0.0:
+        parser.error("--ridge must be finite and strictly positive")
+    if (
+        not np.isfinite(args.policyholder_lsmc_ridge)
+        or args.policyholder_lsmc_ridge < 0.0
+    ):
+        parser.error("--policyholder-lsmc-ridge must be finite and non-negative")
+    if (
+        not np.isfinite(args.policyholder_exercise_buffer_rmse_multiplier)
+        or args.policyholder_exercise_buffer_rmse_multiplier < 0.0
+    ):
+        parser.error(
+            "--policyholder-exercise-buffer-rmse-multiplier must be "
+            "finite and non-negative"
+        )
     if not 0.0 <= args.persistent_exploration_fraction < 1.0:
         parser.error("--persistent-exploration-fraction must be in [0, 1)")
     if (args.portfolio_contract_count is not None
             and (not np.isfinite(args.portfolio_contract_count)
                  or args.portfolio_contract_count <= 0.0)):
         parser.error("--portfolio-contract-count must be positive and finite")
-    min_paths = len(ACTION_CAPS) * args.cross_fit_folds * 20
+    _, _, insurer_basis_names = _basis_specification(
+        (*CONTROL_STATE_FEATURE_NAMES, *PORTFOLIO_CONTROL_STATE_FEATURE_NAMES)
+    )
+    minimum_per_action_fit = max(30, 3 * len(insurer_basis_names))
+    minimum_per_action_total = math.ceil(
+        minimum_per_action_fit
+        * args.cross_fit_folds
+        / (args.cross_fit_folds - 2)
+        * 1.10
+    )
+    min_paths = len(ACTION_CAPS) * minimum_per_action_total
     if args.n_paths < min_paths:
         parser.error(
-            f"--n-paths must be at least {min_paths} for action/fold coverage"
+            f"--n-paths must be at least {min_paths} for stable action/fold coverage"
         )
     return args
 
@@ -507,23 +1082,54 @@ def _vector_crediting_package_value(
     return float(result) if scalar else np.asarray(result, dtype=float)
 
 
+def _vector_intra_year_value_factor(
+    x0: float | Array,
+    protection: Protection,
+    cap: float | Array,
+    tau: float,
+    rate: float | Array,
+    dividend_yield: float,
+    sigma: float | Array,
+    buffer: float = 0.10,
+) -> float | Array:
+    """Array-cap equivalent of the engine's DVA replication factor."""
+    zcb = np.exp(-np.asarray(rate, dtype=float) * max(float(tau), 0.0))
+    package = _vector_crediting_package_value(
+        x0,
+        protection,
+        cap,
+        tau,
+        rate,
+        dividend_yield,
+        sigma,
+        buffer,
+    )
+    result = zcb + np.asarray(package)
+    scalar = all(np.ndim(value) == 0 for value in (x0, cap, rate, sigma))
+    return float(result) if scalar else np.asarray(result, dtype=float)
+
+
 @contextmanager
 def _pathwise_cap_adapter() -> Iterator[None]:
     """Temporarily vectorise projector calls reached by pathwise cap controls.
 
-    The adapter is process-local and restored in ``finally``. DVA remains
-    disabled, while the package pricer is vectorised so the CSM proxy can
-    include cap-dependent Crediting Margin and hedge-execution cost.
+    The adapter is process-local and restored in ``finally``.  It vectorises
+    both the package pricer and the intra-year DVA factor so that the direct
+    monthly projection retains DVA and can include cap-dependent Crediting
+    Margin and hedge-execution cost.
     """
     original_return = projection_module.credited_return
     original_package = projection_module.crediting_package_value
+    original_intra_year = projection_module.intra_year_value_factor
     projection_module.credited_return = _vector_credited_return
     projection_module.crediting_package_value = _vector_crediting_package_value
+    projection_module.intra_year_value_factor = _vector_intra_year_value_factor
     try:
         yield
     finally:
         projection_module.credited_return = original_return
         projection_module.crediting_package_value = original_package
+        projection_module.intra_year_value_factor = original_intra_year
 
 
 def _controlled_product(
@@ -539,6 +1145,88 @@ def _controlled_product(
         rebalance_frequency_months=base.rebalance_frequency_months,
     )
     return replace(product, reference_fund=reference)  # type: ignore[arg-type]
+
+
+def _array_fingerprint(values: Array) -> str:
+    """Stable provenance fingerprint for one complete path/control sample."""
+    array = np.ascontiguousarray(np.asarray(values, dtype=np.float64))
+    digest = hashlib.sha256()
+    digest.update(str(array.shape).encode("ascii"))
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(array.view(np.uint8))
+    return digest.hexdigest()
+
+
+def _fit_cap_aware_policyholder_policies(
+    *,
+    cap_matrix: Array,
+    scenarios: ScenarioSet,
+    product: IndexLinkedLifetimeIncomeProduct,
+    model_points: PolicyholderModelPointSet,
+    mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
+    projection_config: ProjectionConfig,
+    settings: OptimalBehaviourLSMCSettings,
+    progress_label: str,
+) -> PolicyholderFitSet:
+    """Fit one follower policy per economic PolicySpec signature.
+
+    The complete pathwise cap schedule is part of the training sample.  Caps
+    enter the observable follower state in ``optimal_behaviour_lsmc``; a fit
+    is therefore never trained under one reference cap and reused as if it
+    were cap invariant.  Joint and Single-Life fallback branches are fitted
+    before any spouse-survival or portfolio weighting is applied.
+    """
+    caps = np.asarray(cap_matrix, dtype=float)
+    if caps.ndim != 2 or caps.shape[0] != scenarios.n_paths:
+        raise ValueError("Follower cap matrix must match the training paths.")
+    if np.any(np.isnan(caps)) or np.any(caps < 0.0):
+        raise ValueError("Follower cap schedules must be non-negative and not NaN.")
+    controlled = _controlled_product(product, caps)
+    no_actions = no_voluntary_action_behaviour()
+    policies: dict[tuple[object, ...], PolicySpec] = {}
+    for point in model_points.model_points:
+        for branch in _projection_branches(
+            point, product, mortality, no_actions
+        ):
+            policies.setdefault(_policy_signature(branch.policy), branch.policy)
+    fits: dict[tuple[object, ...], object] = {}
+    LOGGER.info(
+        "%s | %d separate PolicySpec signatures | paths=%d",
+        progress_label,
+        len(policies),
+        scenarios.n_paths,
+    )
+    follower_projection = replace(
+        projection_config,
+        record_paths=True,
+        heston_cos=False,
+    )
+    with _pathwise_cap_adapter():
+        for number, (signature, policy) in enumerate(policies.items(), start=1):
+            LOGGER.info(
+                "%s | follower fit %d/%d | age=%.0f | premium=%.0f | spouse=%s",
+                progress_label,
+                number,
+                len(policies),
+                policy.age,
+                policy.initial_investment,
+                policy.spouse,
+            )
+            fits[signature] = fit_optimal_surrender_policy(
+                controlled,
+                policy,
+                scenarios,
+                mortality,
+                expenses=expenses,
+                projection_config=follower_projection,
+                settings=settings,
+            )
+    return PolicyholderFitSet(
+        fits=fits,
+        scenario_fingerprint=scenarios.content_fingerprint,
+        cap_schedule_fingerprint=_array_fingerprint(caps),
+    )
 
 
 def _youngest_covered_age(model_points: PolicyholderModelPointSet) -> float:
@@ -866,7 +1554,7 @@ def _annual_discounted_paths(
         lo = year * STEPS_PER_YEAR + 1
         hi = min((year + 1) * STEPS_PER_YEAR, last_step)
         if lo <= hi:
-            out[:, year] = np.sum(
+            out[:, year] += np.sum(
                 cashflow[:, lo:hi + 1] * discount[:, lo:hi + 1], axis=1
             )
     return out
@@ -898,6 +1586,49 @@ def _annual_start_discounted_paths(
     return out
 
 
+def _annual_discounted_control_paths(
+    cashflow: Array,
+    post_cap_cashflow: Array,
+    discount: Array,
+    n_years: int,
+) -> Array:
+    """Assign split Anniversary cashflows to the economically correct cap.
+
+    The canonical ledger timestamps all Anniversary events in one column.
+    Old-cap crediting, fee posting, mortality and Election belong to the year
+    ending there; hedge restart, customer actions and later same-timestamp
+    events belong to the cap announced at that boundary.  The projector's
+    auxiliary ``post_cap_cashflow`` ledger identifies exactly the latter
+    portion, so no contractual event order is changed or inferred here.
+    """
+    values = np.asarray(cashflow, dtype=float)
+    post = np.asarray(post_cap_cashflow, dtype=float)
+    disc = np.asarray(discount, dtype=float)
+    if values.shape != post.shape or values.shape != disc.shape:
+        raise ValueError("Control-year cashflow ledgers must have equal shapes.")
+    out = _annual_discounted_paths(
+        values,
+        disc,
+        n_years,
+        include_time_zero_in_first_year=True,
+    )
+    # The final grid anniversary has no subsequent control year.  Internal
+    # boundaries alone are shifted from the old-cap reward to the new one.
+    for new_year in range(1, n_years):
+        step = new_year * STEPS_PER_YEAR
+        if step >= values.shape[1]:
+            break
+        shifted = post[:, step] * disc[:, step]
+        out[:, new_year - 1] -= shifted
+        out[:, new_year] += shifted
+    total = np.sum(values * disc, axis=1)
+    gap = total - np.sum(out, axis=1)
+    tolerance = 1.0e-10 * max(1.0, float(np.max(np.abs(total))))
+    if np.any(np.abs(gap) > tolerance):
+        raise RuntimeError("Control-year cashflow allocation failed to reconcile.")
+    return out
+
+
 def _aggregate_portfolio_paths(
     *,
     scenarios: ScenarioSet,
@@ -911,6 +1642,9 @@ def _aggregate_portfolio_paths(
     collect_states: bool,
     progress_label: str,
     model_point_log_interval: int,
+    surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
+    collect_stackelberg_primitives: bool = False,
+    collect_policyholder_by_signature: bool = False,
 ) -> PortfolioPathData:
     """Project all model points under one pathwise cap schedule.
 
@@ -938,7 +1672,23 @@ def _aggregate_portfolio_paths(
     aps_retained = np.zeros_like(guarantee_claims)
     projected_expenses = np.zeros_like(guarantee_claims)
     hedge_costs = np.zeros_like(guarantee_claims)
+    income_paid = np.zeros_like(guarantee_claims)
+    death_benefits = np.zeros_like(guarantee_claims)
+    surrender_benefits = np.zeros_like(guarantee_claims)
+    partial_withdrawals = np.zeros_like(guarantee_claims)
     terminal_closeout = np.zeros_like(guarantee_claims)
+    lapse_events = np.zeros_like(guarantee_claims)
+    signature_control_paths: dict[
+        tuple[object, ...], SignatureControlPaths
+    ] = {}
+    policyholder_benefits_by_signature: dict[
+        tuple[object, ...], Array
+    ] = {}
+    if collect_stackelberg_primitives and surrender_policy_factory is not None:
+        raise ValueError(
+            "Stackelberg primitive collection requires the no-action recorder; "
+            "an external surrender policy cannot be supplied simultaneously."
+        )
 
     representative_premium = float(sum(
         point.contract_weight * point.policy.initial_investment
@@ -954,6 +1704,9 @@ def _aggregate_portfolio_paths(
     cohorts: tuple[tuple[float, str, bool], ...] = ()
     effective_income_starts: tuple[int, ...] = ()
     raw_states: Array | None = None
+    pre_action_feature_names: tuple[str, ...] = ()
+    pre_action_feature_index: dict[str, int] = {}
+    pre_action_states: Array | None = None
     if collect_states:
         (
             feature_names,
@@ -965,6 +1718,19 @@ def _aggregate_portfolio_paths(
         ) = _state_layout(model_points, product)
         raw_states = np.zeros(
             (scenarios.n_paths, n_years + 1, len(feature_names)), dtype=float
+        )
+        pre_action_feature_names = PORTFOLIO_CONTROL_STATE_FEATURE_NAMES
+        pre_action_feature_index = {
+            name: position
+            for position, name in enumerate(pre_action_feature_names)
+        }
+        pre_action_states = np.zeros(
+            (
+                scenarios.n_paths,
+                n_years + 1,
+                len(pre_action_feature_names),
+            ),
+            dtype=float,
         )
         fund = scenarios.monthly_rebalanced_reference_fund_index(
             equity_index=product.reference_fund.equity_index,
@@ -980,6 +1746,9 @@ def _aggregate_portfolio_paths(
                 0.0,
             )
             raw_states[:, year, feature_index["short_rate"]] = (
+                scenarios.short_rate[:, step]
+            )
+            pre_action_states[:, year, pre_action_feature_index["short_rate"]] = (
                 scenarios.short_rate[:, step]
             )
             raw_states[:, year, feature_index["zero_rate_5y"]] = (
@@ -1024,6 +1793,15 @@ def _aggregate_portfolio_paths(
                     branch.behaviour.regime,
                     point.contract_weight * branch_probability,
                 )
+                cap_state_collector = (
+                    _CapDecisionStateCollector()
+                    if collect_states or collect_stackelberg_primitives
+                    else None
+                )
+                primitive_collector = (
+                    _StackelbergPrimitiveCollector()
+                    if collect_stackelberg_primitives else None
+                )
                 result = projection_module.project(
                     controlled,
                     policy,
@@ -1032,46 +1810,406 @@ def _aggregate_portfolio_paths(
                     mortality,
                     expenses=expenses,
                     config=config,
+                    surrender_policy=(
+                        primitive_collector
+                        if primitive_collector is not None
+                        else None
+                        if surrender_policy_factory is None
+                        else surrender_policy_factory(policy)
+                    ),
+                    cap_decision_observer=cap_state_collector,
+                    surrender_decision_observer=primitive_collector,
                 )
                 branch_weight = float(point.contract_weight * branch_probability)
                 n_columns = len(result.times)
                 discount = scenarios.discount[:, :n_columns]
-                guarantee_claims += branch_weight * _annual_discounted_paths(
-                    result.cashflows["guarantee_claims"], discount, n_years
+                if result.post_cap_cashflows is None \
+                        or result.post_cap_lapse_events is None:
+                    raise RuntimeError(
+                        "Projection result lacks the Anniversary cap boundary ledger."
+                    )
+                if result.post_surrender_cashflows is None:
+                    raise RuntimeError(
+                        "Projection result lacks the customer action-boundary ledger."
+                    )
+
+                def annual_control_cashflow(key: str) -> Array:
+                    return _annual_discounted_control_paths(
+                        result.cashflows[key],
+                        result.post_cap_cashflows[key],
+                        discount,
+                        n_years,
+                    )
+
+                guarantee_claims += (
+                    branch_weight * annual_control_cashflow("guarantee_claims")
                 )
                 for key in OTHER_INSURER_FUNDED_BENEFIT_KEYS:
                     other_insurer_funded_benefits += (
-                        branch_weight * _annual_discounted_paths(
-                            result.cashflows[key], discount, n_years
+                        branch_weight * annual_control_cashflow(key)
+                    )
+                fees_product += branch_weight * annual_control_cashflow(
+                    "fees_product"
+                )
+                fees_lip += branch_weight * annual_control_cashflow(
+                    "fees_lip"
+                )
+                annual_crediting_margin = annual_control_cashflow(
+                    "crediting_margin"
+                )
+                crediting_margin += branch_weight * annual_crediting_margin
+                mva_retained += branch_weight * annual_control_cashflow(
+                    "mva_retained"
+                )
+                aps_retained += branch_weight * annual_control_cashflow(
+                    "aps_retained"
+                )
+                projected_expenses += branch_weight * annual_control_cashflow(
+                    "expenses"
+                )
+                hedge_costs += branch_weight * annual_control_cashflow(
+                    "hedge_costs"
+                )
+                income_paid += branch_weight * annual_control_cashflow(
+                    "income_paid"
+                )
+                death_benefits += branch_weight * annual_control_cashflow(
+                    "death_benefits"
+                )
+                surrender_benefits += branch_weight * annual_control_cashflow(
+                    "surrender_benefits"
+                )
+                partial_withdrawals += branch_weight * annual_control_cashflow(
+                    "partial_withdrawals"
+                )
+                terminal_closeout += branch_weight * annual_control_cashflow(
+                    "terminal_closeout"
+                )
+                lapse_events += branch_weight * _annual_discounted_control_paths(
+                    result.lapse_events,
+                    result.post_cap_lapse_events,
+                    np.ones_like(discount),
+                    n_years,
+                )
+
+                signature = _policy_signature(policy)
+                if collect_policyholder_by_signature:
+                    signature_benefits = sum(
+                        annual_control_cashflow(key)
+                        for key in (
+                            "income_paid",
+                            "death_benefits",
+                            "surrender_benefits",
+                            "partial_withdrawals",
+                            "terminal_closeout",
                         )
                     )
-                fees_product += branch_weight * _annual_discounted_paths(
-                    result.cashflows["fees_product"], discount, n_years
-                )
-                fees_lip += branch_weight * _annual_discounted_paths(
-                    result.cashflows["fees_lip"], discount, n_years
-                )
-                crediting_margin += branch_weight * _annual_discounted_paths(
-                    result.cashflows["crediting_margin"], discount, n_years
-                )
-                mva_retained += branch_weight * _annual_discounted_paths(
-                    result.cashflows["mva_retained"], discount, n_years
-                )
-                aps_retained += branch_weight * _annual_discounted_paths(
-                    result.cashflows["aps_retained"], discount, n_years
-                )
-                projected_expenses += branch_weight * _annual_discounted_paths(
-                    result.cashflows["expenses"],
-                    discount,
-                    n_years,
-                    include_time_zero_in_first_year=True,
-                )
-                hedge_costs += branch_weight * _annual_start_discounted_paths(
-                    result.cashflows["hedge_costs"], discount, n_years
-                )
-                terminal_closeout += branch_weight * _annual_discounted_paths(
-                    result.cashflows["terminal_closeout"], discount, n_years
-                )
+                    policyholder_benefits_by_signature.setdefault(
+                        signature, np.zeros_like(signature_benefits)
+                    )
+                    policyholder_benefits_by_signature[signature] += (
+                        branch_weight * signature_benefits
+                    )
+
+                if collect_stackelberg_primitives:
+                    if primitive_collector is None or cap_state_collector is None:
+                        raise RuntimeError("Stackelberg primitive collectors are missing.")
+                    ph_cashflow = sum(
+                        result.cashflows[key]
+                        for key in (
+                            "income_paid",
+                            "death_benefits",
+                            "surrender_benefits",
+                            "partial_withdrawals",
+                            "terminal_closeout",
+                        )
+                    )
+                    ph_post_action = sum(
+                        result.post_surrender_cashflows[key]
+                        for key in (
+                            "income_paid",
+                            "death_benefits",
+                            "surrender_benefits",
+                            "partial_withdrawals",
+                            "terminal_closeout",
+                        )
+                    )
+                    ph_intervals = _annual_discounted_control_paths(
+                        ph_cashflow,
+                        ph_post_action,
+                        discount,
+                        n_years,
+                    )
+                    continue_components = np.stack((
+                        annual_control_cashflow("fees_product"),
+                        annual_control_cashflow("fees_lip"),
+                        annual_control_cashflow("crediting_margin"),
+                        annual_control_cashflow("mva_retained"),
+                        annual_control_cashflow("aps_retained"),
+                        annual_control_cashflow("guarantee_claims"),
+                        np.zeros_like(annual_crediting_margin),
+                        annual_control_cashflow("expenses"),
+                        annual_control_cashflow("hedge_costs"),
+                    ), axis=2)
+                    full_components = np.array(continue_components, copy=True)
+                    for year, action_context in (
+                        primitive_collector.action_value_contexts.items()
+                    ):
+                        if year < 0 or year >= n_years:
+                            continue
+                        step = int(getattr(action_context, "step"))
+                        common = getattr(
+                            action_context, "post_cap_common_cashflows"
+                        )
+                        full = getattr(
+                            action_context,
+                            "full_withdrawal_post_action_cashflows",
+                        )
+
+                        def full_value(key: str) -> Array:
+                            return (
+                                np.asarray(common[key], dtype=float)
+                                + np.asarray(full[key], dtype=float)
+                            ) * discount[:, step]
+
+                        full_components[:, year, :] = np.column_stack((
+                            full_value("fees_product"),
+                            full_value("fees_lip"),
+                            full_value("crediting_margin"),
+                            full_value("mva_retained"),
+                            full_value("aps_retained"),
+                            full_value("guarantee_claims"),
+                            np.zeros(scenarios.n_paths),
+                            full_value("expenses"),
+                            full_value("hedge_costs"),
+                        ))
+
+                    first_decision_year = (
+                        policy.effective_income_start_year(product) + 1
+                    )
+                    existing = signature_control_paths.get(signature)
+                    if existing is None:
+                        existing = SignatureControlPaths(
+                            signature=signature,
+                            policy=policy,
+                            decision_years={},
+                        )
+                        signature_control_paths[signature] = existing
+                    for year in range(first_decision_year, n_years):
+                        action_context = (
+                            primitive_collector.action_value_contexts.get(year)
+                        )
+                        cap_context = cap_state_collector.contexts.get(year)
+                        if action_context is None or cap_context is None:
+                            continue
+                        decision_context = getattr(
+                            action_context, "decision_context"
+                        )
+                        next_context = (
+                            primitive_collector.surrender_contexts.get(year + 1)
+                        )
+                        current_step = int(getattr(decision_context, "step"))
+                        current_scale = (
+                            discount[:, current_step]
+                            * np.asarray(
+                                getattr(decision_context, "inforce_weight"),
+                                dtype=float,
+                            )
+                        )
+                        if next_context is None:
+                            next_scale = np.zeros(scenarios.n_paths)
+                        else:
+                            next_step = int(getattr(next_context, "step"))
+                            next_scale = (
+                                discount[:, next_step]
+                                * np.asarray(
+                                    getattr(next_context, "inforce_weight"),
+                                    dtype=float,
+                                )
+                            )
+                        exposure_context = cap_state_collector.contexts.get(
+                            year + 1
+                        )
+                        next_exposure = np.zeros((scenarios.n_paths, 9))
+                        if exposure_context is not None:
+                            exposure_phase = np.asarray(
+                                getattr(exposure_context, "phase"), dtype=np.int8
+                            )
+                            exposure_inforce = np.asarray(
+                                getattr(exposure_context, "inforce_weight"),
+                                dtype=float,
+                            )
+                            account_value = np.maximum(np.asarray(
+                                getattr(exposure_context, "account_value")
+                            ), 0.0)
+                            surrender_value = np.maximum(np.asarray(
+                                getattr(exposure_context, "surrender_value")
+                            ), 0.0)
+                            locked_income = np.maximum(np.asarray(
+                                getattr(exposure_context, "locked_annual_income")
+                            ), 0.0)
+                            guarantee_pv = np.maximum(np.asarray(
+                                getattr(exposure_context, "guarantee_pv")
+                            ), 0.0)
+                            guarantee_mny = np.clip(np.asarray(
+                                getattr(exposure_context, "guarantee_moneyness")
+                            ), 0.0, 20.0)
+                            next_exposure = np.column_stack((
+                                exposure_inforce,
+                                exposure_inforce
+                                * (exposure_phase == Phase.GROWTH.value),
+                                exposure_inforce
+                                * (exposure_phase == Phase.INCOME.value),
+                                exposure_inforce * account_value
+                                / representative_premium,
+                                exposure_inforce * surrender_value
+                                / representative_premium,
+                                exposure_inforce * locked_income
+                                / representative_premium,
+                                exposure_inforce * guarantee_pv
+                                / representative_premium,
+                                exposure_inforce * guarantee_mny,
+                                exposure_inforce
+                                * (exposure_phase == Phase.INCOME.value)
+                                * (
+                                    account_value
+                                    <= 1.0e-10 * policy.initial_investment
+                                ),
+                            ))
+                        delta = branch_weight * (
+                            full_components[:, year, :]
+                            - continue_components[:, year, :]
+                        )
+                        contribution = branch_weight * next_exposure
+                        record = existing.decision_years.get(year)
+                        if record is None:
+                            existing.decision_years[year] = (
+                                SignatureDecisionYearPaths(
+                                    policy_year=year,
+                                    decision_step=current_step,
+                                    pre_cap_core=_compact_follower_core(
+                                        cap_context,
+                                        premium=float(policy.net_initial_investment),
+                                        cap_attribute="previous_cap",
+                                    ),
+                                    after_cap_core=_compact_follower_core(
+                                        decision_context,
+                                        premium=float(policy.net_initial_investment),
+                                        cap_attribute="announced_cap",
+                                    ),
+                                    phase=np.asarray(
+                                        getattr(decision_context, "phase"),
+                                        dtype=np.int8,
+                                    ).copy(),
+                                    just_elected=np.asarray(
+                                        getattr(decision_context, "just_elected"),
+                                        dtype=bool,
+                                    ).copy(),
+                                    full_withdrawal_eligible=np.asarray(
+                                        getattr(
+                                            decision_context,
+                                            "full_withdrawal_eligible",
+                                        ),
+                                        dtype=bool,
+                                    ).copy(),
+                                    decision_discount_inforce=np.asarray(
+                                        current_scale, dtype=np.float32
+                                    ),
+                                    next_decision_discount_inforce=np.asarray(
+                                        next_scale, dtype=np.float32
+                                    ),
+                                    continue_policyholder_interval_pv=np.asarray(
+                                        ph_intervals[:, year], dtype=np.float32
+                                    ),
+                                    full_withdrawal_value=np.asarray(
+                                        getattr(
+                                            decision_context,
+                                            "surrender_value",
+                                        ),
+                                        dtype=np.float32,
+                                    ),
+                                    insurer_full_minus_continue_components=(
+                                        np.asarray(delta, dtype=np.float32)
+                                    ),
+                                    next_portfolio_exposure_contribution=(
+                                        np.asarray(contribution, dtype=np.float32)
+                                    ),
+                                )
+                            )
+                        else:
+                            record.insurer_full_minus_continue_components += (
+                                np.asarray(delta, dtype=np.float32)
+                            )
+                            record.next_portfolio_exposure_contribution += (
+                                np.asarray(contribution, dtype=np.float32)
+                            )
+
+                if pre_action_states is not None:
+                    if cap_state_collector is None:
+                        raise RuntimeError("Pre-action state collector is missing.")
+                    for year, context in cap_state_collector.contexts.items():
+                        if year < 0 or year > n_years:
+                            continue
+                        phase_at_decision = np.asarray(context.phase, dtype=np.int8)
+                        inforce_at_decision = np.asarray(
+                            context.inforce_weight, dtype=float
+                        )
+                        exposure = branch_weight * inforce_at_decision
+                        growth_exposure = exposure * (
+                            phase_at_decision == Phase.GROWTH.value
+                        )
+                        income_exposure = exposure * (
+                            phase_at_decision == Phase.INCOME.value
+                        )
+                        account_value = np.maximum(
+                            np.asarray(context.account_value, dtype=float), 0.0
+                        )
+                        surrender_value = np.maximum(
+                            np.asarray(context.surrender_value, dtype=float), 0.0
+                        )
+                        locked_income = np.maximum(
+                            np.asarray(context.locked_annual_income, dtype=float),
+                            0.0,
+                        )
+                        guarantee_pv = np.maximum(
+                            np.asarray(context.guarantee_pv, dtype=float), 0.0
+                        )
+                        guarantee_moneyness = np.clip(
+                            np.asarray(context.guarantee_moneyness, dtype=float),
+                            0.0,
+                            20.0,
+                        )
+                        values = {
+                            "inforce_exposure": exposure,
+                            "growth_exposure": growth_exposure,
+                            "income_exposure": income_exposure,
+                            "account_value_per_initial_premium": (
+                                exposure * account_value
+                            ),
+                            "surrender_value_per_initial_premium": (
+                                exposure * surrender_value
+                            ),
+                            "locked_income_per_initial_premium": (
+                                exposure * locked_income
+                            ),
+                            "guarantee_pv_per_initial_premium": (
+                                exposure * guarantee_pv
+                            ),
+                            "guarantee_moneyness_exposure": (
+                                exposure * guarantee_moneyness
+                            ),
+                            "exhausted_income_exposure": (
+                                income_exposure
+                                * (
+                                    account_value
+                                    <= 1.0e-10 * policy.initial_investment
+                                )
+                            ),
+                        }
+                        for name, value in values.items():
+                            pre_action_states[
+                                :, year, pre_action_feature_index[name]
+                            ] += value
 
                 if raw_states is None:
                     continue
@@ -1162,6 +2300,7 @@ def _aggregate_portfolio_paths(
                     branch_count,
                 )
 
+    inforce_exposure: Array | None = None
     if raw_states is not None:
         monetary_columns = [
             feature_index["account_value_per_initial_premium"],
@@ -1224,6 +2363,28 @@ def _aggregate_portfolio_paths(
                 "income_pv_proxy_over_account_value"
             ]],
         )
+        inforce_exposure = np.array(
+            pre_action_states[
+                :, :, pre_action_feature_index["inforce_exposure"]
+            ],
+            copy=True,
+        )
+
+    if pre_action_states is not None:
+        pre_action_monetary_columns = [
+            pre_action_feature_index[name]
+            for name in (
+                "account_value_per_initial_premium",
+                "surrender_value_per_initial_premium",
+                "locked_income_per_initial_premium",
+                "guarantee_pv_per_initial_premium",
+            )
+        ]
+        pre_action_states[:, :, pre_action_monetary_columns] /= (
+            representative_premium
+        )
+        if not np.all(np.isfinite(pre_action_states)):
+            raise RuntimeError("Pre-action portfolio states contain non-finite values.")
 
     return PortfolioPathData(
         guarantee_claims=guarantee_claims,
@@ -1235,10 +2396,20 @@ def _aggregate_portfolio_paths(
         aps_retained=aps_retained,
         expenses=projected_expenses,
         hedge_costs=hedge_costs,
+        income_paid=income_paid,
+        death_benefits=death_benefits,
+        surrender_benefits=surrender_benefits,
+        partial_withdrawals=partial_withdrawals,
         terminal_closeout=terminal_closeout,
+        lapse_events=lapse_events,
+        inforce_exposure=inforce_exposure,
         raw_states=raw_states,
         state_feature_names=feature_names,
+        pre_action_states=pre_action_states,
+        pre_action_state_feature_names=pre_action_feature_names,
         representative_initial_premium=representative_premium,
+        signature_control_paths=signature_control_paths,
+        policyholder_benefits_by_signature=policyholder_benefits_by_signature,
     )
 
 
@@ -1310,31 +2481,284 @@ def _repeat_scenarios(scenarios: ScenarioSet, repeats: int) -> ScenarioSet:
     )
 
 
+def _slice_scenarios(
+    scenarios: ScenarioSet,
+    start: int,
+    stop: int,
+) -> ScenarioSet:
+    """Return a path slice without changing the simulated market history."""
+    if start < 0 or stop <= start or stop > scenarios.n_paths:
+        raise ValueError("Invalid ScenarioSet path slice.")
+
+    def sliced(array: Array) -> Array:
+        return np.asarray(array)[start:stop]
+
+    variance = None
+    if scenarios.variance is not None:
+        variance = {
+            index: sliced(values)
+            for index, values in scenarios.variance.items()
+        }
+    return ScenarioSet(
+        config=scenarios.config,
+        measure=scenarios.measure,
+        dt=scenarios.dt,
+        times=scenarios.times,
+        index_levels={
+            index: sliced(values)
+            for index, values in scenarios.index_levels.items()
+        },
+        short_rate=sliced(scenarios.short_rate),
+        discount=sliced(scenarios.discount),
+        variance=variance,
+        stochastic_rates=scenarios.stochastic_rates,
+        model_name=scenarios.model_name,
+        seed=scenarios.seed,
+        substeps=scenarios.substeps,
+        _copy_inputs=False,
+    )
+
+
+def _truncate_scenarios(
+    scenarios: ScenarioSet,
+    stop_step: int,
+) -> ScenarioSet:
+    """Return a time-prefix view for causal annual policy deployment."""
+    if stop_step < 1 or stop_step > scenarios.n_steps:
+        raise ValueError("Invalid ScenarioSet time-prefix endpoint.")
+    stop = int(stop_step) + 1
+
+    def truncated(array: Array) -> Array:
+        return np.asarray(array)[:, :stop]
+
+    variance = None
+    if scenarios.variance is not None:
+        variance = {
+            index: truncated(values)
+            for index, values in scenarios.variance.items()
+        }
+    return ScenarioSet(
+        config=scenarios.config,
+        measure=scenarios.measure,
+        dt=scenarios.dt,
+        times=np.asarray(scenarios.times)[:stop],
+        index_levels={
+            index: truncated(values)
+            for index, values in scenarios.index_levels.items()
+        },
+        short_rate=truncated(scenarios.short_rate),
+        discount=truncated(scenarios.discount),
+        variance=variance,
+        stochastic_rates=scenarios.stochastic_rates,
+        model_name=scenarios.model_name,
+        seed=scenarios.seed,
+        substeps=scenarios.substeps,
+        _copy_inputs=False,
+    )
+
+
+@dataclass(frozen=True)
+class ControlStateInputs:
+    """Pre-action market history used by the implementable cap policy."""
+
+    market_features: Array
+    annual_reference_fund_return: Array
+
+    @property
+    def n_paths(self) -> int:
+        return int(self.market_features.shape[0])
+
+    @property
+    def n_years(self) -> int:
+        return int(self.annual_reference_fund_return.shape[1])
+
+
+def _control_state_inputs(
+    scenarios: ScenarioSet,
+    product: IndexLinkedLifetimeIncomeProduct,
+    n_years: int,
+) -> ControlStateInputs:
+    """Build market variables observable at each annual decision time.
+
+    The return in control year ``y`` is stored separately and is only used to
+    update the state for ``y + 1``.  It therefore cannot leak into the cap
+    decision at the start of year ``y``.
+    """
+    if n_years <= 0:
+        raise ValueError("Control-state horizon is inconsistent with scenarios.")
+    # The final market interval can be a partial policy year when a covered
+    # life has a fractional issue age.  There is still one action at the start
+    # of that final interval; its terminal state is observed at the last ESG
+    # step rather than beyond the simulated horizon.
+    annual_steps = np.minimum(
+        np.arange(n_years + 1, dtype=int) * STEPS_PER_YEAR,
+        int(scenarios.n_steps),
+    )
+    if np.any(np.diff(annual_steps) <= 0):
+        raise ValueError("Control-state horizon is inconsistent with scenarios.")
+    reference = scenarios.monthly_rebalanced_reference_fund_index(
+        equity_index=product.reference_fund.equity_index,
+        equity_weight=product.reference_fund.equity_weight,
+        bond_tenor=product.reference_fund.bond_tenor_years,
+    )
+    annual_reference = reference[:, annual_steps]
+    annual_return = (
+        annual_reference[:, 1:]
+        / np.maximum(annual_reference[:, :-1], 1.0e-300)
+        - 1.0
+    )
+    features = np.zeros((scenarios.n_paths, n_years + 1, 5), dtype=float)
+    for year, step in enumerate(annual_steps):
+        features[:, year, 0] = scenarios.zero_rate(int(step), 5.0)
+    if scenarios.variance is None:
+        variance = np.full(
+            (scenarios.n_paths, n_years + 1),
+            scenarios.config.equity[Index.GLOBAL_EQUITY].sigma ** 2,
+        )
+    else:
+        variance = scenarios.variance[Index.GLOBAL_EQUITY][:, annual_steps]
+    features[:, :, 1] = variance
+    features[:, :, 2] = np.log(
+        np.maximum(scenarios.discount[:, annual_steps], 1.0e-300)
+    )
+    features[:, 1:, 3] = annual_return
+    features[:, :, 4] = np.log(
+        np.maximum(
+            annual_reference / np.maximum(annual_reference[:, :1], 1.0e-300),
+            1.0e-300,
+        )
+    )
+    if not np.all(np.isfinite(features)) or not np.all(np.isfinite(annual_return)):
+        raise RuntimeError("Control-state market inputs contain non-finite values.")
+    return ControlStateInputs(features, annual_return)
+
+
+def _control_state_paths(
+    inputs: ControlStateInputs,
+    cap_matrix: Array,
+) -> Array:
+    """Create compact, strictly pre-action states from realised history.
+
+    The credited-index and excess-return variables are transparent state
+    proxies, not additional calibrated product or Behaviour parameters.  They
+    summarise the endogenous cap history while keeping a learned policy
+    directly executable before the monthly product projection is run.
+    """
+    caps = np.asarray(cap_matrix, dtype=float)
+    expected_shape = (inputs.n_paths, inputs.n_years)
+    if caps.shape != expected_shape:
+        raise ValueError(
+            f"cap_matrix must have shape {expected_shape}, got {caps.shape}."
+        )
+    if not np.all(np.isfinite(caps)) or np.any(caps < 0.0):
+        raise ValueError("Control-state caps must be finite and non-negative.")
+
+    states = np.zeros(
+        (inputs.n_paths, inputs.n_years + 1, len(CONTROL_STATE_FEATURE_NAMES)),
+        dtype=float,
+    )
+    states[:, :, :5] = inputs.market_features
+    log_credited = np.zeros(inputs.n_paths)
+    cumulative_cap = np.zeros(inputs.n_paths)
+    cumulative_excess = np.zeros(inputs.n_paths)
+    previous_cap = np.zeros(inputs.n_paths)
+    trailing_performance_shortfall = np.zeros(inputs.n_paths)
+    for year in range(inputs.n_years + 1):
+        states[:, year, 5] = log_credited
+        states[:, year, 6] = previous_cap
+        if year:
+            states[:, year, 7] = cumulative_cap / year
+            states[:, year, 8] = cumulative_excess / year
+        states[:, year, 9] = trailing_performance_shortfall
+        if year == inputs.n_years:
+            break
+        cap = caps[:, year]
+        positive_return = np.maximum(
+            inputs.annual_reference_fund_return[:, year], 0.0
+        )
+        credited = np.minimum(positive_return, cap)
+        excess = np.maximum(positive_return - cap, 0.0)
+        trailing_performance_shortfall = np.maximum(
+            np.log1p(inputs.annual_reference_fund_return[:, year])
+            - np.log1p(credited),
+            0.0,
+        )
+        log_credited += np.log1p(credited)
+        cumulative_cap += cap
+        cumulative_excess += excess
+        previous_cap = cap
+    if not np.all(np.isfinite(states)):
+        raise RuntimeError("Control states contain non-finite values.")
+    return states
+
+
+def _portfolio_state_extension(
+    data: PortfolioPathData,
+) -> tuple[Array, tuple[str, ...]]:
+    """Return exact pre-cap portfolio states for leader decisions.
+
+    Market/cap history is supplied by :func:`_control_state_paths`.  This
+    extension comes from the projector's read-only decision observer after
+    the old-cap events and before the current cap starts.  It therefore keeps
+    customer exposure, surrender value and guarantee value without letting
+    the current leader action leak into its own regressors.
+    """
+    if data.pre_action_states is None:
+        raise ValueError("Pre-action portfolio state collection is required.")
+    by_name = {
+        name: position
+        for position, name in enumerate(data.pre_action_state_feature_names)
+    }
+    missing = [
+        name for name in PORTFOLIO_CONTROL_STATE_FEATURE_NAMES
+        if name not in by_name
+    ]
+    if missing:
+        raise ValueError(
+            "Rich portfolio state is missing required features: "
+            + ", ".join(missing)
+        )
+    positions = [by_name[name] for name in PORTFOLIO_CONTROL_STATE_FEATURE_NAMES]
+    names = tuple(
+        data.pre_action_state_feature_names[position] for position in positions
+    )
+    if not names:
+        raise ValueError("No portfolio exposure features remain after state merge.")
+    values = np.asarray(data.pre_action_states[:, :, positions], dtype=float)
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError("Rich portfolio control states contain non-finite values.")
+    return values, names
+
+
+def _merge_control_and_portfolio_states(
+    *,
+    inputs: ControlStateInputs,
+    cap_matrix: Array,
+    data: PortfolioPathData,
+) -> tuple[Array, tuple[str, ...], Array]:
+    portfolio_values, portfolio_names = _portfolio_state_extension(data)
+    compact = _control_state_paths(inputs, cap_matrix)
+    if compact.shape[:2] != portfolio_values.shape[:2]:
+        raise ValueError("Market and portfolio state grids do not align.")
+    merged = np.concatenate((compact, portfolio_values), axis=2)
+    names = (*CONTROL_STATE_FEATURE_NAMES, *portfolio_names)
+    if len(set(names)) != len(names):
+        raise RuntimeError("Merged control-state feature names are not unique.")
+    return merged, names, portfolio_values
+
+
 def _basis_specification(
     feature_names: Sequence[str],
 ) -> tuple[tuple[int, ...], tuple[tuple[int, int], ...], tuple[str, ...]]:
     index = {name: pos for pos, name in enumerate(feature_names)}
     nonlinear_names = (
-        "short_rate",
-        "zero_rate_5y",
-        "heston_variance_global",
-        "log_discount_to_time0",
-        "trailing_reference_fund_return",
-        "inforce_exposure",
-        "growth_exposure",
-        "income_exposure",
         "account_value_per_initial_premium",
-        "locked_income_per_initial_premium",
-        "income_pv_proxy_over_account_value",
-        "exhausted_income_exposure",
+        "guarantee_moneyness_exposure",
     )
     nonlinear = tuple(index[name] for name in nonlinear_names if name in index)
     interaction_names = (
-        ("short_rate", "account_value_per_initial_premium"),
-        ("zero_rate_5y", "income_pv_proxy_over_account_value"),
-        ("heston_variance_global", "account_value_per_initial_premium"),
-        ("income_exposure", "income_pv_proxy_over_account_value"),
-        ("inforce_exposure", "account_value_per_initial_premium"),
+        ("zero_rate_5y", "log_credited_index_proxy"),
+        ("guarantee_moneyness_exposure", "previous_cap"),
     )
     interactions = tuple(
         (index[left], index[right])
@@ -1389,9 +2813,14 @@ def _ridge_fit_multioutput(design: Array, targets: Array, ridge: float) -> Array
         return np.linalg.lstsq(gram + penalty, rhs, rcond=None)[0]
 
 
-def _condition_number(design: Array) -> float:
+def _condition_number(design: Array, ridge: float) -> float:
+    """Condition number of the actual ridge-regularised normal matrix."""
     try:
-        return float(np.linalg.cond(design))
+        gram = design.T @ design
+        penalty_scale = float(np.trace(gram) / max(gram.shape[0], 1))
+        penalty = np.eye(gram.shape[0]) * ridge * max(penalty_scale, 1.0)
+        penalty[0, 0] = 0.0
+        return float(np.linalg.cond(gram + penalty))
     except np.linalg.LinAlgError:
         return float("inf")
 
@@ -1428,7 +2857,10 @@ def _cross_fitted_action_values(
         )
         for action in range(n_actions):
             selected = train & (observed_actions == action)
-            minimum = max(10, len(basis_names) // 2)
+            # Three observations per regularised basis coefficient, followed
+            # by the explicit condition-number gate below, is sufficiently
+            # conservative without discarding balanced late-year action cells.
+            minimum = max(30, 3 * len(basis_names))
             if int(np.sum(selected)) < minimum:
                 raise ValueError(
                     f"Too few training paths for year {year + 1}, action "
@@ -1481,6 +2913,9 @@ def _cross_fitted_action_values(
             "cap": float(cap),
             "observed_path_count": int(np.sum(selected)),
             "basis_dimension": int(full_design.shape[1]),
+            "raw_design_effective_rank": int(np.linalg.matrix_rank(
+                full_design[selected]
+            )),
             "ridge_multiplier": float(ridge),
             "in_sample_rmse_new_business_csm_proxy": float(
                 np.sqrt(residual_variance)
@@ -1492,7 +2927,14 @@ def _cross_fitted_action_values(
             "out_of_fold_r_squared_new_business_csm_proxy": float(
                 oof_r_squared
             ),
-            "design_condition_number": _condition_number(full_design[selected]),
+            "regularized_normal_matrix_condition_number": _condition_number(
+                full_design[selected], ridge
+            ),
+            # Backward-compatible CSV alias; this is the regularised matrix,
+            # not the singular raw design used by the invalid predecessor run.
+            "design_condition_number": _condition_number(
+                full_design[selected], ridge
+            ),
         })
 
     policy = RegressionPolicyYear(
@@ -1501,17 +2943,567 @@ def _cross_fitted_action_values(
         raw_scale=full_scale,
         coefficients=coefficients,
         action_caps=ACTION_CAPS.copy(),
+        action_value_standard_error=np.asarray([
+            float(row["out_of_fold_rmse_new_business_csm_proxy"])
+            / np.sqrt(max(int(row["observed_path_count"]), 1))
+            for row in diagnostics
+        ]),
     )
     # ``basis_names`` is deterministic from the public feature-name list and
     # is stored once in the policy JSON by the caller.
     return predictions, policy, diagnostics
 
 
+def _csm_from_component_values(components: Array) -> Array:
+    """Derive CSM from the nine separately fitted economic components."""
+    values = np.asarray(components, dtype=float)
+    if values.shape[-1] != len(INSURER_COMPONENT_NAMES):
+        raise ValueError("Insurer component tensor has an invalid final axis.")
+    return (
+        values[..., 0]
+        + values[..., 1]
+        + values[..., 2]
+        + values[..., 3]
+        + values[..., 4]
+        - values[..., 5]
+        - values[..., 6]
+        - values[..., 7]
+        - values[..., 8]
+    )
+
+
+def _with_derived_csm(components: Array) -> Array:
+    values = np.asarray(components, dtype=float)
+    return np.concatenate(
+        (_csm_from_component_values(values)[..., None], values), axis=-1
+    )
+
+
+def _component_regression_coefficients(component_beta: Array) -> Array:
+    beta = np.asarray(component_beta, dtype=float)
+    if beta.shape[-1] != len(INSURER_COMPONENT_NAMES):
+        raise ValueError("Component coefficients have an invalid output axis.")
+    return np.concatenate(
+        (_csm_from_component_values(beta)[..., None], beta), axis=-1
+    )
+
+
+def _component_prediction_bounds(targets: Array) -> tuple[Array, Array]:
+    """Finite economic envelope used only as a numerical safety rail."""
+    values = np.asarray(targets, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 10:
+        raise ValueError("Leader targets must contain CSM plus nine components.")
+    component = values[:, 1:]
+    spread = np.std(component, axis=0, ddof=0)
+    floor = np.min(component, axis=0) - 5.0 * spread
+    ceiling = np.max(component, axis=0) + 5.0 * spread
+    for output in NONNEGATIVE_INSURER_COMPONENT_INDICES:
+        floor[output - 1] = 0.0
+    padding = 1.0e-10 * np.maximum(1.0, np.max(np.abs(component), axis=0))
+    ceiling = np.maximum(ceiling + padding, floor + padding)
+    lower = _with_derived_csm(floor[None, :])[0]
+    upper = _with_derived_csm(ceiling[None, :])[0]
+    # CSM is recomputed after component clipping.  Persist its exact finite
+    # envelope implied by the nine component boxes for reproducible rollout.
+    lower[0] = (
+        np.sum(floor[:5]) - np.sum(ceiling[5:])
+    )
+    upper[0] = (
+        np.sum(ceiling[:5]) - np.sum(floor[5:])
+    )
+    return lower, upper
+
+
+def _clip_component_predictions(
+    values: Array,
+    lower: Array,
+    upper: Array,
+) -> tuple[Array, float]:
+    predicted = np.asarray(values, dtype=float)
+    bounded = predicted.copy()
+    before = bounded[..., 1:].copy()
+    bounded[..., 1:] = np.minimum(
+        np.maximum(bounded[..., 1:], lower[1:]), upper[1:]
+    )
+    clipped_fraction = float(np.mean(np.abs(bounded[..., 1:] - before) > 0.0))
+    bounded[..., 0] = _csm_from_component_values(bounded[..., 1:])
+    return bounded, clipped_fraction
+
+
+@dataclass
+class _CoupledLeaderYearFit:
+    deployment: RegressionPolicyYear
+    fold_means: Array
+    fold_scales: Array
+    fold_coefficients: Array
+    fold_lower_bounds: Array
+    fold_upper_bounds: Array
+    stable: bool
+    instability_reasons: tuple[str, ...]
+
+
+def _fit_coupled_leader_year(
+    *,
+    year: int,
+    raw_state: Array,
+    targets: Array,
+    observed_actions: IntArray,
+    fold_ids: IntArray,
+    n_folds: int,
+    ridge: float,
+    feature_names: Sequence[str],
+) -> tuple[Array, _CoupledLeaderYearFit, list[dict[str, object]]]:
+    """Fit insurer components after the already-computed follower response."""
+    n_paths = raw_state.shape[0]
+    nonlinear, interactions, basis_names = _basis_specification(feature_names)
+    n_basis = len(basis_names)
+    n_actions = len(ACTION_CAPS)
+    oof = np.full((n_paths, n_actions, 10), np.nan)
+    fold_means = np.zeros((n_folds, raw_state.shape[1]))
+    fold_scales = np.ones_like(fold_means)
+    fold_coefficients = np.zeros((n_folds, n_actions, n_basis, 10))
+    fold_lower = np.zeros((n_folds, n_actions, 10))
+    fold_upper = np.zeros_like(fold_lower)
+    reasons: set[str] = set()
+    fold_clip_fractions: dict[tuple[int, int], float] = {}
+
+    for fold in range(n_folds):
+        test = fold_ids == fold
+        train = ~test
+        mean, scale = _raw_scaling(raw_state[train])
+        fold_means[fold] = mean
+        fold_scales[fold] = scale
+        test_design = _design_matrix(
+            raw_state[test], mean, scale, nonlinear, interactions
+        )
+        for action in range(n_actions):
+            selected = train & (observed_actions == action)
+            minimum = max(30, 3 * n_basis)
+            count = int(np.count_nonzero(selected))
+            if count < minimum:
+                reasons.add(
+                    f"year_{year + 1}_cap_{ACTION_CAPS[action]:.6f}_"
+                    f"fold_{fold}_support_{count}_below_{minimum}"
+                )
+                if count == 0:
+                    # Exploration validation should prevent this.  Keep a
+                    # finite placeholder so the global fixed-cap fallback can
+                    # be selected on validation rather than emitting NaNs.
+                    component_mean = np.zeros(len(INSURER_COMPONENT_NAMES))
+                    beta_components = np.zeros((n_basis, len(component_mean)))
+                    beta_components[0] = component_mean
+                    bounds_source = np.zeros((1, 10))
+                else:
+                    component_mean = np.mean(targets[selected, 1:], axis=0)
+                    beta_components = np.zeros((n_basis, len(component_mean)))
+                    beta_components[0] = component_mean
+                    bounds_source = targets[selected]
+            else:
+                train_design = _design_matrix(
+                    raw_state[selected], mean, scale, nonlinear, interactions
+                )
+                beta_components = _ridge_fit_multioutput(
+                    train_design, targets[selected, 1:], ridge
+                )
+                condition = _condition_number(train_design, ridge)
+                if not np.isfinite(condition) or condition > 1.0e10:
+                    reasons.add(
+                        f"year_{year + 1}_cap_{ACTION_CAPS[action]:.6f}_"
+                        f"fold_{fold}_condition_{condition:.6g}"
+                    )
+                bounds_source = targets[selected]
+            beta = _component_regression_coefficients(beta_components)
+            lower, upper = _component_prediction_bounds(bounds_source)
+            raw_prediction = test_design @ beta
+            bounded, clip_fraction = _clip_component_predictions(
+                raw_prediction, lower, upper
+            )
+            if clip_fraction > 0.01:
+                reasons.add(
+                    f"year_{year + 1}_cap_{ACTION_CAPS[action]:.6f}_"
+                    f"fold_{fold}_clip_fraction_{clip_fraction:.6g}"
+                )
+            oof[test, action] = bounded
+            fold_coefficients[fold, action] = beta
+            fold_lower[fold, action] = lower
+            fold_upper[fold, action] = upper
+            fold_clip_fractions[(fold, action)] = clip_fraction
+
+    if not np.all(np.isfinite(oof)):
+        reasons.add(f"year_{year + 1}_nonfinite_oof_prediction")
+        oof = np.nan_to_num(oof, nan=-1.0e100, posinf=1.0e100, neginf=-1.0e100)
+
+    full_mean, full_scale = _raw_scaling(raw_state)
+    full_design = _design_matrix(
+        raw_state, full_mean, full_scale, nonlinear, interactions
+    )
+    coefficients = np.zeros((n_actions, n_basis, 10))
+    lower_bounds = np.zeros((n_actions, 10))
+    upper_bounds = np.zeros_like(lower_bounds)
+    diagnostics: list[dict[str, object]] = []
+    action_se = np.zeros(n_actions)
+    for action, cap in enumerate(ACTION_CAPS):
+        selected = observed_actions == action
+        count = int(np.count_nonzero(selected))
+        if count < n_basis:
+            reasons.add(
+                f"year_{year + 1}_cap_{cap:.6f}_full_support_{count}_below_{n_basis}"
+            )
+            component_beta = np.zeros((n_basis, len(INSURER_COMPONENT_NAMES)))
+            if count:
+                component_beta[0] = np.mean(targets[selected, 1:], axis=0)
+                bounds_source = targets[selected]
+            else:
+                bounds_source = np.zeros((1, 10))
+        else:
+            component_beta = _ridge_fit_multioutput(
+                full_design[selected], targets[selected, 1:], ridge
+            )
+            bounds_source = targets[selected]
+        beta = _component_regression_coefficients(component_beta)
+        coefficients[action] = beta
+        lower, upper = _component_prediction_bounds(bounds_source)
+        lower_bounds[action] = lower
+        upper_bounds[action] = upper
+        fitted_raw = full_design[selected] @ beta
+        fitted, in_sample_clip = _clip_component_predictions(
+            fitted_raw, lower, upper
+        )
+        observed_oof = oof[selected, action]
+        residual = targets[selected, 0] - observed_oof[:, 0]
+        rmse = float(np.sqrt(np.mean(residual * residual))) if count else float("inf")
+        target_scale = max(
+            float(np.std(targets[selected, 0])) if count else 0.0,
+            float(np.mean(np.abs(targets[selected, 0]))) if count else 0.0,
+            1.0,
+        )
+        if not np.isfinite(rmse) or rmse > 10.0 * target_scale:
+            reasons.add(
+                f"year_{year + 1}_cap_{cap:.6f}_oof_rmse_ratio_"
+                f"{rmse / target_scale:.6g}"
+            )
+        action_se[action] = rmse / np.sqrt(max(count, 1))
+        target_variance = float(np.var(targets[selected, 0])) if count else 0.0
+        oof_r2 = (
+            1.0 - rmse * rmse / target_variance
+            if target_variance > 1.0e-20 else 1.0
+        )
+        condition = _condition_number(full_design[selected], ridge) if count else float("inf")
+        diagnostics.append({
+            "policy_year": year + 1,
+            "cap": float(cap),
+            "observed_path_count": count,
+            "basis_dimension": n_basis,
+            "ridge_multiplier": float(ridge),
+            "out_of_fold_rmse_new_business_csm_proxy": rmse,
+            "out_of_fold_r_squared_new_business_csm_proxy": float(oof_r2),
+            "in_sample_component_clip_fraction": in_sample_clip,
+            "maximum_fold_component_clip_fraction": max(
+                fold_clip_fractions[(fold, action)] for fold in range(n_folds)
+            ),
+            "regularized_normal_matrix_condition_number": condition,
+            "design_condition_number": condition,
+            "csm_derived_from_components": True,
+        })
+
+    stable = not reasons
+    deployment = RegressionPolicyYear(
+        year=year,
+        raw_mean=full_mean,
+        raw_scale=full_scale,
+        coefficients=coefficients,
+        action_caps=ACTION_CAPS.copy(),
+        action_value_standard_error=action_se,
+        value_lower_bounds=lower_bounds,
+        value_upper_bounds=upper_bounds,
+        numerically_stable=stable,
+    )
+    return oof, _CoupledLeaderYearFit(
+        deployment=deployment,
+        fold_means=fold_means,
+        fold_scales=fold_scales,
+        fold_coefficients=fold_coefficients,
+        fold_lower_bounds=fold_lower,
+        fold_upper_bounds=fold_upper,
+        stable=stable,
+        instability_reasons=tuple(sorted(reasons)),
+    ), diagnostics
+
+
+def _cross_fitted_leader_action_values(
+    fit: _CoupledLeaderYearFit,
+    raw_state: Array,
+    fold_ids: IntArray,
+    feature_names: Sequence[str],
+) -> Array:
+    """Evaluate a future leader rule without reusing a path's own fold."""
+    nonlinear, interactions, _ = _basis_specification(feature_names)
+    raw = np.asarray(raw_state, dtype=float)
+    out = np.zeros((raw.shape[0], len(ACTION_CAPS), 10))
+    for fold in range(fit.fold_coefficients.shape[0]):
+        selected = fold_ids == fold
+        if not np.any(selected):
+            continue
+        design = _design_matrix(
+            raw[selected],
+            fit.fold_means[fold],
+            fit.fold_scales[fold],
+            nonlinear,
+            interactions,
+        )
+        values = np.einsum(
+            "pb,abo->pao", design, fit.fold_coefficients[fold]
+        )
+        for action in range(len(ACTION_CAPS)):
+            values[:, action], _ = _clip_component_predictions(
+                values[:, action],
+                fit.fold_lower_bounds[fold, action],
+                fit.fold_upper_bounds[fold, action],
+            )
+        out[selected] = values
+    if not np.all(np.isfinite(out)):
+        raise RuntimeError("Cross-fitted future leader values are non-finite.")
+    return out
+
+
+@dataclass
+class _CoupledFollowerYearFit:
+    candidate_values: Array
+    deployment_regression: _FollowerDeploymentRegression
+    stable: bool
+    instability_reasons: tuple[str, ...]
+    diagnostic: dict[str, object]
+
+
+def _follower_linear_design(
+    raw: Array,
+    centre: Array,
+    scale: Array,
+    active: IntArray,
+) -> Array:
+    values = np.asarray(raw, dtype=float)
+    return np.column_stack((
+        np.ones(values.shape[0]),
+        (values[:, active] - centre) / scale,
+    ))
+
+
+def _fit_coupled_follower_year(
+    *,
+    signature: tuple[object, ...],
+    policy: PolicySpec,
+    record: SignatureDecisionYearPaths,
+    actual_caps: Array,
+    continuation_target: Array,
+    fold_ids: IntArray,
+    settings: OptimalBehaviourLSMCSettings,
+) -> _CoupledFollowerYearFit:
+    """Cross-fit customer Continue/FULL values without insurer objectives."""
+    premium = float(policy.net_initial_investment)
+    raw_actual = _follower_features_from_core(
+        record.pre_cap_core,
+        announced_cap=actual_caps,
+        duration_years=float(record.policy_year),
+        include_previous_cap=True,
+    )
+    after_actual = _follower_features_from_core(
+        record.after_cap_core,
+        announced_cap=np.asarray(record.after_cap_core, dtype=float)[:, 8],
+        duration_years=float(record.policy_year),
+        include_previous_cap=False,
+    )
+    phase = np.asarray(record.phase, dtype=np.int8)
+    inforce = np.asarray(record.pre_cap_core, dtype=float)[:, 12]
+    fit_eligible = (
+        (phase == Phase.INCOME.value)
+        & (inforce > settings.minimum_inforce_weight)
+    )
+    target = np.column_stack((
+        np.maximum(np.asarray(continuation_target, dtype=float), 0.0),
+        np.maximum(np.asarray(record.full_withdrawal_value, dtype=float), 0.0),
+    ))
+    n_paths = raw_actual.shape[0]
+    n_folds = settings.n_folds
+    predictions = np.zeros((n_paths, len(ACTION_CAPS), 2))
+    reasons: set[str] = set()
+    fold_rmses: list[float] = []
+    raw_scale_all = np.std(raw_actual[fit_eligible], axis=0) \
+        if np.any(fit_eligible) else np.zeros(raw_actual.shape[1])
+    active_columns = np.flatnonzero(raw_scale_all > 1.0e-10).astype(np.int64)
+    basis_dimension = int(active_columns.size + 1)
+    minimum = max(60, 2 * basis_dimension)
+
+    for fold in range(n_folds):
+        test = fold_ids == fold
+        train = (fold_ids != fold) & fit_eligible
+        count = int(np.count_nonzero(train))
+        if count < minimum or active_columns.size == 0:
+            reasons.add(
+                f"year_{record.policy_year}_fold_{fold}_support_"
+                f"{count}_below_{minimum}"
+            )
+            mean_target = (
+                np.mean(target[train], axis=0) if count else np.zeros(2)
+            )
+            predictions[test, :, :] = mean_target
+            continue
+        centre = np.mean(raw_actual[train][:, active_columns], axis=0)
+        scale = np.std(raw_actual[train][:, active_columns], axis=0)
+        scale = np.where(scale > 1.0e-10, scale, 1.0)
+        design = _follower_linear_design(
+            raw_actual[train], centre, scale, active_columns
+        )
+        beta = _ridge_fit_multioutput(
+            design, target[train] / premium, settings.ridge
+        )
+        condition = _condition_number(design, settings.ridge)
+        if not np.isfinite(condition) or condition > settings.maximum_condition_number:
+            reasons.add(
+                f"year_{record.policy_year}_fold_{fold}_condition_{condition:.6g}"
+            )
+        for action, cap in enumerate(ACTION_CAPS):
+            candidate_raw = _follower_features_from_core(
+                np.asarray(record.pre_cap_core)[test],
+                announced_cap=float(cap),
+                duration_years=float(record.policy_year),
+                include_previous_cap=True,
+            )
+            candidate_design = _follower_linear_design(
+                candidate_raw, centre, scale, active_columns
+            )
+            predictions[test, action] = np.maximum(
+                candidate_design @ beta * premium, 0.0
+            )
+        eligible_test = test & fit_eligible
+        if np.any(eligible_test):
+            actual_index = np.argmin(
+                np.abs(
+                    actual_caps[eligible_test, None]
+                    - ACTION_CAPS[None, :]
+                ),
+                axis=1,
+            )
+            observed_prediction = predictions[eligible_test, actual_index]
+            fold_rmses.append(float(np.sqrt(np.mean(
+                (
+                    observed_prediction[:, 0]
+                    - target[eligible_test, 0]
+                ) ** 2
+            ))))
+
+    if not np.all(np.isfinite(predictions)):
+        reasons.add(f"year_{record.policy_year}_nonfinite_policyholder_prediction")
+        predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # A broad training-support envelope prevents a continuous-cap regression
+    # from manufacturing astronomical optionality between observed grid cells.
+    if np.any(fit_eligible):
+        ceiling = np.max(target[fit_eligible], axis=0) + 5.0 * np.std(
+            target[fit_eligible], axis=0
+        )
+    else:
+        ceiling = np.zeros(2)
+    ceiling = np.maximum(ceiling, 0.0)
+    before = predictions.copy()
+    predictions = np.minimum(predictions, ceiling[None, None, :])
+    clip_fraction = float(np.mean(np.abs(before - predictions) > 0.0))
+    # Clipping itself is the safety control.  A few extrapolated candidate
+    # rows are expected when the same path is evaluated at every cap; reject
+    # the entire follower regression only when clipping is pervasive.
+    if clip_fraction > 0.20:
+        reasons.add(
+            f"year_{record.policy_year}_candidate_clip_fraction_{clip_fraction:.6g}"
+        )
+
+    # Deployment uses the exact after-cap customer state.  Its target is the
+    # same coupled Continue value used above; only the information basis moves
+    # from pre-cap-plus-candidate to the realised safe decision context.
+    deployment_scale = np.std(after_actual[fit_eligible], axis=0) \
+        if np.any(fit_eligible) else np.zeros(after_actual.shape[1])
+    deployment_active = np.flatnonzero(
+        deployment_scale > 1.0e-10
+    ).astype(np.int64)
+    deployment_count = int(np.count_nonzero(fit_eligible))
+    if deployment_count < max(60, 2 * (deployment_active.size + 1)):
+        reasons.add(
+            f"year_{record.policy_year}_deployment_support_{deployment_count}"
+        )
+    if deployment_active.size and deployment_count:
+        centre = np.mean(after_actual[fit_eligible][:, deployment_active], axis=0)
+        scale = np.std(after_actual[fit_eligible][:, deployment_active], axis=0)
+        scale = np.where(scale > 1.0e-10, scale, 1.0)
+        design = _follower_linear_design(
+            after_actual[fit_eligible], centre, scale, deployment_active
+        )
+        beta = _ridge_fit_multioutput(
+            design,
+            target[fit_eligible, :1] / premium,
+            settings.ridge,
+        )[:, 0]
+        condition = _condition_number(design, settings.ridge)
+        rank = int(np.linalg.matrix_rank(design))
+    else:
+        centre = np.zeros(0)
+        scale = np.ones(0)
+        beta = np.asarray([
+            float(np.mean(target[fit_eligible, 0]) / premium)
+            if deployment_count else 0.0
+        ])
+        condition = 1.0
+        rank = 1
+    rmse = float(np.mean(fold_rmses)) if fold_rmses else float("inf")
+    stable = (
+        not reasons
+        and np.isfinite(condition)
+        and condition <= settings.maximum_condition_number
+        and rank == beta.size
+    )
+    regression = _FollowerDeploymentRegression(
+        premium=premium,
+        active_feature_indices=deployment_active,
+        centre=np.asarray(centre, dtype=float),
+        scale=np.asarray(scale, dtype=float),
+        coefficients=np.asarray(beta, dtype=float),
+        condition_number=float(condition),
+        matrix_rank=rank,
+        oof_rmse_aud=rmse,
+        stable=stable,
+    )
+    signature_text = json.dumps(signature, default=str, separators=(",", ":"))
+    diagnostic = {
+        "policy_signature": signature_text,
+        "policy_signature_fingerprint": hashlib.sha256(
+            signature_text.encode("utf-8")
+        ).hexdigest(),
+        "policy_year": record.policy_year,
+        "decision_step": record.decision_step,
+        "observations": deployment_count,
+        "folds_used": n_folds,
+        "feature_count": basis_dimension,
+        "matrix_rank": rank,
+        "condition_number": float(condition),
+        "oof_rmse_aud": rmse,
+        "candidate_prediction_clip_fraction": clip_fraction,
+        "regression_accepted_for_exercise": stable,
+        "fallback_reason": "|".join(sorted(reasons)) if reasons else "",
+        "two_value_recursion": True,
+    }
+    return _CoupledFollowerYearFit(
+        candidate_values=predictions,
+        deployment_regression=regression,
+        stable=stable,
+        instability_reasons=tuple(sorted(reasons)),
+        diagnostic=diagnostic,
+    )
+
+
 def _constant_first_year_policy(
     year: int,
     raw_state: Array,
     action_values: Array,
+    action_standard_errors: Array,
     feature_names: Sequence[str],
+    numerically_stable: bool = True,
 ) -> RegressionPolicyYear:
     nonlinear, interactions, _ = _basis_specification(feature_names)
     mean, scale = _raw_scaling(raw_state)
@@ -1528,6 +3520,2292 @@ def _constant_first_year_policy(
         raw_scale=scale,
         coefficients=coefficients,
         action_caps=ACTION_CAPS.copy(),
+        action_value_standard_error=np.asarray(
+            action_standard_errors, dtype=float
+        ).copy(),
+        numerically_stable=bool(numerically_stable),
+    )
+
+
+def _policy_action_values(
+    policy: RegressionPolicyYear,
+    raw_state: Array,
+    feature_names: Sequence[str],
+) -> Array:
+    """Evaluate all fitted cap actions for one pre-action state matrix."""
+    nonlinear, interactions, _ = _basis_specification(feature_names)
+    design = _design_matrix(
+        np.asarray(raw_state, dtype=float),
+        policy.raw_mean,
+        policy.raw_scale,
+        nonlinear,
+        interactions,
+    )
+    if design.shape[1] != policy.coefficients.shape[1]:
+        raise ValueError("Fitted policy basis is incompatible with control states.")
+    values = np.einsum("pb,abo->pao", design, policy.coefficients)
+    if (
+        policy.value_lower_bounds is not None
+        or policy.value_upper_bounds is not None
+    ):
+        if policy.value_lower_bounds is None or policy.value_upper_bounds is None:
+            raise ValueError("Fitted value bounds must be supplied as a pair.")
+        lower = np.asarray(policy.value_lower_bounds, dtype=float)
+        upper = np.asarray(policy.value_upper_bounds, dtype=float)
+        expected = (len(policy.action_caps), values.shape[2])
+        if lower.shape != expected or upper.shape != expected:
+            raise ValueError("Fitted value bounds are shape-inconsistent.")
+        values = np.minimum(np.maximum(values, lower[None, :, :]),
+                            upper[None, :, :])
+        if values.shape[2] == 10:
+            values[:, :, 0] = (
+                values[:, :, 1]
+                + values[:, :, 2]
+                + values[:, :, 3]
+                + values[:, :, 4]
+                + values[:, :, 5]
+                - values[:, :, 6]
+                - values[:, :, 7]
+                - values[:, :, 8]
+                - values[:, :, 9]
+            )
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError("Fitted cap-policy values contain non-finite entries.")
+    return values
+
+
+def _rollout_cap_policy(
+    inputs: ControlStateInputs,
+    policy_years: Sequence[RegressionPolicyYear],
+    feature_names: Sequence[str],
+    fallback_cap: float,
+    advantage_screen_multiplier: float = 1.96,
+    portfolio_state_paths: Optional[Array] = None,
+) -> Array:
+    """Generate an implementable pathwise cap schedule without look-ahead.
+
+    Only market and cap/crediting history through the start of the current year
+    enter the action.  The resulting complete cap matrix can therefore be fed
+    once into the unchanged monthly product projector on independent paths.
+    """
+    names = tuple(feature_names)
+    if names[:len(CONTROL_STATE_FEATURE_NAMES)] != CONTROL_STATE_FEATURE_NAMES:
+        raise ValueError(
+            "Rollout state must start with the documented adapted market/cap state."
+        )
+    extra_feature_count = len(names) - len(CONTROL_STATE_FEATURE_NAMES)
+    if extra_feature_count:
+        if portfolio_state_paths is None:
+            raise ValueError(
+                "Rich fitted policy requires observable portfolio state paths."
+            )
+        rich = np.asarray(portfolio_state_paths, dtype=float)
+        expected = (inputs.n_paths, inputs.n_years + 1, extra_feature_count)
+        if rich.shape != expected or not np.all(np.isfinite(rich)):
+            raise ValueError(
+                f"portfolio_state_paths must be finite with shape {expected}."
+            )
+    elif portfolio_state_paths is not None:
+        raise ValueError("Compact fitted policy cannot accept extra portfolio states.")
+    by_year = {policy.year: policy for policy in policy_years}
+    if 0 not in by_year:
+        raise ValueError("The fitted policy has no first-year decision.")
+    fallback_action = int(np.argmin(np.abs(ACTION_CAPS - fallback_cap)))
+    if not np.isclose(ACTION_CAPS[fallback_action], fallback_cap):
+        raise ValueError("fallback_cap must be on the admissible action grid.")
+    if not np.isfinite(advantage_screen_multiplier) \
+            or advantage_screen_multiplier < 0.0:
+        raise ValueError(
+            "advantage_screen_multiplier must be finite and non-negative."
+        )
+    caps = np.full(
+        (inputs.n_paths, inputs.n_years), fallback_cap, dtype=float
+    )
+    for year in range(inputs.n_years):
+        policy = by_year.get(year)
+        if policy is None:
+            # No customer exposure remains in the omitted market tail.
+            continue
+        states = _control_state_paths(inputs, caps)
+        if extra_feature_count:
+            states = np.concatenate((states, rich), axis=2)
+        values = _policy_action_values(
+            policy, states[:, year, :], feature_names
+        )
+        csm_values = values[:, :, 0]
+        best = _lower_cap_argmax(csm_values, axis=1)
+        rows = np.arange(inputs.n_paths)
+        advantage = (
+            csm_values[rows, best] - csm_values[:, fallback_action]
+        )
+        # This is deliberately only a conservative action screen.  The
+        # per-action residual RMSE/sqrt(n) is not a state-conditional prediction
+        # interval; actual deployment is decided later by a paired direct
+        # monthly-projection validation sample.
+        uncertainty = advantage_screen_multiplier * np.sqrt(
+            policy.action_value_standard_error[best] ** 2
+            + policy.action_value_standard_error[fallback_action] ** 2
+        )
+        chosen = np.where(advantage > uncertainty, best, fallback_action)
+        caps[:, year] = policy.action_caps[chosen]
+    return caps
+
+
+def _rollout_cap_policy_with_projected_states(
+    *,
+    inputs: ControlStateInputs,
+    policy_years: Sequence[RegressionPolicyYear],
+    feature_names: Sequence[str],
+    fallback_cap: float,
+    scenarios: ScenarioSet,
+    product: IndexLinkedLifetimeIncomeProduct,
+    model_points: PolicyholderModelPointSet,
+    behaviour: BehaviourModel,
+    mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
+    projection_config: ProjectionConfig,
+    model_point_log_interval: int,
+    surrender_policy_factory: Optional[Callable[[PolicySpec], object]],
+    collect_policyholder_by_signature: bool = False,
+    maximum_iterations: int = 5,
+) -> tuple[Array, PortfolioPathData, dict[str, object]]:
+    """Roll out the rich-state policy causally, one frozen prefix at a time.
+
+    The state at the start of year ``y`` depends only on caps ``0..y-1``.
+    Therefore a time-prefix portfolio projection with an arbitrary suffix is
+    sufficient to freeze cap ``y`` exactly.  This removes the former
+    full-horizon fixed-point convergence selector and ensures that validation
+    and evaluation execute the same precommitted policy without either sample
+    being allowed to choose a fallback.
+    """
+    if maximum_iterations <= 0:
+        raise ValueError("maximum_iterations must be positive.")
+    caps = np.full((scenarios.n_paths, inputs.n_years), fallback_cap, dtype=float)
+    by_year = {policy.year: policy for policy in policy_years}
+    fallback_action = int(np.argmin(np.abs(ACTION_CAPS - fallback_cap)))
+    if not np.isclose(ACTION_CAPS[fallback_action], fallback_cap):
+        raise ValueError("fallback_cap must be on the admissible action grid.")
+    expected_names = tuple(feature_names)[len(CONTROL_STATE_FEATURE_NAMES):]
+    frozen_action_counts: list[int] = []
+
+    for year in range(inputs.n_years):
+        policy = by_year.get(year)
+        if policy is None or not policy.numerically_stable:
+            frozen_action_counts.append(0)
+            continue
+        stop_step = max(1, min(year * STEPS_PER_YEAR, scenarios.n_steps))
+        prefix_scenarios = _truncate_scenarios(scenarios, stop_step)
+        prefix_projected = _aggregate_portfolio_paths(
+            scenarios=prefix_scenarios,
+            cap_matrix=caps,
+            product=product,
+            model_points=model_points,
+            behaviour=behaviour,
+            mortality=mortality,
+            expenses=expenses,
+            projection_config=projection_config,
+            collect_states=True,
+            progress_label=f"Causal rich-state rollout year {year + 1}",
+            model_point_log_interval=model_point_log_interval,
+            surrender_policy_factory=surrender_policy_factory,
+        )
+        rich, rich_names = _portfolio_state_extension(prefix_projected)
+        if rich_names != expected_names:
+            raise RuntimeError("Evaluation portfolio state layout differs from training.")
+        compact = _control_state_paths(inputs, caps)
+        raw = np.concatenate((compact[:, year, :], rich[:, year, :]), axis=1)
+        if year == 0:
+            values = _policy_action_values(
+                policy, np.mean(raw, axis=0, keepdims=True), feature_names
+            )[0]
+            best = int(_lower_cap_argmax(values[:, 0]))
+            chosen = best
+            caps[:, year] = policy.action_caps[chosen]
+            frozen_action_counts.append(int(chosen != fallback_action))
+        else:
+            values = _policy_action_values(policy, raw, feature_names)
+            best = _lower_cap_argmax(values[:, :, 0], axis=1)
+            chosen = best
+            caps[:, year] = policy.action_caps[chosen]
+            frozen_action_counts.append(int(np.count_nonzero(
+                chosen != fallback_action
+            )))
+
+    projected = _aggregate_portfolio_paths(
+        scenarios=scenarios,
+        cap_matrix=caps,
+        product=product,
+        model_points=model_points,
+        behaviour=behaviour,
+        mortality=mortality,
+        expenses=expenses,
+        projection_config=projection_config,
+        collect_states=True,
+        progress_label="Causal rich-state rollout final projection",
+        model_point_log_interval=model_point_log_interval,
+        surrender_policy_factory=surrender_policy_factory,
+        collect_policyholder_by_signature=collect_policyholder_by_signature,
+    )
+    return caps, projected, {
+        "converged": True,
+        "iterations": inputs.n_years,
+        "changed_action_counts": frozen_action_counts,
+        "maximum_iterations": inputs.n_years,
+        "method": "exact_causal_prefix_rollout",
+        "evaluation_sample_used_for_fallback": False,
+    }
+
+
+def _direct_policy_year_rows(
+    cap_matrix: Array,
+    inforce_exposure: Array,
+    active_policy_years: Sequence[int],
+) -> list[dict[str, object]]:
+    """Summarise cap choices from the independent direct policy rollout."""
+    caps = np.asarray(cap_matrix, dtype=float)
+    exposure = np.asarray(inforce_exposure, dtype=float)
+    rows: list[dict[str, object]] = []
+    for policy_year in active_policy_years:
+        year = int(policy_year) - 1
+        selected = caps[:, year]
+        quantiles = np.quantile(selected, (0.10, 0.50, 0.90))
+        mean_cap = float(np.mean(selected))
+        mean_inforce = float(np.mean(exposure[:, year]))
+        for action, cap in enumerate(ACTION_CAPS):
+            rows.append({
+                "policy_year": int(policy_year),
+                "cap": float(cap),
+                "selected_fraction": float(np.mean(np.isclose(selected, cap))),
+                "mean_selected_cap": mean_cap,
+                "p10_selected_cap": float(quantiles[0]),
+                "median_selected_cap": float(quantiles[1]),
+                "p90_selected_cap": float(quantiles[2]),
+                "economically_active": True,
+                "mean_inforce_exposure": mean_inforce,
+                "source": "independent_direct_policy_rollout",
+                "action_index": action,
+            })
+    return rows
+
+
+def _policyholder_exercise_rows(
+    *,
+    label: str,
+    cap_matrix: Array,
+    projected: PortfolioPathData,
+    active_policy_years: Sequence[int],
+    path_slice: slice = slice(None),
+    cap_values: Sequence[float] = ACTION_CAPS,
+) -> list[dict[str, object]]:
+    """Portfolio-weighted Full-Withdrawal exposure by year and chosen cap."""
+    caps = np.asarray(cap_matrix, dtype=float)[path_slice]
+    events = np.asarray(projected.lapse_events, dtype=float)[path_slice]
+    if caps.shape != events.shape:
+        raise ValueError("Cap and annual exercise matrices must align.")
+    if projected.pre_action_states is None:
+        raise ValueError("Exercise reporting requires pre-action exposures.")
+    state_index = {
+        name: position
+        for position, name in enumerate(
+            projected.pre_action_state_feature_names
+        )
+    }
+    income_exposure = projected.pre_action_states[
+        path_slice, :-1, state_index["income_exposure"]
+    ]
+    rows: list[dict[str, object]] = []
+    for policy_year in active_policy_years:
+        year = int(policy_year) - 1
+        for cap in cap_values:
+            selected = (
+                np.isposinf(caps[:, year])
+                if np.isposinf(cap)
+                else np.isclose(caps[:, year], cap)
+            )
+            count = int(np.count_nonzero(selected))
+            selected_exit_mass = float(np.sum(events[selected, year]))
+            selected_income_exposure = float(np.sum(
+                income_exposure[selected, year]
+            ))
+            rows.append({
+                "policy": label,
+                "policy_year": int(policy_year),
+                "cap": float(cap),
+                "cap_percent": 100.0 * float(cap),
+                "selected_market_path_count": count,
+                "selected_market_path_fraction": float(np.mean(selected)),
+                "mean_full_withdrawal_probability_on_selected_paths": (
+                    float(np.mean(events[selected, year])) if count else 0.0
+                ),
+                "mean_full_withdrawal_probability_all_paths": float(
+                    np.mean(np.where(selected, events[:, year], 0.0))
+                ),
+                "full_withdrawal_exercise_rate_over_income_exposure": (
+                    selected_exit_mass / selected_income_exposure
+                    if selected_income_exposure > 0.0 else 0.0
+                ),
+                "selected_full_withdrawal_exit_mass": selected_exit_mass,
+                "selected_pre_action_income_exposure": (
+                    selected_income_exposure
+                ),
+                "weighting": (
+                    "contract_weight and spouse-branch probability applied "
+                    "once inside the pathwise portfolio projection"
+                ),
+            })
+    return rows
+
+
+def _policyholder_regression_rows(
+    fit_sets: Mapping[str, PolicyholderFitSet],
+) -> list[dict[str, object]]:
+    """Flatten follower-value diagnostics without mixing insurer regressions."""
+    rows: list[dict[str, object]] = []
+    for fit_label, fit_set in fit_sets.items():
+        for signature, fit in fit_set.fits.items():
+            signature_text = json.dumps(signature, default=str, separators=(",", ":"))
+            signature_fingerprint = hashlib.sha256(
+                signature_text.encode("utf-8")
+            ).hexdigest()
+            diagnostics = tuple(fit.diagnostics)
+            if not diagnostics:
+                rows.append({
+                    "fit_label": fit_label,
+                    "policy_signature_fingerprint": signature_fingerprint,
+                    "policy_signature": signature_text,
+                    "policy_year": None,
+                    "decision_step": None,
+                    "observations": fit.training_path_count,
+                    "folds_used": None,
+                    "feature_count": None,
+                    "matrix_rank": None,
+                    "condition_number": None,
+                    "oof_rmse_aud": None,
+                    "oof_r_squared": None,
+                    "mean_immediate_value_aud": None,
+                    "mean_continuation_target_aud": None,
+                    "training_exercise_rate": 0.0,
+                    "regression_accepted_for_exercise": False,
+                    "training_policyholder_value_aud": (
+                        fit.training_policyholder_value_aud
+                    ),
+                    "training_no_action_policyholder_value_aud": (
+                        fit.training_no_action_policyholder_value_aud
+                    ),
+                    "training_candidate_policyholder_value_aud": (
+                        fit.training_candidate_policyholder_value_aud
+                    ),
+                    "training_optionality_uplift_aud": (
+                        fit.training_optionality_uplift_aud
+                    ),
+                    "training_fallback_used": fit.training_fallback_used,
+                    "training_scenario_fingerprint": (
+                        fit.training_scenario_fingerprint
+                    ),
+                    "training_cap_schedule_fingerprint": (
+                        fit_set.cap_schedule_fingerprint
+                    ),
+                })
+                continue
+            for diagnostic in diagnostics:
+                row = diagnostic.as_dict()
+                row.update({
+                    "fit_label": fit_label,
+                    "policy_signature_fingerprint": signature_fingerprint,
+                    "policy_signature": signature_text,
+                    "training_policyholder_value_aud": (
+                        fit.training_policyholder_value_aud
+                    ),
+                    "training_no_action_policyholder_value_aud": (
+                        fit.training_no_action_policyholder_value_aud
+                    ),
+                    "training_candidate_policyholder_value_aud": (
+                        fit.training_candidate_policyholder_value_aud
+                    ),
+                    "training_optionality_uplift_aud": (
+                        fit.training_optionality_uplift_aud
+                    ),
+                    "training_fallback_used": fit.training_fallback_used,
+                    "training_scenario_fingerprint": (
+                        fit.training_scenario_fingerprint
+                    ),
+                    "training_cap_schedule_fingerprint": (
+                        fit_set.cap_schedule_fingerprint
+                    ),
+                })
+                rows.append(row)
+    return rows
+
+
+def _counterfactual_next_leader_state(
+    *,
+    inputs: ControlStateInputs,
+    current_state: Array,
+    year: int,
+    current_cap: Array,
+    next_portfolio_state: Array,
+) -> Array:
+    """Advance only observable market/cap history plus supplied exposures."""
+    state = np.asarray(current_state, dtype=float)
+    cap = np.asarray(current_cap, dtype=float)
+    portfolio = np.asarray(next_portfolio_state, dtype=float)
+    if state.shape[0] != inputs.n_paths or cap.shape != (inputs.n_paths,):
+        raise ValueError("Counterfactual leader transition has invalid path shape.")
+    if portfolio.shape != (
+        inputs.n_paths, len(PORTFOLIO_CONTROL_STATE_FEATURE_NAMES)
+    ):
+        raise ValueError("Counterfactual portfolio state has an invalid shape.")
+    if year < 0 or year >= inputs.n_years:
+        raise ValueError("Counterfactual leader transition year is invalid.")
+    compact = np.zeros((inputs.n_paths, len(CONTROL_STATE_FEATURE_NAMES)))
+    compact[:, :5] = inputs.market_features[:, year + 1, :]
+    reference_return = inputs.annual_reference_fund_return[:, year]
+    positive_return = np.maximum(reference_return, 0.0)
+    credited = np.minimum(positive_return, cap)
+    excess = np.maximum(positive_return - cap, 0.0)
+    compact[:, 5] = state[:, 5] + np.log1p(credited)
+    compact[:, 6] = cap
+    compact[:, 7] = (state[:, 7] * year + cap) / (year + 1)
+    compact[:, 8] = (state[:, 8] * year + excess) / (year + 1)
+    compact[:, 9] = np.maximum(
+        np.log1p(reference_return) - np.log1p(credited), 0.0
+    )
+    out = np.concatenate((compact, portfolio), axis=1)
+    if not np.all(np.isfinite(out)):
+        raise RuntimeError("Counterfactual next leader state is non-finite.")
+    return out
+
+
+def _portfolio_continue_component_tensor(data: PortfolioPathData) -> Array:
+    components = np.stack((
+        data.fees_product,
+        data.fees_lip,
+        data.crediting_margin,
+        data.mva_retained,
+        data.aps_retained,
+        data.guarantee_claims,
+        data.other_insurer_funded_benefits,
+        data.expenses,
+        data.hedge_costs,
+    ), axis=2)
+    return _with_derived_csm(components)
+
+
+def _coupled_backward_induction_rowwise_crossfit_legacy(
+    data: PortfolioPathData,
+    action_indices: IntArray,
+    *,
+    control_inputs: ControlStateInputs,
+    portfolio_state_extension: Array,
+    folds: int,
+    ridge: float,
+    seed: int,
+    follower_settings: OptimalBehaviourLSMCSettings,
+    scenario_fingerprint: str,
+    cap_schedule_fingerprint: str,
+) -> BackwardResult:
+    """Joint two-value fitted Stackelberg recursion.
+
+    At every year the customer continuation value is fitted first for every
+    PolicySpec signature.  The corresponding CONTINUE/FULL response changes
+    the insurer reward and the next aggregate exposure state.  Only then is
+    the insurer action value fitted and the cap selected.  Future customer
+    targets evaluate the already-fitted future leader rule, never the
+    exploratory control law.
+
+    A Policyholder is treated as non-atomic with respect to the portfolio
+    state: a single customer's deviation does not move the future common cap,
+    while the population best-response mass does.  The response/exposure map
+    is iterated vectorially; a cycle falls back to Continue for that year.
+    """
+    if data.raw_states is None or data.inforce_exposure is None:
+        raise ValueError("Coupled backward induction requires rich state paths.")
+    if not data.signature_control_paths:
+        raise ValueError("Coupled backward induction lacks signature primitives.")
+    n_paths, n_years = data.new_business_csm_proxy.shape
+    if action_indices.shape != (n_paths, n_years):
+        raise ValueError("Coupled action indices are shape-inconsistent.")
+    if portfolio_state_extension.shape != (
+        n_paths,
+        n_years + 1,
+        len(PORTFOLIO_CONTROL_STATE_FEATURE_NAMES),
+    ):
+        raise ValueError("Coupled portfolio-state extension is shape-inconsistent.")
+    feature_names = data.state_feature_names
+    if tuple(feature_names) != (
+        *CONTROL_STATE_FEATURE_NAMES,
+        *PORTFOLIO_CONTROL_STATE_FEATURE_NAMES,
+    ):
+        raise ValueError("Coupled recursion requires the documented 20-state layout.")
+
+    rng = np.random.default_rng(seed)
+    fold_ids = np.empty(n_paths, dtype=np.int64)
+    for action in range(len(ACTION_CAPS)):
+        rows = np.flatnonzero(action_indices[:, 0] == action)
+        assigned = np.resize(np.arange(folds, dtype=np.int64), len(rows))
+        fold_ids[rows] = rng.permutation(assigned)
+    if set(np.unique(fold_ids)) != set(range(folds)):
+        raise RuntimeError("Complete-path cross-fitting did not populate every fold.")
+
+    continue_components = _portfolio_continue_component_tensor(data)
+    future_leader: _CoupledLeaderYearFit | None = None
+    future_follower_values: dict[tuple[object, ...], Array] = {}
+    follower_deployment_targets: dict[
+        tuple[object, ...], dict[int, Array]
+    ] = {signature: {} for signature in data.signature_control_paths}
+    follower_rows: list[dict[str, object]] = []
+    leader_rows: list[dict[str, object]] = []
+    policy_year_rows: list[dict[str, object]] = []
+    first_year_action_rows: list[dict[str, object]] = []
+    policy_years: list[RegressionPolicyYear] = []
+    active_years: list[int] = []
+    numerical_reasons: set[str] = set()
+    first_cap = float("nan")
+    first_outputs = np.zeros(10)
+    first_se = float("nan")
+
+    LOGGER.info(
+        "Coupled backward induction | years=%d | actions=%d | paths=%d | "
+        "signatures=%d | folds=%d",
+        n_years,
+        len(ACTION_CAPS),
+        n_paths,
+        len(data.signature_control_paths),
+        folds,
+    )
+    rows_index = np.arange(n_paths)
+    for year in range(n_years - 1, -1, -1):
+        exposure = np.asarray(data.inforce_exposure[:, year], dtype=float)
+        economically_active = bool(np.any(exposure > 0.0))
+        if not economically_active:
+            continue
+        active_years.append(year + 1)
+        if year == n_years - 1 or year == 0 or (year + 1) % 5 == 0:
+            LOGGER.info(
+                "Coupled backward induction | processing policy year %d/%d",
+                year + 1,
+                n_years,
+            )
+
+        records = {
+            signature: paths.decision_years[year]
+            for signature, paths in data.signature_control_paths.items()
+            if year in paths.decision_years
+        }
+        responses = {
+            signature: np.zeros(n_paths, dtype=bool)
+            for signature in records
+        }
+        final_fits: dict[tuple[object, ...], _CoupledFollowerYearFit] = {}
+        final_targets: dict[tuple[object, ...], Array] = {}
+        response_converged = True
+        previous_future_action: Array | None = None
+        maximum_response_iterations = 4 if records else 1
+
+        for response_iteration in range(maximum_response_iterations):
+            next_portfolio = np.array(
+                portfolio_state_extension[:, year + 1, :], copy=True
+            )
+            for signature, response in responses.items():
+                contribution = np.asarray(
+                    records[signature].next_portfolio_exposure_contribution,
+                    dtype=float,
+                )
+                next_portfolio[:, 1:] -= response[:, None] * contribution
+            next_portfolio[:, 1:] = np.maximum(next_portfolio[:, 1:], 0.0)
+            next_state = _counterfactual_next_leader_state(
+                inputs=control_inputs,
+                current_state=data.raw_states[:, year, :],
+                year=year,
+                current_cap=ACTION_CAPS[action_indices[:, year]],
+                next_portfolio_state=next_portfolio,
+            )
+            if future_leader is None:
+                future_action = np.zeros(n_paths, dtype=np.int64)
+            else:
+                future_values = _cross_fitted_leader_action_values(
+                    future_leader, next_state, fold_ids, feature_names
+                )
+                future_action = _lower_cap_argmax(
+                    future_values[:, :, 0], axis=1
+                )
+
+            new_responses: dict[tuple[object, ...], Array] = {}
+            current_follower_values: dict[tuple[object, ...], Array] = {}
+            iteration_fits: dict[
+                tuple[object, ...], _CoupledFollowerYearFit
+            ] = {}
+            iteration_targets: dict[tuple[object, ...], Array] = {}
+            for signature, record in records.items():
+                next_u_grid = future_follower_values.get(signature)
+                if next_u_grid is None:
+                    future_u = np.zeros(n_paths)
+                else:
+                    future_u = next_u_grid[rows_index, future_action]
+                numerator = (
+                    np.asarray(
+                        record.continue_policyholder_interval_pv, dtype=float
+                    )
+                    + np.asarray(
+                        record.next_decision_discount_inforce, dtype=float
+                    ) * future_u
+                )
+                denominator = np.asarray(
+                    record.decision_discount_inforce, dtype=float
+                )
+                continuation_target = np.divide(
+                    numerator,
+                    np.maximum(denominator, 1.0e-300),
+                    out=np.zeros_like(numerator),
+                    where=denominator > 1.0e-300,
+                )
+                paths = data.signature_control_paths[signature]
+                fit = _fit_coupled_follower_year(
+                    signature=signature,
+                    policy=paths.policy,
+                    record=record,
+                    actual_caps=ACTION_CAPS[action_indices[:, year]],
+                    continuation_target=continuation_target,
+                    fold_ids=fold_ids,
+                    settings=follower_settings,
+                )
+                candidate = fit.candidate_values
+                structural_eligible = (
+                    (np.asarray(record.phase) == Phase.INCOME.value)[:, None]
+                    & (~np.asarray(record.just_elected, dtype=bool))[:, None]
+                    & (
+                        np.asarray(record.pre_cap_core, dtype=float)[:, 12]
+                        > follower_settings.minimum_inforce_weight
+                    )[:, None]
+                )
+                buffer = (
+                    follower_settings.exercise_tolerance_aud
+                    + follower_settings.exercise_buffer_rmse_multiplier
+                    * fit.deployment_regression.oof_rmse_aud
+                )
+                response_grid = structural_eligible & (
+                    candidate[:, :, 1] > candidate[:, :, 0] + buffer
+                )
+                if not fit.stable:
+                    response_grid[:] = False
+                response_observed = response_grid[
+                    rows_index, action_indices[:, year]
+                ]
+                # On the actually observed cap the monthly projector's exact
+                # gate is authoritative, including Election and zero-SV rules.
+                response_observed &= np.asarray(
+                    record.full_withdrawal_eligible, dtype=bool
+                )
+                new_responses[signature] = response_observed
+                current_follower_values[signature] = np.where(
+                    response_grid,
+                    candidate[:, :, 1],
+                    candidate[:, :, 0],
+                )
+                iteration_fits[signature] = fit
+                iteration_targets[signature] = continuation_target
+
+            same_response = all(
+                np.array_equal(new_responses[key], responses[key])
+                for key in responses
+            )
+            same_future_action = (
+                previous_future_action is not None
+                and np.array_equal(future_action, previous_future_action)
+            )
+            responses = new_responses
+            final_fits = iteration_fits
+            final_targets = iteration_targets
+            if same_response and (future_leader is None or same_future_action):
+                future_follower_candidate = current_follower_values
+                break
+            previous_future_action = future_action.copy()
+            future_follower_candidate = current_follower_values
+        else:
+            response_converged = False
+
+        if records and not response_converged:
+            reason = f"policy_year_{year + 1}_follower_exposure_fixed_point"
+            numerical_reasons.add(reason)
+            LOGGER.warning(
+                "Coupled follower/exposure map did not converge in year %d; "
+                "using the conservative Continue response for that year.",
+                year + 1,
+            )
+            # Re-evaluate the value functions on the state transition induced
+            # by the deployed all-Continue population.  Reusing the final
+            # oscillating iterate here would hand the preceding year a value
+            # from a response state that is never deployed.
+            continue_next_portfolio = np.array(
+                portfolio_state_extension[:, year + 1, :], copy=True
+            )
+            continue_next_state = _counterfactual_next_leader_state(
+                inputs=control_inputs,
+                current_state=data.raw_states[:, year, :],
+                year=year,
+                current_cap=ACTION_CAPS[action_indices[:, year]],
+                next_portfolio_state=continue_next_portfolio,
+            )
+            if future_leader is None:
+                continue_future_action = np.zeros(n_paths, dtype=np.int64)
+            else:
+                continue_future_values = _cross_fitted_leader_action_values(
+                    future_leader,
+                    continue_next_state,
+                    fold_ids,
+                    feature_names,
+                )
+                continue_future_action = _lower_cap_argmax(
+                    continue_future_values[:, :, 0], axis=1
+                )
+            fallback_fits: dict[
+                tuple[object, ...], _CoupledFollowerYearFit
+            ] = {}
+            fallback_targets: dict[tuple[object, ...], Array] = {}
+            fallback_values: dict[tuple[object, ...], Array] = {}
+            for signature, record in records.items():
+                next_u_grid = future_follower_values.get(signature)
+                future_u = (
+                    np.zeros(n_paths)
+                    if next_u_grid is None
+                    else next_u_grid[rows_index, continue_future_action]
+                )
+                numerator = (
+                    np.asarray(
+                        record.continue_policyholder_interval_pv,
+                        dtype=float,
+                    )
+                    + np.asarray(
+                        record.next_decision_discount_inforce,
+                        dtype=float,
+                    ) * future_u
+                )
+                denominator = np.asarray(
+                    record.decision_discount_inforce, dtype=float
+                )
+                continuation_target = np.divide(
+                    numerator,
+                    np.maximum(denominator, 1.0e-300),
+                    out=np.zeros_like(numerator),
+                    where=denominator > 1.0e-300,
+                )
+                fit = _fit_coupled_follower_year(
+                    signature=signature,
+                    policy=data.signature_control_paths[signature].policy,
+                    record=record,
+                    actual_caps=ACTION_CAPS[action_indices[:, year]],
+                    continuation_target=continuation_target,
+                    fold_ids=fold_ids,
+                    settings=follower_settings,
+                )
+                responses[signature] = np.zeros(n_paths, dtype=bool)
+                fallback_fits[signature] = fit
+                fallback_targets[signature] = continuation_target
+                fallback_values[signature] = fit.candidate_values[:, :, 0]
+            final_fits = fallback_fits
+            final_targets = fallback_targets
+            future_follower_candidate = fallback_values
+
+        # Freeze only stable final customer regressions.  An omitted year is
+        # operationally Continue in the context-aware forward policy.
+        for signature, fit in final_fits.items():
+            diagnostic = dict(fit.diagnostic)
+            diagnostic["response_fixed_point_converged"] = response_converged
+            observed_response = responses[signature]
+            diagnostic["training_exercise_rate"] = float(
+                np.mean(observed_response)
+            )
+            follower_rows.append(diagnostic)
+            if fit.stable and response_converged:
+                step = records[signature].decision_step
+                follower_deployment_targets[signature][step] = np.asarray(
+                    final_targets[signature], dtype=float
+                ).copy()
+            elif fit.instability_reasons:
+                signature_key = hashlib.sha256(
+                    json.dumps(
+                        signature, default=str, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                for reason in fit.instability_reasons:
+                    numerical_reasons.add(
+                        f"policyholder::{signature_key}::{reason}"
+                    )
+        future_follower_values = dict(future_follower_candidate)
+
+        next_portfolio = np.array(
+            portfolio_state_extension[:, year + 1, :], copy=True
+        )
+        immediate = np.array(continue_components[:, year, :], copy=True)
+        for signature, response in responses.items():
+            record = records[signature]
+            delta = np.asarray(
+                record.insurer_full_minus_continue_components, dtype=float
+            )
+            immediate[:, 1:] += response[:, None] * delta
+            contribution = np.asarray(
+                record.next_portfolio_exposure_contribution, dtype=float
+            )
+            next_portfolio[:, 1:] -= response[:, None] * contribution
+        next_portfolio[:, 1:] = np.maximum(next_portfolio[:, 1:], 0.0)
+        immediate[:, 0] = _csm_from_component_values(immediate[:, 1:])
+        next_state = _counterfactual_next_leader_state(
+            inputs=control_inputs,
+            current_state=data.raw_states[:, year, :],
+            year=year,
+            current_cap=ACTION_CAPS[action_indices[:, year]],
+            next_portfolio_state=next_portfolio,
+        )
+        if future_leader is None:
+            future_selected = np.zeros_like(immediate)
+        else:
+            future_values = _cross_fitted_leader_action_values(
+                future_leader, next_state, fold_ids, feature_names
+            )
+            future_action = _lower_cap_argmax(
+                future_values[:, :, 0], axis=1
+            )
+            future_selected = future_values[rows_index, future_action]
+        targets = immediate + future_selected
+        targets[:, 0] = _csm_from_component_values(targets[:, 1:])
+
+        oof, leader_fit, diagnostics = _fit_coupled_leader_year(
+            year=year,
+            raw_state=data.raw_states[:, year, :],
+            targets=targets,
+            observed_actions=action_indices[:, year],
+            fold_ids=fold_ids,
+            n_folds=folds,
+            ridge=ridge,
+            feature_names=feature_names,
+        )
+        leader_rows.extend(diagnostics)
+        numerical_reasons.update(
+            f"insurer::{reason}" for reason in leader_fit.instability_reasons
+        )
+        if year == 0:
+            action_values = np.mean(oof, axis=0)
+            action_se = np.asarray([
+                _standard_error(oof[:, action, 0])
+                for action in range(len(ACTION_CAPS))
+            ])
+            chosen = int(_lower_cap_argmax(action_values[:, 0]))
+            first_cap = float(ACTION_CAPS[chosen])
+            first_outputs = action_values[chosen]
+            first_se = float(action_se[chosen])
+            constant = _constant_first_year_policy(
+                year=0,
+                raw_state=data.raw_states[:, 0, :],
+                action_values=action_values,
+                action_standard_errors=action_se,
+                feature_names=feature_names,
+                numerically_stable=leader_fit.stable,
+            )
+            policy_years.append(constant)
+            for action, cap in enumerate(ACTION_CAPS):
+                first_year_action_rows.append({
+                    "cap": float(cap),
+                    "cap_percent": 100.0 * float(cap),
+                    "selection_estimated_q_new_business_csm_proxy": float(
+                        action_values[action, 0]
+                    ),
+                    "selection_standard_error_new_business_csm_proxy": float(
+                        action_se[action]
+                    ),
+                    "holdout_estimated_q_new_business_csm_proxy": float(
+                        action_values[action, 0]
+                    ),
+                    "holdout_estimated_q_fees_product": float(
+                        action_values[action, 1]
+                    ),
+                    "holdout_estimated_q_fees_lip": float(
+                        action_values[action, 2]
+                    ),
+                    "holdout_estimated_q_crediting_margin": float(
+                        action_values[action, 3]
+                    ),
+                    "holdout_estimated_q_mva_retained": float(
+                        action_values[action, 4]
+                    ),
+                    "holdout_estimated_q_aps_retained": float(
+                        action_values[action, 5]
+                    ),
+                    "holdout_estimated_q_guarantee_claims": float(
+                        action_values[action, 6]
+                    ),
+                    "holdout_estimated_q_other_insurer_funded_benefits": float(
+                        action_values[action, 7]
+                    ),
+                    "holdout_estimated_q_expenses": float(
+                        action_values[action, 8]
+                    ),
+                    "holdout_estimated_q_hedge_costs": float(
+                        action_values[action, 9]
+                    ),
+                    "holdout_standard_error_new_business_csm_proxy": float(
+                        action_se[action]
+                    ),
+                    "selection_path_count": n_paths,
+                    "holdout_path_count": n_paths,
+                    "observed_control_action_path_count": int(np.sum(
+                        action_indices[:, 0] == action
+                    )),
+                    "selection_value_semantics": (
+                        "complete-path out-of-fold fitted action-value mean"
+                    ),
+                    "holdout_value_semantics": (
+                        "legacy output column; identical complete-path OOF "
+                        "fitted action-value mean, not final evaluation CSM"
+                    ),
+                    "economically_active": True,
+                    "is_optimal_first_year_cap": action == chosen,
+                    "two_value_stackelberg_recursion": True,
+                })
+            policy_year_rows.append({
+                "policy_year": 1,
+                "cap": first_cap,
+                "selected_fraction": 1.0,
+                "mean_selected_cap": first_cap,
+                "p10_selected_cap": first_cap,
+                "median_selected_cap": first_cap,
+                "p90_selected_cap": first_cap,
+                "economically_active": True,
+                "mean_inforce_exposure": float(np.mean(exposure)),
+                "follower_response_fixed_point_converged": response_converged,
+            })
+        else:
+            chosen = _lower_cap_argmax(oof[:, :, 0], axis=1)
+            selected_caps = ACTION_CAPS[chosen]
+            mean_cap = float(np.mean(selected_caps))
+            quantiles = np.quantile(selected_caps, (0.10, 0.50, 0.90))
+            for action, cap in enumerate(ACTION_CAPS):
+                fraction = float(np.mean(chosen == action))
+                diagnostics[action]["selected_fraction_cross_fitted"] = fraction
+                policy_year_rows.append({
+                    "policy_year": year + 1,
+                    "cap": float(cap),
+                    "selected_fraction": fraction,
+                    "mean_selected_cap": mean_cap,
+                    "p10_selected_cap": float(quantiles[0]),
+                    "median_selected_cap": float(quantiles[1]),
+                    "p90_selected_cap": float(quantiles[2]),
+                    "economically_active": True,
+                    "mean_inforce_exposure": float(np.mean(exposure)),
+                    "follower_response_fixed_point_converged": (
+                        response_converged
+                    ),
+                })
+            policy_years.append(leader_fit.deployment)
+        future_leader = leader_fit
+
+    policy_years.sort(key=lambda item: item.year)
+    active_years.sort()
+    if not active_years or active_years[0] != 1:
+        raise RuntimeError("The coupled portfolio has no active first policy year.")
+    expected = list(range(1, active_years[-1] + 1))
+    if active_years != expected:
+        raise RuntimeError("Coupled economic policy horizon is not contiguous.")
+    policies: dict[tuple[object, ...], object] = {}
+    signature_fallbacks: set[tuple[object, ...]] = set()
+    signature_fallback_steps: dict[
+        tuple[object, ...], tuple[int, ...]
+    ] = {}
+    for signature, paths in data.signature_control_paths.items():
+        targets_by_step = follower_deployment_targets[signature]
+        features_by_step: dict[int, Array] = {}
+        fold_paths_by_step: dict[int, IntArray] = {}
+        for year, record in paths.decision_years.items():
+            step = record.decision_step
+            if step not in targets_by_step:
+                continue
+            eligible = (
+                (np.asarray(record.phase) == Phase.INCOME.value)
+                & (
+                    np.asarray(record.pre_cap_core, dtype=float)[:, 12]
+                    > follower_settings.minimum_inforce_weight
+                )
+            )
+            features_by_step[step] = _follower_features_from_core(
+                record.after_cap_core,
+                announced_cap=np.asarray(record.after_cap_core, dtype=float)[:, 8],
+                duration_years=float(year),
+                include_previous_cap=False,
+            )[eligible]
+            targets_by_step[step] = np.asarray(
+                targets_by_step[step], dtype=float
+            )[eligible]
+            fold_paths_by_step[step] = fold_ids[eligible].copy()
+        continuation_fit = fit_surrender_continuation_policy(
+            features_by_step,
+            targets_by_step,
+            premium=float(paths.policy.net_initial_investment),
+            settings=follower_settings,
+            fold_ids_by_step=fold_paths_by_step,
+        )
+        policies[signature] = continuation_fit.policy
+        active_year_indices = {policy_year - 1 for policy_year in active_years}
+        expected_steps = {
+            record.decision_step
+            for year, record in paths.decision_years.items()
+            if year in active_year_indices
+        }
+        deployed_steps = set(continuation_fit.policy.regressions)
+        signature_fallback_steps[signature] = tuple(sorted(
+            expected_steps - deployed_steps
+        ))
+        if features_by_step and len(continuation_fit.fallback_steps) == len(
+            features_by_step
+        ):
+            signature_fallbacks.add(signature)
+        signature_text = json.dumps(
+            signature, default=str, separators=(",", ":")
+        )
+        signature_fingerprint = hashlib.sha256(
+            signature_text.encode("utf-8")
+        ).hexdigest()
+        for diagnostic in continuation_fit.diagnostics:
+            row = diagnostic.as_dict()
+            row.update({
+                "policy_signature": signature_text,
+                "policy_signature_fingerprint": signature_fingerprint,
+                "value_function": "coupled_after_cap_deployment_continuation",
+                "two_value_recursion": True,
+            })
+            follower_rows.append(row)
+    fit_set = CoupledPolicyholderFitSet(
+        policies=policies,
+        scenario_fingerprint=scenario_fingerprint,
+        cap_schedule_fingerprint=cap_schedule_fingerprint,
+        fallback_signatures=signature_fallbacks,
+        fallback_steps_by_signature=signature_fallback_steps,
+    )
+    component_csm = _csm_from_component_values(first_outputs[1:][None, :])[0]
+    return BackwardResult(
+        first_year_cap=first_cap,
+        pv_new_business_csm_proxy=float(first_outputs[0]),
+        pv_fees_product=float(first_outputs[1]),
+        pv_fees_lip=float(first_outputs[2]),
+        pv_crediting_margin=float(first_outputs[3]),
+        pv_mva_retained=float(first_outputs[4]),
+        pv_aps_retained=float(first_outputs[5]),
+        pv_guarantee_claims=float(first_outputs[6]),
+        pv_other_insurer_funded_benefits=float(first_outputs[7]),
+        pv_expenses=float(first_outputs[8]),
+        pv_hedge_costs=float(first_outputs[9]),
+        standard_error_new_business_csm_proxy=first_se,
+        first_year_action_rows=first_year_action_rows,
+        policy_year_rows=sorted(
+            policy_year_rows,
+            key=lambda row: (int(row["policy_year"]), float(row["cap"])),
+        ),
+        regression_rows=sorted(
+            leader_rows,
+            key=lambda row: (int(row["policy_year"]), float(row["cap"])),
+        ),
+        policy_years=policy_years,
+        reconciliation_gap=float(first_outputs[0] - component_csm),
+        economically_active_policy_years=tuple(active_years),
+        inactive_market_tail_year_count=n_years - len(active_years),
+        numerically_stable=not any(
+            reason.startswith("insurer::") for reason in numerical_reasons
+        ),
+        numerical_fallback_reasons=tuple(sorted(numerical_reasons)),
+        follower_regression_rows=follower_rows,
+        follower_fit_set=fit_set,
+    )
+
+
+@dataclass
+class _OuterFollowerFit:
+    """One outer-chain customer Q fit evaluated on every path and cap."""
+
+    candidate_values: Array
+    after_cap_continuation: Array
+    after_cap_regression: object | None
+    eligible: NDArray[np.bool_]
+    stable: bool
+    instability_reasons: tuple[str, ...]
+    condition_number: float
+    matrix_rank: int
+    feature_count: int
+    training_rmse_aud: float
+    candidate_clip_fraction: float
+
+
+@dataclass
+class _FollowerChainYearSolution:
+    responses: dict[tuple[object, ...], NDArray[np.bool_]]
+    fits: dict[tuple[object, ...], _OuterFollowerFit]
+    continuation_targets: dict[tuple[object, ...], Array]
+    policyholder_values: dict[tuple[object, ...], Array]
+    next_state: Array
+    future_action: IntArray
+    converged: bool
+
+
+@dataclass
+class _OuterLeaderFit:
+    policy: RegressionPolicyYear
+    predictions: Array
+    instability_reasons: tuple[str, ...]
+    conditions: Array
+    clip_fractions: Array
+    observed_counts: IntArray
+
+
+def _fit_outer_follower_model(
+    *,
+    policy: PolicySpec,
+    record: SignatureDecisionYearPaths,
+    actual_caps: Array,
+    continuation_target: Array,
+    train_mask: NDArray[np.bool_],
+    settings: OptimalBehaviourLSMCSettings,
+    buffer_rmse_override: float | None = None,
+) -> _OuterFollowerFit:
+    """Fit the canonical customer basis on one explicit outer training set.
+
+    The pre-cap models supply candidate-cap Q values.  The after-cap model is
+    the exact same canonical regression object stored in the forward
+    :class:`OptimalSurrenderPolicy`; its observed-cap response therefore needs
+    no later refit.  FULL value remains a separate customer target because the
+    new cap can affect the same-timestamp DVA restart and surrender value.
+    """
+    n_paths = actual_caps.size
+    premium = float(policy.net_initial_investment)
+    pre_actual = _follower_features_from_core(
+        record.pre_cap_core,
+        announced_cap=actual_caps,
+        duration_years=float(record.policy_year),
+        include_previous_cap=False,
+    )
+    after_actual = _follower_features_from_core(
+        record.after_cap_core,
+        announced_cap=np.asarray(record.after_cap_core, dtype=float)[:, 8],
+        duration_years=float(record.policy_year),
+        include_previous_cap=False,
+    )
+    continuation = np.maximum(
+        np.asarray(continuation_target, dtype=float), 0.0
+    )
+    full_value = np.maximum(
+        np.asarray(record.full_withdrawal_value, dtype=float), 0.0
+    )
+    inforce = np.asarray(record.after_cap_core, dtype=float)[:, 12]
+    eligible = (
+        (np.asarray(record.phase) == Phase.INCOME.value)
+        & (inforce > settings.minimum_inforce_weight)
+    )
+    selected = np.asarray(train_mask, dtype=bool) & eligible
+    feature_count = len(POLICYHOLDER_FEATURE_NAMES) + 1
+    minimum = 2 * feature_count
+    reasons: set[str] = set()
+    count = int(np.count_nonzero(selected))
+    if count < minimum:
+        reasons.add(
+            f"support_{count}_below_{minimum}"
+        )
+        mean_continue = float(np.mean(continuation[selected])) if count else 0.0
+        mean_full = float(np.mean(full_value[selected])) if count else 0.0
+        candidate = np.zeros((n_paths, len(ACTION_CAPS), 2))
+        candidate[:, :, 0] = mean_continue
+        candidate[:, :, 1] = mean_full
+        after_prediction = np.full(n_paths, mean_continue)
+        return _OuterFollowerFit(
+            candidate_values=candidate,
+            after_cap_continuation=after_prediction,
+            after_cap_regression=None,
+            eligible=eligible,
+            stable=False,
+            instability_reasons=tuple(sorted(reasons)),
+            condition_number=float("inf"),
+            matrix_rank=0,
+            feature_count=feature_count,
+            training_rmse_aud=float("inf"),
+            candidate_clip_fraction=0.0,
+        )
+
+    try:
+        pre_continue_regression = fit_surrender_continuation_regression(
+            pre_actual[selected],
+            continuation[selected],
+            premium=premium,
+            settings=settings,
+        )
+        pre_full_regression = fit_surrender_continuation_regression(
+            pre_actual[selected],
+            full_value[selected],
+            premium=premium,
+            settings=settings,
+        )
+        after_regression = fit_surrender_continuation_regression(
+            after_actual[selected],
+            continuation[selected],
+            premium=premium,
+            settings=settings,
+        )
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        reasons.add(f"fit_failed:{exc}")
+        mean_continue = float(np.mean(continuation[selected]))
+        mean_full = float(np.mean(full_value[selected]))
+        candidate = np.zeros((n_paths, len(ACTION_CAPS), 2))
+        candidate[:, :, 0] = mean_continue
+        candidate[:, :, 1] = mean_full
+        return _OuterFollowerFit(
+            candidate_values=candidate,
+            after_cap_continuation=np.full(n_paths, mean_continue),
+            after_cap_regression=None,
+            eligible=eligible,
+            stable=False,
+            instability_reasons=tuple(sorted(reasons)),
+            condition_number=float("inf"),
+            matrix_rank=0,
+            feature_count=feature_count,
+            training_rmse_aud=float("inf"),
+            candidate_clip_fraction=0.0,
+        )
+
+    regressions = (
+        pre_continue_regression,
+        pre_full_regression,
+        after_regression,
+    )
+    condition = max(float(item.condition_number) for item in regressions)
+    minimum_rank = min(int(item.matrix_rank) for item in regressions)
+    if any(item.matrix_rank != item.coefficients.size for item in regressions):
+        reasons.add("rank_deficient")
+    if not np.isfinite(condition) or condition > settings.maximum_condition_number:
+        reasons.add(f"condition_{condition:.6g}")
+
+    candidate = np.zeros((n_paths, len(ACTION_CAPS), 2))
+    for action, cap in enumerate(ACTION_CAPS):
+        candidate_features = _follower_features_from_core(
+            record.pre_cap_core,
+            announced_cap=float(cap),
+            duration_years=float(record.policy_year),
+            include_previous_cap=False,
+        )
+        candidate[:, action, 0] = (
+            pre_continue_regression.predict_features(candidate_features)
+        )
+        candidate[:, action, 1] = (
+            pre_full_regression.predict_features(candidate_features)
+        )
+    after_prediction = after_regression.predict_features(after_actual)
+    training_prediction = after_prediction[selected]
+    training_rmse = float(np.sqrt(np.mean(
+        (training_prediction - continuation[selected]) ** 2
+    )))
+    effective_rmse = (
+        training_rmse
+        if buffer_rmse_override is None
+        else float(buffer_rmse_override)
+    )
+    after_regression = replace(
+        after_regression, oof_rmse_aud=effective_rmse
+    )
+
+    target_matrix = np.column_stack((
+        continuation[selected], full_value[selected]
+    ))
+    ceiling = np.maximum(
+        np.max(target_matrix, axis=0)
+        + 5.0 * np.std(target_matrix, axis=0),
+        0.0,
+    )
+    before = candidate.copy()
+    candidate = np.minimum(candidate, ceiling[None, None, :])
+    # Do not clip the observed after-cap prediction.  This exact regression
+    # object is persisted in ``OptimalSurrenderPolicy`` and its forward
+    # prediction must therefore be bit-for-bit the value used to determine
+    # the training response.  Candidate-cap Q values are internal control-
+    # randomisation approximations and may still be bounded defensively.
+    clip_fraction = float(np.mean(np.abs(before - candidate) > 0.0))
+    if clip_fraction > 0.20:
+        reasons.add(f"candidate_clip_fraction_{clip_fraction:.6g}")
+    if not np.all(np.isfinite(candidate)) \
+            or not np.all(np.isfinite(after_prediction)):
+        reasons.add("nonfinite_prediction")
+        candidate = np.nan_to_num(candidate, nan=0.0, posinf=0.0, neginf=0.0)
+        after_prediction = np.nan_to_num(
+            after_prediction, nan=0.0, posinf=0.0, neginf=0.0
+        )
+    return _OuterFollowerFit(
+        candidate_values=candidate,
+        after_cap_continuation=after_prediction,
+        after_cap_regression=after_regression,
+        eligible=eligible,
+        stable=not reasons,
+        instability_reasons=tuple(sorted(reasons)),
+        condition_number=condition,
+        matrix_rank=minimum_rank,
+        feature_count=feature_count,
+        training_rmse_aud=training_rmse,
+        candidate_clip_fraction=clip_fraction,
+    )
+
+
+def _leader_values_for_outer_chain(
+    fit: _CoupledLeaderYearFit,
+    raw_state: Array,
+    chain: int,
+    feature_names: Sequence[str],
+) -> Array:
+    """Evaluate one future outer-fold chain on all supplied states."""
+    if chain == fit.fold_coefficients.shape[0]:
+        return _policy_action_values(fit.deployment, raw_state, feature_names)
+    nonlinear, interactions, _ = _basis_specification(feature_names)
+    design = _design_matrix(
+        np.asarray(raw_state, dtype=float),
+        fit.fold_means[chain],
+        fit.fold_scales[chain],
+        nonlinear,
+        interactions,
+    )
+    values = np.einsum(
+        "pb,abo->pao", design, fit.fold_coefficients[chain]
+    )
+    for action in range(len(ACTION_CAPS)):
+        values[:, action], _ = _clip_component_predictions(
+            values[:, action],
+            fit.fold_lower_bounds[chain, action],
+            fit.fold_upper_bounds[chain, action],
+        )
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError("Outer-chain leader values are non-finite.")
+    return values
+
+
+def _solve_follower_outer_chain_year(
+    *,
+    records: Mapping[tuple[object, ...], SignatureDecisionYearPaths],
+    data: PortfolioPathData,
+    year: int,
+    chain: int,
+    train_mask: NDArray[np.bool_],
+    fold_ids: IntArray,
+    action_indices: IntArray,
+    control_inputs: ControlStateInputs,
+    portfolio_state_extension: Array,
+    future_leader: _CoupledLeaderYearFit | None,
+    future_follower_values: Mapping[tuple[object, ...], Array],
+    follower_settings: OptimalBehaviourLSMCSettings,
+    feature_names: Sequence[str],
+    buffer_rmse_by_signature: Mapping[tuple[object, ...], float] | None = None,
+    force_continue_signatures: frozenset[tuple[object, ...]] = frozenset(),
+) -> _FollowerChainYearSolution:
+    """Solve one fold-pure follower/exposure fixed point for one year."""
+    n_paths = action_indices.shape[0]
+    rows = np.arange(n_paths)
+    responses = {
+        signature: np.zeros(n_paths, dtype=bool)
+        for signature in records
+    }
+    previous_future_action: Array | None = None
+    maximum_iterations = 4 if records else 1
+
+    def evaluate(
+        current_responses: Mapping[
+            tuple[object, ...], NDArray[np.bool_]
+        ],
+    ) -> tuple[
+        Array,
+        IntArray,
+        dict[tuple[object, ...], _OuterFollowerFit],
+        dict[tuple[object, ...], Array],
+        dict[tuple[object, ...], NDArray[np.bool_]],
+        dict[tuple[object, ...], Array],
+    ]:
+        next_portfolio = np.array(
+            portfolio_state_extension[:, year + 1, :], copy=True
+        )
+        for signature, response in current_responses.items():
+            contribution = np.asarray(
+                records[signature].next_portfolio_exposure_contribution,
+                dtype=float,
+            )
+            next_portfolio[:, 1:] -= response[:, None] * contribution
+        next_portfolio[:, 1:] = np.maximum(next_portfolio[:, 1:], 0.0)
+        next_state = _counterfactual_next_leader_state(
+            inputs=control_inputs,
+            current_state=data.raw_states[:, year, :],
+            year=year,
+            current_cap=ACTION_CAPS[action_indices[:, year]],
+            next_portfolio_state=next_portfolio,
+        )
+        if future_leader is None:
+            future_action = np.zeros(n_paths, dtype=np.int64)
+        else:
+            future_values = _leader_values_for_outer_chain(
+                future_leader, next_state, chain, feature_names
+            )
+            future_action = _lower_cap_argmax(
+                future_values[:, :, 0], axis=1
+            )
+
+        fits: dict[tuple[object, ...], _OuterFollowerFit] = {}
+        targets: dict[tuple[object, ...], Array] = {}
+        new_responses: dict[
+            tuple[object, ...], NDArray[np.bool_]
+        ] = {}
+        values: dict[tuple[object, ...], Array] = {}
+        actual_caps = ACTION_CAPS[action_indices[:, year]]
+        for signature, record in records.items():
+            future_grid = future_follower_values.get(signature)
+            if future_grid is None:
+                future_u = np.zeros(n_paths)
+            else:
+                future_u = future_grid[
+                    chain, rows, future_action
+                ]
+            numerator = (
+                np.asarray(
+                    record.continue_policyholder_interval_pv, dtype=float
+                )
+                + np.asarray(
+                    record.next_decision_discount_inforce, dtype=float
+                ) * future_u
+            )
+            denominator = np.asarray(
+                record.decision_discount_inforce, dtype=float
+            )
+            target = np.divide(
+                numerator,
+                np.maximum(denominator, 1.0e-300),
+                out=np.zeros_like(numerator),
+                where=denominator > 1.0e-300,
+            )
+            fit = _fit_outer_follower_model(
+                policy=data.signature_control_paths[signature].policy,
+                record=record,
+                actual_caps=actual_caps,
+                continuation_target=target,
+                train_mask=train_mask,
+                settings=follower_settings,
+                buffer_rmse_override=(
+                    None
+                    if buffer_rmse_by_signature is None
+                    else buffer_rmse_by_signature.get(signature)
+                ),
+            )
+            buffer = (
+                follower_settings.exercise_tolerance_aud
+                + follower_settings.exercise_buffer_rmse_multiplier
+                * (
+                    fit.training_rmse_aud
+                    if fit.after_cap_regression is None
+                    else fit.after_cap_regression.oof_rmse_aud
+                )
+            )
+            exact_response = (
+                fit.eligible
+                & (~np.asarray(record.just_elected, dtype=bool))
+                & np.asarray(record.full_withdrawal_eligible, dtype=bool)
+                & (
+                    np.asarray(record.full_withdrawal_value, dtype=float)
+                    > fit.after_cap_continuation + buffer
+                )
+            )
+            forced_continue = signature in force_continue_signatures
+            if not fit.stable or forced_continue:
+                exact_response[:] = False
+
+            candidate = fit.candidate_values
+            structural = (
+                fit.eligible[:, None]
+                & (~np.asarray(record.just_elected, dtype=bool))[:, None]
+                & (candidate[:, :, 1] > 0.0)
+            )
+            candidate_response = structural & (
+                candidate[:, :, 1] > candidate[:, :, 0] + buffer
+            )
+            if not fit.stable or forced_continue:
+                candidate_response[:] = False
+            candidate_value = np.where(
+                candidate_response,
+                candidate[:, :, 1],
+                candidate[:, :, 0],
+            )
+            # The observed cap has an exact post-DVA state and contractual
+            # eligibility; use it instead of its pre-cap Q approximation.
+            observed_action = action_indices[:, year]
+            candidate_value[rows, observed_action] = np.where(
+                exact_response,
+                np.asarray(record.full_withdrawal_value, dtype=float),
+                fit.after_cap_continuation,
+            )
+            fits[signature] = fit
+            targets[signature] = target
+            new_responses[signature] = exact_response
+            values[signature] = candidate_value
+        return (
+            next_state,
+            future_action,
+            fits,
+            targets,
+            new_responses,
+            values,
+        )
+
+    last: tuple[Array, IntArray, dict, dict, dict, dict] | None = None
+    converged = True
+    for _iteration in range(maximum_iterations):
+        last = evaluate(responses)
+        (
+            _next_state,
+            future_action,
+            _fits,
+            _targets,
+            new_responses,
+            _values,
+        ) = last
+        same_response = all(
+            np.array_equal(new_responses[key], responses[key])
+            for key in responses
+        )
+        same_future_action = (
+            previous_future_action is not None
+            and np.array_equal(future_action, previous_future_action)
+        )
+        responses = new_responses
+        if same_response and (
+            not records or future_leader is None or same_future_action
+        ):
+            break
+        previous_future_action = future_action.copy()
+    else:
+        converged = False
+
+    if not converged and records:
+        responses = {
+            signature: np.zeros(n_paths, dtype=bool)
+            for signature in records
+        }
+        last = evaluate(responses)
+        next_state, future_action, fits, targets, _ignored, values = last
+        for signature, fit in fits.items():
+            values[signature] = fit.candidate_values[:, :, 0].copy()
+            values[signature][
+                rows, action_indices[:, year]
+            ] = fit.after_cap_continuation
+    else:
+        if last is None:
+            raise RuntimeError("Follower outer-chain iteration produced no state.")
+        next_state, future_action, fits, targets, responses, values = last
+    return _FollowerChainYearSolution(
+        responses=responses,
+        fits=fits,
+        continuation_targets=targets,
+        policyholder_values=values,
+        next_state=next_state,
+        future_action=future_action,
+        converged=converged,
+    )
+
+
+def _insurer_targets_for_outer_chain(
+    *,
+    data: PortfolioPathData,
+    year: int,
+    solution: _FollowerChainYearSolution,
+    continue_components: Array,
+    future_leader: _CoupledLeaderYearFit | None,
+    chain: int,
+    feature_names: Sequence[str],
+) -> Array:
+    immediate = np.array(continue_components[:, year, :], copy=True)
+    for signature, response in solution.responses.items():
+        delta = np.asarray(
+            data.signature_control_paths[
+                signature
+            ].decision_years[year].insurer_full_minus_continue_components,
+            dtype=float,
+        )
+        immediate[:, 1:] += response[:, None] * delta
+    immediate[:, 0] = _csm_from_component_values(immediate[:, 1:])
+    if future_leader is None:
+        future_selected = np.zeros_like(immediate)
+    else:
+        future_values = _leader_values_for_outer_chain(
+            future_leader, solution.next_state, chain, feature_names
+        )
+        action = _lower_cap_argmax(future_values[:, :, 0], axis=1)
+        future_selected = future_values[np.arange(future_values.shape[0]), action]
+    target = immediate + future_selected
+    target[:, 0] = _csm_from_component_values(target[:, 1:])
+    return target
+
+
+def _fit_outer_leader_model(
+    *,
+    year: int,
+    raw_state: Array,
+    targets: Array,
+    observed_actions: IntArray,
+    train_mask: NDArray[np.bool_],
+    ridge: float,
+    feature_names: Sequence[str],
+) -> _OuterLeaderFit:
+    """Fit one leader chain on an explicit outer training mask."""
+    nonlinear, interactions, basis_names = _basis_specification(feature_names)
+    n_basis = len(basis_names)
+    n_actions = len(ACTION_CAPS)
+    mean, scale = _raw_scaling(raw_state[train_mask])
+    design_all = _design_matrix(
+        raw_state, mean, scale, nonlinear, interactions
+    )
+    coefficients = np.zeros((n_actions, n_basis, 10))
+    lower_bounds = np.zeros((n_actions, 10))
+    upper_bounds = np.zeros_like(lower_bounds)
+    predictions = np.zeros((raw_state.shape[0], n_actions, 10))
+    standard_errors = np.zeros(n_actions)
+    conditions = np.zeros(n_actions)
+    clip_fractions = np.zeros(n_actions)
+    counts = np.zeros(n_actions, dtype=np.int64)
+    reasons: set[str] = set()
+    minimum = max(30, 3 * n_basis)
+    for action, cap in enumerate(ACTION_CAPS):
+        selected = train_mask & (observed_actions == action)
+        count = int(np.count_nonzero(selected))
+        counts[action] = count
+        if count < minimum:
+            reasons.add(
+                f"year_{year + 1}_cap_{cap:.6f}_support_"
+                f"{count}_below_{minimum}"
+            )
+            component_beta = np.zeros((n_basis, len(INSURER_COMPONENT_NAMES)))
+            if count:
+                component_beta[0] = np.mean(targets[selected, 1:], axis=0)
+                bounds_source = targets[selected]
+            else:
+                bounds_source = np.zeros((1, 10))
+            condition = float("inf")
+        else:
+            component_beta = _ridge_fit_multioutput(
+                design_all[selected], targets[selected, 1:], ridge
+            )
+            bounds_source = targets[selected]
+            condition = _condition_number(design_all[selected], ridge)
+            if not np.isfinite(condition) or condition > 1.0e10:
+                reasons.add(
+                    f"year_{year + 1}_cap_{cap:.6f}_condition_"
+                    f"{condition:.6g}"
+                )
+        beta = _component_regression_coefficients(component_beta)
+        lower, upper = _component_prediction_bounds(bounds_source)
+        raw_prediction = design_all @ beta
+        bounded, clip_fraction = _clip_component_predictions(
+            raw_prediction, lower, upper
+        )
+        if clip_fraction > 0.01:
+            reasons.add(
+                f"year_{year + 1}_cap_{cap:.6f}_clip_fraction_"
+                f"{clip_fraction:.6g}"
+            )
+        coefficients[action] = beta
+        lower_bounds[action] = lower
+        upper_bounds[action] = upper
+        predictions[:, action] = bounded
+        conditions[action] = condition
+        clip_fractions[action] = clip_fraction
+        if count:
+            residual = targets[selected, 0] - bounded[selected, 0]
+            rmse = float(np.sqrt(np.mean(residual * residual)))
+            scale_target = max(
+                float(np.std(targets[selected, 0])),
+                float(np.mean(np.abs(targets[selected, 0]))),
+                1.0,
+            )
+            if not np.isfinite(rmse) or rmse > 10.0 * scale_target:
+                reasons.add(
+                    f"year_{year + 1}_cap_{cap:.6f}_rmse_ratio_"
+                    f"{rmse / scale_target:.6g}"
+                )
+            standard_errors[action] = rmse / np.sqrt(count)
+        else:
+            standard_errors[action] = float("inf")
+    policy = RegressionPolicyYear(
+        year=year,
+        raw_mean=mean,
+        raw_scale=scale,
+        coefficients=coefficients,
+        action_caps=ACTION_CAPS.copy(),
+        action_value_standard_error=standard_errors,
+        value_lower_bounds=lower_bounds,
+        value_upper_bounds=upper_bounds,
+        numerically_stable=not reasons,
+    )
+    return _OuterLeaderFit(
+        policy=policy,
+        predictions=predictions,
+        instability_reasons=tuple(sorted(reasons)),
+        conditions=conditions,
+        clip_fractions=clip_fractions,
+        observed_counts=counts,
+    )
+
+
+def _coupled_backward_induction(
+    data: PortfolioPathData,
+    action_indices: IntArray,
+    *,
+    control_inputs: ControlStateInputs,
+    portfolio_state_extension: Array,
+    folds: int,
+    ridge: float,
+    seed: int,
+    follower_settings: OptimalBehaviourLSMCSettings,
+    scenario_fingerprint: str,
+    cap_schedule_fingerprint: str,
+) -> BackwardResult:
+    """Outer-fold-pure two-value Stackelberg Fitted-Q recursion.
+
+    Each complete-path outer fold owns an independent future Leader/Follower
+    policy chain trained without that fold.  A separate full-sample chain
+    supplies the persisted deployment models.  Thus current held-out values
+    cannot leak indirectly through a future-year regression target, and the
+    exact after-cap follower regression used in insurer rewards is the same
+    frozen object used by the monthly forward projector.
+    """
+    if data.raw_states is None or data.inforce_exposure is None:
+        raise ValueError("Coupled backward induction requires rich state paths.")
+    if not data.signature_control_paths:
+        raise ValueError("Coupled backward induction lacks signature primitives.")
+    n_paths, n_years = data.new_business_csm_proxy.shape
+    if action_indices.shape != (n_paths, n_years):
+        raise ValueError("Coupled action indices are shape-inconsistent.")
+    if portfolio_state_extension.shape != (
+        n_paths,
+        n_years + 1,
+        len(PORTFOLIO_CONTROL_STATE_FEATURE_NAMES),
+    ):
+        raise ValueError("Coupled portfolio-state extension is inconsistent.")
+    feature_names = data.state_feature_names
+    if tuple(feature_names) != (
+        *CONTROL_STATE_FEATURE_NAMES,
+        *PORTFOLIO_CONTROL_STATE_FEATURE_NAMES,
+    ):
+        raise ValueError("Coupled recursion requires the documented state layout.")
+
+    rng = np.random.default_rng(seed)
+    fold_ids = np.empty(n_paths, dtype=np.int64)
+    for action in range(len(ACTION_CAPS)):
+        action_rows = np.flatnonzero(action_indices[:, 0] == action)
+        assigned = np.resize(np.arange(folds, dtype=np.int64), len(action_rows))
+        fold_ids[action_rows] = rng.permutation(assigned)
+    if set(np.unique(fold_ids)) != set(range(folds)):
+        raise RuntimeError("Complete-path outer folds are incomplete.")
+
+    continue_components = _portfolio_continue_component_tensor(data)
+    future_leader: _CoupledLeaderYearFit | None = None
+    future_follower_values: dict[tuple[object, ...], Array] = {}
+    deployment_regressions: dict[
+        tuple[object, ...], dict[int, object]
+    ] = {signature: {} for signature in data.signature_control_paths}
+    follower_rows: list[dict[str, object]] = []
+    leader_rows: list[dict[str, object]] = []
+    policy_year_rows: list[dict[str, object]] = []
+    first_year_action_rows: list[dict[str, object]] = []
+    policy_years: list[RegressionPolicyYear] = []
+    active_years: list[int] = []
+    numerical_reasons: set[str] = set()
+    first_cap = float("nan")
+    first_outputs = np.zeros(10)
+    first_se = float("nan")
+
+    LOGGER.info(
+        "Outer-fold-pure coupled backward induction | years=%d | actions=%d | "
+        "paths=%d | signatures=%d | folds=%d plus deployment chain",
+        n_years,
+        len(ACTION_CAPS),
+        n_paths,
+        len(data.signature_control_paths),
+        folds,
+    )
+    for year in range(n_years - 1, -1, -1):
+        exposure = np.asarray(data.inforce_exposure[:, year], dtype=float)
+        if not np.any(exposure > 0.0):
+            residual = max(
+                float(np.max(np.abs(
+                    np.asarray(getattr(data, name))[:, year]
+                )))
+                for name in (
+                    "fees_product",
+                    "fees_lip",
+                    "crediting_margin",
+                    "mva_retained",
+                    "aps_retained",
+                    "guarantee_claims",
+                    "other_insurer_funded_benefits",
+                    "expenses",
+                    "hedge_costs",
+                )
+            )
+            materiality = 1.0e-8 * data.representative_initial_premium
+            has_follower_continuation = any(
+                np.any(np.abs(np.asarray(values, dtype=float)) > materiality)
+                for values in future_follower_values.values()
+            )
+            if (
+                residual > materiality
+                or future_leader is not None
+                or has_follower_continuation
+            ):
+                raise RuntimeError(
+                    "Inactive policy year has a material reward or a later "
+                    "active continuation; refusing to discard it."
+                )
+            continue
+        active_years.append(year + 1)
+        if year == n_years - 1 or year == 0 or (year + 1) % 5 == 0:
+            LOGGER.info(
+                "Outer-fold coupled recursion | policy year %d/%d",
+                year + 1,
+                n_years,
+            )
+        records = {
+            signature: paths.decision_years[year]
+            for signature, paths in data.signature_control_paths.items()
+            if year in paths.decision_years
+        }
+
+        fold_solutions: list[_FollowerChainYearSolution] = []
+        fold_targets: list[Array] = []
+        fold_leader_fits: list[_OuterLeaderFit] = []
+        for fold in range(folds):
+            train_mask = fold_ids != fold
+            solution = _solve_follower_outer_chain_year(
+                records=records,
+                data=data,
+                year=year,
+                chain=fold,
+                train_mask=train_mask,
+                fold_ids=fold_ids,
+                action_indices=action_indices,
+                control_inputs=control_inputs,
+                portfolio_state_extension=portfolio_state_extension,
+                future_leader=future_leader,
+                future_follower_values=future_follower_values,
+                follower_settings=follower_settings,
+                feature_names=feature_names,
+            )
+            target = _insurer_targets_for_outer_chain(
+                data=data,
+                year=year,
+                solution=solution,
+                continue_components=continue_components,
+                future_leader=future_leader,
+                chain=fold,
+                feature_names=feature_names,
+            )
+            leader_fit = _fit_outer_leader_model(
+                year=year,
+                raw_state=data.raw_states[:, year, :],
+                targets=target,
+                observed_actions=action_indices[:, year],
+                train_mask=train_mask,
+                ridge=ridge,
+                feature_names=feature_names,
+            )
+            fold_solutions.append(solution)
+            fold_targets.append(target)
+            fold_leader_fits.append(leader_fit)
+
+        oof_rmse_by_signature: dict[tuple[object, ...], float] = {}
+        for signature in records:
+            residual_parts: list[Array] = []
+            for fold, solution in enumerate(fold_solutions):
+                fit = solution.fits[signature]
+                held_out = (fold_ids == fold) & fit.eligible
+                if np.any(held_out):
+                    residual_parts.append(
+                        fit.after_cap_continuation[held_out]
+                        - solution.continuation_targets[signature][held_out]
+                    )
+            oof_rmse_by_signature[signature] = (
+                float(np.sqrt(np.mean(np.concatenate(residual_parts) ** 2)))
+                if residual_parts else float("inf")
+            )
+
+        # A missing finite OOF error estimate makes the full-sample exercise
+        # buffer unusable, so that deployment signature is conservatively
+        # frozen to Continue before its insurer target is built.  An unstable
+        # individual outer fit already returns Continue in its own fold-pure
+        # chain; it does not invalidate a separately stable full-sample fit.
+        crossfit_forced_continue = frozenset(
+            signature
+            for signature in records
+            if not np.isfinite(oof_rmse_by_signature[signature])
+        )
+
+        deployment_chain = folds
+        full_solution = _solve_follower_outer_chain_year(
+            records=records,
+            data=data,
+            year=year,
+            chain=deployment_chain,
+            train_mask=np.ones(n_paths, dtype=bool),
+            fold_ids=fold_ids,
+            action_indices=action_indices,
+            control_inputs=control_inputs,
+            portfolio_state_extension=portfolio_state_extension,
+            future_leader=future_leader,
+            future_follower_values=future_follower_values,
+            follower_settings=follower_settings,
+            feature_names=feature_names,
+            buffer_rmse_by_signature=oof_rmse_by_signature,
+            force_continue_signatures=crossfit_forced_continue,
+        )
+        full_target = _insurer_targets_for_outer_chain(
+            data=data,
+            year=year,
+            solution=full_solution,
+            continue_components=continue_components,
+            future_leader=future_leader,
+            chain=deployment_chain,
+            feature_names=feature_names,
+        )
+        full_leader_fit = _fit_outer_leader_model(
+            year=year,
+            raw_state=data.raw_states[:, year, :],
+            targets=full_target,
+            observed_actions=action_indices[:, year],
+            train_mask=np.ones(n_paths, dtype=bool),
+            ridge=ridge,
+            feature_names=feature_names,
+        )
+
+        fold_coefficients = np.stack([
+            item.policy.coefficients for item in fold_leader_fits
+        ])
+        fold_lower = np.stack([
+            item.policy.value_lower_bounds for item in fold_leader_fits
+        ])
+        fold_upper = np.stack([
+            item.policy.value_upper_bounds for item in fold_leader_fits
+        ])
+        leader_instability = {
+            f"outer_fold_{fold}::{reason}"
+            for fold, item in enumerate(fold_leader_fits)
+            for reason in item.instability_reasons
+        }
+        leader_instability.update(
+            f"deployment::{reason}"
+            for reason in full_leader_fit.instability_reasons
+        )
+        leader_fit = _CoupledLeaderYearFit(
+            deployment=full_leader_fit.policy,
+            fold_means=np.stack([
+                item.policy.raw_mean for item in fold_leader_fits
+            ]),
+            fold_scales=np.stack([
+                item.policy.raw_scale for item in fold_leader_fits
+            ]),
+            fold_coefficients=fold_coefficients,
+            fold_lower_bounds=fold_lower,
+            fold_upper_bounds=fold_upper,
+            stable=not leader_instability,
+            instability_reasons=tuple(sorted(leader_instability)),
+        )
+        numerical_reasons.update(
+            f"insurer::{reason}" for reason in leader_instability
+        )
+
+        oof = np.zeros((n_paths, len(ACTION_CAPS), 10))
+        for fold, item in enumerate(fold_leader_fits):
+            held_out = fold_ids == fold
+            oof[held_out] = item.predictions[held_out]
+        if not np.all(np.isfinite(oof)):
+            raise RuntimeError("Outer-fold insurer OOF values are non-finite.")
+
+        for action, cap in enumerate(ACTION_CAPS):
+            observed = action_indices[:, year] == action
+            residual_parts = []
+            target_parts = []
+            for fold in range(folds):
+                selected = observed & (fold_ids == fold)
+                if np.any(selected):
+                    residual_parts.append(
+                        fold_targets[fold][selected, 0]
+                        - oof[selected, action, 0]
+                    )
+                    target_parts.append(fold_targets[fold][selected, 0])
+            residual = np.concatenate(residual_parts)
+            observed_target = np.concatenate(target_parts)
+            rmse = float(np.sqrt(np.mean(residual * residual)))
+            variance = float(np.var(observed_target))
+            leader_rows.append({
+                "policy_year": year + 1,
+                "cap": float(cap),
+                "observed_path_count": int(observed_target.size),
+                "basis_dimension": int(
+                    full_leader_fit.policy.coefficients.shape[1]
+                ),
+                "ridge_multiplier": float(ridge),
+                "out_of_fold_rmse_new_business_csm_proxy": rmse,
+                "out_of_fold_r_squared_new_business_csm_proxy": (
+                    1.0 - rmse * rmse / variance
+                    if variance > 1.0e-20 else 1.0
+                ),
+                "in_sample_component_clip_fraction": float(
+                    full_leader_fit.clip_fractions[action]
+                ),
+                "maximum_fold_component_clip_fraction": float(max(
+                    item.clip_fractions[action]
+                    for item in fold_leader_fits
+                )),
+                "regularized_normal_matrix_condition_number": float(
+                    full_leader_fit.conditions[action]
+                ),
+                "design_condition_number": float(
+                    full_leader_fit.conditions[action]
+                ),
+                "csm_derived_from_components": True,
+                "outer_fold_pure": True,
+            })
+
+        current_follower_values: dict[tuple[object, ...], Array] = {}
+        for signature, record in records.items():
+            chain_values = [
+                solution.policyholder_values[signature]
+                for solution in fold_solutions
+            ]
+            chain_values.append(full_solution.policyholder_values[signature])
+            current_follower_values[signature] = np.stack(chain_values)
+            full_fit = full_solution.fits[signature]
+            deployment_stable = (
+                full_fit.stable
+                and full_solution.converged
+                and np.isfinite(oof_rmse_by_signature[signature])
+                and signature not in crossfit_forced_continue
+            )
+            signature_text = json.dumps(
+                signature, default=str, separators=(",", ":")
+            )
+            reasons = {
+                reason
+                for solution in fold_solutions
+                for reason in solution.fits[signature].instability_reasons
+            }
+            reasons.update(full_fit.instability_reasons)
+            if signature in crossfit_forced_continue:
+                reasons.add("missing_finite_oof_rmse_forced_continue")
+            if not all(solution.converged for solution in fold_solutions) \
+                    or not full_solution.converged:
+                reasons.add("follower_exposure_fixed_point")
+            follower_rows.append({
+                "fit_label": "coupled_control_randomisation",
+                "policy_signature": signature_text,
+                "policy_signature_fingerprint": hashlib.sha256(
+                    signature_text.encode("utf-8")
+                ).hexdigest(),
+                "policy_year": year + 1,
+                "decision_step": record.decision_step,
+                "observations": int(np.count_nonzero(full_fit.eligible)),
+                "folds_used": folds,
+                "feature_count": full_fit.feature_count,
+                "matrix_rank": full_fit.matrix_rank,
+                "condition_number": full_fit.condition_number,
+                "oof_rmse_aud": oof_rmse_by_signature[signature],
+                "candidate_prediction_clip_fraction": (
+                    full_fit.candidate_clip_fraction
+                ),
+                "training_exercise_rate": float(np.mean(
+                    full_solution.responses[signature]
+                )),
+                "regression_accepted_for_exercise": deployment_stable,
+                "outer_crossfit_stable": all(
+                    solution.converged
+                    and solution.fits[signature].stable
+                    for solution in fold_solutions
+                ),
+                "deployment_regression_stable": deployment_stable,
+                "fallback_reason": "|".join(sorted(reasons)),
+                "value_function": (
+                    "outer_fold_pure_policyholder_continuation_and_full_q"
+                ),
+                "two_value_recursion": True,
+                "outer_fold_pure": True,
+                "response_fixed_point_converged": (
+                    full_solution.converged
+                ),
+            })
+            if deployment_stable and full_fit.after_cap_regression is not None:
+                deployment_regressions[signature][record.decision_step] = (
+                    full_fit.after_cap_regression
+                )
+            else:
+                signature_key = hashlib.sha256(
+                    signature_text.encode("utf-8")
+                ).hexdigest()
+                for reason in reasons or {"unstable_follower_regression"}:
+                    numerical_reasons.add(
+                        f"policyholder::{signature_key}::{reason}"
+                    )
+        future_follower_values = current_follower_values
+
+        if year == 0:
+            action_values = np.mean(oof, axis=0)
+            action_se = np.asarray([
+                _standard_error(oof[:, action, 0])
+                for action in range(len(ACTION_CAPS))
+            ])
+            chosen = int(_lower_cap_argmax(action_values[:, 0]))
+            first_cap = float(ACTION_CAPS[chosen])
+            first_outputs = action_values[chosen]
+            first_se = float(action_se[chosen])
+            constant = _constant_first_year_policy(
+                year=0,
+                raw_state=data.raw_states[:, 0, :],
+                action_values=action_values,
+                action_standard_errors=action_se,
+                feature_names=feature_names,
+                numerically_stable=leader_fit.stable,
+            )
+            policy_years.append(constant)
+            for action, cap in enumerate(ACTION_CAPS):
+                values = action_values[action]
+                first_year_action_rows.append({
+                    "cap": float(cap),
+                    "cap_percent": 100.0 * float(cap),
+                    "selection_estimated_q_new_business_csm_proxy": float(
+                        values[0]
+                    ),
+                    "selection_standard_error_new_business_csm_proxy": float(
+                        action_se[action]
+                    ),
+                    "holdout_estimated_q_new_business_csm_proxy": float(values[0]),
+                    "holdout_estimated_q_fees_product": float(values[1]),
+                    "holdout_estimated_q_fees_lip": float(values[2]),
+                    "holdout_estimated_q_crediting_margin": float(values[3]),
+                    "holdout_estimated_q_mva_retained": float(values[4]),
+                    "holdout_estimated_q_aps_retained": float(values[5]),
+                    "holdout_estimated_q_guarantee_claims": float(values[6]),
+                    "holdout_estimated_q_other_insurer_funded_benefits": float(
+                        values[7]
+                    ),
+                    "holdout_estimated_q_expenses": float(values[8]),
+                    "holdout_estimated_q_hedge_costs": float(values[9]),
+                    "holdout_standard_error_new_business_csm_proxy": float(
+                        action_se[action]
+                    ),
+                    "selection_path_count": n_paths,
+                    "holdout_path_count": n_paths,
+                    "observed_control_action_path_count": int(np.sum(
+                        action_indices[:, 0] == action
+                    )),
+                    "economically_active": True,
+                    "is_optimal_first_year_cap": action == chosen,
+                    "two_value_stackelberg_recursion": True,
+                    "outer_fold_pure": True,
+                    "selection_value_semantics": (
+                        "complete-path outer-fold-pure OOF action-value mean"
+                    ),
+                    "holdout_value_semantics": (
+                        "legacy output alias of the outer-fold-pure OOF mean"
+                    ),
+                })
+            policy_year_rows.append({
+                "policy_year": 1,
+                "cap": first_cap,
+                "selected_fraction": 1.0,
+                "mean_selected_cap": first_cap,
+                "p10_selected_cap": first_cap,
+                "median_selected_cap": first_cap,
+                "p90_selected_cap": first_cap,
+                "economically_active": True,
+                "mean_inforce_exposure": float(np.mean(exposure)),
+                "outer_fold_pure": True,
+            })
+        else:
+            chosen = _lower_cap_argmax(oof[:, :, 0], axis=1)
+            selected_caps = ACTION_CAPS[chosen]
+            quantiles = np.quantile(selected_caps, (0.10, 0.50, 0.90))
+            for action, cap in enumerate(ACTION_CAPS):
+                fraction = float(np.mean(chosen == action))
+                policy_year_rows.append({
+                    "policy_year": year + 1,
+                    "cap": float(cap),
+                    "selected_fraction": fraction,
+                    "mean_selected_cap": float(np.mean(selected_caps)),
+                    "p10_selected_cap": float(quantiles[0]),
+                    "median_selected_cap": float(quantiles[1]),
+                    "p90_selected_cap": float(quantiles[2]),
+                    "economically_active": True,
+                    "mean_inforce_exposure": float(np.mean(exposure)),
+                    "outer_fold_pure": True,
+                })
+            policy_years.append(full_leader_fit.policy)
+        future_leader = leader_fit
+
+    policy_years.sort(key=lambda item: item.year)
+    active_years.sort()
+    if not active_years or active_years[0] != 1:
+        raise RuntimeError("The coupled portfolio has no active first policy year.")
+    if active_years != list(range(1, active_years[-1] + 1)):
+        raise RuntimeError("Coupled economic policy horizon is not contiguous.")
+
+    policies: dict[tuple[object, ...], object] = {}
+    fallback_steps_by_signature: dict[
+        tuple[object, ...], tuple[int, ...]
+    ] = {}
+    full_fallback_signatures: set[tuple[object, ...]] = set()
+    active_year_indices = {item - 1 for item in active_years}
+    for signature, paths in data.signature_control_paths.items():
+        regressions = dict(sorted(deployment_regressions[signature].items()))
+        policies[signature] = OptimalSurrenderPolicy(
+            regressions=MappingProxyType(regressions),
+            settings=follower_settings,
+        )
+        expected_steps = {
+            record.decision_step
+            for year, record in paths.decision_years.items()
+            if year in active_year_indices
+        }
+        fallback_steps = tuple(sorted(expected_steps - set(regressions)))
+        fallback_steps_by_signature[signature] = fallback_steps
+        if expected_steps and len(fallback_steps) == len(expected_steps):
+            full_fallback_signatures.add(signature)
+    fit_set = CoupledPolicyholderFitSet(
+        policies=policies,
+        scenario_fingerprint=scenario_fingerprint,
+        cap_schedule_fingerprint=cap_schedule_fingerprint,
+        fallback_signatures=full_fallback_signatures,
+        fallback_steps_by_signature=fallback_steps_by_signature,
+    )
+    component_csm = _csm_from_component_values(first_outputs[1:][None, :])[0]
+    return BackwardResult(
+        first_year_cap=first_cap,
+        pv_new_business_csm_proxy=float(first_outputs[0]),
+        pv_fees_product=float(first_outputs[1]),
+        pv_fees_lip=float(first_outputs[2]),
+        pv_crediting_margin=float(first_outputs[3]),
+        pv_mva_retained=float(first_outputs[4]),
+        pv_aps_retained=float(first_outputs[5]),
+        pv_guarantee_claims=float(first_outputs[6]),
+        pv_other_insurer_funded_benefits=float(first_outputs[7]),
+        pv_expenses=float(first_outputs[8]),
+        pv_hedge_costs=float(first_outputs[9]),
+        standard_error_new_business_csm_proxy=first_se,
+        first_year_action_rows=first_year_action_rows,
+        policy_year_rows=sorted(
+            policy_year_rows,
+            key=lambda row: (int(row["policy_year"]), float(row["cap"])),
+        ),
+        regression_rows=sorted(
+            leader_rows,
+            key=lambda row: (int(row["policy_year"]), float(row["cap"])),
+        ),
+        policy_years=policy_years,
+        reconciliation_gap=float(first_outputs[0] - component_csm),
+        economically_active_policy_years=tuple(active_years),
+        inactive_market_tail_year_count=n_years - len(active_years),
+        numerically_stable=not any(
+            reason.startswith("insurer::") for reason in numerical_reasons
+        ),
+        numerical_fallback_reasons=tuple(sorted(numerical_reasons)),
+        follower_regression_rows=follower_rows,
+        follower_fit_set=fit_set,
     )
 
 
@@ -1542,6 +5820,8 @@ def _backward_induction(
     """Cross-fitted Fitted-Q recursion for a repeated discrete control."""
     if data.raw_states is None:
         raise ValueError("Backward induction requires recorded state paths.")
+    if data.inforce_exposure is None:
+        raise ValueError("Backward induction requires in-force exposure paths.")
     n_paths, n_years = data.new_business_csm_proxy.shape
     if action_indices.shape != (n_paths, n_years):
         raise ValueError("Action indices and projected rewards are inconsistent.")
@@ -1567,8 +5847,6 @@ def _backward_induction(
     policy_year_rows: list[dict[str, object]] = []
     first_year_action_rows: list[dict[str, object]] = []
     active_policy_years: list[int] = []
-    inforce_index = data.state_feature_names.index("inforce_exposure")
-
     first_cap = float("nan")
     first_outputs = np.zeros(10)
     first_se = float("nan")
@@ -1579,7 +5857,7 @@ def _backward_induction(
                 "Backward induction | processing policy year %d/%d",
                 year + 1, n_years,
             )
-        year_exposure = data.raw_states[:, year, inforce_index]
+        year_exposure = data.inforce_exposure[:, year]
         if not np.any(year_exposure > 0.0):
             residual_magnitude = max(
                 float(np.max(np.abs(data.new_business_csm_proxy[:, year]))),
@@ -1596,7 +5874,11 @@ def _backward_induction(
                 float(np.max(np.abs(data.hedge_costs[:, year]))),
                 float(np.max(np.abs(continuation))),
             )
-            materiality = 1.0e-10 * data.representative_initial_premium
+            # Split Anniversary ledgers can leave cancellation noise of a few
+            # 1e-10 of premium once all in-force mass is exactly zero.  A one
+            # part in 1e8 audit threshold still rejects any economically
+            # relevant tail while avoiding a false failure on that arithmetic.
+            materiality = 1.0e-8 * data.representative_initial_premium
             if residual_magnitude > materiality:
                 raise RuntimeError(
                     "Policy year %d has zero in-force exposure but residual "
@@ -1650,7 +5932,7 @@ def _backward_induction(
                 holdout_standard_errors[action] = _standard_error(
                     targets[holdout, 0]
                 )
-            chosen_action = int(np.argmax(selection_values[:, 0]))
+            chosen_action = int(_lower_cap_argmax(selection_values[:, 0]))
             first_cap = float(ACTION_CAPS[chosen_action])
             first_outputs = holdout_values[chosen_action]
             first_se = holdout_standard_errors[chosen_action]
@@ -1719,6 +6001,7 @@ def _backward_induction(
                 year,
                 data.raw_states[selection_paths, year, :],
                 selection_values,
+                selection_standard_errors,
                 data.state_feature_names,
             )
             policy_years.append(first_policy)
@@ -1732,7 +6015,7 @@ def _backward_induction(
                 "p90_selected_cap": first_cap,
                 "economically_active": True,
                 "mean_inforce_exposure": float(np.mean(
-                    data.raw_states[:, year, inforce_index]
+                    data.inforce_exposure[:, year]
                 )),
             })
             continue
@@ -1747,7 +6030,7 @@ def _backward_induction(
             ridge=ridge,
             feature_names=data.state_feature_names,
         )
-        chosen = np.argmax(predictions[:, :, 0], axis=1)
+        chosen = _lower_cap_argmax(predictions[:, :, 0], axis=1)
         rows = np.arange(n_paths)
         continuation = predictions[rows, chosen, :]
         selected_caps = ACTION_CAPS[chosen]
@@ -1760,7 +6043,7 @@ def _backward_induction(
         )
         mean_cap = float(np.mean(selected_caps))
         quantiles = np.quantile(selected_caps, (0.10, 0.50, 0.90))
-        mean_inforce = float(np.mean(data.raw_states[:, year, inforce_index]))
+        mean_inforce = float(np.mean(data.inforce_exposure[:, year]))
         for action, cap in enumerate(ACTION_CAPS):
             fraction = float(np.mean(chosen == action))
             diagnostics[action]["selected_fraction_cross_fitted"] = fraction
@@ -1837,9 +6120,9 @@ def _benchmark_cases() -> list[tuple[str, float, str]]:
             "credited return is identically zero",
         ),
         (
-            "fixed_cap_0.2pct",
-            0.002,
-            "same 0.20% cap in every crediting year",
+            "fixed_cap_0.25pct",
+            0.0025,
+            "same 0.25% cap in every crediting year",
         ),
     ]
     cases.extend(
@@ -1873,7 +6156,12 @@ def _summed_csm_components(
         "other_insurer_funded_benefits",
         "expenses",
         "hedge_costs",
+        "income_paid",
+        "death_benefits",
+        "surrender_benefits",
+        "partial_withdrawals",
         "terminal_closeout",
+        "lapse_events",
     )
     return {
         name: np.sum(np.asarray(getattr(projected, name))[rows], axis=1)
@@ -1895,8 +6183,13 @@ def _csm_benchmark_row(
     """Create one auditable fixed/special-policy CSM result row."""
     difference = portfolio_scale * (csm_paths - best_fixed_paths)
 
+    def component(name: str) -> Array:
+        return np.asarray(
+            components.get(name, np.zeros_like(csm_paths)), dtype=float
+        )
+
     def mean_pv(name: str) -> float:
-        return portfolio_scale * float(np.mean(components[name]))
+        return portfolio_scale * float(np.mean(component(name)))
 
     future_fees = components["fees_product"] + components["fees_lip"]
     other_margins = (
@@ -1911,6 +6204,17 @@ def _csm_benchmark_row(
     total_costs = components["expenses"] + components["hedge_costs"]
     reconstructed_csm = future_fees + other_margins - total_benefits - total_costs
     reconciliation = csm_paths - reconstructed_csm
+    lapse_events = np.asarray(
+        components.get("lapse_events", np.zeros_like(csm_paths)),
+        dtype=float,
+    )
+    policyholder_benefits = (
+        component("income_paid")
+        + component("death_benefits")
+        + component("surrender_benefits")
+        + component("partial_withdrawals")
+        + component("terminal_closeout")
+    )
     return {
         "case": label,
         "cap": cap,
@@ -1951,13 +6255,30 @@ def _csm_benchmark_row(
             portfolio_scale * float(np.max(np.abs(reconciliation)))
         ),
         "pv_terminal_closeout_excluded_aud": mean_pv("terminal_closeout"),
-        "new_business_csm_difference_vs_best_fixed_1_to_20_aud": float(
+        "pv_policyholder_benefits_aud": portfolio_scale * float(
+            np.mean(policyholder_benefits)
+        ),
+        "pv_policyholder_income_aud": mean_pv("income_paid"),
+        "pv_policyholder_death_benefits_aud": mean_pv("death_benefits"),
+        "pv_policyholder_surrender_benefits_aud": mean_pv(
+            "surrender_benefits"
+        ),
+        "pv_policyholder_partial_withdrawals_aud": mean_pv(
+            "partial_withdrawals"
+        ),
+        "expected_cumulative_full_surrender_probability": float(
+            np.mean(lapse_events)
+        ),
+        "expected_cumulative_full_surrenders_scaled_contract_count": (
+            portfolio_scale * float(np.mean(lapse_events))
+        ),
+        "new_business_csm_difference_vs_best_fixed_admissible_aud": float(
             np.mean(difference)
         ),
         "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud": (
             _standard_error(difference)
         ),
-        "is_best_fixed_cap_1_to_20": is_best_fixed,
+        "is_best_fixed_cap_admissible_grid": is_best_fixed,
         "n_common_random_number_paths": int(csm_paths.size),
     }
 
@@ -1975,9 +6296,20 @@ def _evaluate_fixed_benchmarks(
     projection_config: ProjectionConfig,
     portfolio_scale: float,
     model_point_log_interval: int,
-) -> tuple[list[dict[str, object]], dict[str, Array]]:
-    """Direct fixed-policy projections with paired common market paths."""
+    selection_path_count: int,
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, Array],
+    dict[str, Array],
+    str,
+    dict[str, float],
+]:
+    """Select fixed cap on one sample and report it on an independent sample."""
     cases = _benchmark_cases()
+    if not 0 < selection_path_count < base_scenarios.n_paths:
+        raise ValueError(
+            "selection_path_count must leave a non-empty evaluation sample."
+        )
     path_values: dict[str, Array] = {}
     component_paths: dict[str, dict[str, Array]] = {}
     batch_count = int(np.ceil(len(cases) / batch_size))
@@ -2027,29 +6359,60 @@ def _evaluate_fixed_benchmarks(
             batch_number, batch_count, time.perf_counter() - batch_started,
         )
 
-    fixed_labels = [f"fixed_cap_{percent}pct" for percent in range(1, 21)]
+    fixed_labels = [
+        label
+        for label, cap, _ in cases
+        if label.startswith("fixed_cap_")
+        and np.any(np.isclose(cap, ACTION_CAPS))
+    ]
+    selection_slice = slice(0, selection_path_count)
+    evaluation_slice = slice(selection_path_count, None)
     best_label = max(
         fixed_labels,
-        key=lambda label: float(np.mean(path_values[label])),
+        key=lambda label: float(np.mean(path_values[label][selection_slice])),
     )
-    best_paths = path_values[best_label]
+    best_paths = path_values[best_label][evaluation_slice]
+    evaluation_path_values = {
+        label: values[evaluation_slice]
+        for label, values in path_values.items()
+    }
+    selection_path_values = {
+        label: values[selection_slice]
+        for label, values in path_values.items()
+    }
+    selection_means = {
+        label: portfolio_scale * float(np.mean(path_values[label][selection_slice]))
+        for label in fixed_labels
+    }
     LOGGER.info(
-        "Best fixed 1%%-20%% benchmark | %s | New Business CSM proxy %.2f",
-        best_label, portfolio_scale * float(np.mean(best_paths)),
+        "Best fixed admissible benchmark selected independently | %s | "
+        "selection CSM %.2f | evaluation CSM %.2f",
+        best_label,
+        selection_means[best_label],
+        portfolio_scale * float(np.mean(best_paths)),
     )
     rows: list[dict[str, object]] = []
     for label, cap, definition in cases:
-        csm_paths = path_values[label]
+        csm_paths = path_values[label][evaluation_slice]
+        components = {
+            name: values[evaluation_slice]
+            for name, values in component_paths[label].items()
+        }
         row = _csm_benchmark_row(
             label=label,
             cap=None if np.isposinf(cap) else float(cap),
             definition=definition,
-            components=component_paths[label],
+            components=components,
             csm_paths=csm_paths,
             best_fixed_paths=best_paths,
             portfolio_scale=portfolio_scale,
             is_best_fixed=label == best_label,
         )
+        row["fixed_cap_selection_sample_csm_aud"] = (
+            selection_means.get(label)
+        )
+        row["n_fixed_cap_selection_paths"] = selection_path_count
+        row["n_final_evaluation_paths"] = base_scenarios.n_paths - selection_path_count
         rows.append(row)
         LOGGER.debug(
             "Benchmark result | %s | future fees=%.2f | other margins=%.2f | "
@@ -2065,7 +6428,357 @@ def _evaluate_fixed_benchmarks(
             row["standard_error_new_business_csm_proxy_aud"],
             row["pv_terminal_closeout_excluded_aud"],
         )
-    return rows, path_values
+    selection_metadata = {
+        "selection_path_count": float(selection_path_count),
+        "evaluation_path_count": float(
+            base_scenarios.n_paths - selection_path_count
+        ),
+        "best_fixed_selection_csm_aud": selection_means[best_label],
+    }
+    return (
+        rows,
+        evaluation_path_values,
+        selection_path_values,
+        best_label,
+        selection_metadata,
+    )
+
+
+def _policyholder_signature_validation(
+    *,
+    candidate: PortfolioPathData,
+    comparator: PortfolioPathData,
+    path_slice: slice,
+    policy_label: str,
+    cap: float | None,
+    portfolio_scale: float,
+    sample_fingerprint: str,
+) -> tuple[list[dict[str, object]], set[tuple[object, ...]]]:
+    """Paired Policyholder-value gate, kept separate by PolicySpec signature."""
+    candidate_keys = set(candidate.policyholder_benefits_by_signature)
+    comparator_keys = set(comparator.policyholder_benefits_by_signature)
+    if candidate_keys != comparator_keys or not candidate_keys:
+        raise RuntimeError(
+            "Signature-separated Policyholder validation ledgers are missing "
+            "or inconsistent."
+        )
+    rows: list[dict[str, object]] = []
+    failed: set[tuple[object, ...]] = set()
+    for signature in sorted(candidate_keys, key=repr):
+        candidate_paths = np.sum(
+            candidate.policyholder_benefits_by_signature[signature], axis=1
+        )[path_slice]
+        comparator_paths = np.sum(
+            comparator.policyholder_benefits_by_signature[signature], axis=1
+        )[path_slice]
+        delta = portfolio_scale * (candidate_paths - comparator_paths)
+        mean, standard_error = _paired_mean_and_standard_error(delta)
+        lower = mean - 1.96 * standard_error
+        rejected = bool(lower < -1.0e-10)
+        if rejected:
+            failed.add(signature)
+        signature_text = json.dumps(
+            signature, default=str, separators=(",", ":")
+        )
+        rows.append({
+            "policy": policy_label,
+            "cap": cap,
+            "cap_percent": None if cap is None else 100.0 * cap,
+            "policy_signature": signature_text,
+            "policy_signature_fingerprint": hashlib.sha256(
+                signature_text.encode("utf-8")
+            ).hexdigest(),
+            "sample": "validation",
+            "sample_fingerprint": sample_fingerprint,
+            "sample_path_count": int(delta.size),
+            "policyholder_pv_difference_vs_continue_aud": mean,
+            "paired_standard_error_aud": standard_error,
+            "confidence_95pct_lower_aud": lower,
+            "confidence_95pct_upper_aud": mean + 1.96 * standard_error,
+            "continue_fallback_required": rejected,
+            "selection_rule": (
+                "fallback if the paired 95% lower confidence bound is negative"
+            ),
+        })
+    return rows, failed
+
+
+def _evaluate_fixed_lsmc_benchmarks(
+    *,
+    training_scenarios: ScenarioSet,
+    evaluation_scenarios: ScenarioSet,
+    n_years: int,
+    product: IndexLinkedLifetimeIncomeProduct,
+    model_points: PolicyholderModelPointSet,
+    mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
+    projection_config: ProjectionConfig,
+    portfolio_scale: float,
+    model_point_log_interval: int,
+    selection_path_count: int,
+    follower_settings: OptimalBehaviourLSMCSettings,
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, Array],
+    dict[str, Array],
+    str,
+    dict[str, float],
+    dict[str, PolicyholderFitSet],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    """Fresh, cap-consistent follower fit for every fixed/sanity cap.
+
+    Training/cross-fitting uses ``training_scenarios`` only.  The first slice
+    of ``evaluation_scenarios`` is reserved for signature-level follower
+    validation and fixed-cap selection; the second slice is the untouched
+    final sample.  All caps share common random numbers within each split.
+    """
+    if not 0 < selection_path_count < evaluation_scenarios.n_paths:
+        raise ValueError("Fixed-LSMC selection must leave final evaluation paths.")
+    no_actions = no_voluntary_action_behaviour()
+    rows_by_label: dict[str, dict[str, object]] = {}
+    all_paths: dict[str, Array] = {}
+    all_components: dict[str, dict[str, Array]] = {}
+    fit_sets: dict[str, PolicyholderFitSet] = {}
+    exercise_rows: list[dict[str, object]] = []
+    validation_rows: list[dict[str, object]] = []
+    cases = _benchmark_cases()
+    selection = slice(0, selection_path_count)
+    final = slice(selection_path_count, None)
+    validation_fingerprint = _slice_scenarios(
+        evaluation_scenarios, 0, selection_path_count
+    ).content_fingerprint
+    LOGGER.info(
+        "Fixed-cap follower LSMC | %d separately trained fixed/sanity caps",
+        len(cases),
+    )
+    for number, (label, cap, definition) in enumerate(cases, start=1):
+        LOGGER.info(
+            "Fixed-cap follower LSMC %d/%d | cap=%.2f%%",
+            number,
+            len(cases),
+            100.0 * cap,
+        )
+        train_caps = np.full(
+            (training_scenarios.n_paths, n_years), cap, dtype=float
+        )
+        fit_set = _fit_cap_aware_policyholder_policies(
+            cap_matrix=train_caps,
+            scenarios=training_scenarios,
+            product=product,
+            model_points=model_points,
+            mortality=mortality,
+            expenses=expenses,
+            projection_config=projection_config,
+            settings=follower_settings,
+            progress_label=f"Fixed follower {100.0 * cap:g}%",
+        )
+        fit_sets[label] = fit_set
+        evaluation_caps = np.full(
+            (evaluation_scenarios.n_paths, n_years), cap, dtype=float
+        )
+        projected = _aggregate_portfolio_paths(
+            scenarios=evaluation_scenarios,
+            cap_matrix=evaluation_caps,
+            product=product,
+            model_points=model_points,
+            behaviour=no_actions,
+            mortality=mortality,
+            expenses=expenses,
+            projection_config=projection_config,
+            collect_states=True,
+            progress_label=f"Fixed follower evaluation {100.0 * cap:g}%",
+            model_point_log_interval=model_point_log_interval,
+            surrender_policy_factory=fit_set.factory,
+            collect_policyholder_by_signature=True,
+        )
+        continue_projected = _aggregate_portfolio_paths(
+            scenarios=evaluation_scenarios,
+            cap_matrix=evaluation_caps,
+            product=product,
+            model_points=model_points,
+            behaviour=no_actions,
+            mortality=mortality,
+            expenses=expenses,
+            projection_config=projection_config,
+            collect_states=False,
+            progress_label=(
+                f"Fixed follower Continue validation {100.0 * cap:g}%"
+            ),
+            model_point_log_interval=model_point_log_interval,
+            collect_policyholder_by_signature=True,
+        )
+        cap_validation_rows, failed_signatures = (
+            _policyholder_signature_validation(
+                candidate=projected,
+                comparator=continue_projected,
+                path_slice=selection,
+                policy_label=f"fixed_lsmc::{label}",
+                cap=float(cap),
+                portfolio_scale=portfolio_scale,
+                sample_fingerprint=validation_fingerprint,
+            )
+        )
+        fit_set.validation_fallback_signatures.update(failed_signatures)
+        if failed_signatures:
+            LOGGER.warning(
+                "Fixed-cap follower validation | cap=%s | %d signature(s) "
+                "replaced by Continue before final evaluation",
+                "uncapped" if np.isposinf(cap) else f"{100.0 * cap:g}%",
+                len(failed_signatures),
+            )
+            projected = _aggregate_portfolio_paths(
+                scenarios=evaluation_scenarios,
+                cap_matrix=evaluation_caps,
+                product=product,
+                model_points=model_points,
+                behaviour=no_actions,
+                mortality=mortality,
+                expenses=expenses,
+                projection_config=projection_config,
+                collect_states=True,
+                progress_label=(
+                    f"Validated fixed follower evaluation {100.0 * cap:g}%"
+                ),
+                model_point_log_interval=model_point_log_interval,
+                surrender_policy_factory=fit_set.factory,
+                collect_policyholder_by_signature=True,
+            )
+        deployed_by_signature = projected.policyholder_benefits_by_signature
+        continue_by_signature = (
+            continue_projected.policyholder_benefits_by_signature
+        )
+        by_fingerprint = {
+            row["policy_signature_fingerprint"]: row
+            for row in cap_validation_rows
+        }
+        for signature in sorted(deployed_by_signature, key=repr):
+            signature_text = json.dumps(
+                signature, default=str, separators=(",", ":")
+            )
+            fingerprint = hashlib.sha256(
+                signature_text.encode("utf-8")
+            ).hexdigest()
+            post_delta = portfolio_scale * (
+                np.sum(deployed_by_signature[signature], axis=1)[selection]
+                - np.sum(continue_by_signature[signature], axis=1)[selection]
+            )
+            post_mean, post_se = _paired_mean_and_standard_error(post_delta)
+            by_fingerprint[fingerprint].update({
+                "deployed_policyholder_pv_difference_vs_continue_aud": (
+                    post_mean
+                ),
+                "deployed_paired_standard_error_aud": post_se,
+                "deployed_confidence_95pct_lower_aud": (
+                    post_mean - 1.96 * post_se
+                ),
+                "continue_fallback_deployed": (
+                    signature in failed_signatures
+                ),
+            })
+        validation_rows.extend(cap_validation_rows)
+        components = _summed_csm_components(projected, slice(None))
+        csm_paths = np.sum(projected.new_business_csm_proxy, axis=1)
+        all_paths[label] = csm_paths
+        all_components[label] = components
+        rows_by_label[label] = {
+            "case": label,
+            "cap": float(cap),
+            "definition": definition,
+        }
+        if projected.inforce_exposure is None:
+            raise RuntimeError("Fixed-cap exercise reporting lacks exposure paths.")
+        active_years = tuple(
+            int(year + 1)
+            for year in np.flatnonzero(
+                np.any(projected.inforce_exposure > 0.0, axis=0)
+            )
+        )
+        exercise_rows.extend(_policyholder_exercise_rows(
+            label=f"fixed_lsmc::{label}",
+            cap_matrix=evaluation_caps,
+            projected=projected,
+            active_policy_years=active_years,
+            path_slice=final,
+            cap_values=(float(cap),),
+        ))
+
+    admissible_labels = [
+        label
+        for label, cap, _ in cases
+        if np.any(np.isclose(cap, ACTION_CAPS))
+    ]
+    admissible_selection_means = np.asarray([
+        float(np.mean(all_paths[label][selection]))
+        for label in admissible_labels
+    ])
+    best_label = admissible_labels[
+        int(_lower_cap_argmax(admissible_selection_means))
+    ]
+    best_final_paths = all_paths[best_label][final]
+    result_rows: list[dict[str, object]] = []
+    for label, cap, definition in cases:
+        components = {
+            name: values[final]
+            for name, values in all_components[label].items()
+        }
+        row = _csm_benchmark_row(
+            label=label,
+            cap=float(cap),
+            definition=definition + "; cap-consistent follower LSMC",
+            components=components,
+            csm_paths=all_paths[label][final],
+            best_fixed_paths=best_final_paths,
+            portfolio_scale=portfolio_scale,
+            is_best_fixed=label == best_label,
+        )
+        row.update({
+            "fixed_cap_base_case": label,
+            "policyholder_behaviour": "lsmc",
+            "fixed_cap_selection_sample_csm_aud": (
+                portfolio_scale * float(np.mean(all_paths[label][selection]))
+            ),
+            "n_fixed_cap_selection_paths": selection_path_count,
+            "n_final_evaluation_paths": (
+                evaluation_scenarios.n_paths - selection_path_count
+            ),
+            "policyholder_training_scenario_fingerprint": (
+                training_scenarios.content_fingerprint
+            ),
+            "policyholder_training_cap_schedule_fingerprint": (
+                fit_sets[label].cap_schedule_fingerprint
+            ),
+            "policyholder_training_fallback_signature_count": (
+                fit_sets[label].fallback_count
+            ),
+        })
+        result_rows.append(row)
+    evaluation_values = {
+        label: paths[final] for label, paths in all_paths.items()
+    }
+    selection_values = {
+        label: paths[selection] for label, paths in all_paths.items()
+    }
+    metadata = {
+        "selection_path_count": float(selection_path_count),
+        "evaluation_path_count": float(
+            evaluation_scenarios.n_paths - selection_path_count
+        ),
+        "best_fixed_selection_csm_aud": portfolio_scale * float(
+            np.mean(all_paths[best_label][selection])
+        ),
+    }
+    return (
+        result_rows,
+        evaluation_values,
+        selection_values,
+        best_label,
+        metadata,
+        fit_sets,
+        exercise_rows,
+        validation_rows,
+    )
 
 
 def _evaluate_explicit_schedule_benchmark(
@@ -2123,16 +6836,249 @@ def _evaluate_explicit_schedule_benchmark(
     return row, csm_paths
 
 
+def _evaluate_pathwise_policy_benchmark(
+    *,
+    label: str,
+    definition: str,
+    cap_matrix: Array,
+    scenarios: ScenarioSet,
+    product: IndexLinkedLifetimeIncomeProduct,
+    model_points: PolicyholderModelPointSet,
+    behaviour: BehaviourModel,
+    mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
+    projection_config: ProjectionConfig,
+    portfolio_scale: float,
+    comparison_paths: Array,
+    model_point_log_interval: int,
+    surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
+) -> tuple[dict[str, object], Array, PortfolioPathData]:
+    """Directly project a frozen pathwise feedback-policy schedule."""
+    caps = np.asarray(cap_matrix, dtype=float)
+    if caps.ndim != 2 or caps.shape[0] != scenarios.n_paths:
+        raise ValueError("Pathwise policy caps must match evaluation scenarios.")
+    if not np.all(np.isfinite(caps)) or np.any(caps < ACTION_CAPS[0] - 1.0e-15):
+        raise ValueError("Pathwise policy contains an inadmissible cap.")
+    projected = _aggregate_portfolio_paths(
+        scenarios=scenarios,
+        cap_matrix=caps,
+        product=product,
+        model_points=model_points,
+        behaviour=behaviour,
+        mortality=mortality,
+        expenses=expenses,
+        projection_config=projection_config,
+        collect_states=True,
+        progress_label=label,
+        model_point_log_interval=model_point_log_interval,
+        surrender_policy_factory=surrender_policy_factory,
+    )
+    components = _summed_csm_components(projected, slice(None))
+    csm_paths = np.sum(projected.new_business_csm_proxy, axis=1)
+    row = _csm_benchmark_row(
+        label=label,
+        cap=None,
+        definition=definition,
+        components=components,
+        csm_paths=csm_paths,
+        best_fixed_paths=np.asarray(comparison_paths, dtype=float),
+        portfolio_scale=portfolio_scale,
+        is_best_fixed=False,
+    )
+    row["policy_value_source"] = "independent_direct_monthly_projector_rollout"
+    return row, csm_paths, projected
+
+
+def _projected_policy_benchmark_row(
+    *,
+    label: str,
+    definition: str,
+    projected: PortfolioPathData,
+    comparison_paths: Array,
+    portfolio_scale: float,
+) -> tuple[dict[str, object], Array]:
+    """Report an already completed direct monthly-projector rollout."""
+    components = _summed_csm_components(projected, slice(None))
+    csm_paths = np.sum(projected.new_business_csm_proxy, axis=1)
+    row = _csm_benchmark_row(
+        label=label,
+        cap=None,
+        definition=definition,
+        components=components,
+        csm_paths=csm_paths,
+        best_fixed_paths=np.asarray(comparison_paths, dtype=float),
+        portfolio_scale=portfolio_scale,
+        is_best_fixed=False,
+    )
+    row["policy_value_source"] = "independent_direct_monthly_projector_rollout"
+    return row, csm_paths
+
+
+def _paired_mean_and_standard_error(values: Array, scale: float = 1.0) -> tuple[float, float]:
+    sample = scale * np.asarray(values, dtype=float)
+    return float(np.mean(sample)), _standard_error(sample)
+
+
+def _adaptive_policy_passes_validation(
+    *,
+    insurer_regression_stable: bool,
+    policyholder_validation_passed: bool,
+    causal_rollout_valid: bool,
+    csm_delta_aud: float,
+    paired_standard_error_aud: float,
+    confidence_multiplier: float = 1.96,
+) -> bool:
+    """Pure validation-sample deployment rule; evaluation is not an input."""
+    values = np.asarray(
+        (csm_delta_aud, paired_standard_error_aud, confidence_multiplier),
+        dtype=float,
+    )
+    if not np.all(np.isfinite(values)) or paired_standard_error_aud < 0.0:
+        return False
+    return bool(
+        insurer_regression_stable
+        and policyholder_validation_passed
+        and causal_rollout_valid
+        and csm_delta_aud
+        > confidence_multiplier * paired_standard_error_aud
+    )
+
+
+def _surrender_policy_payload(policy: object) -> dict[str, object]:
+    """Serialize the frozen context-only follower policy used in rollout."""
+    settings = getattr(policy, "settings")
+    regressions = getattr(policy, "regressions")
+    return {
+        "settings": {
+            key: value
+            for key, value in vars(settings).items()
+        },
+        "feature_names": list(POLICYHOLDER_FEATURE_NAMES),
+        "regressions_by_decision_step": [
+            {
+                "decision_step": int(step),
+                "premium": float(regression.premium),
+                "active_feature_indices": (
+                    regression.active_feature_indices.tolist()
+                ),
+                "orthogonal_components": (
+                    regression.orthogonal_components.tolist()
+                ),
+                "centre": regression.centre.tolist(),
+                "scale": regression.scale.tolist(),
+                "coefficients": regression.coefficients.tolist(),
+                "condition_number": float(regression.condition_number),
+                "matrix_rank": int(regression.matrix_rank),
+                "oof_rmse_aud": float(regression.oof_rmse_aud),
+            }
+            for step, regression in sorted(regressions.items())
+        ],
+    }
+
+
+def _policyholder_fit_set_payload(fit_set: object) -> dict[str, object]:
+    """Persist every signature-specific frozen follower regression."""
+    if isinstance(fit_set, CoupledPolicyholderFitSet):
+        policies = fit_set.policies
+        validation_fallbacks = set(fit_set.fallback_signatures)
+        fallback_steps = dict(fit_set.fallback_steps_by_signature)
+        source = "coupled_two_value_backward_induction"
+    elif isinstance(fit_set, PolicyholderFitSet):
+        policies = {
+            signature: fit.policy
+            for signature, fit in fit_set.fits.items()
+        }
+        validation_fallbacks = set(
+            fit_set.validation_fallback_signatures
+        )
+        fallback_steps = {
+            signature: tuple(sorted(
+                int(diagnostic.decision_step)
+                for diagnostic in fit.diagnostics
+                if not bool(
+                    diagnostic.regression_accepted_for_exercise
+                )
+            ))
+            for signature, fit in fit_set.fits.items()
+        }
+        for signature in validation_fallbacks:
+            fit = fit_set.fits[signature]
+            fallback_steps[signature] = tuple(sorted(
+                set(fallback_steps.get(signature, ()))
+                | {int(step) for step in fit.policy.regressions}
+                | {
+                    int(diagnostic.decision_step)
+                    for diagnostic in fit.diagnostics
+                }
+            ))
+        source = "fresh_fixed_cap_policyholder_lsmc"
+    else:
+        raise TypeError("Unsupported Policyholder fit-set type.")
+    signatures: list[dict[str, object]] = []
+    for signature in sorted(policies, key=repr):
+        signature_text = json.dumps(
+            signature, default=str, separators=(",", ":")
+        )
+        trained_policy = policies[signature]
+        # Deployment replaces a failed signature with Continue.  Persist that
+        # switch explicitly while retaining the trained regression for audit.
+        signatures.append({
+            "policy_signature": signature_text,
+            "policy_signature_fingerprint": hashlib.sha256(
+                signature_text.encode("utf-8")
+            ).hexdigest(),
+            "continue_fallback_deployed": signature in validation_fallbacks,
+            "continue_fallback_decision_steps": list(
+                fallback_steps.get(signature, ())
+            ),
+            "trained_policy": _surrender_policy_payload(trained_policy),
+            "deployed_regression_count": (
+                0
+                if signature in validation_fallbacks
+                else len(getattr(trained_policy, "regressions"))
+            ),
+        })
+    return {
+        "source": source,
+        "training_scenario_fingerprint": fit_set.scenario_fingerprint,
+        "training_cap_schedule_fingerprint": (
+            fit_set.cap_schedule_fingerprint
+        ),
+        "signature_count": fit_set.signature_count,
+        "fallback_signature_count": fit_set.fallback_count,
+        "signatures": signatures,
+    }
+
+
 def _policy_payload(
     result: BackwardResult,
     feature_names: Sequence[str],
     projection_semantics: Mapping[str, object],
+    *,
+    fixed_fallback_cap: float,
+    deployed_first_year_cap: float,
+    adaptive_policy_selected: bool,
+    validation_delta_aud: float,
+    validation_paired_standard_error_aud: float,
+    advantage_screen_multiplier: float | None = None,
 ) -> dict[str, object]:
     nonlinear, interactions, basis_names = _basis_specification(feature_names)
+    deployed_rule = (
+        "Apply the year-specific fitted-Q coefficients, choose the maximum "
+        "CSM action with the lower-cap tie-break, and use the same rule as "
+        "the coupled backward recursion."
+        if adaptive_policy_selected
+        else "Ignore the fitted-Q coefficients for deployment and apply the "
+        "fixed fallback cap in every policy year."
+    )
     return {
         "engine_version": ENGINE_VERSION,
         "method": "cross_fitted_control_randomisation_fitted_q",
         "optimization_direction": "maximize",
+        "numerically_stable": bool(result.numerically_stable),
+        "numerical_fallback_reasons": list(
+            result.numerical_fallback_reasons
+        ),
         "projection_semantics": dict(projection_semantics),
         "objective_outputs": [
             "new_business_csm_proxy",
@@ -2157,6 +7103,36 @@ def _policy_payload(
             "terminal_closeout",
         ],
         "action_caps": ACTION_CAPS.tolist(),
+        "deployment": {
+            "policy_type": (
+                "adaptive_fitted_q"
+                if adaptive_policy_selected
+                else "fixed_cap_fallback"
+            ),
+            "adaptive_policy_selected": bool(adaptive_policy_selected),
+            "fitted_coefficients_authoritative_for_deployment": bool(
+                adaptive_policy_selected
+            ),
+            "fixed_fallback_cap_decimal": float(fixed_fallback_cap),
+            "fixed_fallback_cap_percent": 100.0 * float(fixed_fallback_cap),
+            "deployed_first_year_cap_decimal": float(deployed_first_year_cap),
+            "deployed_first_year_cap_percent": (
+                100.0 * float(deployed_first_year_cap)
+            ),
+            "adaptive_validation_delta_vs_fixed_aud": float(
+                validation_delta_aud
+            ),
+            "adaptive_validation_paired_standard_error_aud": float(
+                validation_paired_standard_error_aud
+            ),
+            "adaptive_validation_rule": (
+                "Select the adaptive candidate only when its paired direct-"
+                "projection validation delta exceeds 1.96 standard errors."
+            ),
+            "local_action_advantage_screen_applied": False,
+            "advantage_screen_is_confidence_interval": False,
+            "deployed_rule": deployed_rule,
+        },
         "raw_state_features": list(feature_names),
         "economically_active_policy_years": list(
             result.economically_active_policy_years
@@ -2177,14 +7153,31 @@ def _policy_payload(
                 "raw_mean": item.raw_mean.tolist(),
                 "raw_scale": item.raw_scale.tolist(),
                 "coefficients_by_action_basis_output": item.coefficients.tolist(),
+                "action_value_standard_error": (
+                    item.action_value_standard_error.tolist()
+                ),
+                "value_lower_bounds_by_action_output": (
+                    None
+                    if item.value_lower_bounds is None
+                    else item.value_lower_bounds.tolist()
+                ),
+                "value_upper_bounds_by_action_output": (
+                    None
+                    if item.value_upper_bounds is None
+                    else item.value_upper_bounds.tolist()
+                ),
+                "numerically_stable": bool(item.numerically_stable),
             }
             for item in result.policy_years
         ],
-        "application_rule": (
+        "application_rule": deployed_rule,
+        "fitted_candidate_rule": (
             "At each economically active anniversary form only the listed "
             "pre-action state, apply that year's scaling and basis, predict "
-            "all action values, and select the cap with the largest approximate "
-            "New Business CSM prediction. No policy is fitted after all covered "
+            "all action values, and choose their maximum with the contractual "
+            "lower-cap tie-break. The complete adaptive rule is selected or "
+            "rejected only on the separate paired validation sample; there is "
+            "no pathwise rollout screen. No policy is fitted after all covered "
             "lives have zero in-force exposure."
         ),
     }
@@ -2264,11 +7257,158 @@ def _save_figure(
     return paths
 
 
+def _plot_flexibility_value(
+    *,
+    pyplot,
+    ticker,
+    benchmark_rows: Sequence[Mapping[str, object]],
+    directory: Path,
+    plot_format: str,
+    dpi: int,
+) -> list[Path]:
+    """Plain-language comparison based only on direct evaluation cashflows."""
+    no_credit = next(
+        row for row in benchmark_rows if row["case"] == "no_crediting_cap_0pct"
+    )
+    best_fixed = next(
+        row for row in benchmark_rows
+        if row["is_best_fixed_cap_admissible_grid"]
+    )
+    requested_fixed = next(
+        row for row in benchmark_rows
+        if row.get("is_best_fixed_cap_requested_1_to_20_grid", False)
+    )
+    flexible = next(
+        row for row in benchmark_rows if row["case"] == "flexible_lsmc_policy"
+    )
+    rows = (no_credit, requested_fixed, best_fixed, flexible)
+    labels = (
+        "Keine Gutschrift\n(0 %)",
+        (
+            "Bester fixer Cap\n"
+            f"nur 1–20 % ({float(requested_fixed['cap_percent']):g} %)"
+        ),
+        f"Bester fixer Cap\n({float(best_fixed['cap_percent']):g} %)",
+        (
+            "Flexible jährliche\nCap-Politik"
+            if flexible.get("adaptive_policy_selected", False)
+            else "Validierte Regel\n(fixer Fallback)"
+        ),
+    )
+    values = np.asarray([
+        float(row["estimated_new_business_csm_proxy_aud"]) for row in rows
+    ])
+    errors = 1.96 * np.asarray([
+        float(row["standard_error_new_business_csm_proxy_aud"]) for row in rows
+    ])
+    delta = float(
+        flexible["new_business_csm_difference_vs_best_fixed_admissible_aud"]
+    )
+    delta_se = float(
+        flexible[
+            "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
+        ]
+    )
+    lower = delta - 1.96 * delta_se
+    upper = delta + 1.96 * delta_se
+
+    figure, (top, bottom) = pyplot.subplots(
+        2, 1, figsize=(10.5, 8.2),
+        gridspec_kw={"height_ratios": (2.2, 1.0)},
+    )
+    colours = ("#8A94A3", "#5B8DB8", "#2F6B9A", "#168A45")
+    positions = np.arange(4)
+    bars = top.bar(
+        positions, values, yerr=errors, capsize=5, color=colours, alpha=0.9
+    )
+    top.axhline(0.0, color="black", linewidth=0.8)
+    top.set_xticks(positions, labels)
+    top.set_ylabel("New-Business-CSM-Proxy (AUD; höher ist besser)")
+    top.set_title("Direkter Vergleich auf denselben unabhängigen Marktpfaden")
+    top.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
+    top.grid(axis="y", alpha=0.25)
+    for bar, value in zip(bars, values):
+        vertical = 4 if value >= 0.0 else -14
+        alignment = "bottom" if value >= 0.0 else "top"
+        top.annotate(
+            f"AUD {_aud_formatter(value, None)}",
+            (bar.get_x() + bar.get_width() / 2.0, value),
+            xytext=(0, vertical), textcoords="offset points",
+            ha="center", va=alignment, fontsize=9,
+        )
+
+    bottom.errorbar(
+        [0.0], [delta], yerr=[1.96 * delta_se], fmt="o", markersize=8,
+        capsize=7, linewidth=2.0, color="#168A45",
+    )
+    bottom.axhline(0.0, color="black", linewidth=1.0)
+    bottom.set_xlim(-0.75, 0.75)
+    bottom.set_xticks([0.0], ["Flexibel minus bester fixer Cap"])
+    bottom.set_ylabel("Gepaarter Δ CSM (AUD)")
+    bottom.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
+    bottom.grid(axis="y", alpha=0.25)
+    if np.isclose(delta_se, 0.0) and np.isclose(delta, 0.0):
+        # Avoid a degenerate +/-0 y-axis when validation rejects the adaptive
+        # candidate and the direct rollout intentionally equals the fallback.
+        vertical_span = max(1_000.0, 0.04 * float(np.max(np.abs(values))))
+        bottom.set_ylim(-vertical_span, vertical_span)
+        evidence = "adaptive Regel verworfen; fixer Fallback"
+    else:
+        evidence = (
+            "95%-Intervall vollständig über null"
+            if lower > 0.0
+            else "kein positiver Flexibilitätswert nachgewiesen"
+        )
+    bottom.set_title(
+        f"Reiner Flexibilitätswert ggü. fairem fixer Vergleich: "
+        f"AUD {_aud_formatter(delta, None)} "
+        f"[{_aud_formatter(lower, None)}, {_aud_formatter(upper, None)}]; {evidence}",
+        fontsize=10,
+    )
+    exercise_rate = float(flexible.get(
+        "policyholder_full_withdrawal_exercise_rate_over_income_exposure",
+        0.0,
+    ))
+    deployment_note = (
+        "fixer Fallback"
+        if not flexible.get("adaptive_policy_selected", False)
+        else "adaptive Regel"
+    )
+    boundary_note = (
+        "; erster Cap am Rand des Aktionsgitters"
+        if flexible.get("deployed_first_year_cap_on_action_grid_boundary", False)
+        else ""
+    )
+    figure.text(
+        0.01, 0.01,
+        "Alle Balken stammen aus direkten Monatsprojektionen. Der flexible CSM "
+        "ist kein regressierter Bellman-Wert; das Δ-Intervall nutzt gepaarte "
+        "Common-Random-Number-Pfade. Ein Vorsprung gegenüber dem eingeschränkten "
+        "1–20-%-Check kann allein aus dem zusätzlich zulässigen 0,25-%-Cap stammen "
+        "und ist dann kein Flexibilitätswert.",
+        fontsize=8,
+    )
+    figure.text(
+        0.01,
+        0.04,
+        f"Policyholder exercise rate / Income exposure: "
+        f"{100.0 * exercise_rate:.2f}%; deployment: {deployment_note}"
+        f"{boundary_note}.",
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0.0, 0.075, 1.0, 1.0))
+    return _save_figure(
+        figure=figure, pyplot=pyplot, directory=directory,
+        stem="00_flexibility_value", plot_format=plot_format, dpi=dpi,
+    )
+
+
 def _plot_first_year_choice(
     *,
     pyplot,
     ticker,
     rows: Sequence[Mapping[str, object]],
+    summary: Mapping[str, object],
     directory: Path,
     plot_format: str,
     dpi: int,
@@ -2293,26 +7433,39 @@ def _plot_first_year_choice(
     ])
     chosen = next(row for row in ordered if row["is_optimal_first_year_cap"])
     chosen_cap = float(chosen["cap_percent"])
+    deployed_cap = float(summary["optimal_first_year_cap_percent"])
+    coupled_oof = any(
+        bool(row.get("two_value_stackelberg_recursion", False))
+        for row in ordered
+    )
 
     figure, axis = pyplot.subplots(figsize=(10.5, 6.2))
     axis.errorbar(
         caps, selection, yerr=1.96 * selection_se,
         marker="o", markersize=4, linewidth=1.5, capsize=2,
-        label="Selection folds: estimated Q",
+        label=(
+            "Complete-path OOF coupled Q"
+            if coupled_oof else "Selection folds: estimated Q"
+        ),
     )
-    axis.errorbar(
-        caps, holdout, yerr=1.96 * holdout_se,
-        marker="s", markersize=3.5, linewidth=1.2, capsize=2,
-        linestyle="--", label="Held-out fold: estimated Q",
-    )
+    if not coupled_oof:
+        axis.errorbar(
+            caps, holdout, yerr=1.96 * holdout_se,
+            marker="s", markersize=3.5, linewidth=1.2, capsize=2,
+            linestyle="--", label="Held-out fold: estimated Q",
+        )
     axis.axvline(
         chosen_cap, color="black", linewidth=1.2, linestyle=":",
-        label=f"Chosen first-year cap: {chosen_cap:g}%",
+        label=f"Unconstrained Bellman choice: {chosen_cap:g}%",
+    )
+    axis.axvline(
+        deployed_cap, color="#168A45", linewidth=1.5, linestyle="--",
+        label=f"Validated deployed cap: {deployed_cap:g}%",
     )
     axis.axhline(0.0, color="grey", linewidth=0.8)
     axis.set_xlabel("First-year cap (%)")
     axis.set_ylabel("Approximate New Business CSM (AUD; higher is better)")
-    axis.set_title("First-year cap decision: CSM-maximising Fitted-Q values")
+    axis.set_title("First-year Fitted-Q diagnostic and validated deployed cap")
     axis.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     axis.grid(alpha=0.25)
     axis.legend(loc="best")
@@ -2334,13 +7487,16 @@ def _plot_fixed_cap_checks(
     pyplot,
     ticker,
     benchmark_rows: Sequence[Mapping[str, object]],
-    summary: Mapping[str, object],
     directory: Path,
     plot_format: str,
     dpi: int,
 ) -> list[Path]:
     numeric = sorted(
-        (row for row in benchmark_rows if row["cap_percent"] is not None),
+        (
+            row for row in benchmark_rows
+            if row["cap_percent"] is not None
+            and np.isfinite(float(row["cap_percent"]))
+        ),
         key=lambda row: float(row["cap_percent"]),
     )
     caps = np.asarray([float(row["cap_percent"]) for row in numeric])
@@ -2353,7 +7509,7 @@ def _plot_fixed_cap_checks(
     ])
     difference = np.asarray([
         float(row[
-            "new_business_csm_difference_vs_best_fixed_1_to_20_aud"
+            "new_business_csm_difference_vs_best_fixed_admissible_aud"
         ]) for row in numeric
     ])
     paired_se = np.asarray([
@@ -2361,7 +7517,9 @@ def _plot_fixed_cap_checks(
             "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
         ]) for row in numeric
     ])
-    best = next(row for row in numeric if row["is_best_fixed_cap_1_to_20"])
+    best = next(
+        row for row in numeric if row["is_best_fixed_cap_admissible_grid"]
+    )
     best_cap = float(best["cap_percent"])
 
     figure, (top, bottom) = pyplot.subplots(
@@ -2374,12 +7532,12 @@ def _plot_fixed_cap_checks(
     )
     top.axvline(
         best_cap, color="black", linestyle=":", linewidth=1.2,
-        label=f"Best fixed 1%-20% cap: {best_cap:g}%",
+        label=f"Best fixed admissible cap: {best_cap:g}%",
     )
     special_styles = {
         "uncapped_positive_credit": ("No upper cap", "tab:green", "--"),
-        "lsmc_first_year_then_best_fixed_continuation": (
-            "LSMC year 1, then best fixed", "tab:purple", "-."
+        "flexible_lsmc_policy": (
+            "Flexible annual cap policy (direct rollout)", "tab:purple", "-."
         ),
     }
     for case, (label, colour, style) in special_styles.items():
@@ -2389,13 +7547,8 @@ def _plot_fixed_cap_checks(
                 float(matching[0]["estimated_new_business_csm_proxy_aud"]),
                 color=colour, linestyle=style, linewidth=1.2, label=label,
             )
-    top.axhline(
-        float(summary["estimated_optimal_new_business_csm_proxy_aud"]),
-        color="tab:red", linestyle=":", linewidth=1.4,
-        label="Held-out Bellman estimate (not direct rollout)",
-    )
     top.set_ylabel("Approximate New Business CSM (AUD)")
-    top.set_title("CSM-maximising fixed-cap and special-policy checks")
+    top.set_title("Direct fixed-cap checks and flexible-policy rollout")
     top.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     top.grid(alpha=0.25)
     top.legend(loc="best", fontsize=8)
@@ -2433,7 +7586,11 @@ def _plot_fixed_cap_decomposition(
     dpi: int,
 ) -> list[Path]:
     numeric = sorted(
-        (row for row in benchmark_rows if row["cap_percent"] is not None),
+        (
+            row for row in benchmark_rows
+            if row["cap_percent"] is not None
+            and np.isfinite(float(row["cap_percent"]))
+        ),
         key=lambda row: float(row["cap_percent"]),
     )
     caps = np.asarray([float(row["cap_percent"]) for row in numeric])
@@ -2504,6 +7661,60 @@ def _plot_fixed_cap_decomposition(
     )
 
 
+def _plot_lapse_behaviour_by_cap(
+    *,
+    pyplot,
+    benchmark_rows: Sequence[Mapping[str, object]],
+    summary: Mapping[str, object],
+    directory: Path,
+    plot_format: str,
+    dpi: int,
+) -> list[Path]:
+    """Show the directly projected full-surrender response to fixed caps."""
+    rows = sorted(
+        (
+            row for row in benchmark_rows
+            if str(row["case"]).startswith("fixed_cap_")
+            and row.get("cap_percent") is not None
+            and 0.25 <= float(row["cap_percent"]) <= 20.0
+        ),
+        key=lambda row: float(row["cap_percent"]),
+    )
+    caps = np.asarray([float(row["cap_percent"]) for row in rows])
+    lapse = 100.0 * np.asarray([
+        float(row["expected_cumulative_full_surrender_probability"])
+        for row in rows
+    ])
+    figure, axis = pyplot.subplots(figsize=(10.5, 5.6))
+    axis.plot(caps, lapse, marker="o", linewidth=2.0, color="#A44A3F")
+    best_cap = float(summary["best_fixed_cap_admissible_percent"])
+    axis.axvline(
+        best_cap, color="#2F6B9A", linestyle="--", linewidth=1.5,
+        label=f"Bester fixer Cap: {best_cap:g} %",
+    )
+    axis.set_xlabel("Jährlich fixer Cap (%)")
+    axis.set_ylabel("Erwartete kumulierte Full-Surrender-Wahrscheinlichkeit (%)")
+    axis.set_title(
+        "Direkt projizierte Behaviour-Reaktion auf den Crediting-Cap\n"
+        f"Performance-Gap={summary['performance_gap_behaviour_enabled']}, "
+        f"Basis={summary['behaviour_value_basis']}"
+    )
+    axis.grid(alpha=0.25)
+    axis.legend(loc="best")
+    figure.text(
+        0.01, 0.01,
+        "Growth Surrender ist produktseitig verboten. Die Kurve misst daher "
+        "Full Surrender in den modellierten Income-Zweigen; Joint-Life-"
+        "Continue-Income bleibt bis zur Kohortenerweiterung statisch.",
+        fontsize=8,
+    )
+    figure.tight_layout(rect=(0.0, 0.055, 1.0, 1.0))
+    return _save_figure(
+        figure=figure, pyplot=pyplot, directory=directory,
+        stem="06_lapse_behaviour_by_cap", plot_format=plot_format, dpi=dpi,
+    )
+
+
 def _plot_dynamic_policy(
     *,
     pyplot,
@@ -2562,8 +7773,8 @@ def _plot_dynamic_policy(
     ])
     heat.set_ylabel("Cap action")
     heat.set_title(
-        "CSM-maximising cross-fitted cap choices; grey tail has zero exposure "
-        "(not an independent rollout)"
+        "Cap choices in the independent direct policy rollout; "
+        "grey tail has zero exposure"
     )
     figure.colorbar(image, ax=heat, label="Selected path fraction", pad=0.01)
 
@@ -2686,11 +7897,13 @@ def _generate_plots(
     plot_directory = output / "plots"
     plot_directory.mkdir(parents=True, exist_ok=True)
     stems = (
+        "00_flexibility_value",
         "01_first_year_cap_choice",
         "02_fixed_cap_sanity_checks",
         "03_fixed_cap_pv_decomposition",
         "04_dynamic_cap_policy",
         "05_regression_diagnostics",
+        "06_lapse_behaviour_by_cap",
     )
     for stem in stems:
         for extension in ("png", "svg"):
@@ -2699,13 +7912,18 @@ def _generate_plots(
                 stale.unlink()
                 LOGGER.debug("Removed stale plot from previous run | %s", stale)
     paths: list[Path] = []
+    paths.extend(_plot_flexibility_value(
+        pyplot=pyplot, ticker=ticker, benchmark_rows=benchmark_rows,
+        directory=plot_directory, plot_format=plot_format, dpi=dpi,
+    ))
     paths.extend(_plot_first_year_choice(
         pyplot=pyplot, ticker=ticker, rows=first_year_rows,
+        summary=summary,
         directory=plot_directory, plot_format=plot_format, dpi=dpi,
     ))
     paths.extend(_plot_fixed_cap_checks(
         pyplot=pyplot, ticker=ticker, benchmark_rows=benchmark_rows,
-        summary=summary, directory=plot_directory,
+        directory=plot_directory,
         plot_format=plot_format, dpi=dpi,
     ))
     paths.extend(_plot_fixed_cap_decomposition(
@@ -2724,12 +7942,24 @@ def _generate_plots(
         pyplot=pyplot, rows=regression_rows,
         directory=plot_directory, plot_format=plot_format, dpi=dpi,
     ))
+    paths.extend(_plot_lapse_behaviour_by_cap(
+        pyplot=pyplot,
+        benchmark_rows=benchmark_rows,
+        summary=summary,
+        directory=plot_directory,
+        plot_format=plot_format,
+        dpi=dpi,
+    ))
     return paths, str(matplotlib.__version__)
 
 
 def main() -> None:
     args = parse_args()
     run_started = time.perf_counter()
+    run_created_utc = datetime.now(timezone.utc).isoformat()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    script_path = Path(__file__).resolve()
+    script_sha256 = hashlib.sha256(script_path.read_bytes()).hexdigest()
     output = args.output.expanduser().resolve()
     preexisting_outputs = list(output.glob("*")) if output.is_dir() else []
     output.mkdir(parents=True, exist_ok=True)
@@ -2751,6 +7981,27 @@ def main() -> None:
             "files and plots will be overwritten.",
             len(preexisting_outputs),
         )
+    # Invalidate any completed summary from an earlier run before the first
+    # fallible stage.  If this process stops unexpectedly, consumers see an
+    # explicit non-completed status and the current run id, never stale results
+    # presented as the outcome of the new invocation.
+    running_summary = {
+        "status": "running",
+        "run_id": run_id,
+        "created_utc": run_created_utc,
+        "script": str(script_path),
+        "script_sha256": script_sha256,
+        "run_log_file": str(log_path.relative_to(output)),
+        "message": (
+            "Run in progress or interrupted; use results only when status is "
+            "completed. See run.log for the last completed stage."
+        ),
+    }
+    with (output / "optimization_summary.json").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        json.dump(running_summary, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
     with _logged_stage("Validate headless Matplotlib plotting backend"):
         plotting_backend = _load_plotting_backend()
 
@@ -2778,14 +8029,30 @@ def main() -> None:
         loaded_behaviour = load_dynamic_behaviour_assumptions(
             args.dynamic_behaviour,
             assumption_set_id=args.behaviour_assumption_set,
-            value_basis="base",
+            value_basis=args.behaviour_value_basis,
         )
     # Resolve Take-up deterministically from each model point's effective
     # Election anniversary.  Branch-specific dynamic/static treatment is
     # applied below exactly as in the active portfolio wrapper.
-    behaviour = replace(
+    dynamic_behaviour = replace(
         loaded_behaviour.behaviour,
         take_up=replace(loaded_behaviour.behaviour.take_up, mode="deterministic"),
+    )
+    if not args.performance_gap_behaviour:
+        dynamic_behaviour = replace(
+            dynamic_behaviour,
+            dynamic=replace(
+                dynamic_behaviour.dynamic,
+                performance=replace(
+                    dynamic_behaviour.dynamic.performance,
+                    excess_hazard_cap=0.0,
+                ),
+            ),
+        )
+    behaviour = (
+        dynamic_behaviour
+        if args.policyholder_behaviour == "dynamic"
+        else no_voluntary_action_behaviour(dynamic_behaviour)
     )
     with _logged_stage("Load and validate policyholder model points"):
         model_points = load_policyholder_model_points(
@@ -2849,10 +8116,55 @@ def main() -> None:
     )
     projection_semantics: dict[str, object] = {
         "engine_version": ENGINE_VERSION,
+        "policyholder_behaviour_mode": args.policyholder_behaviour,
+        "statistical_lapse_applied_alongside_lsmc": False,
+        "policyholder_lsmc_replaces_statistical_voluntary_actions": (
+            args.policyholder_behaviour == "lsmc"
+        ),
+        "leader_state_timing": (
+            "after old-cap credit, fee posting, mortality and Election; before "
+            "new-cap DVA/hedge restart"
+        ),
+        "announced_cap_observable_to_same_anniversary_surrender": True,
         "source_behaviour_regime": loaded_behaviour.behaviour.regime,
         "base_behaviour_regime": behaviour.regime,
         "dynamic_lapse_or_withdrawal_active_on_base_behaviour": (
             dynamic_behaviour_active
+        ),
+        "behaviour_value_basis": args.behaviour_value_basis,
+        "performance_gap_behaviour_enabled": bool(
+            args.performance_gap_behaviour
+        ),
+        "performance_lapse_model": "competing_risk_excess_hazard",
+        "performance_lapse_retention_gamma": float(
+            behaviour.dynamic.performance.retention_gamma
+        ),
+        "performance_lapse_retention_floor": float(
+            behaviour.dynamic.performance.retention_floor
+        ),
+        "performance_lapse_shortfall_deadband": float(
+            behaviour.dynamic.performance.shortfall_deadband
+        ),
+        "performance_shortfall_max_log_return": float(
+            behaviour.dynamic.performance.shortfall_max
+        ),
+        "performance_lapse_excess_hazard_cap": float(
+            behaviour.dynamic.performance.excess_hazard_cap
+        ),
+        "performance_lapse_excess_hazard_scale": float(
+            behaviour.dynamic.performance.excess_hazard_scale
+        ),
+        "performance_lapse_annual_probability_cap": float(
+            behaviour.dynamic.performance.annual_probability_cap
+        ),
+        "performance_gap_definition": (
+            "positive part of trailing annual log(reference-fund gross return) "
+            "minus log(customer credited gross return), observed after annual "
+            "crediting; customer fund only, no backing-asset or hedge P&L input"
+        ),
+        "growth_surrender_treatment": (
+            "contractually prohibited; performance-gap coefficient cannot "
+            "create Growth-phase lapses"
         ),
         "behaviour_treatment_by_branch": behaviour_treatment_by_branch,
         "source_income_take_up_mode": loaded_behaviour.behaviour.take_up.mode,
@@ -2901,7 +8213,9 @@ def main() -> None:
             False if joint_life_count else None
         ),
         "income_lapse_after_account_value_exhaustion": (
-            "remains active while a locked Income guarantee exists"
+            "full surrender is ineligible once the customer surrender value "
+            "is exhausted; a positive lifetime-income guarantee cannot be "
+            "forfeited for zero consideration"
         ),
         "mortality_monthly_conversion": (
             "one annual q_x per Policy Year converted to twelve reconciled "
@@ -2915,7 +8229,9 @@ def main() -> None:
         "mortality_terminal_age": float(MORTALITY_TERMINAL_AGE),
         "scalar_behaviour_schedule_validation": "strict_engine_loader",
         "new_business_csm_proxy_scope": (
-            "Product Fees + LIP Fees + Crediting Margin + MVA/APS retained "
+            "Product Fees + LIP Fees "
+            + ("+ Crediting Margin " if args.hedge_gain else "")
+            + "+ MVA/APS retained "
             "minus Guarantee Claims, other insurer-funded benefits, operating "
             "expenses and hedge-execution costs"
         ),
@@ -2923,7 +8239,8 @@ def main() -> None:
             OTHER_INSURER_FUNDED_BENEFIT_KEYS
         ),
         "account_value_funded_policyholder_benefits_in_csm_proxy": False,
-        "crediting_margin_in_csm_proxy": True,
+        "crediting_margin_in_csm_proxy": bool(args.hedge_gain),
+        "hedge_gain_toggle": bool(args.hedge_gain),
         "operating_expenses_in_csm_proxy": True,
         "hedge_costs_in_csm_proxy": True,
         "hedge_volatility_spread": float(costs.projection.hedge_vol_spread),
@@ -2943,11 +8260,16 @@ def main() -> None:
     )
     projection_config = replace(
         costs.projection,
-        dva_enabled=False,
-        crediting_margin_enabled=True,
+        crediting_margin_enabled=bool(args.hedge_gain),
         record_paths=True,
-        max_age=120.0,
         heston_cos=False,
+    )
+    follower_settings = OptimalBehaviourLSMCSettings(
+        ridge=args.policyholder_lsmc_ridge,
+        n_folds=args.policyholder_lsmc_folds,
+        exercise_buffer_rmse_multiplier=(
+            args.policyholder_exercise_buffer_rmse_multiplier
+        ),
     )
     LOGGER.info(
         "Inputs ready | engine=%s | model points=%d | youngest covered age=%.1f | "
@@ -2983,10 +8305,22 @@ def main() -> None:
         "Behaviour treatment by branch | %s", behaviour_treatment_by_branch
     )
     LOGGER.info(
-        "Behaviour feedback | realised crediting and Account-Value moneyness "
-        "affect dynamic Single-Life/Lump-Sum-Spouse/fallback branches; the "
-        "Continue-Income Joint branch uses static CSV base rates and no direct "
-        "announced-cap elasticity is added."
+        "Behaviour feedback | mode=%s | LSMC uses a signature-specific "
+        "customer-value function with explicit announced cap and no parallel "
+        "statistical lapse; leader state is the exact pre-cap aggregate "
+        "portfolio exposure plus adapted market/cap history.",
+        args.policyholder_behaviour,
+    )
+    LOGGER.info(
+        "Performance-gap lapse proxy | enabled=%s | basis=%s | competing-risk "
+        "hazard cap=%.4f | scale=%.4f | deadband=%.4f | clip=%.2f | "
+        "Growth surrender prohibited",
+        args.performance_gap_behaviour,
+        args.behaviour_value_basis,
+        behaviour.dynamic.performance.excess_hazard_cap,
+        behaviour.dynamic.performance.excess_hazard_scale,
+        behaviour.dynamic.performance.shortfall_deadband,
+        behaviour.dynamic.performance.shortfall_max,
     )
     LOGGER.info(
         "Mortality | Policy-Year annual q_x reconciled to monthly decrements | "
@@ -2995,8 +8329,10 @@ def main() -> None:
     )
     LOGGER.info(
         "Objective | MAX New Business CSM proxy | +Product/LIP Fees "
-        "+Crediting/MVA/APS margins -Guarantee/other insurer benefits "
-        "-Expenses -Hedge costs | hedge vol spread=%.6f",
+        "+%sCrediting Margin +MVA/APS margins -Guarantee/other insurer benefits "
+        "-Expenses -Hedge costs | DVA=%s | hedge vol spread=%.6f",
+        "" if args.hedge_gain else "NO ",
+        projection_config.dva_enabled,
         projection_config.hedge_vol_spread,
     )
     LOGGER.info(
@@ -3039,6 +8375,7 @@ def main() -> None:
         exploration_metadata["persistent_path_count"],
         exploration_metadata["minimum_action_count_in_any_year"],
     )
+    exploratory_follower_fits: Optional[object] = None
     with _logged_stage("Project control-randomisation training portfolio"):
         training_data = _aggregate_portfolio_paths(
             scenarios=training_scenarios,
@@ -3052,6 +8389,23 @@ def main() -> None:
             collect_states=True,
             progress_label="Control-randomisation training projection",
             model_point_log_interval=args.model_point_log_interval,
+            surrender_policy_factory=None,
+            collect_stackelberg_primitives=(
+                args.policyholder_behaviour == "lsmc"
+            ),
+        )
+    with _logged_stage("Merge adapted market history and rich portfolio states"):
+        training_control_inputs = _control_state_inputs(
+            training_scenarios, costs.product, n_years
+        )
+        (
+            training_data.raw_states,
+            training_data.state_feature_names,
+            training_portfolio_state_extension,
+        ) = _merge_control_and_portfolio_states(
+            inputs=training_control_inputs,
+            cap_matrix=exploratory_caps,
+            data=training_data,
         )
     LOGGER.debug(
         "Training arrays | CSM rewards=%s | states=%s | representative premium=%.2f",
@@ -3084,15 +8438,30 @@ def main() -> None:
             training_closeout_max_abs,
         )
     with _logged_stage("Run cross-fitted Fitted-Q backward induction"):
-        backward = _backward_induction(
-            training_data,
-            action_indices,
-            folds=args.cross_fit_folds,
-            ridge=args.ridge,
-            seed=args.seed + 130_363,
-        )
+        if args.policyholder_behaviour == "lsmc":
+            backward = _coupled_backward_induction(
+                training_data,
+                action_indices,
+                control_inputs=training_control_inputs,
+                portfolio_state_extension=training_portfolio_state_extension,
+                folds=args.cross_fit_folds,
+                ridge=args.ridge,
+                seed=args.seed + 130_363,
+                follower_settings=follower_settings,
+                scenario_fingerprint=training_scenarios.content_fingerprint,
+                cap_schedule_fingerprint=_array_fingerprint(exploratory_caps),
+            )
+            exploratory_follower_fits = backward.follower_fit_set
+        else:
+            backward = _backward_induction(
+                training_data,
+                action_indices,
+                folds=args.cross_fit_folds,
+                ridge=args.ridge,
+                seed=args.seed + 130_363,
+            )
     LOGGER.info(
-        "Backward result | first-year cap=%.2f%% | held-out Bellman CSM=%.2f | "
+        "Backward diagnostic | first-year cap=%.2f%% | held-out Bellman value=%.2f | "
         "future fees=%.2f | other margins=%.2f | benefits=%.2f | "
         "expenses=%.2f | hedge costs=%.2f | MC SE=%.2f",
         100.0 * backward.first_year_cap,
@@ -3129,14 +8498,23 @@ def main() -> None:
         float(row["design_condition_number"])
         for row in backward.regression_rows
     ])
-    unstable = (~np.isfinite(condition_values)) | (condition_values > 1.0e12)
-    if np.any(unstable):
+    unstable = (~np.isfinite(condition_values)) | (condition_values > 1.0e10)
+    if np.any(unstable) and args.policyholder_behaviour != "lsmc":
+        raise RuntimeError(
+            "Regression health gate failed: %d/%d regularised year-action "
+            "normal matrices exceed 1e10 or are non-finite (maximum=%s)."
+            % (
+                int(np.sum(unstable)),
+                len(condition_values),
+                str(np.max(condition_values)),
+            )
+        )
+    if args.policyholder_behaviour == "lsmc" and not backward.numerically_stable:
         LOGGER.warning(
-            "Regression conditioning diagnostic | %d/%d year-action fits exceed "
-            "1e12 or are non-finite | maximum=%s",
-            int(np.sum(unstable)),
-            len(condition_values),
-            str(np.max(condition_values)),
+            "Coupled insurer regression failed one or more numerical gates; "
+            "the adaptive policy is ineligible and validation will deploy the "
+            "precommitted best fixed cap. Reasons=%d",
+            len(backward.numerical_fallback_reasons),
         )
     if backward.regression_rows:
         oof_r2 = np.asarray([
@@ -3155,7 +8533,7 @@ def main() -> None:
             "heston_hull_white",
             market.esg,
             horizon_years,
-            args.benchmark_paths,
+            2 * args.benchmark_paths,
             measure=Measure.RISK_NEUTRAL,
             seed=args.seed + 1,
             substeps=args.heston_substeps,
@@ -3166,52 +8544,492 @@ def main() -> None:
         benchmark_scenarios.n_paths,
         benchmark_scenarios.n_steps,
     )
-    with _logged_stage("Evaluate fixed-cap sanity checks"):
-        benchmark_rows, benchmark_path_values = _evaluate_fixed_benchmarks(
+    validation_scenarios = _slice_scenarios(
+        benchmark_scenarios, 0, args.benchmark_paths
+    )
+    evaluation_scenarios = _slice_scenarios(
+        benchmark_scenarios,
+        args.benchmark_paths,
+        2 * args.benchmark_paths,
+    )
+    sample_fingerprints = {
+        "training": training_scenarios.content_fingerprint,
+        "validation": validation_scenarios.content_fingerprint,
+        "evaluation": evaluation_scenarios.content_fingerprint,
+    }
+    if len(set(sample_fingerprints.values())) != 3:
+        raise RuntimeError(
+            "Training, validation and evaluation ScenarioSets must be disjoint."
+        )
+    LOGGER.info(
+        "Disjoint samples | training=%s | validation=%s | evaluation=%s",
+        sample_fingerprints["training"],
+        sample_fingerprints["validation"],
+        sample_fingerprints["evaluation"],
+    )
+
+    continue_behaviour = no_voluntary_action_behaviour(dynamic_behaviour)
+    with _logged_stage("Evaluate always-Continue fixed-cap benchmarks"):
+        continue_results = _evaluate_fixed_benchmarks(
             base_scenarios=benchmark_scenarios,
             n_years=n_years,
             batch_size=args.benchmark_batch_size,
             product=costs.product,
             model_points=model_points,
-            behaviour=behaviour,
+            behaviour=continue_behaviour,
             mortality=mortality,
             expenses=costs.expenses,
             projection_config=projection_config,
             portfolio_scale=portfolio_scale,
             model_point_log_interval=args.model_point_log_interval,
+            selection_path_count=args.benchmark_paths,
+        )
+    with _logged_stage("Evaluate existing dynamic-Behaviour fixed-cap benchmarks"):
+        dynamic_results = _evaluate_fixed_benchmarks(
+            base_scenarios=benchmark_scenarios,
+            n_years=n_years,
+            batch_size=args.benchmark_batch_size,
+            product=costs.product,
+            model_points=model_points,
+            behaviour=dynamic_behaviour,
+            mortality=mortality,
+            expenses=costs.expenses,
+            projection_config=projection_config,
+            portfolio_scale=portfolio_scale,
+            model_point_log_interval=args.model_point_log_interval,
+            selection_path_count=args.benchmark_paths,
         )
 
+    fixed_lsmc_fit_sets: dict[str, PolicyholderFitSet] = {}
+    fixed_policyholder_exercise_rows: list[dict[str, object]] = []
+    policyholder_validation_rows: list[dict[str, object]] = []
+    if args.policyholder_behaviour == "lsmc":
+        with _logged_stage(
+            "Fit and evaluate a fresh policyholder LSMC under every fixed cap"
+        ):
+            (
+                benchmark_rows,
+                benchmark_path_values,
+                fixed_selection_path_values,
+                best_fixed_label,
+                fixed_selection_metadata,
+                fixed_lsmc_fit_sets,
+                fixed_policyholder_exercise_rows,
+                policyholder_validation_rows,
+            ) = _evaluate_fixed_lsmc_benchmarks(
+                training_scenarios=training_scenarios,
+                evaluation_scenarios=benchmark_scenarios,
+                n_years=n_years,
+                product=costs.product,
+                model_points=model_points,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=projection_config,
+                portfolio_scale=portfolio_scale,
+                model_point_log_interval=args.model_point_log_interval,
+                selection_path_count=args.benchmark_paths,
+                follower_settings=follower_settings,
+            )
+    elif args.policyholder_behaviour == "dynamic":
+        (
+            benchmark_rows,
+            benchmark_path_values,
+            fixed_selection_path_values,
+            best_fixed_label,
+            fixed_selection_metadata,
+        ) = dynamic_results
+        for row in benchmark_rows:
+            row["policyholder_behaviour"] = "dynamic"
+    else:
+        (
+            benchmark_rows,
+            benchmark_path_values,
+            fixed_selection_path_values,
+            best_fixed_label,
+            fixed_selection_metadata,
+        ) = continue_results
+        for row in benchmark_rows:
+            row["policyholder_behaviour"] = "continue"
+
+    behaviour_benchmark_rows: list[dict[str, object]] = []
+    for mode, result in (
+        ("continue", continue_results),
+        ("dynamic", dynamic_results),
+    ):
+        for source in result[0]:
+            row = dict(source)
+            row["fixed_cap_base_case"] = source["case"]
+            row["case"] = f"{source['case']}__{mode}"
+            row["policyholder_behaviour"] = mode
+            behaviour_benchmark_rows.append(row)
+
     best_fixed_row = next(
-        row for row in benchmark_rows if row["is_best_fixed_cap_1_to_20"]
+        row for row in benchmark_rows
+        if row["is_best_fixed_cap_admissible_grid"]
     )
     best_fixed_cap = float(best_fixed_row["cap"])
-    fallback_schedule = np.full(n_years, best_fixed_cap)
-    fallback_schedule[0] = backward.first_year_cap
-    if np.isclose(best_fixed_cap, 0.01) or np.isclose(best_fixed_cap, 0.20):
+    fixed_1_to_20_rows = [
+        row for row in benchmark_rows
+        if str(row["case"]).startswith("fixed_cap_")
+        and row["cap_percent"] is not None
+        and 1.0 <= float(row["cap_percent"]) <= 20.0
+    ]
+    requested_grid_values = np.asarray([
+        float(row["fixed_cap_selection_sample_csm_aud"])
+        for row in fixed_1_to_20_rows
+    ])
+    best_fixed_1_to_20_row = fixed_1_to_20_rows[
+        int(_lower_cap_argmax(requested_grid_values))
+    ]
+    for row in benchmark_rows:
+        row["is_best_fixed_cap_requested_1_to_20_grid"] = (
+            row is best_fixed_1_to_20_row
+        )
+    if np.isclose(best_fixed_cap, ACTION_CAPS[0]) \
+            or np.isclose(best_fixed_cap, ACTION_CAPS[-1]):
         LOGGER.warning(
-            "Best fixed 1%%-20%% cap lies on its comparison-grid boundary: %.0f%%.",
+            "Best fixed admissible cap lies on its grid boundary: %.2f%%.",
             100.0 * best_fixed_cap,
         )
-    with _logged_stage("Evaluate direct first-year-cap fallback schedule"):
-        fallback_row, _ = _evaluate_explicit_schedule_benchmark(
-            label="lsmc_first_year_then_best_fixed_continuation",
-            definition=(
-                f"LSMC-selected first-year cap {backward.first_year_cap:.2%}; "
-                f"thereafter fixed {best_fixed_cap:.0%} cap"
-            ),
-            cap_schedule=fallback_schedule,
-            scenarios=benchmark_scenarios,
+
+    coupled_follower_fit = exploratory_follower_fits
+    coupled_follower_factory = (
+        None if coupled_follower_fit is None else coupled_follower_fit.factory
+    )
+    policyholder_validation_fallback_used = False
+    policyholder_validation_failed_signature_count = 0
+    policyholder_validation_uplift_aud: float | None = None
+    policyholder_validation_uplift_se_aud: float | None = None
+    with _logged_stage("Validate adaptive policy against fixed fallback"):
+        validation_control_inputs = _control_state_inputs(
+            validation_scenarios, costs.product, n_years
+        )
+        (
+            validation_cap_matrix,
+            validation_projected,
+            validation_rollout_metadata,
+        ) = _rollout_cap_policy_with_projected_states(
+            inputs=validation_control_inputs,
+            policy_years=backward.policy_years,
+            feature_names=training_data.state_feature_names,
+            fallback_cap=best_fixed_cap,
+            scenarios=validation_scenarios,
             product=costs.product,
             model_points=model_points,
             behaviour=behaviour,
             mortality=mortality,
             expenses=costs.expenses,
             projection_config=projection_config,
-            portfolio_scale=portfolio_scale,
-            comparison_paths=benchmark_path_values[str(best_fixed_row["case"])],
             model_point_log_interval=args.model_point_log_interval,
+            surrender_policy_factory=coupled_follower_factory,
+            collect_policyholder_by_signature=(
+                args.policyholder_behaviour == "lsmc"
+            ),
         )
-    benchmark_rows.append(fallback_row)
+        validation_row, _ = _projected_policy_benchmark_row(
+            label="adaptive_policy_validation",
+            definition=(
+                "validation-only coupled cap/follower policy with exact "
+                "pre-cap portfolio state"
+            ),
+            projected=validation_projected,
+            comparison_paths=fixed_selection_path_values[best_fixed_label],
+            portfolio_scale=portfolio_scale,
+        )
+
+        if args.policyholder_behaviour == "lsmc":
+            validation_continue = _aggregate_portfolio_paths(
+                scenarios=validation_scenarios,
+                cap_matrix=validation_cap_matrix,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=continue_behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=projection_config,
+                collect_states=False,
+                progress_label="Policyholder validation Continue comparator",
+                model_point_log_interval=args.model_point_log_interval,
+                collect_policyholder_by_signature=True,
+            )
+            adaptive_signature_rows, failed_signatures = (
+                _policyholder_signature_validation(
+                    candidate=validation_projected,
+                    comparator=validation_continue,
+                    path_slice=slice(None),
+                    policy_label="adaptive_coupled_lsmc",
+                    cap=None,
+                    portfolio_scale=portfolio_scale,
+                    sample_fingerprint=sample_fingerprints["validation"],
+                )
+            )
+            policyholder_validation_rows.extend(adaptive_signature_rows)
+            policyholder_validation_failed_signature_count = len(
+                failed_signatures
+            )
+            if failed_signatures:
+                policyholder_validation_fallback_used = True
+                LOGGER.warning(
+                    "Adaptive Policyholder validation failed for %d/%d "
+                    "PolicySpec signature(s); rejecting the complete coupled "
+                    "leader/follower policy before final evaluation.",
+                    len(failed_signatures),
+                    len(adaptive_signature_rows),
+                )
+            policyholder_uplift_paths = portfolio_scale * (
+                np.sum(validation_projected.policyholder_benefits, axis=1)
+                - np.sum(validation_continue.policyholder_benefits, axis=1)
+            )
+            (
+                policyholder_validation_uplift_aud,
+                policyholder_validation_uplift_se_aud,
+            ) = _paired_mean_and_standard_error(policyholder_uplift_paths)
+            if (
+                policyholder_validation_uplift_aud
+                - 1.96 * policyholder_validation_uplift_se_aud
+                < -1.0e-10
+            ):
+                policyholder_validation_fallback_used = True
+                LOGGER.warning(
+                    "Policyholder LSMC did not establish non-negative value "
+                    "versus Continue on validation paths (delta %.2f, paired "
+                    "SE %.2f); rejecting the adaptive leader/follower policy.",
+                    policyholder_validation_uplift_aud,
+                    policyholder_validation_uplift_se_aud,
+                )
+    validation_delta = float(validation_row[
+        "new_business_csm_difference_vs_best_fixed_admissible_aud"
+    ])
+    validation_delta_se = float(validation_row[
+        "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
+    ])
+    validation_adaptive_policy_selected = _adaptive_policy_passes_validation(
+        insurer_regression_stable=backward.numerically_stable,
+        policyholder_validation_passed=(
+            not policyholder_validation_fallback_used
+        ),
+        causal_rollout_valid=bool(validation_rollout_metadata["converged"]),
+        csm_delta_aud=validation_delta,
+        paired_standard_error_aud=validation_delta_se,
+    )
+    adaptive_policy_selected = validation_adaptive_policy_selected
+    LOGGER.info(
+        "Adaptive-policy validation | delta vs fixed fallback=%.2f | paired "
+        "SE=%.2f | causal rollout valid=%s | insurer regression stable=%s | "
+        "selected=%s",
+        validation_delta,
+        validation_delta_se,
+        validation_rollout_metadata["converged"],
+        backward.numerically_stable,
+        validation_adaptive_policy_selected,
+    )
+
+    best_fixed_follower_factory = (
+        fixed_lsmc_fit_sets[best_fixed_label].factory
+        if args.policyholder_behaviour == "lsmc"
+        else None
+    )
+    if args.policyholder_behaviour == "lsmc":
+        deployed_follower_fit_set = (
+            coupled_follower_fit
+            if adaptive_policy_selected
+            else fixed_lsmc_fit_sets[best_fixed_label]
+        )
+        if deployed_follower_fit_set is None:
+            raise RuntimeError("Deployed Policyholder fit set is missing.")
+        deployed_policyholder_continue_fallback_used = bool(
+            deployed_follower_fit_set.fallback_count
+        )
+        deployed_policyholder_fallback_signature_count = int(
+            deployed_follower_fit_set.fallback_count
+        )
+        deployed_policyholder_fallback_step_count = int(
+            deployed_follower_fit_set.fallback_step_count
+        )
+    else:
+        deployed_policyholder_continue_fallback_used = False
+        deployed_policyholder_fallback_signature_count = 0
+        deployed_policyholder_fallback_step_count = 0
+    # Frozen before the final sample: evaluation can measure or fail, but can
+    # never change the selected policy or any fallback.
+    evaluation_rollout_fallback_used = False
+    with _logged_stage("Roll out fitted cap decisions on independent paths"):
+        evaluation_control_inputs = _control_state_inputs(
+            evaluation_scenarios, costs.product, n_years
+        )
+        if adaptive_policy_selected:
+            (
+                flexible_cap_matrix,
+                flexible_projected,
+                evaluation_rollout_metadata,
+            ) = _rollout_cap_policy_with_projected_states(
+                inputs=evaluation_control_inputs,
+                policy_years=backward.policy_years,
+                feature_names=training_data.state_feature_names,
+                fallback_cap=best_fixed_cap,
+                scenarios=evaluation_scenarios,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=projection_config,
+                model_point_log_interval=args.model_point_log_interval,
+                surrender_policy_factory=coupled_follower_factory,
+            )
+            if not evaluation_rollout_metadata["converged"]:
+                raise RuntimeError(
+                    "Frozen adaptive policy could not be executed on the final "
+                    "sample. Evaluation is not allowed to select a fallback."
+                )
+        if not adaptive_policy_selected:
+            flexible_cap_matrix = np.full(
+                (evaluation_scenarios.n_paths, n_years),
+                best_fixed_cap,
+                dtype=float,
+            )
+            flexible_projected = _aggregate_portfolio_paths(
+                scenarios=evaluation_scenarios,
+                cap_matrix=flexible_cap_matrix,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=projection_config,
+                collect_states=True,
+                progress_label="Deployed fixed-cap fallback",
+                model_point_log_interval=args.model_point_log_interval,
+                surrender_policy_factory=best_fixed_follower_factory,
+            )
+            evaluation_rollout_metadata = {
+                "converged": True,
+                "iterations": 0,
+                "changed_action_counts": [],
+                "maximum_iterations": 0,
+                "fixed_cap_fallback": True,
+            }
+    first_year_caps = np.unique(flexible_cap_matrix[:, 0])
+    if first_year_caps.size != 1:
+        raise RuntimeError(
+            "The time-zero decision must be the same on every evaluation path."
+        )
+    selected_first_year_cap = float(first_year_caps[0])
+    with _logged_stage("Report direct flexible/fallback projection"):
+        flexible_row, flexible_csm_paths = _projected_policy_benchmark_row(
+            label="flexible_lsmc_policy",
+            definition=(
+                "actual deployed coupled annual cap/Policyholder policy; "
+                "independent monthly-projector rollout, or independently "
+                "selected fixed-cap fallback when validation rejects it"
+            ),
+            projected=flexible_projected,
+            portfolio_scale=portfolio_scale,
+            comparison_paths=benchmark_path_values[best_fixed_label],
+        )
+    benchmark_rows.append(flexible_row)
+    flexible_row["adaptive_policy_selected"] = adaptive_policy_selected
+    flexible_row["validation_adaptive_policy_selected"] = (
+        validation_adaptive_policy_selected
+    )
+    flexible_row["policyholder_behaviour"] = args.policyholder_behaviour
+    flexible_row["policyholder_continue_fallback_used"] = (
+        deployed_policyholder_continue_fallback_used
+    )
+    flexible_row["adaptive_candidate_policyholder_validation_rejected"] = (
+        policyholder_validation_fallback_used
+    )
+    flexible_row["deployed_policyholder_fallback_signature_count"] = (
+        deployed_policyholder_fallback_signature_count
+    )
+    flexible_row["deployed_policyholder_fallback_step_count"] = (
+        deployed_policyholder_fallback_step_count
+    )
+    flexible_row["evaluation_rollout_fallback_used"] = (
+        evaluation_rollout_fallback_used
+    )
+    flexible_row["validation_csm_difference_vs_fixed_aud"] = validation_delta
+    flexible_row["validation_paired_standard_error_aud"] = validation_delta_se
+    if flexible_projected.inforce_exposure is None:
+        raise RuntimeError("Direct flexible rollout did not record in-force exposure.")
+    direct_policy_rows = _direct_policy_year_rows(
+        flexible_cap_matrix,
+        flexible_projected.inforce_exposure,
+        backward.economically_active_policy_years,
+    )
+    deployed_policyholder_exercise_rows = _policyholder_exercise_rows(
+        label="deployed_flexible_or_fixed_fallback",
+        cap_matrix=flexible_cap_matrix,
+        projected=flexible_projected,
+        active_policy_years=backward.economically_active_policy_years,
+    )
+    policyholder_exercise_rows = [
+        *fixed_policyholder_exercise_rows,
+        *deployed_policyholder_exercise_rows,
+    ]
+    total_exercise_mass = sum(
+        float(row["selected_full_withdrawal_exit_mass"])
+        for row in deployed_policyholder_exercise_rows
+    )
+    total_income_exposure = sum(
+        float(row["selected_pre_action_income_exposure"])
+        for row in deployed_policyholder_exercise_rows
+    )
+    flexible_row[
+        "policyholder_full_withdrawal_exercise_rate_over_income_exposure"
+    ] = (
+        total_exercise_mass / total_income_exposure
+        if total_income_exposure > 0.0 else 0.0
+    )
+    flexible_row["deployed_first_year_cap_on_action_grid_boundary"] = bool(
+        np.isclose(selected_first_year_cap, ACTION_CAPS[0])
+        or np.isclose(selected_first_year_cap, ACTION_CAPS[-1])
+    )
+    policyholder_fit_sets_for_diagnostics: dict[str, PolicyholderFitSet] = {
+        f"fixed_cap::{label}": fit_set
+        for label, fit_set in fixed_lsmc_fit_sets.items()
+    }
+    policyholder_regression_rows = list(backward.follower_regression_rows)
+    for row in policyholder_regression_rows:
+        row.setdefault("fit_label", "coupled_control_randomisation")
+    policyholder_regression_rows.extend(_policyholder_regression_rows(
+        policyholder_fit_sets_for_diagnostics
+    ))
+    if not policyholder_regression_rows:
+        policyholder_regression_rows = [{
+            "fit_label": "not_applicable",
+            "policyholder_behaviour": args.policyholder_behaviour,
+            "reason": "No Policyholder LSMC regression in this legacy mode.",
+        }]
+    if not policyholder_validation_rows:
+        policyholder_validation_rows = [{
+            "policy": "not_applicable",
+            "policyholder_behaviour": args.policyholder_behaviour,
+            "reason": "No Policyholder LSMC validation in this legacy mode.",
+        }]
+
+    direct_nonnegative_fields = (
+        "pv_guarantee_claims_aud",
+        "pv_other_insurer_funded_benefits_aud",
+        "pv_expenses_aud",
+        "pv_hedge_costs_aud",
+    )
+    direct_reconciliation_scale = (
+        portfolio_scale * training_data.representative_initial_premium
+    )
+    for row in benchmark_rows:
+        for field in direct_nonnegative_fields:
+            if float(row[field]) < -1.0e-8:
+                raise RuntimeError(
+                    f"Direct projection produced negative {field} for {row['case']}."
+                )
+        if abs(float(row[
+            "new_business_csm_component_reconciliation_gap_aud"
+        ])) > 1.0e-8 * max(1.0, direct_reconciliation_scale):
+            raise RuntimeError(
+                f"CSM component reconciliation failed for {row['case']}."
+            )
+
     benchmark_closeout_max_abs = max(
         abs(float(row["pv_terminal_closeout_excluded_aud"]))
         for row in benchmark_rows
@@ -3230,14 +9048,20 @@ def main() -> None:
         benchmark_closeout_max_abs,
     )
     LOGGER.info(
-        "Direct fallback result | %s | New Business CSM proxy=%.2f | MC SE=%.2f",
-        fallback_row["definition"],
-        fallback_row["estimated_new_business_csm_proxy_aud"],
-        fallback_row["standard_error_new_business_csm_proxy_aud"],
+        "Direct flexible-policy result | first-year cap %.2f%% | CSM=%.2f | "
+        "MC SE=%.2f | paired delta vs best fixed=%.2f",
+        100.0 * selected_first_year_cap,
+        flexible_row["estimated_new_business_csm_proxy_aud"],
+        flexible_row["standard_error_new_business_csm_proxy_aud"],
+        flexible_row[
+            "new_business_csm_difference_vs_best_fixed_admissible_aud"
+        ],
     )
-    optimal_csm = portfolio_scale * backward.pv_new_business_csm_proxy
-    optimal_se = (
-        portfolio_scale * backward.standard_error_new_business_csm_proxy
+    optimal_csm = float(
+        flexible_row["estimated_new_business_csm_proxy_aud"]
+    )
+    optimal_se = float(
+        flexible_row["standard_error_new_business_csm_proxy_aud"]
     )
     best_fixed_csm = float(
         best_fixed_row["estimated_new_business_csm_proxy_aud"]
@@ -3251,23 +9075,35 @@ def main() -> None:
 
     summary = {
         "status": "completed",
+        "run_id": run_id,
+        "created_utc": run_created_utc,
         "engine_version": ENGINE_VERSION,
         "valuation_label": (
             "market-consistent approximate New Business CSM cap-management "
             "study under fixed proxy product and behaviour assumptions"
         ),
-        "method": "gas-storage-style control-randomisation Fitted-Q LSMC",
+        "method": (
+            "dynamic Stackelberg/bilevel control: cap-aware Policyholder LSMC "
+            "best responses nested inside control-randomisation insurer Fitted-Q"
+        ),
         "estimate_type": (
-            "first cap selected without fold zero; CSM proxy evaluated on held-out "
-            "fold zero with complete-path cross-fitted continuation values"
+            "frozen Fitted-Q policy evaluated by an independent direct monthly-"
+            "projector rollout; fixed cap selected on a separate validation sample"
         ),
         "csm_measurement_label": (
             "approximate market-consistent New Business CSM proxy; aligned "
             "with insurer net value before Risk Margin, not reported IFRS 17 CSM"
         ),
+        "optimality_scope": (
+            "best validated implementable policy within the documented observable "
+            "pre-action market and portfolio-state class, with the best admissible fixed cap as "
+            "a conservative fallback; not a proof of the global control optimum"
+        ),
         "objective_direction": "maximize",
         "objective": (
-            "maximise PV(collected Product and LIP Fees + Crediting Margin + "
+            "maximise PV(collected Product and LIP Fees"
+            + (" + Crediting Margin" if args.hedge_gain else "")
+            + " + "
             "MVA/APS retained) - PV(Guarantee Claims + other insurer-funded "
             "benefits + operating expenses + hedge-execution costs)"
         ),
@@ -3281,8 +9117,11 @@ def main() -> None:
         "benchmark_terminal_closeout_max_absolute_mean_pv_aud": (
             benchmark_closeout_max_abs
         ),
-        "optimal_first_year_cap": backward.first_year_cap,
-        "optimal_first_year_cap_percent": 100.0 * backward.first_year_cap,
+        "optimal_first_year_cap": selected_first_year_cap,
+        "optimal_first_year_cap_percent": 100.0 * selected_first_year_cap,
+        "unconstrained_bellman_first_year_cap_diagnostic": (
+            backward.first_year_cap
+        ),
         "estimated_optimal_new_business_csm_proxy_aud": optimal_csm,
         "estimated_optimal_recognised_csm_proxy_aud": max(optimal_csm, 0.0),
         "estimated_optimal_loss_component_proxy_aud": max(-optimal_csm, 0.0),
@@ -3290,100 +9129,184 @@ def main() -> None:
             optimal_csm / scaled_initial_premium
         ),
         "estimated_optimal_pv_guarantee_claims_aud": (
-            portfolio_scale * backward.pv_guarantee_claims
+            flexible_row["pv_guarantee_claims_aud"]
         ),
         "estimated_optimal_pv_other_insurer_funded_benefits_aud": (
-            portfolio_scale * backward.pv_other_insurer_funded_benefits
+            flexible_row["pv_other_insurer_funded_benefits_aud"]
         ),
         "estimated_optimal_pv_product_fees_aud": (
-            portfolio_scale * backward.pv_fees_product
+            flexible_row["pv_product_fees_aud"]
         ),
         "estimated_optimal_pv_lip_fees_aud": (
-            portfolio_scale * backward.pv_fees_lip
+            flexible_row["pv_lip_fees_aud"]
         ),
-        "estimated_optimal_pv_future_fees_aud": portfolio_scale * (
-            backward.pv_fees_product + backward.pv_fees_lip
-        ),
+        "estimated_optimal_pv_future_fees_aud": flexible_row[
+            "pv_future_fees_aud"
+        ],
         "estimated_optimal_pv_crediting_margin_aud": (
-            portfolio_scale * backward.pv_crediting_margin
+            flexible_row["pv_crediting_margin_aud"]
         ),
         "estimated_optimal_pv_mva_retained_aud": (
-            portfolio_scale * backward.pv_mva_retained
+            flexible_row["pv_mva_retained_aud"]
         ),
         "estimated_optimal_pv_aps_retained_aud": (
-            portfolio_scale * backward.pv_aps_retained
+            flexible_row["pv_aps_retained_aud"]
         ),
-        "estimated_optimal_pv_other_insurer_margins_aud": portfolio_scale * (
-            backward.pv_crediting_margin
-            + backward.pv_mva_retained
-            + backward.pv_aps_retained
-        ),
-        "estimated_optimal_pv_total_insurer_inflows_aud": portfolio_scale * (
-            backward.pv_fees_product
-            + backward.pv_fees_lip
-            + backward.pv_crediting_margin
-            + backward.pv_mva_retained
-            + backward.pv_aps_retained
-        ),
+        "estimated_optimal_pv_other_insurer_margins_aud": flexible_row[
+            "pv_other_insurer_margins_aud"
+        ],
+        "estimated_optimal_pv_total_insurer_inflows_aud": flexible_row[
+            "pv_total_insurer_inflows_aud"
+        ],
         "estimated_optimal_pv_total_insurer_funded_benefits_aud": (
-            portfolio_scale * (
-                backward.pv_guarantee_claims
-                + backward.pv_other_insurer_funded_benefits
-            )
+            flexible_row["pv_total_insurer_funded_benefits_aud"]
         ),
         "estimated_optimal_pv_expenses_aud": (
-            portfolio_scale * backward.pv_expenses
+            flexible_row["pv_expenses_aud"]
         ),
         "estimated_optimal_pv_hedge_costs_aud": (
-            portfolio_scale * backward.pv_hedge_costs
+            flexible_row["pv_hedge_costs_aud"]
         ),
-        "estimated_optimal_pv_total_costs_aud": portfolio_scale * (
-            backward.pv_expenses + backward.pv_hedge_costs
-        ),
+        "estimated_optimal_pv_total_costs_aud": flexible_row[
+            "pv_total_costs_aud"
+        ],
+        "estimated_optimal_policyholder_pv_aud": flexible_row[
+            "pv_policyholder_benefits_aud"
+        ],
+        "estimated_optimal_policyholder_income_pv_aud": flexible_row[
+            "pv_policyholder_income_aud"
+        ],
+        "estimated_optimal_policyholder_death_benefit_pv_aud": flexible_row[
+            "pv_policyholder_death_benefits_aud"
+        ],
+        "estimated_optimal_policyholder_surrender_benefit_pv_aud": flexible_row[
+            "pv_policyholder_surrender_benefits_aud"
+        ],
+        "deployed_policyholder_exercise_rate_over_income_exposure": flexible_row[
+            "policyholder_full_withdrawal_exercise_rate_over_income_exposure"
+        ],
         "estimated_optimal_new_business_csm_proxy_standard_error_aud": (
             optimal_se
         ),
-        "optimal_csm_evaluation_sample": "held-out cross-fit fold zero",
-        "conditional_holdout_csm_mc_interval_95pct_lower_aud": (
+        "estimated_optimal_cumulative_full_surrender_probability": (
+            flexible_row[
+                "expected_cumulative_full_surrender_probability"
+            ]
+        ),
+        "optimal_csm_evaluation_sample": (
+            "independent direct rollout sample, disjoint from training and "
+            "fixed-cap selection"
+        ),
+        "direct_rollout_csm_mc_interval_95pct_lower_aud": (
             optimal_csm - 1.96 * optimal_se
         ),
-        "conditional_holdout_csm_mc_interval_95pct_upper_aud": (
+        "direct_rollout_csm_mc_interval_95pct_upper_aud": (
             optimal_csm + 1.96 * optimal_se
         ),
-        "conditional_holdout_mc_interval_scope": (
-            "path dispersion conditional on fitted continuation models; excludes "
-            "regression, model-selection and repeated-sample uncertainty"
+        "direct_rollout_mc_interval_scope": (
+            "path dispersion of realised monthly-projector cashflows conditional "
+            "on the frozen fitted policy"
         ),
         "new_business_csm_component_reconciliation_gap_aud": (
-            portfolio_scale * backward.reconciliation_gap
+            flexible_row[
+                "new_business_csm_component_reconciliation_gap_aud"
+            ]
         ),
-        "best_fixed_cap_1_to_20_case": best_fixed_row["case"],
-        "best_fixed_cap_1_to_20_percent": best_fixed_row["cap_percent"],
+        "best_fixed_cap_admissible_case": best_fixed_row["case"],
+        "best_fixed_cap_admissible_percent": best_fixed_row["cap_percent"],
+        "best_fixed_cap_requested_1_to_20_case": (
+            best_fixed_1_to_20_row["case"]
+        ),
+        "best_fixed_cap_requested_1_to_20_percent": (
+            best_fixed_1_to_20_row["cap_percent"]
+        ),
+        "best_fixed_cap_requested_1_to_20_csm_aud": (
+            best_fixed_1_to_20_row[
+                "estimated_new_business_csm_proxy_aud"
+            ]
+        ),
+        "flexible_minus_best_fixed_requested_1_to_20_csm_aud": (
+            optimal_csm
+            - float(best_fixed_1_to_20_row[
+                "estimated_new_business_csm_proxy_aud"
+            ])
+        ),
+        "flexible_policy_fixed_fallback_cap_percent": 100.0 * best_fixed_cap,
+        "fitted_policy_local_action_advantage_screen_applied": False,
+        "adaptive_policy_validation_confidence_multiplier": 1.96,
+        "adaptive_policy_selected_on_validation_sample": (
+            validation_adaptive_policy_selected
+        ),
+        "adaptive_policy_actually_deployed": adaptive_policy_selected,
+        "adaptive_policy_evaluation_operational_fallback_used": (
+            evaluation_rollout_fallback_used
+        ),
+        "adaptive_policy_validation_state_rollout": validation_rollout_metadata,
+        "adaptive_policy_evaluation_state_rollout": evaluation_rollout_metadata,
+        "adaptive_policy_validation_csm_difference_vs_fixed_aud": (
+            validation_delta
+        ),
+        "adaptive_policy_validation_paired_standard_error_aud": (
+            validation_delta_se
+        ),
+        "adaptive_policy_validation_selection_rule": (
+            "deploy adaptive rule only if validation delta exceeds 1.96 paired SE; "
+            "otherwise deploy the admissible fixed fallback"
+        ),
+        "flexible_policy_deviation_rule": (
+            "if paired validation selects the complete adaptive rule, choose "
+            "the fitted maximum-CSM action at every state with the lower-cap "
+            "tie-break used in backward induction; otherwise deploy the fixed "
+            "fallback in every year"
+        ),
         "best_fixed_cap_new_business_csm_proxy_aud": best_fixed_csm,
         "best_fixed_cap_new_business_csm_proxy_standard_error_aud": (
             best_fixed_se
         ),
-        "direct_first_year_cap_then_best_fixed_new_business_csm_proxy_aud": (
-            fallback_row["estimated_new_business_csm_proxy_aud"]
+        "best_fixed_cap_cumulative_full_surrender_probability": (
+            best_fixed_row[
+                "expected_cumulative_full_surrender_probability"
+            ]
         ),
-        "direct_first_year_cap_then_best_fixed_csm_standard_error_aud": fallback_row[
-            "standard_error_new_business_csm_proxy_aud"
-        ],
-        "direct_first_year_cap_then_best_fixed_definition": fallback_row[
-            "definition"
-        ],
         "estimated_optimal_minus_best_fixed_new_business_csm_proxy_aud": (
-            optimal_csm - best_fixed_csm
+            flexible_row[
+                "new_business_csm_difference_vs_best_fixed_admissible_aud"
+            ]
         ),
-        "approximate_unpaired_csm_standard_error_of_difference_aud": float(
-            np.sqrt(optimal_se ** 2 + best_fixed_se ** 2)
+        "paired_standard_error_optimal_minus_best_fixed_csm_aud": flexible_row[
+            "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
+        ],
+        "paired_optimal_minus_best_fixed_csm_interval_95pct_lower_aud": (
+            float(flexible_row[
+                "new_business_csm_difference_vs_best_fixed_admissible_aud"
+            ])
+            - 1.96 * float(flexible_row[
+                "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
+            ])
+        ),
+        "paired_optimal_minus_best_fixed_csm_interval_95pct_upper_aud": (
+            float(flexible_row[
+                "new_business_csm_difference_vs_best_fixed_admissible_aud"
+            ])
+            + 1.96 * float(flexible_row[
+                "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
+            ])
+        ),
+        "bellman_value_diagnostic_only_aud": (
+            portfolio_scale * backward.pv_new_business_csm_proxy
+        ),
+        "bellman_value_diagnostic_standard_error_aud": (
+            portfolio_scale * backward.standard_error_new_business_csm_proxy
+        ),
+        "coupled_insurer_regressions_numerically_stable": (
+            backward.numerically_stable
+        ),
+        "coupled_numerical_fallback_reasons": list(
+            backward.numerical_fallback_reasons
         ),
         "action_caps": ACTION_CAPS.tolist(),
-        "cap_grid_convention": "0.20%, followed by integer 1% caps through 20%",
-        "cap_floor_override": (
-            "0.20% research constraint overrides the active product's fixed "
-            "0.25% guaranteed minimum for this counterfactual only"
-        ),
+        "cap_grid_convention": "0.25%, followed by integer 1% caps through 20%",
+        "cap_floor_override": None,
         "youngest_covered_age_at_issue": _youngest_covered_age(model_points),
         "market_scenario_horizon_years": horizon_years,
         "last_economically_active_policy_year": (
@@ -3402,12 +9325,54 @@ def main() -> None:
         ),
         "valuation_measure": Measure.RISK_NEUTRAL.value,
         "market_model": "heston_hull_white",
+        "policyholder_behaviour_mode": args.policyholder_behaviour,
+        "policyholder_objective": (
+            "maximise risk-neutral PV of Income, Death, Surrender, permitted "
+            "Withdrawal and Terminal-Closeout cashflows; issue premium is sunk"
+        ),
+        "policyholder_validation_continue_fallback_used": (
+            policyholder_validation_fallback_used
+        ),
+        "deployed_policyholder_continue_fallback_used": (
+            deployed_policyholder_continue_fallback_used
+        ),
+        "deployed_policyholder_fallback_signature_count": (
+            deployed_policyholder_fallback_signature_count
+        ),
+        "deployed_policyholder_fallback_step_count": (
+            deployed_policyholder_fallback_step_count
+        ),
+        "policyholder_validation_failed_signature_count": (
+            policyholder_validation_failed_signature_count
+        ),
+        "policyholder_validation_pv_uplift_vs_continue_aud": (
+            policyholder_validation_uplift_aud
+        ),
+        "policyholder_validation_paired_standard_error_aud": (
+            policyholder_validation_uplift_se_aud
+        ),
+        "policyholder_training_signature_count": (
+            0 if exploratory_follower_fits is None
+            else exploratory_follower_fits.signature_count
+        ),
+        "policyholder_training_signature_fallback_count": (
+            0 if exploratory_follower_fits is None
+            else exploratory_follower_fits.fallback_count
+        ),
+        "policyholder_training_cap_schedule_fingerprint": (
+            None if exploratory_follower_fits is None
+            else exploratory_follower_fits.cap_schedule_fingerprint
+        ),
+        "sample_fingerprints": sample_fingerprints,
         "n_control_randomisation_paths": args.n_paths,
-        "n_benchmark_paths_per_case": args.benchmark_paths,
+        "n_fixed_cap_selection_paths_per_case": args.benchmark_paths,
+        "n_final_evaluation_paths_per_case": args.benchmark_paths,
+        "fixed_cap_selection_metadata": fixed_selection_metadata,
         "cross_fit_folds": args.cross_fit_folds,
         "ridge_multiplier": args.ridge,
-        "dva_enabled": False,
-        "crediting_margin_in_objective": True,
+        "dva_enabled": bool(projection_config.dva_enabled),
+        "hedge_gain_enabled": bool(args.hedge_gain),
+        "crediting_margin_in_objective": bool(args.hedge_gain),
         "mva_and_aps_retained_in_objective": True,
         "hedge_costs_in_objective": True,
         "expenses_in_objective": True,
@@ -3415,6 +9380,32 @@ def main() -> None:
             OTHER_INSURER_FUNDED_BENEFIT_KEYS
         ),
         "base_policy_behaviour_regime": behaviour.regime,
+        "behaviour_value_basis": args.behaviour_value_basis,
+        "performance_gap_behaviour_enabled": bool(
+            args.performance_gap_behaviour
+        ),
+        "performance_lapse_model": "competing_risk_excess_hazard",
+        "performance_lapse_retention_gamma": float(
+            behaviour.dynamic.performance.retention_gamma
+        ),
+        "performance_lapse_retention_floor": float(
+            behaviour.dynamic.performance.retention_floor
+        ),
+        "performance_lapse_shortfall_deadband": float(
+            behaviour.dynamic.performance.shortfall_deadband
+        ),
+        "performance_shortfall_max_log_return": float(
+            behaviour.dynamic.performance.shortfall_max
+        ),
+        "performance_lapse_excess_hazard_cap": float(
+            behaviour.dynamic.performance.excess_hazard_cap
+        ),
+        "performance_lapse_excess_hazard_scale": float(
+            behaviour.dynamic.performance.excess_hazard_scale
+        ),
+        "performance_lapse_annual_probability_cap": float(
+            behaviour.dynamic.performance.annual_probability_cap
+        ),
         "behaviour_treatment_by_branch": behaviour_treatment_by_branch,
         "source_income_take_up_mode": loaded_behaviour.behaviour.take_up.mode,
         "income_take_up_mode": behaviour.take_up.mode,
@@ -3443,11 +9434,84 @@ def main() -> None:
         backward,
         training_data.state_feature_names,
         projection_semantics,
+        fixed_fallback_cap=best_fixed_cap,
+        deployed_first_year_cap=selected_first_year_cap,
+        adaptive_policy_selected=adaptive_policy_selected,
+        validation_delta_aud=validation_delta,
+        validation_paired_standard_error_aud=validation_delta_se,
     )
+    policy_payload["stackelberg_control"] = {
+        "leader": "insurer annual cap chosen first",
+        "follower": (
+            "Policyholder observes the announced cap and chooses Continue or "
+            "contractually eligible Full Withdrawal from a separate value function"
+        ),
+        "policyholder_behaviour_mode": args.policyholder_behaviour,
+        "objectives_mixed": False,
+        "policyholder_training_scenario_fingerprint": (
+            None if exploratory_follower_fits is None
+            else exploratory_follower_fits.scenario_fingerprint
+        ),
+        "policyholder_training_cap_schedule_fingerprint": (
+            None if exploratory_follower_fits is None
+            else exploratory_follower_fits.cap_schedule_fingerprint
+        ),
+        "policyholder_signature_count": (
+            0 if exploratory_follower_fits is None
+            else exploratory_follower_fits.signature_count
+        ),
+        "policyholder_training_fallback_signature_count": (
+            0 if exploratory_follower_fits is None
+            else exploratory_follower_fits.fallback_count
+        ),
+        "policyholder_validation_continue_fallback_used": (
+            policyholder_validation_fallback_used
+        ),
+        "deployed_policyholder_continue_fallback_used": (
+            deployed_policyholder_continue_fallback_used
+        ),
+        "deployed_policyholder_fallback_signature_count": (
+            deployed_policyholder_fallback_signature_count
+        ),
+        "deployed_policyholder_fallback_step_count": (
+            deployed_policyholder_fallback_step_count
+        ),
+        "policyholder_validation_failed_signature_count": (
+            policyholder_validation_failed_signature_count
+        ),
+        "policyholder_validation_pv_uplift_vs_continue_aud": (
+            policyholder_validation_uplift_aud
+        ),
+        "policyholder_validation_paired_standard_error_aud": (
+            policyholder_validation_uplift_se_aud
+        ),
+        "sample_fingerprints": sample_fingerprints,
+        "anniversary_timing_document": "CREDITING_CAP_STACKELBERG.md",
+    }
+    if args.policyholder_behaviour == "lsmc":
+        if coupled_follower_fit is None:
+            raise RuntimeError("Coupled follower policy payload is missing.")
+        fixed_fallback_fit = fixed_lsmc_fit_sets[best_fixed_label]
+        policy_payload["stackelberg_control"].update({
+            "coupled_candidate_follower_policy": (
+                _policyholder_fit_set_payload(coupled_follower_fit)
+            ),
+            "fixed_fallback_follower_policy": (
+                _policyholder_fit_set_payload(fixed_fallback_fit)
+            ),
+            "deployed_follower_policy_source": (
+                "coupled_candidate_follower_policy"
+                if adaptive_policy_selected
+                else "fixed_fallback_follower_policy"
+            ),
+        })
     manifest = {
-        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "output_schema_version": "crediting-cap-lsmc-2.0",
+        "run_id": run_id,
+        "created_utc": run_created_utc,
         "engine_version": ENGINE_VERSION,
-        "script": str(Path(__file__).resolve()),
+        "script": str(script_path),
+        "script_sha256": script_sha256,
         "summary_file": "optimization_summary.json",
         "output_inventory": {
             "summary": "optimization_summary.json",
@@ -3456,8 +9520,13 @@ def main() -> None:
             "csv_tables": [
                 "first_year_action_values.csv",
                 "optimal_policy_by_year.csv",
+                "cross_fitted_policy_diagnostics_by_year.csv",
                 "regression_diagnostics.csv",
+                "policyholder_regression_diagnostics.csv",
+                "policyholder_validation_diagnostics.csv",
+                "policyholder_exercise_by_year_and_cap.csv",
                 "fixed_cap_sanity_checks.csv",
+                "fixed_cap_behaviour_benchmarks.csv",
                 "model_point_projection_treatments.csv",
             ],
             "log": "run.log",
@@ -3483,8 +9552,13 @@ def main() -> None:
                 "tables; shown as a grey zero-exposure tail in the policy plot"
             ),
         },
-        "training_scenario_fingerprint": training_scenarios.content_fingerprint,
-        "benchmark_scenario_fingerprint": benchmark_scenarios.content_fingerprint,
+        "training_scenario_fingerprint": sample_fingerprints["training"],
+        "validation_scenario_fingerprint": sample_fingerprints["validation"],
+        "evaluation_scenario_fingerprint": sample_fingerprints["evaluation"],
+        "benchmark_parent_scenario_fingerprint": (
+            benchmark_scenarios.content_fingerprint
+        ),
+        "scenario_samples_are_pairwise_distinct": True,
         "training_seed": args.seed,
         "benchmark_seed": args.seed + 1,
         "heston_substeps": args.heston_substeps,
@@ -3497,7 +9571,8 @@ def main() -> None:
             "optimization_direction": "maximize",
             "included_fee_inflows": ["fees_product", "fees_lip"],
             "included_other_insurer_margins": [
-                "crediting_margin", "mva_retained", "aps_retained",
+                *(["crediting_margin"] if args.hedge_gain else []),
+                "mva_retained", "aps_retained",
             ],
             "included_insurer_funded_benefits": [
                 "guarantee_claims",
@@ -3530,40 +9605,62 @@ def main() -> None:
         },
         "policy_value_outputs": {
             "dynamic_feedback_value": (
-                "held-out fitted-Bellman estimate; no independent full rollout"
+                "independent direct monthly-projector rollout of frozen policy"
             ),
-            "directly_projected_admissible_control": (
-                "LSMC first-year cap followed by the best fixed 1%-20% cap"
+            "bellman_value": (
+                "diagnostic only; never reported or plotted as realised CSM"
             ),
         },
         "nonanticipativity": {
             "decision_state_time": "start of each crediting year",
             "future_reference_fund_return_in_state": False,
             "future_discount_factor_in_state": False,
+            "control_state_features": list(CONTROL_STATE_FEATURE_NAMES),
+            "portfolio_control_state_features": list(
+                PORTFOLIO_CONTROL_STATE_FEATURE_NAMES
+            ),
+            "control_state_history_rule": (
+                "state at year y uses market observations, fund returns and caps "
+                "only through year y-1"
+            ),
             "fold_unit": "complete market/control path",
-            "first_cap_selection_folds": "all folds except fold zero",
-            "first_cap_csm_evaluation_fold": "fold zero only",
+            "first_cap_selection_folds": (
+                "complete-path out-of-fold fitted action values across every fold"
+                if args.policyholder_behaviour == "lsmc"
+                else "all folds except fold zero in the legacy control fit"
+            ),
+            "first_cap_bellman_diagnostic_fold": (
+                "complete-path OOF mean across every fold"
+                if args.policyholder_behaviour == "lsmc"
+                else "fold zero only in the legacy control fit"
+            ),
+            "realised_csm_evaluation_sample": (
+                "independent final ScenarioSet; no control-fit fold"
+            ),
             "evaluation_fold_used_in_any_regression_fit": False,
-            "dva_disabled_for_pre_action_state": True,
+            "dva_enabled_in_product_projection": bool(
+                projection_config.dva_enabled
+            ),
+            "pre_action_state_independent_of_current_cap": True,
         },
         "limitations": [
-            "The optimal-policy CSM proxy is cross-fitted but is not a second, fully "
-            "independent forward simulation of the learned state-feedback policy.",
-            "The annual administrative Account-Value view disables intra-year DVA; "
-            "cap effects on dynamic Behaviour branches enter through realised "
-            "annual crediting. Crediting Margin and hedge cost use the engine's "
-            "annual option-package proxy, not a full ALM replication.",
-            f"The regression state compresses {len(model_points.model_points)} "
-            "model points into portfolio, age, "
-            "premium, age/sex/Single-vs-Joint and, when heterogeneous, effective-"
-            "Income-start cohort buckets; its ten-times-"
-            "income moneyness feature is a "
-            "basis proxy, while actual dynamic-branch Behaviour probabilities use "
-            "the engine's full pathwise moneyness calculation.",
-            "The existing Behaviour model has no direct announced-cap covariate; "
-            "for dynamic Single-Life, Lump-Sum-Spouse and fallback branches the cap "
-            "affects lapse and withdrawals through subsequent realised crediting "
-            "and Account-Value moneyness; no new elasticity is invented.",
+            "The leader state contains exact pre-cap aggregate Account Value, "
+            "Surrender Value, locked Income, guarantee PV/moneyness and phase "
+            "exposures plus market and crediting history. It remains an aggregate "
+            "Markov compression rather than the complete model-point distribution, "
+            "so a useful adaptive rule can still be missed.",
+            "The cap-aware follower is fitted separately by economic PolicySpec "
+            "signature on the common control-randomisation design. This is a fitted "
+            "bilevel approximation to the repeated Stackelberg equilibrium, not a "
+            "proof of the global continuous-state subgame-perfect optimum; every "
+            "reported value is therefore checked in an independent direct rollout.",
+            "The monthly product rollout retains DVA, fee subledger, mortality, "
+            "expenses, crediting margin and hedge-cost logic. No new calibrated "
+            "Behaviour or market parameter is introduced.",
+            "In LSMC mode statistical Ordinary/Performance lapse and scheduled "
+            "voluntary withdrawals are replaced by the optimal Full-Withdrawal "
+            "hook. In the separately reported dynamic benchmark, the existing "
+            "Behaviour model still has no direct announced-cap elasticity.",
             "The Continue-Income Joint-Life branch uses static CSV base lapse and "
             "withdrawal rates while its Single-Life fallback remains dynamic; full "
             "p11/p10/p01 Account-Value and fee cohorts are not implemented.",
@@ -3593,12 +9690,12 @@ def main() -> None:
             "as an inactive grey tail in the policy plot.",
             "Joint-Life survival assumes independent lives and omits divorce, common "
             "mortality shocks and changing spouse eligibility.",
-            "The 0.20% minimum is a requested counterfactual and is below the "
-            "active case-study product's documented 0.25% guaranteed minimum.",
-            "The best fixed 1%-to-20% benchmark is selected on the same finite "
-            "benchmark sample used to report it and its reported maximum CSM proxy "
-            "is therefore subject to a small upward winner's-curse bias; paired "
-            "path differences are also reported.",
+            "The admissible action and fixed-comparison grid is exactly 0.25%, then "
+            "integer caps from 1% through 20%. Zero crediting and no upper cap are "
+            "non-contractual sanity checks only.",
+            "The best fixed admissible cap is selected on a validation sample and "
+            "reported on a disjoint final sample. Flexible-minus-fixed differences "
+            "are paired on common final-evaluation market paths.",
         ],
     }
 
@@ -3607,9 +9704,29 @@ def main() -> None:
     )
     csv_outputs = (
         (output / "first_year_action_values.csv", scaled_first_year_rows),
-        (output / "optimal_policy_by_year.csv", backward.policy_year_rows),
+        (output / "optimal_policy_by_year.csv", direct_policy_rows),
+        (
+            output / "cross_fitted_policy_diagnostics_by_year.csv",
+            backward.policy_year_rows,
+        ),
         (output / "regression_diagnostics.csv", backward.regression_rows),
+        (
+            output / "policyholder_regression_diagnostics.csv",
+            policyholder_regression_rows,
+        ),
+        (
+            output / "policyholder_validation_diagnostics.csv",
+            policyholder_validation_rows,
+        ),
+        (
+            output / "policyholder_exercise_by_year_and_cap.csv",
+            policyholder_exercise_rows,
+        ),
         (output / "fixed_cap_sanity_checks.csv", benchmark_rows),
+        (
+            output / "fixed_cap_behaviour_benchmarks.csv",
+            behaviour_benchmark_rows,
+        ),
         (output / "model_point_projection_treatments.csv", treatment_rows),
     )
     with _logged_stage("Write CSV result tables"):
@@ -3647,7 +9764,7 @@ def main() -> None:
             with path.open("w", encoding="utf-8") as handle:
                 json.dump(
                     payload, handle, indent=2, ensure_ascii=False,
-                    default=_json_default,
+                    default=_json_default, allow_nan=False,
                 )
                 handle.write("\n")
             LOGGER.debug("Checkpoint JSON written | %s", path)
@@ -3657,7 +9774,7 @@ def main() -> None:
             plotting_backend=plotting_backend,
             output=output,
             first_year_rows=scaled_first_year_rows,
-            policy_rows=backward.policy_year_rows,
+            policy_rows=direct_policy_rows,
             regression_rows=backward.regression_rows,
             benchmark_rows=benchmark_rows,
             summary=summary,
@@ -3693,7 +9810,7 @@ def main() -> None:
             with path.open("w", encoding="utf-8") as handle:
                 json.dump(
                     payload, handle, indent=2, ensure_ascii=False,
-                    default=_json_default,
+                    default=_json_default, allow_nan=False,
                 )
                 handle.write("\n")
             LOGGER.debug("JSON written | %s", path)
@@ -3701,9 +9818,9 @@ def main() -> None:
     total_elapsed = time.perf_counter() - run_started
     LOGGER.info(
         "RUN COMPLETE | elapsed %.1fs | first-year cap %.2f%% | "
-        "held-out Bellman CSM %.2f | best fixed cap %.0f%% / CSM %.2f",
+        "direct flexible CSM %.2f | best fixed cap %.2f%% / CSM %.2f",
         total_elapsed,
-        100.0 * backward.first_year_cap,
+        100.0 * selected_first_year_cap,
         optimal_csm,
         100.0 * best_fixed_cap,
         best_fixed_csm,

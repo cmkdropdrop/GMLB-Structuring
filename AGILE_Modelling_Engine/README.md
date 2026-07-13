@@ -227,10 +227,7 @@ costs = load_cost_assumptions(
     projection=portfolio_projection,
 )
 loaded_behaviour = load_dynamic_behaviour_assumptions().behaviour
-behaviour = replace(
-    loaded_behaviour,
-    take_up=replace(loaded_behaviour.take_up, mode="deterministic"),
-)
+behaviour = loaded_behaviour
 model_points = load_policyholder_model_points(
     expected_market_parameter_set_id=market.parameter_set_id,
     expected_yield_curve_id=market.curve_id,
@@ -291,23 +288,24 @@ market-consistent values, as applicable. Material boundaries include:
   monthly decrements and terminated no later than age 115;
 - dynamic behaviour schedules and coefficients are explicitly
   `uncalibrated_proxy`; contractual eligibility overrides them, so they cannot
-  create Growth lapse or Growth withdrawals. The portfolio runner also gives
-  the explicit model-point `income_start_year` priority over dynamic Take-up;
-- Joint-Life portfolio values weight the spouse-alive Election case and the
-  Single-Life fallback by spouse survival to the effective Election
-  anniversary. A Continue-Income joint branch uses state-independent static
-  CSV base behaviour while its Single-Life fallback remains dynamic; separate
-  `p11/p10/p01` Account-Value cohorts are not yet implemented. Lives are
-  independent, and divorce/removal, common shocks and legal eligibility
-  changes are not modelled. Core Spouse projections therefore require a
-  deterministic Income Election; Continue-Income Joint-Life core calls also
-  require state-independent static lapse/withdrawal behaviour;
+  create Growth lapse or Growth withdrawals. Dynamic Take-up is evaluated
+  only from current-Anniversary state. The model-point `income_start_year` is
+  retained only for the explicit deterministic validation benchmark;
+- state-dependent Joint-Life runs carry separate pathwise Primary/Spouse life
+  statuses. Election and post-Election behaviour therefore act on the actual
+  `p11`, `p10` or `p01` path state rather than on a nonlinear function of an
+  averaged survivor state. The deterministic benchmark retains the former
+  spouse-survival-weighted Joint-/Single-Life split for exact backward
+  validation. Lives are independent; divorce/removal, common shocks and legal
+  eligibility changes are not modelled;
 - the intra-year DVA and hedge-package value use a Black-Scholes call-spread
   proxy with the complete Reference Fund volatility obtained by joint
   equity/Hull-White moment matching. This is not a calibration to mixed-fund
   option quotes and does not reproduce the full Heston distribution;
-- the portfolio path rejects COS and does not use LSMC. The retained COS and
-  LSMC implementations are legacy research utilities only;
+- the statistical Dynamic portfolio path rejects COS and does not use LSMC.
+  The separate optimal-behaviour runner trains a combined Income-Election and
+  Full-Withdrawal policy on independent paths and freezes it for out-of-sample
+  evaluation;
 - current model-point loading supports the repository's duration-zero
   new-business Growth records, not a general in-force conversion;
 - MVA, hedge execution, expenses, capital and shareholder values retain the

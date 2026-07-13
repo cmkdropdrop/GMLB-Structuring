@@ -9,7 +9,8 @@ is a transitional alias for older research imports.  See ``README.md`` and
 from .behavior import (BehaviourModel, DynamicHazardFunction,
                        DynamicLapseParams, DynamicTakeUpParams,
                        DynamicWithdrawalParams, FractionalLogitFunction,
-                       IncomeTakeUp, LapseAssumptions, WithdrawalBehaviour)
+                       IncomeTakeUp, LapseAssumptions,
+                       PerformanceLapseFunction, WithdrawalBehaviour)
 from .capital import CapitalResult, CapitalStresses, compute_capital
 from .crediting import (HedgeMarket, credited_return, crediting_package_value,
                         crediting_margin_rate, fair_cap,
@@ -56,7 +57,21 @@ from .product import (AgePensionPlusSpec, AgileProduct, CapSchedule,
                       JULY_2026_MALE_INCOME_RATES)
 from .profitability import (ProfitabilityResult, ProfitabilitySettings,
                             analyse_profitability)
-from .projection import ProjectionConfig, ProjectionResult, project
+from .projection import (CreditingCapDecisionContext, ProjectionConfig,
+                         ProjectionResult, SurrenderActionValueContext,
+                         SurrenderDecisionContext, project)
+from .optimal_behaviour_lsmc import (
+    CrossFittedOptimalSurrenderPolicy, SurrenderContinuationPolicyFit,
+    SurrenderContinuationRegressionDiagnostic,
+    build_surrender_regression_features,
+    build_surrender_regression_features_from_arrays,
+    fit_surrender_continuation_regression,
+    fit_surrender_continuation_policy,
+)
+from .stackelberg_control import (
+    PolicyholderAction, TabularStackelbergProblem,
+    TabularStackelbergSolution, solve_tabular_stackelberg,
+)
 from .portfolio import (FairFeeSolveResult, ModelPointPortfolioValuation,
                          PortfolioProgress, PortfolioValuationResult,
                          value_policyholder_portfolio)
@@ -81,21 +96,33 @@ __all__ = [
     "DEFAULT_GUARANTEED_MIN_CAPS", "JULY_2026_FEMALE_INCOME_RATES",
     "JULY_2026_MALE_INCOME_RATES",
     "FractionalLogitFunction", "LapseAssumptions", "MVASpec",
+    "PerformanceLapseFunction",
     "MarketAssumptionSet", "Measure", "ModelPointPortfolioValuation",
     "MortalityTable", "PolicySpec", "PolicyholderModelPoint",
     "PolicyholderModelPointSet", "PortfolioProgress", "PortfolioValuationResult",
     "ProfitabilityResult",
     "ProfitabilitySettings", "ProjectionConfig", "ProjectionResult",
     "Protection", "ReferenceFundSpec", "Scenario", "ScenarioSet", "Sex",
-    "SpouseDeathElection",
+    "SpouseDeathElection", "SurrenderDecisionContext",
+    "SurrenderActionValueContext",
+    "CreditingCapDecisionContext", "CrossFittedOptimalSurrenderPolicy",
+    "SurrenderContinuationPolicyFit",
+    "SurrenderContinuationRegressionDiagnostic",
+    "PolicyholderAction",
+    "TabularStackelbergProblem", "TabularStackelbergSolution",
     "ValuationResult", "ValuationSettings", "WithdrawalBehaviour",
     "WithdrawalRules", "YieldCurve",
-    "analyse_profitability", "compute_capital", "credited_return",
+    "analyse_profitability", "build_surrender_regression_features",
+    "build_surrender_regression_features_from_arrays",
+    "compute_capital", "credited_return",
     "crediting_margin_rate", "crediting_package_value", "fair_cap",
-    "fair_lifetime_income_premium", "greeks", "heston_intra_year_value_factor",
+    "fair_lifetime_income_premium", "fit_surrender_continuation_regression",
+    "fit_surrender_continuation_policy",
+    "greeks", "heston_intra_year_value_factor",
     "heston_package_value", "heston_put_cos", "intra_year_value_factor",
     "load_cost_assumptions", "load_dynamic_behaviour_assumptions",
     "load_market_assumptions", "load_policyholder_model_points", "project",
-    "resolve_horizon", "run_sensitivities", "simulate", "standard_scenarios",
+    "resolve_horizon", "run_sensitivities", "simulate",
+    "solve_tabular_stackelberg", "standard_scenarios",
     "value_contract", "value_policyholder_portfolio",
 ]

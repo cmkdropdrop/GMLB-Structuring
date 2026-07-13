@@ -718,8 +718,10 @@ class PolicySpec:
     #: generic product always uses its product-wide 50/50 Reference Fund.
     allocation: Mapping[InvestmentOption, float] = field(
         default_factory=lambda: {InvestmentOption.AUS_TP: 1.0})
-    #: Planned income commencement in policy years.  The contractual election
-    #: grid contains Policy Anniversaries only.
+    #: Deterministic Income-Election benchmark in policy years.  Dynamic and
+    #: optimal-behaviour main runs do not treat this value as the realised
+    #: start date; they retain it solely for backwards-compatible validation.
+    #: The contractual election grid contains Policy Anniversaries only.
     income_start_year: float = 5.0
     income_type: IncomeType = IncomeType.FIXED
     spouse: bool = False
@@ -857,13 +859,13 @@ class PolicySpec:
     def effective_income_start_year(
         self, product: IndexLinkedLifetimeIncomeProduct
     ) -> int:
-        """Resolve the deterministic Income Election anniversary.
+        """Resolve the explicit deterministic benchmark anniversary.
 
-        The model-point anniversary remains the primary contractual input, but
-        Income must start no later than the first Policy Anniversary strictly
-        after the automatic-start age is reached.  Keeping this resolution on
-        ``PolicySpec`` gives projection, rate-card validation and the
-        pre-Election spouse-survival split one common convention.
+        The model-point anniversary is used only when a caller explicitly
+        selects deterministic Election.  Income must then start no later than
+        the first Policy Anniversary strictly after the automatic-start age is
+        reached.  Dynamic/optimal main runs use the same automatic-age gate but
+        do not otherwise use ``income_start_year`` as their realised date.
         """
         scheduled = max(
             int(round(float(self.income_start_year))),
