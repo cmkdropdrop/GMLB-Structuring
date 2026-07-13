@@ -35,8 +35,8 @@ the insurer's backing or hedge portfolio.
 | Growth phase | at least one full policy year; no lapse, full surrender, free, partial or excess withdrawal |
 | Income election | once per Policy Anniversary; irreversible; automatic contractual backstop at the first anniversary after age 100 |
 | Income | Fixed Lifetime Income only, monthly in arrears |
-| Reference Fund | 50% Global Equity and 50% nominal Australian-government five-year bond sleeve |
-| Rebalancing | monthly back to 50/50 |
+| Reference Fund | CSV-configured Global-Equity share (30% in the shipped base case) and the complementary nominal Australian-government five-year bond sleeve |
+| Rebalancing | monthly back to the configured target allocation |
 | Crediting | annual point-to-point Total Protection on the complete Reference Fund return |
 | Maximum Return | fixed 6% per year; Guaranteed Minimum Cap 0.25% |
 | Investment switch | none; the same Reference Fund remains in Growth and Income |
@@ -90,7 +90,7 @@ credit spread, default, rating migration or inflation-linked-bond component.
 At each month end the complete simple Reference Fund return is formed first:
 
 ```text
-R_F,m = 0.50 * R_E,m + 0.50 * R_B,m,
+R_F,m = 0.30 * R_E,m + 0.70 * R_B,m,
 F_m   = F_(m-1) * (1 + R_F,m).
 ```
 
@@ -334,8 +334,9 @@ Life, the separately sampled `p11`, `p10` and `p01` paths retain their own
 Account Value, fee and life-status history; the nonlinear response is never
 applied to an averaged survivor state. Contractual Growth prohibitions and the
 automatic-start gate take precedence over proxy rates. The model-point
-`income_start_year` affects only the explicit deterministic validation
-benchmark.
+`income_start_year` is an explicit deterministic benchmark and one member of
+the pre-declared LSMC training-anchor library; it does not constrain the
+dynamic Election state transition.
 
 ### 9.1 Combined optimal-behaviour policy
 
@@ -386,6 +387,16 @@ agreement on common paths and a Policyholder lower-bound change no larger than
 0.1% of premium. Failure is reported as `policy_iteration_not_converged` and
 invalidates the policy.
 
+Before the policy is frozen, its cross-fitted training value is compared with
+the pre-declared fixed Election library (earliest, year 5, year 10, model-point
+date and contractual force, with duplicates removed). Fixed-date LSMC Income
+actions are retained only when their paired 95% training lower bound is at
+least one basis point of premium higher than Continue. The fully dynamic policy
+is retained only when its paired 95% training lower bound clears the best
+remaining fixed candidate by the same amount. Otherwise that fixed candidate
+is stored explicitly as the training anchor. This selection uses training paths
+only and therefore does not weaken or tune on the independent validation gate.
+
 Training, validation and final evaluation are three independent samples. The
 frozen policy must pass paired 95% non-inferiority gates for Election-only,
 Income-action-only and Combined behaviour against a pre-declared deterministic
@@ -397,7 +408,8 @@ validation paths and are each reported on the same final evaluation paths.
 The first seed is the pre-declared primary reporting policy; final evaluation
 is never used to select among seeds. The fit-basis fingerprint includes
 training scenario content, Cap,
-stress, product and canonical policy basis, mortality, expenses, projection
+stress, product and policy basis including the pre-declared model-point
+benchmark date, mortality, expenses, projection
 configuration and LSMC settings. A Cap×stress analysis must therefore refit,
 and evidence a distinct fit basis, for every cell.
 
@@ -602,7 +614,7 @@ withdrawal benefit, never both.
 duration-zero new-business Growth records. It validates premium, Account Value,
 phase, Fixed Income, spouse fields, identifiers and source weights. The four
 AGILE allocation columns are validated for source integrity but deliberately
-ignored; the generic 50/50 Reference Fund is a product-level rule.
+ignored; the generic Reference Fund allocation is a product-level CSV input.
 
 `value_policyholder_portfolio()` builds one common risk-neutral scenario set
 large enough for all model-point horizons, reuses it for all model points and

@@ -31,10 +31,12 @@ The optimisation selects the cap with the largest proxy value after the
 cap-aware customer best response.  ``--policyholder-behaviour`` retains
 reproducible ``dynamic`` and ``continue`` comparators; ``lsmc`` is the default.
 
-The admissible action grid is ``{0.25%, 1%, 2%, ..., 20%}``, matching the
-documented Guaranteed Minimum Cap while replacing the case study's fixed 6%
-Maximum Return for this counterfactual.  Fixed-cap checks distinguish zero
-crediting from uncapped positive-return crediting.
+The fast default action grid is ``{0.25%, 2%, 4%, 6%, 8%, 10%, 12%, 15%, 20%}``.
+It screens all actions with the cap-randomised follower and performs fresh
+cap-specific LSMC fits only for the three leading candidates.  The historical
+``{0.25%, 1%, 2%, ..., 20%}`` grid and complete refit set remain available via
+explicit CLI options.  Both grids respect the documented Guaranteed Minimum
+Cap while replacing the case study's fixed 6% Maximum Return.
 
 Important timing convention
 ---------------------------
@@ -65,7 +67,9 @@ import json
 import logging
 import math
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -88,7 +92,6 @@ from agile_engine import (  # noqa: E402
     DEFAULT_COST_ASSUMPTIONS_PATH,
     DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY,
     DEFAULT_MODEL_PARAMETERS_PATH,
-    DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
     ExpenseAssumptions,
     FeeSpec,
     HedgeCapLegMode,
@@ -104,6 +107,7 @@ from agile_engine import (  # noqa: E402
     __version__ as ENGINE_VERSION,
     load_cost_assumptions,
     load_dynamic_behaviour_assumptions,
+    load_equity_allocation,
     load_market_assumptions,
     load_policyholder_model_points,
     simulate,
@@ -132,7 +136,16 @@ Array = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 STEPS_PER_YEAR = 12
 
-ACTION_CAPS = np.concatenate((np.array([0.0025]), np.arange(0.01, 0.201, 0.01)))
+FULL_ACTION_CAPS = np.concatenate((
+    np.array([0.0025]), np.arange(0.01, 0.201, 0.01)
+))
+FAST_ACTION_CAPS = np.asarray(
+    (0.0025, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20),
+    dtype=float,
+)
+# Retain the historical full grid at import time for helper/API compatibility.
+# ``main`` selects the requested run grid before any fitting starts.
+ACTION_CAPS = FULL_ACTION_CAPS.copy()
 OTHER_INSURER_FUNDED_BENEFIT_KEYS: tuple[str, ...] = ()
 CONTROL_STATE_FEATURE_NAMES = (
     "zero_rate_5y",
@@ -176,6 +189,11 @@ FOLLOWER_PRE_CAP_FEATURE_NAMES = (
 )
 DEFAULT_OUTPUT_DIRECTORY = (
     Path(__file__).resolve().parent / "output" / "crediting_cap_lsmc"
+)
+DEFAULT_FAST_MODEL_POINTS_PATH = (
+    ENGINE_ROOT.parent
+    / "input_model_points_policyholders"
+    / "model_points_policyholders_1_point_proxy.csv"
 )
 LOGGER = logging.getLogger("crediting_cap_lsmc")
 COMBINED_FOLLOWER_VERSION = "combined_optimal_behaviour_lsmc_v2"
@@ -240,7 +258,7 @@ class PathwiseReferenceFundSpec:
 
     cap_matrix: Array
     equity_index: Index = Index.GLOBAL_EQUITY
-    equity_weight: float = 0.50
+    equity_weight: float = 0.30
     bond_tenor_years: float = 5.0
     rebalance_frequency_months: int = 1
     specification_vintage: str = "counterfactual-lsmc-control-grid"
@@ -1006,11 +1024,20 @@ def _lower_cap_argmax(values: Array, axis: int = -1) -> IntArray:
     return np.asarray(np.argmax(tied, axis=axis), dtype=np.int64)
 
 
+def _configured_action_caps(mode: str) -> Array:
+    """Return an isolated action grid for the requested runtime profile."""
+    if mode == "fast":
+        return FAST_ACTION_CAPS.copy()
+    if mode == "full":
+        return FULL_ACTION_CAPS.copy()
+    raise ValueError(f"Unknown cap-grid mode: {mode!r}")
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-points", type=Path,
-        default=DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
+        default=DEFAULT_FAST_MODEL_POINTS_PATH,
         help="policyholder model-point CSV",
     )
     parser.add_argument(
@@ -1062,19 +1089,52 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_MODEL_PARAMETERS_PATH,
     )
     parser.add_argument(
-        "--n-paths", type=int, default=4_200,
-        help="control-randomisation paths (default gives 200 paths/action/year)",
+        "--n-paths", type=int, default=3_000,
+        help="control-randomisation paths",
     )
     parser.add_argument(
-        "--benchmark-paths", type=int, default=500,
+        "--benchmark-paths", type=int, default=100,
         help=(
             "paths in each independent fixed-cap selection and final evaluation "
             "sample"
         ),
     )
     parser.add_argument(
-        "--benchmark-batch-size", type=int, default=4,
+        "--benchmark-batch-size", type=int, default=8,
         help="number of fixed-cap cases projected together",
+    )
+    parser.add_argument(
+        "--cap-grid",
+        choices=("fast", "full"),
+        default="fast",
+        help=(
+            "fast uses 0.25%%, 2%% steps through 12%%, 15%% and 20%%; "
+            "full uses every integer cap from 1%% through 20%%"
+        ),
+    )
+    parser.add_argument(
+        "--fixed-cap-refit-count",
+        type=int,
+        default=3,
+        help=(
+            "number of screening winners receiving a fresh cap-specific LSMC; "
+            "zero refits the complete grid including sanity cases"
+        ),
+    )
+    parser.add_argument(
+        "--fixed-cap-workers",
+        type=int,
+        default=4,
+        help="parallel workers for independent cap-specific follower fits",
+    )
+    parser.add_argument(
+        "--comparison-benchmarks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "also run the separate Dynamic and always-Continue fixed-cap grids "
+            "(default: disabled)"
+        ),
     )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--heston-substeps", type=int, default=4)
@@ -1147,6 +1207,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--n-paths and --benchmark-paths must be positive")
     if args.benchmark_batch_size <= 0:
         parser.error("--benchmark-batch-size must be positive")
+    if args.fixed_cap_refit_count < 0:
+        parser.error("--fixed-cap-refit-count must be non-negative")
+    if args.fixed_cap_workers <= 0:
+        parser.error("--fixed-cap-workers must be positive")
     if args.model_point_log_interval <= 0:
         parser.error("--model-point-log-interval must be positive")
     if args.plot_dpi < 72:
@@ -1188,7 +1252,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         / (args.cross_fit_folds - 2)
         * 1.10
     )
-    min_paths = len(ACTION_CAPS) * minimum_per_action_total
+    selected_action_caps = _configured_action_caps(args.cap_grid)
+    if args.fixed_cap_refit_count > len(selected_action_caps):
+        parser.error(
+            "--fixed-cap-refit-count cannot exceed the selected action-grid size"
+        )
+    min_paths = len(selected_action_caps) * minimum_per_action_total
     if args.n_paths < min_paths:
         parser.error(
             f"--n-paths must be at least {min_paths} for stable action/fold coverage"
@@ -1405,35 +1474,64 @@ def _vector_retained_excess_return(
     return float(result) if scalar else np.asarray(result, dtype=float)
 
 
+_PATHWISE_CAP_ADAPTER_LOCK = threading.RLock()
+_PATHWISE_CAP_ADAPTER_DEPTH = 0
+_PATHWISE_CAP_ADAPTER_ORIGINALS: tuple[object, ...] | None = None
+
+
 @contextmanager
 def _pathwise_cap_adapter() -> Iterator[None]:
     """Temporarily vectorise projector calls reached by pathwise cap controls.
 
-    The adapter is process-local and restored in ``finally``.  It vectorises
-    customer and insurer option functions so that the direct monthly
-    projection retains DVA and includes pathwise cap-dependent hedge costs and
-    retained hedge gains.
+    The reference-counted lock makes overlapping fixed-cap worker threads safe:
+    the shared vector functions remain installed until the last active worker
+    exits.  It vectorises customer and insurer option functions so that the
+    direct monthly projection retains DVA and includes pathwise cap-dependent
+    hedge costs and retained hedge gains.
     """
-    original_return = projection_module.credited_return
-    original_package = projection_module.crediting_package_value
-    original_intra_year = projection_module.intra_year_value_factor
-    original_hedge_package = projection_module.hedge_option_package_value
-    original_retained_excess = projection_module.retained_excess_return
-    projection_module.credited_return = _vector_credited_return
-    projection_module.crediting_package_value = _vector_crediting_package_value
-    projection_module.intra_year_value_factor = _vector_intra_year_value_factor
-    projection_module.hedge_option_package_value = (
-        _vector_hedge_option_package_value
-    )
-    projection_module.retained_excess_return = _vector_retained_excess_return
+    global _PATHWISE_CAP_ADAPTER_DEPTH, _PATHWISE_CAP_ADAPTER_ORIGINALS
+    with _PATHWISE_CAP_ADAPTER_LOCK:
+        if _PATHWISE_CAP_ADAPTER_DEPTH == 0:
+            _PATHWISE_CAP_ADAPTER_ORIGINALS = (
+                projection_module.credited_return,
+                projection_module.crediting_package_value,
+                projection_module.intra_year_value_factor,
+                projection_module.hedge_option_package_value,
+                projection_module.retained_excess_return,
+            )
+            projection_module.credited_return = _vector_credited_return
+            projection_module.crediting_package_value = (
+                _vector_crediting_package_value
+            )
+            projection_module.intra_year_value_factor = (
+                _vector_intra_year_value_factor
+            )
+            projection_module.hedge_option_package_value = (
+                _vector_hedge_option_package_value
+            )
+            projection_module.retained_excess_return = (
+                _vector_retained_excess_return
+            )
+        _PATHWISE_CAP_ADAPTER_DEPTH += 1
     try:
         yield
     finally:
-        projection_module.credited_return = original_return
-        projection_module.crediting_package_value = original_package
-        projection_module.intra_year_value_factor = original_intra_year
-        projection_module.hedge_option_package_value = original_hedge_package
-        projection_module.retained_excess_return = original_retained_excess
+        with _PATHWISE_CAP_ADAPTER_LOCK:
+            _PATHWISE_CAP_ADAPTER_DEPTH -= 1
+            if _PATHWISE_CAP_ADAPTER_DEPTH < 0:
+                raise RuntimeError("Pathwise-cap adapter depth became negative.")
+            if _PATHWISE_CAP_ADAPTER_DEPTH == 0:
+                originals = _PATHWISE_CAP_ADAPTER_ORIGINALS
+                if originals is None:
+                    raise RuntimeError("Pathwise-cap adapter lost its originals.")
+                (
+                    projection_module.credited_return,
+                    projection_module.crediting_package_value,
+                    projection_module.intra_year_value_factor,
+                    projection_module.hedge_option_package_value,
+                    projection_module.retained_excess_return,
+                ) = originals
+                _PATHWISE_CAP_ADAPTER_ORIGINALS = None
 
 
 def _controlled_product(
@@ -6607,19 +6705,18 @@ def _benchmark_cases() -> list[tuple[str, float, str]]:
             0.0,
             "credited return is identically zero",
         ),
-        (
-            "fixed_cap_0.25pct",
-            0.0025,
-            "same 0.25% cap in every crediting year",
-        ),
     ]
     cases.extend(
         (
-            f"fixed_cap_{percent}pct",
-            percent / 100.0,
-            f"same {percent}% cap in every crediting year",
+            (
+                "fixed_cap_0.25pct"
+                if np.isclose(cap, 0.0025)
+                else f"fixed_cap_{100.0 * cap:g}pct"
+            ),
+            float(cap),
+            f"same {100.0 * cap:g}% cap in every crediting year",
         )
-        for percent in range(1, 21)
+        for cap in ACTION_CAPS
     )
     cases.append((
         "uncapped_positive_credit",
@@ -6785,6 +6882,8 @@ def _evaluate_fixed_benchmarks(
     portfolio_scale: float,
     model_point_log_interval: int,
     selection_path_count: int,
+    cases: Optional[Sequence[tuple[str, float, str]]] = None,
+    combined_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
 ) -> tuple[
     list[dict[str, object]],
     dict[str, Array],
@@ -6793,23 +6892,25 @@ def _evaluate_fixed_benchmarks(
     dict[str, float],
 ]:
     """Select fixed cap on one sample and report it on an independent sample."""
-    cases = _benchmark_cases()
+    selected_cases = list(_benchmark_cases() if cases is None else cases)
+    if not selected_cases:
+        raise ValueError("Fixed-cap benchmark cases must not be empty.")
     if not 0 < selection_path_count < base_scenarios.n_paths:
         raise ValueError(
             "selection_path_count must leave a non-empty evaluation sample."
         )
     path_values: dict[str, Array] = {}
     component_paths: dict[str, dict[str, Array]] = {}
-    batch_count = int(np.ceil(len(cases) / batch_size))
+    batch_count = int(np.ceil(len(selected_cases) / batch_size))
     LOGGER.info(
         "Fixed-cap benchmarks | %d cases | %d batches | %d CRN paths/case",
-        len(cases), batch_count, base_scenarios.n_paths,
+        len(selected_cases), batch_count, base_scenarios.n_paths,
     )
 
     for batch_number, start in enumerate(
-        range(0, len(cases), batch_size), start=1
+        range(0, len(selected_cases), batch_size), start=1
     ):
-        batch = cases[start:start + batch_size]
+        batch = selected_cases[start:start + batch_size]
         labels = ", ".join(label for label, _, _ in batch)
         batch_started = time.perf_counter()
         LOGGER.info(
@@ -6832,6 +6933,7 @@ def _evaluate_fixed_benchmarks(
             collect_states=False,
             progress_label=f"Benchmark batch {batch_number}/{batch_count}",
             model_point_log_interval=model_point_log_interval,
+            combined_policy_factory=combined_policy_factory,
         )
         for position, (label, _, _) in enumerate(batch):
             lo = position * base_scenarios.n_paths
@@ -6849,7 +6951,7 @@ def _evaluate_fixed_benchmarks(
 
     fixed_labels = [
         label
-        for label, cap, _ in cases
+        for label, cap, _ in selected_cases
         if label.startswith("fixed_cap_")
         and np.any(np.isclose(cap, ACTION_CAPS))
     ]
@@ -6880,7 +6982,7 @@ def _evaluate_fixed_benchmarks(
         portfolio_scale * float(np.mean(best_paths)),
     )
     rows: list[dict[str, object]] = []
-    for label, cap, definition in cases:
+    for label, cap, definition in selected_cases:
         csm_paths = path_values[label][evaluation_slice]
         components = {
             name: values[evaluation_slice]
@@ -7011,6 +7113,8 @@ def _evaluate_fixed_lsmc_benchmarks(
     model_point_log_interval: int,
     selection_path_count: int,
     follower_settings: OptimalBehaviourLSMCSettings,
+    cases: Optional[Sequence[tuple[str, float, str]]] = None,
+    workers: int = 1,
 ) -> tuple[
     list[dict[str, object]],
     dict[str, Array],
@@ -7021,7 +7125,7 @@ def _evaluate_fixed_lsmc_benchmarks(
     list[dict[str, object]],
     list[dict[str, object]],
 ]:
-    """Fresh, cap-consistent follower fit for every fixed/sanity cap.
+    """Fresh, cap-consistent follower fit for the selected fixed/sanity caps.
 
     Training/cross-fitting uses ``training_scenarios`` only.  The first slice
     of ``evaluation_scenarios`` is reserved for signature-level follower
@@ -7030,6 +7134,122 @@ def _evaluate_fixed_lsmc_benchmarks(
     """
     if not 0 < selection_path_count < evaluation_scenarios.n_paths:
         raise ValueError("Fixed-LSMC selection must leave final evaluation paths.")
+    if workers <= 0:
+        raise ValueError("Fixed-LSMC workers must be positive.")
+    selected_cases = list(_benchmark_cases() if cases is None else cases)
+    if not selected_cases:
+        raise ValueError("Fixed-LSMC cases must not be empty.")
+
+    # The fast path refits only admissible screening winners.  Each case owns
+    # its fit and evaluation policies, while ScenarioSets and assumptions are
+    # immutable/read-only.  Recursive single-case calls keep the audited
+    # sequential implementation authoritative and make result merging small.
+    all_cases_are_admissible = all(
+        np.any(np.isclose(cap, ACTION_CAPS))
+        for _, cap, _ in selected_cases
+    )
+    if workers > 1 and len(selected_cases) > 1 and all_cases_are_admissible:
+        max_workers = min(int(workers), len(selected_cases))
+        LOGGER.info(
+            "Parallel fixed-cap LSMC refits | cases=%d | workers=%d",
+            len(selected_cases), max_workers,
+        )
+        ordered_results: list[object | None] = [None] * len(selected_cases)
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="fixed-cap-lsmc",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _evaluate_fixed_lsmc_benchmarks,
+                    training_scenarios=training_scenarios,
+                    evaluation_scenarios=evaluation_scenarios,
+                    n_years=n_years,
+                    product=product,
+                    model_points=model_points,
+                    mortality=mortality,
+                    expenses=expenses,
+                    projection_config=projection_config,
+                    portfolio_scale=portfolio_scale,
+                    model_point_log_interval=model_point_log_interval,
+                    selection_path_count=selection_path_count,
+                    follower_settings=follower_settings,
+                    cases=(case,),
+                    workers=1,
+                ): index
+                for index, case in enumerate(selected_cases)
+            }
+            for future in as_completed(futures):
+                ordered_results[futures[future]] = future.result()
+
+        if any(result is None for result in ordered_results):
+            raise RuntimeError("A parallel fixed-cap LSMC result is missing.")
+        result_rows: list[dict[str, object]] = []
+        evaluation_values: dict[str, Array] = {}
+        selection_values: dict[str, Array] = {}
+        fit_sets: dict[str, PolicyholderFitSet] = {}
+        exercise_rows: list[dict[str, object]] = []
+        validation_rows: list[dict[str, object]] = []
+        for result in ordered_results:
+            assert result is not None
+            (
+                rows_i,
+                evaluation_i,
+                selection_i,
+                _best_i,
+                _metadata_i,
+                fit_sets_i,
+                exercise_i,
+                validation_i,
+            ) = result
+            result_rows.extend(rows_i)
+            evaluation_values.update(evaluation_i)
+            selection_values.update(selection_i)
+            fit_sets.update(fit_sets_i)
+            exercise_rows.extend(exercise_i)
+            validation_rows.extend(validation_i)
+
+        labels = [label for label, _, _ in selected_cases]
+        selection_means = np.asarray([
+            float(np.mean(selection_values[label])) for label in labels
+        ])
+        best_label = labels[int(_lower_cap_argmax(selection_means))]
+        best_final_paths = evaluation_values[best_label]
+        for row in result_rows:
+            label = str(row["case"])
+            difference = portfolio_scale * (
+                evaluation_values[label] - best_final_paths
+            )
+            row.update({
+                "new_business_csm_difference_vs_best_fixed_admissible_aud": (
+                    float(np.mean(difference))
+                ),
+                "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud": (
+                    _standard_error(difference)
+                ),
+                "is_best_fixed_cap_admissible_grid": label == best_label,
+            })
+        metadata = {
+            "selection_path_count": float(selection_path_count),
+            "evaluation_path_count": float(
+                evaluation_scenarios.n_paths - selection_path_count
+            ),
+            "best_fixed_selection_csm_aud": portfolio_scale * float(
+                np.mean(selection_values[best_label])
+            ),
+            "parallel_workers": float(max_workers),
+        }
+        return (
+            result_rows,
+            evaluation_values,
+            selection_values,
+            best_label,
+            metadata,
+            fit_sets,
+            exercise_rows,
+            validation_rows,
+        )
+
     no_actions = no_voluntary_action_behaviour()
     rows_by_label: dict[str, dict[str, object]] = {}
     all_paths: dict[str, Array] = {}
@@ -7037,7 +7257,7 @@ def _evaluate_fixed_lsmc_benchmarks(
     fit_sets: dict[str, PolicyholderFitSet] = {}
     exercise_rows: list[dict[str, object]] = []
     validation_rows: list[dict[str, object]] = []
-    cases = _benchmark_cases()
+    cases = selected_cases
     selection = slice(0, selection_path_count)
     final = slice(selection_path_count, None)
     validation_fingerprint = _slice_scenarios(
@@ -7925,34 +8145,51 @@ def _plot_flexibility_value(
     dpi: int,
 ) -> list[Path]:
     """Plain-language comparison based only on direct evaluation cashflows."""
-    no_credit = next(
-        row for row in benchmark_rows if row["case"] == "no_crediting_cap_0pct"
-    )
     best_fixed = next(
         row for row in benchmark_rows
         if row["is_best_fixed_cap_admissible_grid"]
     )
-    requested_fixed = next(
-        row for row in benchmark_rows
-        if row.get("is_best_fixed_cap_requested_1_to_20_grid", False)
-    )
     flexible = next(
         row for row in benchmark_rows if row["case"] == "flexible_lsmc_policy"
     )
-    rows = (no_credit, requested_fixed, best_fixed, flexible)
-    labels = (
-        "Keine Gutschrift\n(0 %)",
+    rows: list[Mapping[str, object]] = []
+    labels: list[str] = []
+    colours: list[str] = []
+    no_credit = next(
         (
-            "Bester fixer Cap\n"
-            f"nur 1–20 % ({float(requested_fixed['cap_percent']):g} %)"
+            row for row in benchmark_rows
+            if row["case"] == "no_crediting_cap_0pct"
         ),
-        f"Bester fixer Cap\n({float(best_fixed['cap_percent']):g} %)",
+        None,
+    )
+    if no_credit is not None:
+        rows.append(no_credit)
+        labels.append("Keine Gutschrift\n(0 %)")
+        colours.append("#8A94A3")
+    requested_fixed = next(
+        (
+            row for row in benchmark_rows
+            if row.get("is_best_fixed_cap_requested_1_to_20_grid", False)
+        ),
+        None,
+    )
+    if requested_fixed is not None and requested_fixed is not best_fixed:
+        rows.append(requested_fixed)
+        labels.append(
+            "Bester frisch refitteter Cap\n"
+            f"ab 1 % ({float(requested_fixed['cap_percent']):g} %)"
+        )
+        colours.append("#5B8DB8")
+    rows.extend((best_fixed, flexible))
+    labels.extend((
+        f"Bester frisch refitteter Cap\n({float(best_fixed['cap_percent']):g} %)",
         (
             "Flexible jährliche\nCap-Politik"
             if flexible.get("adaptive_policy_selected", False)
             else "Validierte Regel\n(fixer Fallback)"
         ),
-    )
+    ))
+    colours.extend(("#2F6B9A", "#168A45"))
     values = np.asarray([
         float(row["estimated_new_business_csm_proxy_aud"]) for row in rows
     ])
@@ -7974,8 +8211,7 @@ def _plot_flexibility_value(
         2, 1, figsize=(10.5, 8.2),
         gridspec_kw={"height_ratios": (2.2, 1.0)},
     )
-    colours = ("#8A94A3", "#5B8DB8", "#2F6B9A", "#168A45")
-    positions = np.arange(4)
+    positions = np.arange(len(rows))
     bars = top.bar(
         positions, values, yerr=errors, capsize=5, color=colours, alpha=0.9
     )
@@ -8041,9 +8277,8 @@ def _plot_flexibility_value(
         0.01, 0.01,
         "Alle Balken stammen aus direkten Monatsprojektionen. Der flexible CSM "
         "ist kein regressierter Bellman-Wert; das Δ-Intervall nutzt gepaarte "
-        "Common-Random-Number-Pfade. Ein Vorsprung gegenüber dem eingeschränkten "
-        "1–20-%-Check kann allein aus dem zusätzlich zulässigen 0,25-%-Cap stammen "
-        "und ist dann kein Flexibilitätswert.",
+        "Common-Random-Number-Pfade. Im schnellen Default werden nur die im "
+        "Screening ausgewählten Cap-Finalisten frisch und cap-spezifisch refittet.",
         fontsize=8,
     )
     figure.text(
@@ -8221,10 +8456,24 @@ def _plot_fixed_cap_checks(
     bottom.set_ylabel("Paired Δ CSM\ncase − best fixed (AUD)")
     bottom.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     bottom.grid(alpha=0.25)
+    reported_special_cases = {
+        str(row["case"]) for row in benchmark_rows
+    }
+    if {
+        "no_crediting_cap_0pct", "uncapped_positive_credit"
+    }.issubset(reported_special_cases):
+        comparison_note = (
+            "0% means zero crediting. 'No upper cap' means max(fund return, 0). "
+        )
+    else:
+        comparison_note = (
+            "The fast default reports only freshly fitted cap finalists; the "
+            "0% and uncapped sanity cases require a complete refit run. "
+        )
     figure.text(
         0.01, 0.01,
-        "0% means zero crediting. 'No upper cap' means max(fund return, 0). "
-        "Paired intervals use common market paths; positive Δ CSM is better.",
+        comparison_note
+        + "Paired intervals use common market paths; positive Δ CSM is better.",
         fontsize=8,
     )
     figure.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
@@ -8612,7 +8861,9 @@ def _generate_plots(
 
 
 def main() -> None:
+    global ACTION_CAPS
     args = parse_args()
+    ACTION_CAPS = _configured_action_caps(args.cap_grid)
     run_started = time.perf_counter()
     run_created_utc = datetime.now(timezone.utc).isoformat()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -8625,13 +8876,26 @@ def main() -> None:
     LOGGER.info("Crediting-cap LSMC run started | output=%s", output)
     LOGGER.info(
         "Controls | training paths=%d | benchmark paths=%d | seed=%d | "
-        "folds=%d | Heston substeps=%d | caps=%s",
+        "folds=%d | Heston substeps=%d | cap grid=%s | caps=%s",
         args.n_paths,
         args.benchmark_paths,
         args.seed,
         args.cross_fit_folds,
         args.heston_substeps,
+        args.cap_grid,
         ",".join(f"{100.0 * cap:g}%" for cap in ACTION_CAPS),
+    )
+    LOGGER.info(
+        "Fast selection | cap-specific refits=%s | workers=%d | "
+        "comparison benchmark grids=%s | model points=%s",
+        (
+            "all"
+            if args.fixed_cap_refit_count == 0
+            else str(args.fixed_cap_refit_count)
+        ),
+        args.fixed_cap_workers,
+        args.comparison_benchmarks,
+        args.model_points,
     )
     if preexisting_outputs:
         LOGGER.warning(
@@ -8666,8 +8930,19 @@ def main() -> None:
     with _logged_stage("Load market assumptions"):
         market = load_market_assumptions(args.zero_curve, args.model_parameters)
     LOGGER.debug("Market inputs | %s", market.source_metadata())
+    with _logged_stage("Load equity allocation"):
+        equity_allocation = load_equity_allocation()
+    LOGGER.info(
+        "Equity allocation | id=%s | equity=%.2f%% | bonds=%.2f%% | %s",
+        equity_allocation.allocation_id,
+        100.0 * equity_allocation.equity_weight,
+        100.0 * equity_allocation.bond_weight,
+        equity_allocation.source_path,
+    )
     generic_product = IndexLinkedLifetimeIncomeProduct(
-        reference_fund=ReferenceFundSpec(),
+        reference_fund=ReferenceFundSpec(
+            equity_weight=equity_allocation.equity_weight,
+        ),
         fees=FeeSpec(lip_waived_in_income_phase_if_aps=False),
         dividend_yield={
             index: parameters.dividend_yield
@@ -9307,43 +9582,121 @@ def main() -> None:
     )
 
     continue_behaviour = no_voluntary_action_behaviour(dynamic_behaviour)
-    with _logged_stage("Evaluate always-Continue fixed-cap benchmarks"):
-        continue_results = _evaluate_fixed_benchmarks(
-            base_scenarios=benchmark_scenarios,
-            n_years=n_years,
-            batch_size=args.benchmark_batch_size,
-            product=costs.product,
-            model_points=model_points,
-            behaviour=continue_behaviour,
-            mortality=mortality,
-            expenses=costs.expenses,
-            projection_config=projection_config,
-            portfolio_scale=portfolio_scale,
-            model_point_log_interval=args.model_point_log_interval,
-            selection_path_count=args.benchmark_paths,
-        )
-    with _logged_stage("Evaluate existing dynamic-Behaviour fixed-cap benchmarks"):
-        dynamic_results = _evaluate_fixed_benchmarks(
-            base_scenarios=benchmark_scenarios,
-            n_years=n_years,
-            batch_size=args.benchmark_batch_size,
-            product=costs.product,
-            model_points=model_points,
-            behaviour=dynamic_behaviour,
-            mortality=mortality,
-            expenses=costs.expenses,
-            projection_config=projection_config,
-            portfolio_scale=portfolio_scale,
-            model_point_log_interval=args.model_point_log_interval,
-            selection_path_count=args.benchmark_paths,
-        )
+    continue_results = None
+    dynamic_results = None
+    if args.comparison_benchmarks or args.policyholder_behaviour == "continue":
+        with _logged_stage("Evaluate always-Continue fixed-cap benchmarks"):
+            continue_results = _evaluate_fixed_benchmarks(
+                base_scenarios=benchmark_scenarios,
+                n_years=n_years,
+                batch_size=args.benchmark_batch_size,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=continue_behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=projection_config,
+                portfolio_scale=portfolio_scale,
+                model_point_log_interval=args.model_point_log_interval,
+                selection_path_count=args.benchmark_paths,
+            )
+    if args.comparison_benchmarks or args.policyholder_behaviour == "dynamic":
+        with _logged_stage(
+            "Evaluate existing dynamic-Behaviour fixed-cap benchmarks"
+        ):
+            dynamic_results = _evaluate_fixed_benchmarks(
+                base_scenarios=benchmark_scenarios,
+                n_years=n_years,
+                batch_size=args.benchmark_batch_size,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=dynamic_behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=projection_config,
+                portfolio_scale=portfolio_scale,
+                model_point_log_interval=args.model_point_log_interval,
+                selection_path_count=args.benchmark_paths,
+            )
 
     fixed_lsmc_fit_sets: dict[str, PolicyholderFitSet] = {}
     fixed_policyholder_exercise_rows: list[dict[str, object]] = []
     policyholder_validation_rows: list[dict[str, object]] = []
+    fixed_cap_screening_rows: list[dict[str, object]] = []
     if args.policyholder_behaviour == "lsmc":
+        if exploratory_follower_fits is None:
+            raise RuntimeError("LSMC cap screening requires the coupled fit.")
+        if args.fixed_cap_refit_count == 0:
+            refit_cases = _benchmark_cases()
+            fixed_cap_screening_rows = [{
+                "status": "not_used_complete_grid_refit",
+                "cap_grid_mode": args.cap_grid,
+                "cap_specific_refit_count": len(refit_cases),
+            }]
+        else:
+            screening_cases = [
+                case for case in _benchmark_cases()
+                if np.any(np.isclose(case[1], ACTION_CAPS))
+            ]
+            with _logged_stage(
+                "Screen fixed caps with the cap-randomised follower"
+            ):
+                screening_result = _evaluate_fixed_benchmarks(
+                    base_scenarios=benchmark_scenarios,
+                    n_years=n_years,
+                    batch_size=args.benchmark_batch_size,
+                    product=costs.product,
+                    model_points=model_points,
+                    behaviour=continue_behaviour,
+                    mortality=mortality,
+                    expenses=costs.expenses,
+                    projection_config=projection_config,
+                    portfolio_scale=portfolio_scale,
+                    model_point_log_interval=args.model_point_log_interval,
+                    selection_path_count=args.benchmark_paths,
+                    cases=screening_cases,
+                    combined_policy_factory=exploratory_follower_fits.factory,
+                )
+            fixed_cap_screening_rows = screening_result[0]
+            screening_selection_values = screening_result[2]
+            screening_means = {
+                label: float(np.mean(values))
+                for label, values in screening_selection_values.items()
+            }
+            ranked_cases = sorted(
+                screening_cases,
+                key=lambda case: (-screening_means[case[0]], case[1]),
+            )
+            selected_labels = {
+                case[0]
+                for case in ranked_cases[:args.fixed_cap_refit_count]
+            }
+            refit_cases = [
+                case for case in screening_cases if case[0] in selected_labels
+            ]
+            for rank, case in enumerate(ranked_cases, start=1):
+                row = next(
+                    item for item in fixed_cap_screening_rows
+                    if item["case"] == case[0]
+                )
+                row.update({
+                    "screening_rank": rank,
+                    "selected_for_cap_specific_lsmc_refit": (
+                        case[0] in selected_labels
+                    ),
+                    "screening_follower_contract_version": (
+                        COMBINED_FOLLOWER_VERSION
+                    ),
+                    "screening_only_not_final_cap_value": True,
+                })
+            LOGGER.info(
+                "Cap screening selected %d/%d fresh refits | %s",
+                len(refit_cases),
+                len(screening_cases),
+                ", ".join(label for label, _, _ in refit_cases),
+            )
         with _logged_stage(
-            "Fit and evaluate a fresh policyholder LSMC under every fixed cap"
+            "Fit and evaluate fresh policyholder LSMCs for screened caps"
         ):
             (
                 benchmark_rows,
@@ -9367,8 +9720,12 @@ def main() -> None:
                 model_point_log_interval=args.model_point_log_interval,
                 selection_path_count=args.benchmark_paths,
                 follower_settings=follower_settings,
+                cases=refit_cases,
+                workers=args.fixed_cap_workers,
             )
     elif args.policyholder_behaviour == "dynamic":
+        if dynamic_results is None:
+            raise RuntimeError("Dynamic fixed-cap results were not evaluated.")
         (
             benchmark_rows,
             benchmark_path_values,
@@ -9379,6 +9736,8 @@ def main() -> None:
         for row in benchmark_rows:
             row["policyholder_behaviour"] = "dynamic"
     else:
+        if continue_results is None:
+            raise RuntimeError("Continue fixed-cap results were not evaluated.")
         (
             benchmark_rows,
             benchmark_path_values,
@@ -9389,17 +9748,35 @@ def main() -> None:
         for row in benchmark_rows:
             row["policyholder_behaviour"] = "continue"
 
+    if not fixed_cap_screening_rows:
+        fixed_cap_screening_rows.append({
+            "status": "not_applicable",
+            "policyholder_behaviour": args.policyholder_behaviour,
+            "reason": "Cap-randomised LSMC screening is used only in LSMC mode.",
+        })
+
     behaviour_benchmark_rows: list[dict[str, object]] = []
     for mode, result in (
         ("continue", continue_results),
         ("dynamic", dynamic_results),
     ):
+        if result is None:
+            continue
         for source in result[0]:
             row = dict(source)
             row["fixed_cap_base_case"] = source["case"]
             row["case"] = f"{source['case']}__{mode}"
             row["policyholder_behaviour"] = mode
             behaviour_benchmark_rows.append(row)
+    if not behaviour_benchmark_rows:
+        behaviour_benchmark_rows.append({
+            "status": "skipped_by_fast_default",
+            "comparison_benchmarks_enabled": False,
+            "reason": (
+                "Separate Dynamic and always-Continue cap grids are optional "
+                "comparators and do not drive the LSMC cap selection."
+            ),
+        })
 
     best_fixed_row = next(
         row for row in benchmark_rows
@@ -9416,9 +9793,11 @@ def main() -> None:
         float(row["fixed_cap_selection_sample_csm_aud"])
         for row in fixed_1_to_20_rows
     ])
-    best_fixed_1_to_20_row = fixed_1_to_20_rows[
-        int(_lower_cap_argmax(requested_grid_values))
-    ]
+    best_fixed_1_to_20_row = (
+        best_fixed_row
+        if not fixed_1_to_20_rows
+        else fixed_1_to_20_rows[int(_lower_cap_argmax(requested_grid_values))]
+    )
     for row in benchmark_rows:
         row["is_best_fixed_cap_requested_1_to_20_grid"] = (
             row is best_fixed_1_to_20_row
@@ -9915,8 +10294,9 @@ def main() -> None:
             "study under fixed proxy product and behaviour assumptions"
         ),
         "method": (
-            "Stackelberg/bilevel cap study: the same combined-v2 Policyholder "
-            "LSMC for fixed caps and the cap-randomised insurer Fitted-Q policy"
+            "Stackelberg/bilevel cap study: cap-randomised combined-v2 "
+            "Policyholder LSMC screening followed by fresh cap-specific LSMC "
+            "refits for the selected finalists and an insurer Fitted-Q policy"
             if args.policyholder_behaviour == "lsmc"
             else "annual control-randomisation insurer Fitted-Q with "
             f"{args.policyholder_behaviour} comparison behaviour"
@@ -9931,8 +10311,9 @@ def main() -> None:
         ),
         "optimality_scope": (
             "best validated implementable policy within the documented observable "
-            "pre-action market and portfolio-state class, with the best admissible fixed cap as "
-            "a conservative fallback; not a proof of the global control optimum"
+            "pre-action market and portfolio-state class, with the best fresh "
+            "cap-specific refit among the screening finalists as a conservative "
+            "fallback; not a proof of the global control optimum"
         ),
         "objective_direction": "maximize",
         "objective": (
@@ -10052,6 +10433,18 @@ def main() -> None:
         ),
         "best_fixed_cap_admissible_case": best_fixed_row["case"],
         "best_fixed_cap_admissible_percent": best_fixed_row["cap_percent"],
+        "best_fixed_cap_scope": (
+            "fresh cap-specific LSMC fits among screening finalists"
+            if args.policyholder_behaviour == "lsmc"
+            and args.fixed_cap_refit_count > 0
+            else "complete configured fixed-cap benchmark set"
+        ),
+        "best_refitted_cap_at_least_1pct_case": (
+            best_fixed_1_to_20_row["case"]
+        ),
+        "best_refitted_cap_at_least_1pct_percent": (
+            best_fixed_1_to_20_row["cap_percent"]
+        ),
         "best_fixed_cap_requested_1_to_20_case": (
             best_fixed_1_to_20_row["case"]
         ),
@@ -10068,6 +10461,10 @@ def main() -> None:
             - float(best_fixed_1_to_20_row[
                 "estimated_new_business_csm_proxy_aud"
             ])
+        ),
+        "legacy_requested_1_to_20_fields_scope": (
+            "best available fresh refit at or above 1%; under the fast default "
+            "this is not a complete integer 1%-to-20% comparison"
         ),
         "flexible_policy_fixed_fallback_cap_percent": 100.0 * best_fixed_cap,
         "fitted_policy_local_action_advantage_screen_applied": False,
@@ -10179,7 +10576,22 @@ def main() -> None:
             backward.numerical_fallback_reasons
         ),
         "action_caps": ACTION_CAPS.tolist(),
-        "cap_grid_convention": "0.25%, followed by integer 1% caps through 20%",
+        "cap_grid_mode": args.cap_grid,
+        "cap_grid_convention": (
+            "0.25%, 2%, 4%, 6%, 8%, 10%, 12%, 15%, 20%"
+            if args.cap_grid == "fast"
+            else "0.25%, followed by integer 1% caps through 20%"
+        ),
+        "fixed_cap_screening_enabled": bool(
+            args.policyholder_behaviour == "lsmc"
+            and args.fixed_cap_refit_count > 0
+        ),
+        "fixed_cap_screening_case_count": sum(
+            1 for row in fixed_cap_screening_rows if "case" in row
+        ),
+        "fixed_cap_specific_refit_count": len(fixed_lsmc_fit_sets),
+        "fixed_cap_workers": args.fixed_cap_workers,
+        "comparison_benchmarks_enabled": args.comparison_benchmarks,
         "cap_floor_override": None,
         "youngest_covered_age_at_issue": _youngest_covered_age(model_points),
         "market_scenario_horizon_years": horizon_years,
@@ -10463,6 +10875,7 @@ def main() -> None:
                 "policyholder_regression_diagnostics.csv",
                 "policyholder_validation_diagnostics.csv",
                 "policyholder_exercise_by_year_and_cap.csv",
+                "fixed_cap_screening.csv",
                 "fixed_cap_sanity_checks.csv",
                 "fixed_cap_behaviour_benchmarks.csv",
                 "model_point_projection_treatments.csv",
@@ -10472,6 +10885,7 @@ def main() -> None:
         },
         "engine_market_inputs": market.source_metadata(),
         "cost_assumptions": costs.source_metadata(),
+        "equity_allocation": equity_allocation.source_metadata(),
         "dynamic_behaviour_assumptions": loaded_behaviour.source_metadata(),
         "model_points": model_points.source_metadata(),
         "model_point_projection_treatments_file": (
@@ -10649,8 +11063,9 @@ def main() -> None:
             "Markov compression rather than the complete model-point distribution, "
             "so a useful adaptive rule can still be missed.",
             "The deployable combined-v2 follower is fitted separately by economic "
-            "PolicySpec signature both for every fixed cap and across the complete "
-            "randomised cap paths used by the coupled policy. The resulting "
+            "PolicySpec signature across the complete randomised cap paths and "
+            "again for every cap-specific screening finalist. Non-finalist cap "
+            "values are screening diagnostics, not cap-consistent final values. The resulting "
             "Stackelberg solution is a fitted bilevel approximation, not a proof of the global "
             "continuous-state subgame-perfect optimum.",
             "The monthly product rollout retains DVA, fee subledger, mortality, "
@@ -10692,12 +11107,14 @@ def main() -> None:
             "as an inactive grey tail in the policy plot.",
             "Joint-Life survival assumes independent lives and omits divorce, common "
             "mortality shocks and changing spouse eligibility.",
-            "The admissible action and fixed-comparison grid is exactly 0.25%, then "
-            "integer caps from 1% through 20%. Zero crediting and no upper cap are "
-            "non-contractual sanity checks only.",
-            "The best fixed admissible cap is selected on a validation sample "
-            "and reported on a disjoint final sample; deployed-minus-fixed "
-            "differences use common final-evaluation paths.",
+            "The fast default action grid is 0.25%, 2%, 4%, 6%, 8%, 10%, 12%, "
+            "15% and 20%; the full 1%-spaced grid remains explicitly selectable.",
+            "The cap-randomised follower screens the action grid on the validation "
+            "sample. Only the configured finalists receive fresh cap-specific LSMC "
+            "fits, and the best finalist is reported on the disjoint final sample. "
+            "A cap omitted by screening can therefore be better than every finalist.",
+            "Separate Dynamic and always-Continue cap grids are disabled by the "
+            "fast default and remain optional reporting comparators.",
         ],
     }
 
@@ -10724,6 +11141,7 @@ def main() -> None:
             output / "policyholder_exercise_by_year_and_cap.csv",
             policyholder_exercise_rows,
         ),
+        (output / "fixed_cap_screening.csv", fixed_cap_screening_rows),
         (output / "fixed_cap_sanity_checks.csv", benchmark_rows),
         (
             output / "fixed_cap_behaviour_benchmarks.csv",

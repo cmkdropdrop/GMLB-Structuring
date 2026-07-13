@@ -82,6 +82,7 @@ ENV/
 !input_dynamic_behaviour/dynamic_behaviour_baselines.csv
 !input_dynamic_behaviour/dynamic_behaviour_coefficients.csv
 !input_MC_analysis/portfolio_analysis.csv
+!input_equity_allocation/equity_allocation.csv
 *.bib
 
 # Stylesheets and text files

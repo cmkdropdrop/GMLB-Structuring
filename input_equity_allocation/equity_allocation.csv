@@ -1,0 +1,2 @@
+allocation_id,equity_weight,allocation_basis,description
+generic_reference_fund,0.30,product_design_input,Equity share of the monthly rebalanced reference fund; the bond share is derived as one minus the equity share

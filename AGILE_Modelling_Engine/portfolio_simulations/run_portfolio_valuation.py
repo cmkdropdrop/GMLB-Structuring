@@ -55,6 +55,7 @@ from agile_engine import (  # noqa: E402
     __version__ as ENGINE_VERSION,
     load_cost_assumptions,
     load_dynamic_behaviour_assumptions,
+    load_equity_allocation,
     load_market_assumptions,
     load_policyholder_model_points,
     value_policyholder_portfolio,
@@ -1197,9 +1198,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             stress.label,
         )
         logger.info("[2/6] Markt-, Kosten-, Behaviour- und Modellpunktdaten laden")
+        equity_allocation = load_equity_allocation()
+        logger.info(
+            "Aktienallokation | id=%s | equity=%.2f%% | bonds=%.2f%% | %s",
+            equity_allocation.allocation_id,
+            100.0 * equity_allocation.equity_weight,
+            100.0 * equity_allocation.bond_weight,
+            equity_allocation.source_path,
+        )
         market = load_market_assumptions(args.zero_curve, args.model_parameters)
         generic_base_product = IndexLinkedLifetimeIncomeProduct(
             reference_fund=ReferenceFundSpec(
+                equity_weight=equity_allocation.equity_weight,
                 scenario_maximum_return=args.crediting_cap_rate,
             ),
             fees=FeeSpec(lip_waived_in_income_phase_if_aps=False),
@@ -1453,8 +1463,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "complete reference fund; COS is not used.",
             "Dynamic take-up, lapse and withdrawal inputs are uncalibrated "
             "Behaviour proxies rather than a fully calibrated forecast.",
-            "The five-year government-bond sleeve and fixed 50/50 monthly "
-            "rebalancing are product-model proxy conventions.",
+            "The five-year government-bond sleeve and monthly rebalancing to "
+            "the CSV-configured target allocation are product-model proxy "
+            "conventions.",
             "No bond term premium, credit spreads, defaults, FX layer or "
             "transaction costs are modelled. The customer Reference Fund has "
             "no internal charge; the insurer hedge reference carries the "
@@ -1553,6 +1564,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     costs.product.reference_fund.effective_maximum_return
                 ),
                 "reference_fund": {
+                    "allocation_input": equity_allocation.source_metadata(),
                     "specification_vintage": (
                         costs.product.reference_fund.specification_vintage
                     ),
@@ -1673,6 +1685,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "model_points": model_points.source_metadata(),
                 "market": market.source_metadata(),
                 "costs": costs.source_metadata(),
+                "equity_allocation": equity_allocation.source_metadata(),
                 "dynamic_behaviour": {
                     **behaviour_assumptions.source_metadata(),
                     "portfolio_application": {

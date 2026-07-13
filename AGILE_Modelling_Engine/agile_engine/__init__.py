@@ -26,6 +26,12 @@ from .dynamic_behaviour_assumptions import (
     DynamicBehaviourAssumptionSet,
     load_dynamic_behaviour_assumptions,
 )
+from .equity_allocation import (
+    DEFAULT_EQUITY_ALLOCATION_ID,
+    DEFAULT_EQUITY_ALLOCATION_PATH,
+    EquityAllocation,
+    load_equity_allocation,
+)
 from .curves import YieldCurve
 from .esg import (ESGConfig, EquityParams, HestonParams, HullWhiteParams,
                   Measure, ScenarioSet, simulate)
@@ -108,10 +114,12 @@ __all__ = [
     "CapitalResult", "CapitalStresses", "CostAssumptionSet",
     "DEFAULT_AUSTRALIAN_ZERO_CURVE_PATH", "DEFAULT_COST_ASSUMPTIONS_PATH",
     "DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY", "DEFAULT_MARKET_DATA_DIRECTORY",
+    "DEFAULT_EQUITY_ALLOCATION_ID", "DEFAULT_EQUITY_ALLOCATION_PATH",
     "DEFAULT_MODEL_PARAMETERS_PATH", "DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH",
     "DynamicBehaviourAssumptionSet", "DynamicHazardFunction",
     "DynamicLapseParams", "DynamicTakeUpParams", "DynamicWithdrawalParams", "ESGConfig",
-    "EquityParams", "ExpenseAssumptions", "FairFeeSolveResult", "FeeSpec",
+    "EquityAllocation", "EquityParams", "ExpenseAssumptions",
+    "FairFeeSolveResult", "FeeSpec",
     "FIXED_REFERENCE_FUND_CAP", "FundingSource", "GENERIC_GUARANTEED_MIN_CAP",
     "HedgeCapLegMode", "HedgeMarket",
     "HestonParams", "HullWhiteParams", "IncomeRateTable", "IncomeTakeUp",
@@ -165,7 +173,8 @@ __all__ = [
     "greeks", "heston_intra_year_value_factor",
     "heston_package_value", "heston_put_cos", "intra_year_value_factor",
     "load_cost_assumptions", "load_dynamic_behaviour_assumptions",
-    "load_market_assumptions", "load_policyholder_model_points", "project",
+    "load_equity_allocation", "load_market_assumptions",
+    "load_policyholder_model_points", "project",
     "resolve_horizon", "retained_excess_return", "run_sensitivities", "simulate",
     "solve_tabular_stackelberg", "standard_scenarios",
     "value_contract", "value_policyholder_portfolio",

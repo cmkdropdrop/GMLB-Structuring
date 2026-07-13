@@ -2,9 +2,10 @@
 
 The active product is the independent Australian case study documented in
 ``Produktdesign_Index_Linked_Lifetime_Income_Fallbeispiel.md``.  It has one
-monthly rebalanced reference fund (50% global total-return equity and 50%
-rolling five-year Australian-government zero-coupon bonds), Total Protection,
-a fixed 6% annual Maximum Return and Fixed Lifetime Income only.
+monthly rebalanced reference fund (a product-input global total-return-equity
+share and the complementary share in rolling five-year Australian-government
+zero-coupon bonds), Total Protection, a fixed 6% annual Maximum Return and
+Fixed Lifetime Income only.
 
 Some AGILE-era enums and rate-card columns remain as compatibility scaffolding
 for older research callers.  They do not define the active customer's
@@ -102,17 +103,18 @@ GENERIC_GUARANTEED_MIN_CAP = 0.0025
 class ReferenceFundSpec:
     """Contractual reference fund of the generic case-study product.
 
-    The strict validation is intentional.  These are product rules, not
-    market-model parameters or inferred model-point allocations.
+    The equity weight is a product input.  The remaining structural rules are
+    deliberately strict and are not market-model parameters or inferred
+    model-point allocations.
     """
 
     equity_index: Index = Index.GLOBAL_EQUITY
-    equity_weight: float = 0.50
+    equity_weight: float = 0.30
     bond_tenor_years: float = 5.0
     rebalance_frequency_months: int = 1
     maximum_return: float = FIXED_REFERENCE_FUND_CAP
     guaranteed_minimum_cap: float = GENERIC_GUARANTEED_MIN_CAP
-    specification_vintage: str = "generic-case-study-2026-07-12"
+    specification_vintage: str = "generic-case-study-2026-07-13"
     #: Optional non-contractual override for design and sensitivity runs.  The
     #: contractual ``maximum_return`` remains fixed at 6% and is retained in
     #: the assumption fingerprint and run manifest.
@@ -130,8 +132,8 @@ class ReferenceFundSpec:
             raise ValueError("Reference-fund parameters must be finite.")
         if self.equity_index != Index.GLOBAL_EQUITY:
             raise ValueError("The generic reference fund must use Global Equity.")
-        if not np.isclose(self.equity_weight, 0.50, rtol=0.0, atol=1e-12):
-            raise ValueError("The generic reference fund must be 50% equity / 50% bonds.")
+        if not 0.0 <= self.equity_weight <= 1.0:
+            raise ValueError("Reference-fund equity_weight must be in [0, 1].")
         if not np.isclose(self.bond_tenor_years, 5.0, rtol=0.0, atol=1e-12):
             raise ValueError("The generic bond sleeve must have constant five-year tenor.")
         if self.rebalance_frequency_months != 1:
@@ -715,7 +717,7 @@ class PolicySpec:
     commencement_year: float = 2026.5
     initial_investment: float = 100_000.0
     #: Legacy AGILE allocation retained only for input compatibility.  The
-    #: generic product always uses its product-wide 50/50 Reference Fund.
+    #: generic product always uses its product-wide Reference Fund allocation.
     allocation: Mapping[InvestmentOption, float] = field(
         default_factory=lambda: {InvestmentOption.AUS_TP: 1.0})
     #: Deterministic Income-Election benchmark in policy years.  Dynamic and

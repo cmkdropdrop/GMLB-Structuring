@@ -21,7 +21,7 @@ from agile_engine.projection import project
 
 
 def _good_market_scenarios(*, horizon_years: int = 3) -> ScenarioSet:
-    """Deterministic good market where the 50/50 fund return is below 20%."""
+    """Deterministic good market where the 30/70 fund return is below 20%."""
     n_steps = horizon_years * 12
     times = np.arange(n_steps + 1, dtype=float) / 12.0
     curve = YieldCurve.flat(0.04)

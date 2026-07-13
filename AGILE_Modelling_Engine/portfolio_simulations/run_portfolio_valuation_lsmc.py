@@ -9,10 +9,10 @@ evaluation use separate held-out samples.  One or three predeclared training-
 seed triplets may be fitted; every fitted policy must independently pass the
 Election-, Income-action- and Combined-policy gates on the same validation
 paths.  The first seed remains the predeclared primary policy for the canonical
-V00/V01/V10/V11 outputs.  The
-model-point ``income_start_year`` is retained only for explicit
-deterministic validation benchmarks.  A paired dynamic-behaviour benchmark is
-produced on the same final evaluation scenarios by default.
+V00/V01/V10/V11 outputs.  The model-point ``income_start_year`` remains a
+deterministic benchmark and is also one member of the predeclared training
+anchor library.  A paired dynamic-behaviour benchmark is produced on the same
+final evaluation scenarios by default.
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ from agile_engine import (  # noqa: E402
     __version__ as ENGINE_VERSION,
     load_cost_assumptions,
     load_dynamic_behaviour_assumptions,
+    load_equity_allocation,
     load_market_assumptions,
     load_policyholder_model_points,
     value_contract,
@@ -419,7 +420,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def _policy_signature(policy: PolicySpec) -> tuple[object, ...]:
-    """Identify a combined-policy fit without the legacy benchmark start year."""
+    """Identify every input that can change a combined-policy fit or anchor."""
     return (
         float(policy.age),
         policy.sex.value,
@@ -427,6 +428,11 @@ def _policy_signature(policy: PolicySpec) -> tuple[object, ...]:
         float(policy.initial_investment),
         policy.income_type.value,
         bool(policy.spouse),
+        (
+            None
+            if policy.income_start_year is None
+            else float(policy.income_start_year)
+        ),
         None if policy.spouse_age is None else float(policy.spouse_age),
         None if policy.spouse_sex is None else policy.spouse_sex.value,
         policy.spouse_death_election.value,
@@ -934,9 +940,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             stress.stress_id,
             stress.label,
         )
+        equity_allocation = load_equity_allocation()
+        logger.info(
+            "Aktienallokation | id=%s | equity=%.2f%% | bonds=%.2f%% | %s",
+            equity_allocation.allocation_id,
+            100.0 * equity_allocation.equity_weight,
+            100.0 * equity_allocation.bond_weight,
+            equity_allocation.source_path,
+        )
         market = load_market_assumptions(args.zero_curve, args.model_parameters)
         generic_base_product = IndexLinkedLifetimeIncomeProduct(
             reference_fund=ReferenceFundSpec(
+                equity_weight=equity_allocation.equity_weight,
                 scenario_maximum_return=args.crediting_cap_rate),
             fees=FeeSpec(lip_waived_in_income_phase_if_aps=False),
             dividend_yield={
@@ -1631,6 +1646,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             key=lambda item: str(item[0]),
                         )
                     },
+                    "selected_training_anchors": {
+                        repr(key): {
+                            "fixed_election_step": (
+                                fit.selected_fixed_election_step
+                            ),
+                            "fixed_election_year": (
+                                None
+                                if fit.selected_fixed_election_step is None
+                                else fit.selected_fixed_election_step / 12.0
+                            ),
+                            "income_action_mode": (
+                                fit.selected_income_action_mode
+                            ),
+                        }
+                        for key, fit in sorted(
+                            fits_by_seed[index].items(),
+                            key=lambda item: str(item[0]),
+                        )
+                    },
                 }
                 for index, result in enumerate(validation_results_by_seed)
             ],
@@ -2031,6 +2065,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "lsmc_surrender_fallback_policy_count": sum(
                 fit.surrender_fallback_used for fit in fits.values()
             ),
+            "lsmc_fixed_election_anchor_policy_count": sum(
+                fit.selected_fixed_election_step is not None
+                for fit in fits.values()
+            ),
             "lsmc_action_set": (
                 "growth:wait|start_income_now;"
                 + (
@@ -2039,7 +2077,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     else "income:continue|full_withdrawal"
                 )
             ),
-            "lsmc_income_election": "pathwise_optimal_bellman_policy",
+            "lsmc_income_election": (
+                "pathwise_optimal_bellman_policy_with_predeclared_"
+                "fixed_strategy_training_anchor"
+            ),
             "income_take_up_mode": "optimal_lsmc",
             "income_take_up_source": "frozen_combined_lsmc_policy",
             "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
@@ -2333,6 +2374,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "training_fallback_used": fit.training_fallback_used,
                         "election_fallback_used": fit.election_fallback_used,
                         "surrender_fallback_used": fit.surrender_fallback_used,
+                        "selected_fixed_election_step": (
+                            fit.selected_fixed_election_step
+                        ),
+                        "selected_fixed_election_year": (
+                            None
+                            if fit.selected_fixed_election_step is None
+                            else fit.selected_fixed_election_step / 12.0
+                        ),
+                        "selected_income_action_mode": (
+                            fit.selected_income_action_mode
+                        ),
                         "fit_valid": fit.valid,
                         "fit_invalid_reasons": "|".join(fit.invalid_reasons),
                         "income_action_exposure_coverage": (
@@ -2374,6 +2426,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "training_fallback_used": fit.training_fallback_used,
                     "election_fallback_used": fit.election_fallback_used,
                     "surrender_fallback_used": fit.surrender_fallback_used,
+                    "selected_fixed_election_step": (
+                        fit.selected_fixed_election_step
+                    ),
+                    "selected_fixed_election_year": (
+                        None
+                        if fit.selected_fixed_election_step is None
+                        else fit.selected_fixed_election_step / 12.0
+                    ),
+                    "selected_income_action_mode": (
+                        fit.selected_income_action_mode
+                    ),
                     "fit_valid": fit.valid,
                     "fit_invalid_reasons": "|".join(fit.invalid_reasons),
                     "income_action_exposure_coverage": (
@@ -2775,7 +2838,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "crediting_cap",
                     "stress_audit",
                     "product",
-                    "policy_with_legacy_benchmark_start_canonicalised",
+                    "policy_including_predeclared_benchmark_start",
                     "mortality",
                     "expenses",
                     "projection_config",
@@ -2803,8 +2866,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "fallback_to_no_action_if_training_underperforms": (
                     lsmc_settings.fallback_to_no_action_if_training_underperforms),
                 "fallback_semantics": (
-                    "compatibility_flag_invalidates_fit;no_material_wait_or_"
-                    "continue_policy_is_deployed"
+                    "training_only_paired_95pct_lower_bound_against_"
+                    "predeclared_fixed_election_and_continue_strategies"
                 ),
                 "material_fit_failure_policy": "hard_abort_after_diagnostics",
                 "unique_policy_fits": len(fits),
@@ -2835,6 +2898,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     fit.election_fallback_used for fit in fits.values()),
                 "surrender_fallback_policy_count": sum(
                     fit.surrender_fallback_used for fit in fits.values()),
+                "fixed_election_anchor_policy_count": sum(
+                    fit.selected_fixed_election_step is not None
+                    for fit in fits.values()
+                ),
+                "selected_training_anchors": {
+                    repr(key): {
+                        "fixed_election_step": fit.selected_fixed_election_step,
+                        "fixed_election_year": (
+                            None
+                            if fit.selected_fixed_election_step is None
+                            else fit.selected_fixed_election_step / 12.0
+                        ),
+                        "income_action_mode": fit.selected_income_action_mode,
+                    }
+                    for key, fit in sorted(
+                        fits.items(), key=lambda item: str(item[0])
+                    )
+                },
                 "accepted_election_regression_count": (
                     accepted_election_regression_count
                 ),
@@ -3044,6 +3125,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "model_points": model_points.source_metadata(),
                 "market": market.source_metadata(),
                 "costs": costs.source_metadata(),
+                "equity_allocation": equity_allocation.source_metadata(),
                 "dynamic_behaviour_benchmark_only": (
                     None
                     if behaviour_assumptions is None
@@ -3062,7 +3144,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "Continue or Full Withdrawal (contract-terminating lapse); "
                     "Partial Withdrawal is excluded."
                 ),
-                "The five-year government-bond sleeve, monthly 50/50 rebalancing, "
+                "The five-year government-bond sleeve, monthly rebalancing to "
+                "the CSV-configured target allocation, "
                 "absence of bond term premium and other fixed proxy assumptions "
                 "remain unchanged from the dynamic benchmark.",
                 (

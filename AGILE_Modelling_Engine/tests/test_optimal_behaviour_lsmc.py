@@ -512,6 +512,15 @@ def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issu
     assert fit.policy_iteration_count <= 2
     assert fit.income_action_exposure_coverage >= 0.99
     assert fit.valid, fit.invalid_reasons
+    assert fit.selected_income_action_mode in {"lsmc", "continue"}
+    if fit.selected_fixed_election_step is not None:
+        assert not fit.policy.election_regressions
+        assert (
+            fit.policy.fixed_election_step
+            == fit.selected_fixed_election_step
+        )
+    if fit.selected_income_action_mode == "continue":
+        assert not fit.policy.income_action_regressions
 
     rollout = project(
         product,
@@ -533,6 +542,41 @@ def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issu
         & (rollout.lapse_events > 0.0)
     )
     assert np.isfinite(list(rollout.pv_by_component().values())).all()
+
+
+def test_fixed_training_anchor_is_a_valid_frozen_election_policy():
+    _, scenarios = _setup(n_paths=48, seed=3301, horizon=3.0)
+    product = IndexLinkedLifetimeIncomeProduct(
+        automatic_income_start_age=67.0
+    )
+    policy_spec = PolicySpec(age=65, income_start_year=2)
+    settings = OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=19)
+    policy = OptimalBehaviourPolicy(
+        election_regressions={},
+        surrender_policy=OptimalSurrenderPolicy(
+            regressions={}, settings=settings
+        ),
+        premium=policy_spec.net_initial_investment,
+        issue_age=policy_spec.age,
+        settings=settings,
+        fixed_election_step=12,
+        income_action_regressions={},
+        monthly_income_actions_required=False,
+    )
+
+    rollout = project(
+        product,
+        policy_spec,
+        scenarios,
+        no_voluntary_action_behaviour(),
+        MortalityTable.gompertz_makeham(),
+        config=ProjectionConfig(record_paths=False, max_age=68.0),
+        income_election_policy=policy,
+        income_action_policy=policy,
+    )
+
+    assert np.all(rollout.income_election_events[:, :12] == 0.0)
+    assert np.all(rollout.income_election_events[:, 12] > 0.0)
 
 
 def test_combined_fit_identity_changes_for_each_cap_and_stress_basis():

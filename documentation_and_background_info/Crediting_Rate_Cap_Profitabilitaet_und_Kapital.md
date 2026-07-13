@@ -14,7 +14,7 @@ competition and sales volumes are outside scope.
 
 ## 2. Product mechanics
 
-- The Reference Fund is 50% Global Equity and 50% nominal Australian
+- The Reference Fund is 30% Global Equity and 70% nominal Australian
   government bonds, rebalanced monthly.
 - The full fund return is calculated before Total Protection and the Cap are
   applied.
@@ -149,7 +149,7 @@ Crediting Years. Any changing Cap schedule is a separately identified product
 or sensitivity, not an automatic management action.
 
 The repository capital model is an AGILE-specific research proxy, not an
-APRA/LAGIC fund-level calculation for the new 50/50 product. It does not fully
+APRA/LAGIC fund-level calculation for the new 30/70 product. It does not fully
 represent actual assets, derivatives or residual hedge risks, and its capital
 run-off is not a full annual stress revaluation.
 

@@ -45,6 +45,12 @@ der nummerierten LSMC-Trainings-Seed-Sätze tatsächlich aktiv sind, bestimmt da
 aufrufende Skript und nicht die CSV. Explizite Kommandozeilenwerte für
 Pfadanzahlen oder Seeds bleiben als Overrides verfügbar.
 
+Die Aktienquote des Reference Fund wird aus
+`../../input_equity_allocation/equity_allocation.csv` gelesen. Der Bondanteil
+wird immer als `1 - equity_weight` abgeleitet. Der mitgelieferte Basiswert ist
+30 % Aktien / 70 % Bonds; die Allokation ist eine Produkteingabe und kein
+kalibrierter Marktparameter.
+
 ## Crediting-Rate-Szenarien
 
 `run_crediting_rate_scenarios.py` ruft den Portfolio-Runner für mehrere
@@ -107,7 +113,7 @@ New-Business-Zustand: Growth-Phase, Fixed Income, kein bereits initiiertes
 Withdrawal und kein Locked Income. Premium, Initial Investment und Account
 Value bei `t=0` müssen konsistent sein. Alte AGILE-Allokationsfelder sowie
 Produkt-, PDS- und Cap-Metadaten werden nur auf Quellenintegrität geprüft; sie
-steuern weder den generischen 50/50-Reference-Fund noch dessen festen 6%-Cap.
+steuern weder die zentrale Reference-Fund-Allokation noch dessen festen 6%-Cap.
 
 ## Einzelbewertung und Portfolioaggregation
 
@@ -349,7 +355,8 @@ spätestens am ersten zulässigen Anniversary nach Erreichen des Alters 100.
 `income_start_year` des Modellpunkts ist deshalb im Dynamic-Hauptlauf kein
 realisierter Starttermin mehr. Es bleibt als rückwärtskompatibler Produktinput
 für `--income-election-mode deterministic` und für die expliziten
-2×2-Validierungsbenchmarks erhalten. Die Behaviour-CSVs sind die Parameterquelle
+2×2-Validierungsbenchmarks sowie als vorab deklarierter Kandidat der
+LSMC-Trainings-Untergrenze erhalten. Die Behaviour-CSVs sind die Parameterquelle
 für Dynamic Take-up sowie Ordinary-/Performance-Lapse und Withdrawals; es wird
 keine zusätzliche physische Kalibrierung eingeführt.
 
@@ -672,6 +679,9 @@ ungültiger Fit oder eine negative unabhängige Policyholder-Validation bricht
 den Lauf hart ab; er wird nicht still als `WAIT` oder `CONTINUE` ausgeliefert.
 Numerisch ausgelassene immaterielle Zustände bleiben die einzige interne
 No-Action-Konvention und werden in den Diagnosen ausgewiesen.
+Vor dem Einfrieren wird eine statistisch nicht robuste dynamische Policy jedoch
+explizit auf den besten vorab deklarierten festen Trainingsanker zurückgesetzt;
+gewählter Starttermin und Income-Modus werden in CSV und Manifest protokolliert.
 
 Im LSMC-Modus ersetzt die kombinierte v2-Policy die statistischen
 Ordinary-/Performance-Lapses und planmäßigen freiwilligen Withdrawals; sie
@@ -700,9 +710,11 @@ Einstieg und delegiert bei direkter Ausfuehrung an diesen kanonischen Runner.
 
 - Der Maximum Return ist als Produkteigenschaft fest auf 6 % gesetzt und kein
   aus einer Volatilitätsfläche kalibrierter Marktparameter.
-- Der Reference Fund besteht aus 50 % Global Equity und 50 % nominalen
-  australischen Staatsanleihen. Der Bond-Sleeve rolliert monatlich auf fünf
-  Jahre konstante Restlaufzeit; monatlich wird auf 50/50 rebalanciert.
+- Die Global-Equity-Quote des Reference Fund kommt aus
+  `../../input_equity_allocation/equity_allocation.csv`; der Bondanteil ist ihr
+  Komplement. Der Bond-Sleeve rolliert monatlich auf fünf Jahre konstante
+  Restlaufzeit; monatlich wird auf die konfigurierte Zielallokation
+  rebalanciert.
 - Der unterjährige DVA ist ein moment-matched Black-Scholes-Proxy auf den
   vollständigen Reference Fund. Cap und Floor werden nicht getrennt auf Equity-
   und Bond-Sleeve angewandt.

@@ -61,14 +61,14 @@ In diesem Dokument gelten folgende Begriffe:
 | Income | ausschließlich Fixed Lifetime Income |
 | Zahlungsweise | monatlich nachschüssig; erste Rate einen Monat nach Income Election |
 | Investment Exposure | ein einziger fester Reference Fund |
-| Reference Fund | 50 % Global Equity und 50 % nominale australische Staatsanleihen |
-| Rebalancing | monatlich auf 50/50 zurückgesetzt |
+| Reference Fund | 30 % Global Equity und 70 % nominale australische Staatsanleihen |
+| Rebalancing | monatlich auf 30/70 zurückgesetzt |
 | Bond-Sleeve | monatlich rollierendes Portfolio mit konstanter Restlaufzeit von fünf Jahren |
 | Schutz | ausschließlich Total Protection auf den vollständigen Reference-Fund-Return |
 | Maximum Return | für die vorliegende Modellimplementierung konstant 6,00 % p. a. |
 | Guaranteed Minimum Cap | 0,25 % p. a.; Untergrenze des künftig gesetzten Caps, keine Mindestjahresrendite |
 | Alternativer Fixed-Return-Zweig | nicht vorgesehen |
-| Wechsel der Investmentoption | nicht zulässig; der 50/50-Reference-Fund bleibt auch in der Income Phase maßgeblich |
+| Wechsel der Investmentoption | nicht zulässig; der 30/70-Reference-Fund bleibt auch in der Income Phase maßgeblich |
 | Withdrawals in Growth | nicht zulässig, einschließlich Partial, Excess und Full Withdrawal |
 | Withdrawals in Income | Partial/Excess und Full Withdrawal nach den Regeln in Abschnitt 10 |
 | Todesfallleistung | positives AV ohne MVA; bei Spouse Income alternativ Einkommensfortzahlung |
@@ -76,7 +76,7 @@ In diesem Dokument gelten folgende Begriffe:
 | Adviser Service Fee | im Fallprodukt weder upfront noch laufend angeboten |
 | Pension+-Option | nicht angeboten |
 
-Der numerische Cap des neuen 50/50-Reference-Funds darf nicht aus einem Cap
+Der numerische Cap des neuen 30/70-Reference-Funds darf nicht aus einem Cap
 für eine reine Aktienoption übernommen werden. Für die vorliegende
 Modellimplementierung ist er als eigenständige Produkteigenschaft konstant auf
 6,00 % p. a. festgelegt. Eine spätere variable Cap Schedule oder faire
@@ -111,7 +111,7 @@ Die Zustände sind:
   vollständig zum Guarantee Claim.
 
 Der Wechsel von Growth zu Income ist endgültig. Ein Wechsel zurück in Growth,
-ein Wechsel des Reference Funds oder eine Änderung des 50/50-Exposures ist
+ein Wechsel des Reference Funds oder eine Änderung des 30/70-Exposures ist
 nicht möglich.
 
 # 4. Reference Fund
@@ -171,7 +171,7 @@ Mit einem normierten Fondsindex \(F_0=1\) gilt
 F_m=F_{m-1}(1+R^F_m).
 \]
 
-Am Ende jedes Monats wird auf 50 % Global Equity und 50 % Australian Bonds
+Am Ende jedes Monats wird auf 30 % Global Equity und 70 % Australian Bonds
 zurückgesetzt. Die Gewichte driften daher innerhalb des Monats, werden aber
 nicht kontinuierlich gehalten. Transaktionskosten und taktische
 Allokationsentscheidungen werden nicht angesetzt.
@@ -330,7 +330,7 @@ als separaten Hedge-Gewinn. Kundengutschrift, AV und Claims bleiben in beiden
 Modi identisch.
 
 Der verwendete faire Paketwert ist mangels ausführbarer Preisfläche ein
-Moment-Matching-/Black-Scholes-Proxy auf den vollständigen 50/50-Reference-
+Moment-Matching-/Black-Scholes-Proxy auf den vollständigen 30/70-Reference-
 Fund und keine exakte Heston-Hull-White-Bewertung oder Marktquote.
 
 # 6. Account Value, Fee-Subledger und Ereignisreihenfolge
@@ -1459,7 +1459,7 @@ folgende Anpassungen erforderlich:
 
 1. Einführung eines Australian-Government-Bond-Sleeves mit monatlichem
    Fünfjahres-Rolling;
-2. Bildung des vollständigen 50/50-Fund-Returns vor Anwendung von Floor und
+2. Bildung des vollständigen 30/70-Fund-Returns vor Anwendung von Floor und
    Cap;
 3. Fortführung desselben Reference Funds in Growth und Income ohne
    automatischen Optionswechsel;

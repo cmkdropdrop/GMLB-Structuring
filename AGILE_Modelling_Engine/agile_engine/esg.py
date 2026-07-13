@@ -403,7 +403,7 @@ class ScenarioSet:
 
     def monthly_rebalanced_reference_fund_index(
             self, equity_index: Index = Index.GLOBAL_EQUITY,
-            equity_weight: float = 0.50, bond_tenor: float = 5.0) -> Array:
+            equity_weight: float = 0.30, bond_tenor: float = 5.0) -> Array:
         """Index of the generic monthly rebalanced equity/bond reference fund."""
         equity_index = Index(equity_index)
         if not np.isfinite(equity_weight) or not 0.0 <= equity_weight <= 1.0:
@@ -433,7 +433,7 @@ class ScenarioSet:
     def reference_fund_effective_vol(
             self, step: int, horizon: float = 1.0,
             equity_index: Index = Index.GLOBAL_EQUITY,
-            equity_weight: float = 0.50, bond_tenor: float = 5.0) -> Array:
+            equity_weight: float = 0.30, bond_tenor: float = 5.0) -> Array:
         """Moment-matched option volatility for the complete reference fund.
 
         The fund's rolling-bond diffusion is combined with the zero-bond

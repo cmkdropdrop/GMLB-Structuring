@@ -8,9 +8,11 @@ whose combined Policyholder policy uses the same
 Growth ``WAIT``/``START_INCOME_NOW`` and monthly Income
 ``CONTINUE``/``PARTIAL_WITHDRAWAL``/``FULL_WITHDRAWAL`` actions.
 
-The delegated optimiser still reports separately labelled Dynamic and
-always-Continue benchmarks, but they cannot be selected as the customer
-behaviour used by this entry point.
+The delegated optimiser uses its fast defaults: one proxy model point, a coarse
+cap grid, three fresh cap-specific finalist fits, and no separate Dynamic or
+always-Continue comparison grids.  The comparison grids remain explicitly
+available, but they cannot be selected as the customer behaviour used by this
+entry point.
 """
 
 from __future__ import annotations

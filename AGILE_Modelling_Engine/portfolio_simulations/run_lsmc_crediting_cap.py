@@ -324,7 +324,7 @@ class AnnualMarket:
     """Jahresweise Marktgroessen; alle Arrays (n_paths, ...) auf Jahrestagen.
 
     ``fund_return[:, n]`` ist der Point-to-Point-Return des kompletten
-    50/50-Referenzfonds ueber Policenjahr n, ``disc`` der pfadweise
+    30/70-Referenzfonds ueber Policenjahr n, ``disc`` der pfadweise
     Diskontfaktor D(0, n) an den Jahrestagen, ``grow_cash[:, n] = D_n/D_{n+1}``
     die realisierte Geldmarkt-Bruttoverzinsung des Jahres n.
     """

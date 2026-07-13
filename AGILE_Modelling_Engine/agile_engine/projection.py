@@ -15,7 +15,8 @@ surrender and every Growth withdrawal are structurally prohibited.
 Monthly event order (documented convention)
 -------------------------------------------
 1. Global-Equity and rolling five-year AUD-government-bond evolution, followed
-   by monthly 50/50 rebalancing of the complete Reference Fund,
+   by monthly rebalancing of the complete Reference Fund to its configured
+   equity/bond target allocation,
 2. Anniversary only: Total-Protection credit with the fixed 6% cap applied
    once to the complete annual Reference-Fund return,
 3. ACT/365F Product-Fee/LIP accrual; posting at an Anniversary and immediately

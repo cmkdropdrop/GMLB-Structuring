@@ -46,18 +46,19 @@ cap; `--hedge-cap-leg-mode not_sold` keeps that leg and reports the excess
 payoff as a separate hedge gain. Neither backing nor hedge cashflows alter
 customer Account Value, credited return or Guarantee Claims.
 
-- 50% Global Equity, treated as an AUD-denominated or AUD-hedged total-return
-  index;
-- 50% nominal Australian-government bonds, represented by a monthly rolling
-  five-year zero-coupon-bond sleeve;
-- monthly rebalancing back to 50/50;
+- a Global-Equity share read from
+  `../input_equity_allocation/equity_allocation.csv` (30% in the shipped base
+  case), treated as an AUD-denominated or AUD-hedged total-return index;
+- the complementary share in nominal Australian-government bonds, represented
+  by a monthly rolling five-year zero-coupon-bond sleeve;
+- monthly rebalancing back to the CSV-configured target allocation;
 - no credit spread, default, rating migration, inflation-linked bond, FX,
   transaction-cost or tactical-allocation model.
 
 For month `m`, the engine first forms the complete simple fund return
 
 ```text
-R_fund,m = 0.50 * R_global,m + 0.50 * R_bond,m
+R_fund,m = w_equity * R_global,m + (1 - w_equity) * R_bond,m
 ```
 
 and compounds these monthly returns into the Reference Fund index. At the
@@ -101,6 +102,7 @@ credit-spread curve or physical calibration file is requested.
 | --- | --- | --- |
 | Australian zero curve | `input_market_data/australian_zero_curve.csv` | initial curve, discounting and Hull-White fit |
 | Market-model parameters | `input_market_data/model_parameters.csv` | equity, Heston, Hull-White and correlations |
+| Equity allocation | `../input_equity_allocation/equity_allocation.csv` | product-level Global-Equity share; the bond share is derived as its complement |
 | Cost assumptions | `../input_cost_assumptions/cost_assumptions.csv` | customer fees, expenses, MVA, hedge, capital and shareholder assumptions according to each row's status |
 | Dynamic behaviour | `../input_dynamic_behaviour/dynamic_behaviour_baselines.csv` and `dynamic_behaviour_coefficients.csv` | versioned behavioural proxies |
 | Policyholder model points | `../input_model_points_policyholders/model_points_policyholders_4_point_proxy.csv` | default four-point proxy for portfolio demographics, premiums, weights and elections; the 48-point file remains an explicit full-grid alternative |
@@ -304,7 +306,8 @@ market-consistent values, as applicable. Material boundaries include:
   `uncalibrated_proxy`; contractual eligibility overrides them, so they cannot
   create Growth lapse or Growth withdrawals. Dynamic Take-up is evaluated
   only from current-Anniversary state. The model-point `income_start_year` is
-  retained only for the explicit deterministic validation benchmark;
+  an explicit deterministic validation benchmark and a pre-declared candidate
+  in the LSMC training-anchor library; it does not constrain dynamic Election;
 - state-dependent Joint-Life runs carry separate pathwise Primary/Spouse life
   statuses. Election and post-Election behaviour therefore act on the actual
   `p11`, `p10` or `p01` path state rather than on a nonlinear function of an

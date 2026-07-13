@@ -2,8 +2,9 @@
 
 This module is intentionally separate from the archived legacy implementation
 in :mod:`agile_engine.lsmc`.  Training cashflows and the final out-of-sample
-rollout both use the current monthly projector, including the generic 50/50
-Reference Fund, daily fee subledger, monthly income, mortality, MVA, expenses,
+rollout both use the current monthly projector, including the configured
+Reference-Fund target allocation, daily fee subledger, monthly income,
+mortality, MVA, expenses,
 hedge costs and crediting margin.
 
 The primary API solves ``WAIT | START_INCOME_NOW`` in Growth and
@@ -2159,6 +2160,7 @@ class OptimalBehaviourPolicy:
     issue_age: float
     settings: OptimalBehaviourLSMCSettings
     automatic_income_start_age: float = 100.0
+    fixed_election_step: Optional[int] = None
     income_action_regressions: Mapping[
         int, IncomeActionRegressionSet
     ] = field(default_factory=dict)
@@ -2196,7 +2198,11 @@ class OptimalBehaviourPolicy:
         voluntary_eligible &= ~forced
         action = np.zeros(context.n_paths, dtype=bool)
         regression = self.election_regressions.get(step)
-        if regression is not None and regression.stable(self.settings) \
+        if self.fixed_election_step is not None:
+            action = voluntary_eligible & (
+                step >= int(self.fixed_election_step)
+            )
+        elif regression is not None and regression.stable(self.settings) \
                 and np.any(voluntary_eligible):
             advantage = regression.predict(
                 context,
@@ -2463,6 +2469,7 @@ class CrossFittedOptimalBehaviourPolicy:
     issue_age: float
     settings: OptimalBehaviourLSMCSettings
     automatic_income_start_age: float = 100.0
+    fixed_election_step: Optional[int] = None
     income_action_regressions_by_step: Mapping[
         int, _CrossFittedIncomeActionRegressionSet
     ] = field(default_factory=dict)
@@ -2486,6 +2493,14 @@ class CrossFittedOptimalBehaviourPolicy:
                 + ",".join(self.invalid_reasons)
             )
         step = int(context.step)
+        if self.fixed_election_step is not None:
+            eligible = (
+                context.voluntary_election_eligible
+                & ~np.asarray(context.forced_election, dtype=bool)
+                & (context.phase == Phase.GROWTH.value)
+                & (context.inforce_weight > self.settings.minimum_inforce_weight)
+            )
+            return eligible & (step >= int(self.fixed_election_step))
         pairs = self.election_regressions_by_step.get(step)
         if pairs is None:
             eligible = (
@@ -2858,6 +2873,8 @@ class OptimalBehaviourPolicyFit:
     training_candidate_policyholder_value_aud: float
     election_fallback_used: bool
     surrender_fallback_used: bool
+    selected_fixed_election_step: Optional[int]
+    selected_income_action_mode: str
     valid: bool = True
     invalid_reasons: tuple[str, ...] = ()
     fit_version: str = "combined_optimal_behaviour_lsmc_v3"
@@ -5341,6 +5358,7 @@ def fit_optimal_behaviour_policy(
     # resulting complete cross-fitted policy once through the canonical
     # projector before applying either training lower-bound gate.  This keeps
     # the speed-up while removing regression-value bias from policy selection.
+    candidate_path_value = bellman_candidate_path_value
     candidate_value = bellman_candidate_value
     if not material_election_failures and income_action_fit.valid:
         validation_policy = CrossFittedOptimalBehaviourPolicy(
@@ -5376,36 +5394,153 @@ def fit_optimal_behaviour_policy(
             income_election_policy=validation_policy,
             income_action_policy=validation_policy,
         )
-        candidate_value = float(np.mean(np.sum(
+        candidate_path_value = np.sum(
             _discounted_policyholder_cashflows(
                 validation_projection, training_scenarios
             ),
             axis=1,
-        )))
+        )
+        candidate_value = float(np.mean(candidate_path_value))
 
-    election_fallback = bool(
-        settings.fallback_to_no_action_if_training_underperforms
-        and candidate_value < wait_value
-    )
-    surrender_fallback = bool(
-        income_action_fit.fallback_used or not income_action_fit.valid
-    )
-    # A final cross-fitted lower-bound gate protects against an adverse
-    # interaction between the separately solved absorbing phase and Growth
-    # policy.  Evaluation paths are never inspected for this choice.
-    combined_underperformed = bool(
-        settings.fallback_to_no_action_if_training_underperforms
-        and candidate_value < no_action_value
-    )
-    if combined_underperformed:
-        election_fallback = True
-        surrender_fallback = True
+    # Validation compares the frozen policy with a pre-declared library of
+    # fixed Election dates, not merely with WAIT until contractual force.  Use
+    # the same library here, on training paths only, so the training fallback
+    # and the independent validation gate have coherent lower bounds.  The
+    # optional LSMC Income rule is retained at a fixed Election date only when
+    # its paired 95% lower confidence bound exceeds the fixed candidate by one
+    # basis point of premium.  The fully dynamic policy must clear the same
+    # conservative threshold over the best fixed training anchor before it is
+    # deployed.  The final evaluation sample is never used for either
+    # selection.
+    def paired_lower_confidence_bound(
+        selected: Array,
+        benchmark: Array,
+    ) -> float:
+        difference = np.asarray(selected, dtype=float) - np.asarray(
+            benchmark, dtype=float
+        )
+        if difference.shape != (n_paths,):
+            raise ValueError("Training lower-bound paths must match scenarios.")
+        standard_error = float(
+            np.std(difference, ddof=1) / np.sqrt(float(difference.size))
+        )
+        return float(np.mean(difference) - 1.96 * standard_error)
 
+    def fixed_step(year: int) -> int:
+        return min(
+            forced_step,
+            max(minimum_step, int(year) * STEPS_PER_YEAR),
+        )
+
+    fixed_election_steps = tuple(dict.fromkeys((
+        minimum_step,
+        fixed_step(5),
+        fixed_step(10),
+        fixed_step(policy.effective_income_start_year(product)),
+        forced_step,
+    )))
+    no_action_path_value = np.sum(
+        _discounted_policyholder_cashflows(
+            no_action_projection, training_scenarios
+        ),
+        axis=1,
+    )
+    fixed_training_candidates: list[
+        tuple[float, int, str, Array]
+    ] = []
+    training_selection_margin = premium / 10_000.0
+    for anchor_step in fixed_election_steps:
+        if anchor_step == forced_step:
+            continue_projection = no_action_projection
+        else:
+            continue_projection, _ = _project_fixed_election_branch(
+                start_step=anchor_step,
+                product=product,
+                policy=policy,
+                scenarios=training_scenarios,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=expenses,
+                config=config,
+                income_action_policy=None,
+            )
+        continue_path_value = (
+            no_action_path_value
+            if anchor_step == forced_step
+            else np.sum(
+                _discounted_policyholder_cashflows(
+                    continue_projection, training_scenarios
+                ),
+                axis=1,
+            )
+        )
+        anchor_mode = "continue"
+        anchor_path_value = continue_path_value
+        if income_action_fit.valid and not income_action_fit.fallback_used:
+            anchor_income_policy = _CrossFittedIncomeActionPolicy(
+                regressions_by_step=(
+                    income_action_fit.cross_fitted_regressions_by_step
+                ),
+                premium=premium,
+                settings=settings,
+            )
+            income_projection, _ = _project_fixed_election_branch(
+                start_step=anchor_step,
+                product=product,
+                policy=policy,
+                scenarios=training_scenarios,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=expenses,
+                config=config,
+                income_action_policy=anchor_income_policy,
+            )
+            income_path_value = np.sum(
+                _discounted_policyholder_cashflows(
+                    income_projection, training_scenarios
+                ),
+                axis=1,
+            )
+            if paired_lower_confidence_bound(
+                income_path_value, continue_path_value
+            ) >= training_selection_margin:
+                anchor_mode = "lsmc"
+                anchor_path_value = income_path_value
+        fixed_training_candidates.append((
+            float(np.mean(anchor_path_value)),
+            int(anchor_step),
+            anchor_mode,
+            np.asarray(anchor_path_value, dtype=float),
+        ))
+
+    (
+        best_fixed_value,
+        best_fixed_step,
+        best_fixed_income_mode,
+        best_fixed_path_value,
+    ) = max(fixed_training_candidates, key=lambda item: item[0])
+    selected_fixed_election_step: Optional[int] = None
+    selected_income_action_mode = (
+        "continue"
+        if income_action_fit.fallback_used or not income_action_fit.valid
+        else "lsmc"
+    )
     selected_value = candidate_value
-    if election_fallback:
-        selected_value = wait_value
-    if combined_underperformed:
-        selected_value = no_action_value
+    dynamic_fit_complete = bool(
+        not material_election_failures and income_action_fit.valid
+    )
+    if settings.fallback_to_no_action_if_training_underperforms and (
+        not dynamic_fit_complete
+        or paired_lower_confidence_bound(
+            candidate_path_value, best_fixed_path_value
+        ) < training_selection_margin
+    ):
+        selected_fixed_election_step = int(best_fixed_step)
+        selected_income_action_mode = best_fixed_income_mode
+        selected_value = float(best_fixed_value)
+
+    election_fallback = selected_fixed_election_step is not None
+    surrender_fallback = selected_income_action_mode == "continue"
 
     selected_election_regressions = (
         MappingProxyType({})
@@ -5449,6 +5584,7 @@ def fit_optimal_behaviour_policy(
         issue_age=float(policy.age),
         settings=settings,
         automatic_income_start_age=float(product.automatic_income_start_age),
+        fixed_election_step=selected_fixed_election_step,
         income_action_regressions=selected_income_regressions,
         monthly_income_actions_required=not surrender_fallback,
         valid=not invalid_reasons,
@@ -5462,19 +5598,16 @@ def fit_optimal_behaviour_policy(
         issue_age=float(policy.age),
         settings=settings,
         automatic_income_start_age=float(product.automatic_income_start_age),
+        fixed_election_step=selected_fixed_election_step,
         income_action_regressions_by_step=selected_cross_income_regressions,
         monthly_income_actions_required=not surrender_fallback,
         valid=not invalid_reasons,
         invalid_reasons=invalid_reasons,
     )
-    # ``income_start_year`` is deliberately absent from the optimal policy's
-    # state transition and is retained on PolicySpec only for deterministic
-    # validation runs.  Canonicalise that legacy field so equivalent optimal
-    # policies share one honest fit-basis identity.
-    optimal_policy_basis = replace(
-        policy,
-        income_start_year=float(product.min_years_before_income),
-    )
+    # ``income_start_year`` does not constrain the dynamic state transition,
+    # but it is one member of the predeclared fixed training-anchor library.
+    # It must therefore remain in the fit basis and cache identity.
+    optimal_policy_basis = policy
     fit_basis_fingerprint = assumption_fingerprint(
         "combined_optimal_behaviour_lsmc_v3",
         training_scenarios.content_fingerprint,
@@ -5520,6 +5653,8 @@ def fit_optimal_behaviour_policy(
         training_candidate_policyholder_value_aud=candidate_value,
         election_fallback_used=election_fallback,
         surrender_fallback_used=surrender_fallback,
+        selected_fixed_election_step=selected_fixed_election_step,
+        selected_income_action_mode=selected_income_action_mode,
         valid=not invalid_reasons,
         invalid_reasons=invalid_reasons,
         income_action_exposure_coverage=(

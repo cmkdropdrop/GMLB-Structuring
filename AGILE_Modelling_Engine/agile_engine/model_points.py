@@ -4,8 +4,8 @@ The operational default is the fast four-point proxy; the legacy AGILE-shaped
 48-point new-business grid remains an explicit alternative.  Only demographic,
 premium and contractual election fields are mapped to :class:`PolicySpec`.
 The four legacy allocation columns are validated for source integrity but are
-deliberately ignored: the generic product's 50/50 reference fund is a
-product-wide rule, not a model-point allocation.
+deliberately ignored: the generic product's reference-fund allocation is a
+product-level input, not a model-point allocation.
 """
 
 from __future__ import annotations
@@ -266,8 +266,9 @@ class PolicyholderModelPointSet:
             "premium_volume_weight_usage": "exposure_and_reconciliation_only",
             "ignored_legacy_columns": list(self.ignored_legacy_columns),
             "legacy_allocation_treatment": (
-                "validated_but_not_mapped; generic product uses its fixed "
-                "50/50 Global Equity/Australian Government Bond reference fund"
+                "validated_but_not_mapped; generic product uses its "
+                "product-level Global Equity/Australian Government Bond "
+                "reference-fund allocation"
             ),
             "cap_vintage_treatment": (
                 "legacy source metadata only; it does not set the generic "
