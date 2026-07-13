@@ -31,23 +31,29 @@ Monthly event order (documented convention)
 8. dynamically modelled Income-phase Excess/Partial Withdrawals, and
 9. Income-phase lapse / Full Withdrawal after event-driven fee posting and MVA.
 
-Daily Value Adjustment modelling proxy (PDS section 7)
+Daily Value Adjustment and insurer hedge/backing model
 -------------------------------------------------------
 Intra-year Account Value is valued as a zero bond maturing at the next
 Anniversary plus one Total-Protection package on the *complete* Reference
 Fund, ``pz_t = P(t,T_anniv) + V_pkg(t)``.
-At each anniversary the insurer extracts the cap-setting margin
-iv_frame * (1 - pz_s) upfront; afterwards the policyholder pool
-iv_frame * pz_t is an exact discounted martingale that converges to the
-contractual 1 + credit at the next Anniversary.  The package uses a
+The customer-facing value ``iv_frame * pz_t`` is an exact discounted
+martingale that converges to the contractual 1 + credit at the next
+Anniversary.  The package uses a
 joint-model moment-matched volatility derived solely from the existing
 Global-Equity and Hull-White parameters.  It is a transparent DVA proxy, not a
 claim of exact conditional mixed-fund option valuation.
-The CSV hedge-volatility proxy is repriced separately and booked as a
-non-negative insurer ``hedge_costs`` outflow at each crediting-period start;
-it does not change this customer-facing DVA state.
-It still requires reconciliation to an administrative formula and executable
-transaction quotes.  Neither COS nor LSMC is used by the portfolio workflow.
+
+The insurer backing is separate.  The administrative crediting frame is held
+in a continuously rolled AUD overnight account; its pathwise income is
+obtained from the simulated short-rate integral.  The under-year DVA option
+mark remains a customer-liability value, not a backing asset.  At each
+crediting-period start, the insurer buys either the standard capped call spread
+or, explicitly, an
+uncapped long call.  Fair premium, purchase markup, hedge-reference management
+fee and any legacy execution proxy are insurer hedge costs.  They never alter
+the customer Reference Fund, Account Value, credited return or claims.  The
+uncapped alternative alone records the option payoff above the customer cap as
+an insurer hedge gain.  Neither COS nor LSMC is used by the portfolio workflow.
 """
 
 from __future__ import annotations
@@ -63,9 +69,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .behavior import BehaviourModel
-from .crediting import (credited_return, crediting_package_value,
+from .crediting import (HedgeCapLegMode, credited_return,
+                        crediting_package_value, hedge_option_package_value,
                         heston_package_value,
-                        intra_year_value_factor)
+                        intra_year_value_factor, retained_excess_return)
 from .esg import ScenarioSet, STEPS_PER_YEAR
 from .mortality import MortalityTable
 from .product import (IndexLinkedLifetimeIncomeProduct, ExpenseAssumptions, FundingSource,
@@ -453,34 +460,71 @@ class ProjectionConfig:
     #: added to customer DVA values and is not interpreted as a cash expense
     #: rate; see the ``hedge_costs`` cashflow.
     hedge_vol_spread: float = 0.0
+    #: Purchase-price markup as a fraction of the fair option-package value.
+    #: ``0.005`` means a quote of 100.5% of fair value, not 50bp of notional.
+    option_fair_value_markup: float = 0.005
+    #: Annual notional-cost proxy for the hedge-reference management-fee drag.
+    #: It is an insurer cost only and never reduces customer Reference-Fund
+    #: return or the contractual option payoff path.
+    hedge_reference_management_fee: float = 0.003
+    #: The standard strategy sells the cap call.  ``NOT_SOLD`` buys the
+    #: uncapped positive-return call and retains its payoff above the cap.
+    hedge_cap_leg_mode: HedgeCapLegMode = HedgeCapLegMode.SOLD
     #: record full state paths (IV, income and phase) for diagnostics.
     record_paths: bool = True
     #: maximum projection age of the life insured. The default reaches the
     #: mortality-table terminal age so lifetime-income tails are not truncated.
     max_age: float = 115.0
-    #: include the crediting margin cashflow (cap-setting margin).
+    #: Include insurer backing income and optional retained hedge gain in the
+    #: backward-compatible aggregate ``crediting_margin`` cashflow.
     crediting_margin_enabled: bool = True
     #: independent, reproducible RNG seed for stochastic income take-up.
     take_up_seed: int = 97
-    #: independent, reproducible mortality seed used only when a pathwise life
-    #: status is required for Dynamic/Policy-controlled Joint-Life Election.
-    #: The deterministic benchmark retains the historical expected-decrement
-    #: implementation and therefore does not consume this seed.
+    #: Independent, reproducible mortality seed used whenever separate
+    #: pathwise Joint-Life states are required.  A standalone deterministic
+    #: projection keeps the historical expected-decrement implementation
+    #: unless ``force_pathwise_joint_life`` is enabled.
     mortality_seed: int = 193
+    #: Force separate sampled Primary/Spouse life states for Joint-Life
+    #: portfolios.  Portfolio behaviour-factor runs enable this for every arm
+    #: so V00/V01/V10/V11 share the same mortality random numbers; the default
+    #: preserves the expected-decrement treatment for standalone deterministic
+    #: projections.
+    force_pathwise_joint_life: bool = False
     #: Legacy four-equity-option switch.  The generic mixed reference fund is
     #: always valued with a joint-model moment-matched BS proxy and never with
     #: COS.  Portfolio valuation also sets this flag explicitly to ``False``.
     heston_cos: bool = False
 
     def __post_init__(self) -> None:
-        if not np.isfinite(self.hedge_vol_spread) or not np.isfinite(self.max_age):
+        numeric = np.asarray([
+            self.hedge_vol_spread,
+            self.option_fair_value_markup,
+            self.hedge_reference_management_fee,
+            self.max_age,
+        ], dtype=float)
+        if not np.all(np.isfinite(numeric)):
             raise ValueError("Projection numeric settings must be finite.")
         if self.hedge_vol_spread < 0.0:
             raise ValueError("hedge_vol_spread must be non-negative.")
+        if self.option_fair_value_markup < 0.0:
+            raise ValueError("option_fair_value_markup must be non-negative.")
+        if not 0.0 <= self.hedge_reference_management_fee < 1.0:
+            raise ValueError(
+                "hedge_reference_management_fee must be in [0, 1)."
+            )
         if self.max_age <= 0.0:
             raise ValueError("Projection max_age must be positive.")
+        try:
+            object.__setattr__(
+                self,
+                "hedge_cap_leg_mode",
+                HedgeCapLegMode(self.hedge_cap_leg_mode),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Unknown hedge_cap_leg_mode.") from exc
         for name in ("dva_enabled", "record_paths", "crediting_margin_enabled",
-                     "heston_cos"):
+                     "force_pathwise_joint_life", "heston_cos"):
             if not isinstance(getattr(self, name), (bool, np.bool_)):
                 raise ValueError(f"{name} must be boolean.")
         for name in ("take_up_seed", "mortality_seed"):
@@ -494,8 +538,19 @@ class ProjectionConfig:
 CASHFLOW_KEYS = (
     "premium", "income_paid", "guarantee_claims", "death_benefits",
     "surrender_benefits", "partial_withdrawals", "terminal_closeout",
-    "fees_product", "fees_lip", "crediting_margin", "mva_retained",
-    "aps_retained", "hedge_costs", "expenses",
+    "fees_product", "fees_lip", "crediting_margin", "money_market_income",
+    "hedge_gain", "mva_retained", "aps_retained", "hedge_costs",
+    "hedge_option_fair_value_costs", "hedge_option_markup_costs",
+    "hedge_management_fee_costs", "hedge_execution_costs",
+    "contract_financing_margin", "expenses",
+)
+
+PHASE_CASHFLOW_KEYS = (
+    "policyholder_benefits_pre_election",
+    "policyholder_benefits_post_election",
+    "growth_fees",
+    "growth_crediting_margin",
+    "post_election_guarantee_claims",
 )
 
 
@@ -573,10 +628,14 @@ class ProjectionResult:
 
     All cashflow entries at column ``k`` occur at time ``times[k]`` and are
     already weighted with the in-force probability of the path.
-    Policyholder-facing flows are positive. Insurer income (fees, margins,
-    MVA retained) and insurer outgo (hedge/operating costs) are each recorded
-    as positive magnitudes in their own buckets; net-value formulas apply the
-    appropriate sign.
+    Policyholder-facing flows are positive. Insurer income (fees, backing
+    income, hedge gains and MVA retained) and insurer outgo (hedge/operating
+    costs) are recorded in separate buckets; net-value formulas apply the
+    appropriate sign. ``crediting_margin`` and ``hedge_costs`` are the
+    backward-compatible P&L aggregates. Their component buckets are audit
+    diagnostics and must not be added to insurer net value a second time.
+    ``contract_financing_margin`` is a customer-contract identity diagnostic;
+    it is not an additional insurer P&L cashflow.
     """
 
     times: Array
@@ -600,6 +659,7 @@ class ProjectionResult:
     forced_income_election_events: Optional[Array] = None
     growth_exposure: Optional[Array] = None
     income_exposure: Optional[Array] = None
+    phase_cashflows: Optional[Dict[str, Array]] = None
     post_cap_cashflows: Optional[Dict[str, Array]] = None
     post_cap_lapse_events: Optional[Array] = None
     post_surrender_cashflows: Optional[Dict[str, Array]] = None
@@ -617,6 +677,17 @@ class ProjectionResult:
         return {k: float(np.mean(np.sum(cf * d, axis=1)))
                 for k, cf in self.cashflows.items()}
 
+    def pv_phase_by_component(self) -> Dict[str, float]:
+        """PV of exact transaction-time Growth/Election phase ledgers."""
+        if self.phase_cashflows is None:
+            return {}
+        n = len(self.times)
+        d = self.scenarios.discount[:, :n]
+        return {
+            key: float(np.mean(np.sum(cashflow * d, axis=1)))
+            for key, cashflow in self.phase_cashflows.items()
+        }
+
     def pv_insurer_net(self) -> float:
         """PV of insurer net cashflow after claims and insurer costs."""
         pv = self.pv_by_component()
@@ -629,7 +700,13 @@ class ProjectionResult:
         all contract-financed flows,
 
             P0 = PV(PH benefits) - PV(guarantee claims)
-                 + PV(fees) + PV(crediting margin) + PV(MVA / APS retained).
+                 + PV(fees) + PV(contract financing margin)
+                 + PV(MVA / APS retained).
+
+        The identity is deliberately independent of the insurer's chosen
+        backing and hedge execution.  Money-market income, actual hedge costs,
+        retained excess gains and operating expenses are shareholder P&L and
+        are therefore excluded here.
 
         Returns the relative gap (should be ~0 for risk-neutral scenarios up
         to Monte-Carlo and discretisation error).
@@ -637,8 +714,12 @@ class ProjectionResult:
         pv = self.pv_by_component()
         ph = (pv["income_paid"] + pv["death_benefits"] + pv["surrender_benefits"]
               + pv["partial_withdrawals"] + pv["terminal_closeout"])
-        financed = (ph - pv["guarantee_claims"] + pv["fees_product"] + pv["fees_lip"]
-                    + pv["crediting_margin"] + pv["mva_retained"] + pv["aps_retained"])
+        financed = (
+            ph - pv["guarantee_claims"]
+            + pv["fees_product"] + pv["fees_lip"]
+            + pv["contract_financing_margin"]
+            + pv["mva_retained"] + pv["aps_retained"]
+        )
         p0 = pv["premium"]
         return float((financed - p0) / p0)
 
@@ -774,7 +855,14 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     policy_controlled_election = income_election_policy is not None
     pathwise_joint_life = bool(
         policy.spouse
-        and (take_up.mode != "deterministic" or policy_controlled_election)
+        and (
+            take_up.mode != "deterministic"
+            or policy_controlled_election
+            or surrender_policy is not None
+            or behaviour.use_dynamic
+            or behaviour.use_dynamic_withdrawals
+            or config.force_pathwise_joint_life
+        )
     )
     if (
         policy.spouse
@@ -912,12 +1000,12 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     # the election month: payments are monthly in arrears, the first one falls
     # one month after the Lifetime Income Commencement Date (PDS section 13).
     w = np.ones(n_paths)                          # in-force probability weight
-    # Dynamic/Policy-controlled Joint-Life Election cannot apply a nonlinear
-    # response to a mortality-state-averaged p11/p10/p01 value.  For that case
-    # only, simulate the Primary/Spouse life status explicitly with a separate
-    # reproducible seed.  The deterministic benchmark continues to use the
-    # historical expected-decrement joint/single fallback in the portfolio
-    # layer and therefore remains unchanged.
+    # Nonlinear Joint-Life behaviour cannot act on a mortality-state-averaged
+    # p11/p10/p01 value, so those cases simulate Primary/Spouse status with a
+    # separate reproducible seed.  Portfolio factor runners also force this
+    # treatment for their deterministic arms to keep one common mortality
+    # basis; standalone deterministic calls retain the historical expected-
+    # decrement fallback unless explicitly configured otherwise.
     primary_alive = np.ones(n_paths, dtype=bool)
     spouse_alive = np.ones(n_paths, dtype=bool)
     joint_income_cover = np.zeros(n_paths, dtype=bool)
@@ -944,8 +1032,54 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     # from the actual income election date, not from policy issue.
     joint_surv_primary = np.ones(n_paths)
     joint_surv_spouse = np.ones(n_paths)
+    # This flag survives termination and therefore identifies the contractual
+    # phase in which a cashflow was generated even after ``phase`` becomes
+    # TERMINATED.  It is updated exactly at the Election transaction boundary.
+    has_elected_income = np.zeros(n_paths, dtype=bool)
 
     cfs: Dict[str, Array] = {k: np.zeros((n_paths, n_steps + 1)) for k in CASHFLOW_KEYS}
+    phase_cfs: Dict[str, Array] = {
+        key: np.zeros((n_paths, n_steps + 1))
+        for key in PHASE_CASHFLOW_KEYS
+    }
+
+    def classify_phase_cashflow_delta(
+        step: int,
+        before: Mapping[str, Array],
+        post_election: NDArray[np.bool_],
+    ) -> None:
+        """Book one exact event-order slice to the phase-analysis ledger."""
+        post = np.asarray(post_election, dtype=bool)
+        if post.shape != (n_paths,):
+            raise ValueError("Phase cashflow mask must have one value per path.")
+
+        def delta(key: str) -> Array:
+            return cfs[key][:, step] - np.asarray(before[key], dtype=float)
+
+        benefits = sum(
+            (delta(key) for key in (
+                "income_paid",
+                "death_benefits",
+                "surrender_benefits",
+                "partial_withdrawals",
+                "terminal_closeout",
+            )),
+            np.zeros(n_paths),
+        )
+        fees = delta("fees_product") + delta("fees_lip")
+        phase_cfs["policyholder_benefits_pre_election"][:, step] += np.where(
+            post, 0.0, benefits
+        )
+        phase_cfs["policyholder_benefits_post_election"][:, step] += np.where(
+            post, benefits, 0.0
+        )
+        phase_cfs["growth_fees"][:, step] += np.where(post, 0.0, fees)
+        phase_cfs["growth_crediting_margin"][:, step] += np.where(
+            post, 0.0, delta("crediting_margin")
+        )
+        phase_cfs["post_election_guarantee_claims"][:, step] += np.where(
+            post, delta("guarantee_claims"), 0.0
+        )
     # Anniversary timestamps contain events on both sides of the new-cap
     # announcement.  This auxiliary ledger records only the cashflow portion
     # after that boundary, without changing the canonical cashflow buckets.
@@ -1325,8 +1459,8 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     income_lapse_ordinary_prob = income_lapse_prob.copy()
     income_lapse_performance_prob = np.zeros(n_paths)
 
-    def reference_package_only(step: int, volatility_spread: float = 0.0) -> Array:
-        """One-year Total-Protection package value on the whole fund."""
+    def reference_customer_package_value(step: int) -> Array:
+        """Fair capped customer package used only by the contract identity."""
         r_cc = scenarios.forward_zero_cc(step, 1.0)
         sigma = scenarios.reference_fund_effective_vol(
             step,
@@ -1334,7 +1468,7 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             equity_index=reference_spec.equity_index,
             equity_weight=reference_spec.equity_weight,
             bond_tenor=reference_spec.bond_tenor_years,
-        ) + float(volatility_spread)
+        )
         return np.asarray(crediting_package_value(
             1.0,
             Protection.TOTAL,
@@ -1345,39 +1479,81 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             sigma,
         ))
 
-    def book_hedge_execution_cost(step: int) -> None:
-        """Book an adverse, non-negative option-execution cost.
+    def reference_hedge_option_value(
+            step: int, volatility_spread: float = 0.0) -> Array:
+        """Fair one-year insurer hedge value on the complete Reference Fund."""
+        r_cc = scenarios.forward_zero_cc(step, 1.0)
+        sigma = scenarios.reference_fund_effective_vol(
+            step,
+            horizon=1.0,
+            equity_index=reference_spec.equity_index,
+            equity_weight=reference_spec.equity_weight,
+            bond_tenor=reference_spec.bond_tenor_years,
+        ) + float(volatility_spread)
+        return np.asarray(hedge_option_package_value(
+            1.0,
+            reference_spec.cap(step // STEPS_PER_YEAR),
+            1.0,
+            r_cc,
+            0.0,
+            sigma,
+            config.hedge_cap_leg_mode,
+        ))
 
-        ``hedge_vol_spread`` is a quote proxy rather than a cash rate.  The
-        amount is therefore derived by repricing the annual option package and
-        taking the absolute mid-to-spread price difference.  The absolute
-        difference is essential for capped call spreads and buffered packages,
-        whose *net* vega can be negative; a positive execution-cost assumption
-        must never create insurer income.
+    def book_annual_hedge_costs(step: int) -> None:
+        """Book the annual option purchase and all incremental hedge costs.
+
+        Fair value and its relative purchase markup are charged at the start
+        of the crediting period.  The 30bp hedge-reference management fee is an
+        annual cost on hedge notional; it is not a customer fund fee.  The
+        optional legacy volatility-spread repricing remains a separate,
+        non-negative execution component and is zero in the standard CSV.
         """
-        if config.hedge_vol_spread == 0.0 or step >= n_steps:
+        if step >= n_steps:
             return
-        mid = reference_package_only(step, 0.0)
-        spread_quote = reference_package_only(step, config.hedge_vol_spread)
-        cost_rate = np.abs(spread_quote - mid)
-        cost = iv_frame * cost_rate
-        cfs["hedge_costs"][:, step] += w * np.where(
-            phase < Phase.TERMINATED.value, cost, 0.0
+        active = phase < Phase.TERMINATED.value
+        fair_rate = np.maximum(reference_hedge_option_value(step, 0.0), 0.0)
+        fair_cost = iv_frame * fair_rate
+        markup_cost = fair_cost * config.option_fair_value_markup
+        management_cost = (
+            iv_frame * config.hedge_reference_management_fee
         )
+        if config.hedge_vol_spread > 0.0:
+            spread_quote = reference_hedge_option_value(
+                step, config.hedge_vol_spread,
+            )
+            execution_cost = iv_frame * np.abs(spread_quote - fair_rate)
+        else:
+            execution_cost = np.zeros(n_paths)
+
+        components = {
+            "hedge_option_fair_value_costs": fair_cost,
+            "hedge_option_markup_costs": markup_cost,
+            "hedge_management_fee_costs": management_cost,
+            "hedge_execution_costs": execution_cost,
+        }
+        aggregate = np.zeros(n_paths)
+        for key, amount in components.items():
+            weighted = w * np.where(active, amount, 0.0)
+            cfs[key][:, step] += weighted
+            aggregate += weighted
+        cfs["hedge_costs"][:, step] += aggregate
 
     def restart_dva_period(step: int) -> None:
         """Start a fresh annual crediting / DVA replication period."""
         nonlocal iv
         if step < n_steps:
-            book_hedge_execution_cost(step)
+            book_annual_hedge_costs(step)
         if config.dva_enabled and step < n_steps:
             # No restart at the final grid point: the horizon closeout pays
             # the current DVA-consistent IV, so no new crediting year is hedged.
             pz_start = package_and_zcb(step, 1.0, phase)
-            if config.crediting_margin_enabled:
-                margin_up = iv_frame * (1.0 - pz_start)
-                cfs["crediting_margin"][:, step] += w * np.where(
-                    phase < Phase.TERMINATED.value, margin_up, 0.0)
+            financing_margin = iv_frame * (1.0 - pz_start)
+            cfs["contract_financing_margin"][:, step] += w * np.where(
+                phase < Phase.TERMINATED.value,
+                financing_margin,
+                0.0,
+            )
             iv = iv_frame * pz_start
 
     def fee_settlement(account_value: Array) -> tuple[Array, Array, Array]:
@@ -1554,8 +1730,13 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             decision = np.asarray(method(context=context))
             if decision.shape != (n_paths,):
                 return np.zeros(n_paths, dtype=bool)
-            if np.issubdtype(decision.dtype, np.number) \
-                    and not np.all(np.isfinite(decision)):
+            if np.issubdtype(decision.dtype, np.bool_):
+                return decision.astype(bool, copy=True)
+            if not np.issubdtype(decision.dtype, np.number):
+                return np.zeros(n_paths, dtype=bool)
+            if not np.all(np.isfinite(decision)) or not np.all(
+                (decision == 0) | (decision == 1)
+            ):
                 return np.zeros(n_paths, dtype=bool)
             return decision.astype(bool)
         except Exception:
@@ -1671,15 +1852,21 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         key: values[:, 0].copy() for key, values in cfs.items()
     }
 
-    # upfront crediting margin of the first policy year (see anniversary block)
-    if config.dva_enabled and config.crediting_margin_enabled:
+    # The contract-financing margin preserves the customer-flow identity.  It
+    # is not insurer P&L; actual backing income and hedge costs are separate.
+    if config.dva_enabled:
         pz0 = package_and_zcb(0, 1.0, phase)
-        cfs["crediting_margin"][:, 0] += iv_frame * (1.0 - pz0)
-    book_hedge_execution_cost(0)
+        cfs["contract_financing_margin"][:, 0] += iv_frame * (1.0 - pz0)
+    book_annual_hedge_costs(0)
     for key in CASHFLOW_KEYS:
         post_cap_cfs[key][:, 0] = (
             cfs[key][:, 0] - issue_pre_cap_cashflows[key]
         )
+    classify_phase_cashflow_delta(
+        0,
+        {key: np.zeros(n_paths) for key in CASHFLOW_KEYS},
+        has_elected_income,
+    )
 
     context_aware_surrender = (
         False
@@ -1749,14 +1936,35 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     for k in range(n_steps):
         step = k + 1
         t = times[step]
+        step_start_cashflows = {
+            key: values[:, step].copy() for key, values in cfs.items()
+        }
         is_anniv = (step - anniv_step) == STEPS_PER_YEAR
         growth = phase == Phase.GROWTH.value
         income = phase == Phase.INCOME.value
         income_at_interval_start = income.copy()
         w_month_start = w.copy()
         av_month_start = np.maximum(iv.copy(), 0.0)
+        backing_base_for_interval = np.where(
+            phase < Phase.TERMINATED.value, np.maximum(iv_frame, 0.0), 0.0)
         fee_base_for_interval = np.where(
             phase < Phase.TERMINATED.value, np.maximum(iv_frame, 0.0), 0.0)
+        if config.crediting_margin_enabled:
+            # The insurer backs the administrative crediting frame in a
+            # continuously rolled overnight account, never in the customer
+            # Reference Fund.  ``iv`` can include the under-year DVA option
+            # mark and is a customer-liability value, not a backing asset.
+            # The discount-factor ratio is the
+            # pathwise simulated short-rate accumulation and therefore the
+            # daily/continuous overnight equivalent over this interval.
+            overnight_return = (
+                scenarios.money_market_accumulation(k, step) - 1.0
+            )
+            backing_income = (
+                w_month_start * backing_base_for_interval * overnight_return
+            )
+            cfs["money_market_income"][:, step] += backing_income
+            cfs["crediting_margin"][:, step] += backing_income
         just_elected[:] = False
         pre_cap_step_cashflows: Optional[dict[str, Array]] = None
         pre_cap_step_lapse: Optional[Array] = None
@@ -1795,16 +2003,36 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 0.0,
             )
 
-            # Crediting margin without DVA (approximation mode): realised at
-            # year end per unit held, (1 - V_pkg) * cash_growth - 1.
-            # In DVA mode the margin is extracted upfront below (exact
-            # replication accounting). Zero when caps are budget-neutral.
-            if config.crediting_margin_enabled and not config.dva_enabled:
-                grow_cash = scenarios.discount[:, anniv_step] / np.maximum(
-                    scenarios.discount[:, step], 1e-300)
-                v_pkg = reference_package_only(anniv_step, 0.0)
-                margin = iv_frame * ((1.0 - v_pkg) * grow_cash - 1.0)
-                cfs["crediting_margin"][:, step] += w * np.where(phase < 2, margin, 0.0)
+            if not config.dva_enabled:
+                grow_cash = scenarios.money_market_accumulation(
+                    anniv_step, step,
+                )
+                customer_package = reference_customer_package_value(anniv_step)
+                financing_margin = iv_frame * (
+                    (1.0 - customer_package) * grow_cash - 1.0
+                )
+                cfs["contract_financing_margin"][:, step] += w * np.where(
+                    growth | income,
+                    financing_margin,
+                    0.0,
+                )
+
+            if config.crediting_margin_enabled:
+                # Only the explicit uncapped hedge retains performance above
+                # the customer's cap.  It has already incurred the higher
+                # long-call fair premium at the start of this crediting year.
+                excess_rate = np.asarray(retained_excess_return(
+                    previous_reference_return,
+                    reference_spec.cap(year_idx),
+                    config.hedge_cap_leg_mode,
+                ))
+                gain = w * np.where(
+                    growth | income,
+                    iv_frame * excess_rate,
+                    0.0,
+                )
+                cfs["hedge_gain"][:, step] += gain
+                cfs["crediting_margin"][:, step] += gain
 
             iv_frame = np.maximum(new_iv, 0.0)
             iv = iv_frame.copy()
@@ -1977,9 +2205,12 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         # only after that decrement; the next crediting/DVA period is therefore
         # funded only for survivors.  This removes the former hybrid in which
         # Primary mortality was combined with post-election DVA state.
-        growth_exposure[:, step] = w * (
-            phase == Phase.GROWTH.value
-        ).astype(float)
+        classify_phase_cashflow_delta(
+            step, step_start_cashflows, has_elected_income
+        )
+        election_boundary_cashflows = {
+            key: values[:, step].copy() for key, values in cfs.items()
+        }
         if is_anniv:
             growth = phase == Phase.GROWTH.value
             if growth.any():
@@ -1997,6 +2228,7 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                         and policy.funding_source == FundingSource.NON_SUPERANNUATION):
                     activate_aps(elect, step, t)
                 elect_income(elect, step, t)
+                has_elected_income[elect] = True
             pre_cap_step_cashflows = {
                 key: values[:, step].copy() for key, values in cfs.items()
             }
@@ -2004,6 +2236,14 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             observe_cap_decision(step, float(t))
             restart_dva_period(step)
             free_utilisation, excess_rate = wd_dynamic_rates(step, t)
+
+        # This is an end-of-transaction-point state: contracts which elected
+        # at this Anniversary are no longer counted in the subsequent Growth
+        # interval, while the separate eligible exposure above remains the
+        # correct pre-Election denominator.
+        growth_exposure[:, step] = w * (
+            phase == Phase.GROWTH.value
+        ).astype(float)
 
         # ---- income payment (monthly, in arrears; first payment one month
         # after the income election, PDS section 13) ----------------------- #
@@ -2380,6 +2620,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             post_cap_lapse_events[:, step] = (
                 lapse_events[:, step] - pre_cap_step_lapse
             )
+        classify_phase_cashflow_delta(
+            step, election_boundary_cashflows, has_elected_income
+        )
         if iv_paths is not None:
             iv_paths[:, step] = iv
             income_paths[:, step] = income_annual
@@ -2390,6 +2633,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     # Value in its own closeout bucket.  With the full lifetime horizon the
     # hard terminal-age mortality convention leaves this amount at zero.
     final = n_steps
+    terminal_phase_boundary_cashflows = {
+        key: values[:, final].copy() for key, values in cfs.items()
+    }
     residual_mask = (phase < 2)
     terminal_fee_product, terminal_fee_lip, terminal_post_fee_av = \
         fee_settlement(iv)
@@ -2406,6 +2652,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     phase = np.where(
         residual_mask, Phase.TERMINATED.value, phase).astype(np.int8)
     w = np.where(residual_mask, 0.0, w)
+    classify_phase_cashflow_delta(
+        final, terminal_phase_boundary_cashflows, has_elected_income
+    )
     inforce[:, final] = w
     if final_pre_surrender_cashflows is not None:
         for key in CASHFLOW_KEYS:
@@ -2460,6 +2709,10 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                             income_exposure=(
                                 income_exposure[:, :n_steps + 1]
                             ),
+                            phase_cashflows={
+                                key: value[:, :n_steps + 1]
+                                for key, value in phase_cfs.items()
+                            },
                             post_cap_cashflows={
                                 key: value[:, :n_steps + 1]
                                 for key, value in post_cap_cfs.items()

@@ -8,7 +8,7 @@ with the pathwise money-market account.
 Key outputs
 -----------
 * component present values (income, guarantee claims, death, surrender, fees,
-  crediting margin, MVA),
+  stochastic money-market backing income, hedge gains/costs and MVA),
 * BEL split into current Account Value and non-unit part,
 * the guarantee "net value" (Lifetime Income Premium income vs. guarantee
   claims) and the fair Lifetime Income Premium,
@@ -17,6 +17,7 @@ Key outputs
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, Optional
 
@@ -100,7 +101,7 @@ class ValuationResult:
     bel_nonunit: float
     bel_total: float
     guarantee_value: float          # PV(claims) - PV(LIP): net cost of the GLWB rider
-    insurer_net_value: float        # PV(margins) - claims - hedge/operating costs
+    insurer_net_value: float        # PV(backing/fee income) - claims/insurer costs
     identity_gap: float
     projection: ProjectionResult
     settings: ValuationSettings
@@ -141,6 +142,45 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
                    income_election_policy: Optional[object] = None,
                    ) -> ValuationResult:
     """Full risk-neutral valuation of one model point."""
+    def external_policy_identity(candidate: Optional[object]) -> object:
+        if candidate is None:
+            return None
+        explicit = getattr(candidate, "provenance_fingerprint", None)
+        if explicit not in (None, ""):
+            return (
+                candidate.__class__.__module__,
+                candidate.__class__.__qualname__,
+                str(explicit),
+            )
+        # Capture a best-effort stable identity before the projector can
+        # mutate action-statistic/context collectors on a research hook.
+        # Production LSMC policies expose the explicit fingerprint above.
+        raw_state = getattr(candidate, "__dict__", None)
+        if isinstance(raw_state, Mapping):
+            mutable_collectors = {
+                "attempts",
+                "contexts",
+                "election_contexts",
+                "evaluation_statistics",
+                "surrender_contexts",
+            }
+            state = {
+                key: value
+                for key, value in raw_state.items()
+                if key not in mutable_collectors
+            }
+        else:
+            state = None
+        return (
+            candidate.__class__.__module__,
+            candidate.__class__.__qualname__,
+            assumption_fingerprint(state),
+        )
+
+    surrender_policy_identity = external_policy_identity(surrender_policy)
+    income_election_policy_identity = external_policy_identity(
+        income_election_policy
+    )
     if scenarios is None:
         scenarios = build_scenarios(esg_config, settings, Measure.RISK_NEUTRAL,
                                     horizon_years=resolve_horizon(settings, policy))
@@ -180,6 +220,7 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
                   surrender_policy=surrender_policy,
                   income_election_policy=income_election_policy)
     pv = res.pv_by_component()
+    pv.update(res.pv_phase_by_component())
 
     premium = pv["premium"]
     bel_nonunit = (pv["guarantee_claims"] + pv["hedge_costs"] + pv["expenses"]
@@ -189,7 +230,15 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
 
     provenance = assumption_fingerprint(product, policy, esg_config, mortality,
                                         behaviour, expenses, settings,
-                                        scenarios.content_fingerprint)
+                                        scenarios.content_fingerprint,
+                                        (
+                                            "surrender_policy",
+                                            surrender_policy_identity,
+                                        ),
+                                        (
+                                            "income_election_policy",
+                                            income_election_policy_identity,
+                                        ))
     return ValuationResult(pv=pv, premium=premium, bel_nonunit=bel_nonunit,
                            bel_total=policy.net_initial_investment + bel_nonunit,
                            guarantee_value=guarantee_value,

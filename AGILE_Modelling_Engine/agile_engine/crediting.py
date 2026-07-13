@@ -11,6 +11,12 @@ In option terms (per unit of Investment Value, R = S_T/S_0 - 1):
 * Total Protection  = Call(K=1) - Call(K=1+cap)                (bull call spread)
 * Partial 10        = Call(K=1) - Call(K=1+cap) - Put(K=0.90)  (spread - OTM put)
 
+The insurer's standard Total-Protection hedge uses the same bull call spread:
+the cap call is sold.  An explicit alternative keeps that cap leg instead,
+using the uncapped long Call(K=1); its payoff above the customer cap is then a
+separate insurer hedge gain.  This hedge choice does not alter the customer's
+``credited_return``.
+
 These static replications drive
 
 * the Daily Value Adjustment (intra-year market value of the crediting
@@ -37,6 +43,7 @@ contaminate the contractual DVA mid value.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
@@ -52,6 +59,20 @@ if TYPE_CHECKING:   # avoid a circular import at runtime
 Array = NDArray[np.float64]
 
 PARTIAL_BUFFER = 0.10
+
+
+class HedgeCapLegMode(str, Enum):
+    """Whether the insurer sells the call leg that finances the crediting cap."""
+
+    SOLD = "sold"
+    NOT_SOLD = "not_sold"
+
+
+def _hedge_cap_leg_mode(mode: HedgeCapLegMode | str) -> HedgeCapLegMode:
+    try:
+        return HedgeCapLegMode(mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Unknown hedge cap-leg mode.") from exc
 
 
 def _crediting_terms(protection: Protection, cap: float,
@@ -132,6 +153,64 @@ def crediting_package_value(x0: float | Array, protection: Protection, cap: floa
     if protection == Protection.TOTAL:
         return call_spread
     return call_spread - _bs_put(x0, 1.0 - buffer, tau, r, q, sigma)
+
+
+def hedge_option_package_value(
+        x0: float | Array, cap: float, tau: float, r: float | Array,
+        q: float, sigma: float | Array,
+        cap_leg_mode: HedgeCapLegMode | str = HedgeCapLegMode.SOLD,
+) -> float | Array:
+    """PV of the insurer's Total-Protection option hedge per unit notional.
+
+    With the standard ``SOLD`` cap leg, the package is
+    ``Call(K=1) - Call(K=1+cap)`` on the gross return.  With ``NOT_SOLD`` it is
+    the uncapped ``Call(K=1)``.  Inputs may be pathwise arrays and follow the
+    vectorisation of the module's Black-Scholes primitives.
+    """
+    _, cap, _ = _crediting_terms(Protection.TOTAL, cap, PARTIAL_BUFFER)
+    mode = _hedge_cap_leg_mode(cap_leg_mode)
+    x = np.asarray(x0, dtype=float)
+    rates = np.asarray(r, dtype=float)
+    vols = np.asarray(sigma, dtype=float)
+    tau = float(tau)
+    q = float(q)
+    if not np.all(np.isfinite(x)) or np.any(x < 0.0):
+        raise ValueError("x0 must be finite and non-negative.")
+    if not np.all(np.isfinite(rates)):
+        raise ValueError("r must be finite.")
+    if not np.all(np.isfinite(vols)) or np.any(vols < 0.0):
+        raise ValueError("sigma must be finite and non-negative.")
+    if not np.isfinite(tau) or tau < 0.0:
+        raise ValueError("tau must be finite and non-negative.")
+    if not np.isfinite(q):
+        raise ValueError("q must be finite.")
+
+    long_call = _bs_call(x, 1.0, tau, rates, q, vols)
+    if mode == HedgeCapLegMode.SOLD:
+        out = long_call - _bs_call(x, 1.0 + cap, tau, rates, q, vols)
+    else:
+        out = long_call
+    scalar = np.ndim(x0) == 0 and np.ndim(r) == 0 and np.ndim(sigma) == 0
+    return float(out) if scalar else np.asarray(out, dtype=float)
+
+
+def retained_excess_return(
+        index_return: float | Array, cap: float,
+        cap_leg_mode: HedgeCapLegMode | str = HedgeCapLegMode.SOLD,
+) -> float | Array:
+    """Insurer payoff above the customer cap when the cap leg is not sold.
+
+    The standard sold-leg strategy has no retained excess.  The alternative
+    returns ``max(index_return - cap, 0)`` without changing customer crediting.
+    """
+    _, cap, _ = _crediting_terms(Protection.TOTAL, cap, PARTIAL_BUFFER)
+    mode = _hedge_cap_leg_mode(cap_leg_mode)
+    returns = np.asarray(index_return, dtype=float)
+    if not np.all(np.isfinite(returns)):
+        raise ValueError("index_return must be finite.")
+    out = (np.zeros_like(returns) if mode == HedgeCapLegMode.SOLD
+           else np.maximum(returns - cap, 0.0))
+    return float(out) if np.ndim(index_return) == 0 else out
 
 
 # ---------------------------------------------------------------------------

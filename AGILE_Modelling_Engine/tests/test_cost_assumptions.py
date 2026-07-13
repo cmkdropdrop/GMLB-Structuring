@@ -45,7 +45,9 @@ EXPECTED_VALUES = {
         "ExpenseAssumptions.maintenance_pct_of_iv": 0.0005,
         "ExpenseAssumptions.expense_inflation": 0.025,
         "ExpenseAssumptions.commission_pct_of_premium": 0.0,
-        "ProjectionConfig.hedge_vol_spread": 0.005,
+        "ProjectionConfig.hedge_vol_spread": 0.0,
+        "ProjectionConfig.option_fair_value_markup": 0.005,
+        "ProjectionConfig.hedge_reference_management_fee": 0.003,
         "MVASpec.cost_loading_per_remaining_year": 0.0061744444,
         "MVASpec.cost_loading": 0.0,
         "CapitalStresses.coc_rate": 0.06,
@@ -61,7 +63,9 @@ EXPECTED_VALUES = {
         "ExpenseAssumptions.maintenance_pct_of_iv": 0.00025,
         "ExpenseAssumptions.expense_inflation": 0.02,
         "ExpenseAssumptions.commission_pct_of_premium": 0.0,
-        "ProjectionConfig.hedge_vol_spread": 0.0025,
+        "ProjectionConfig.hedge_vol_spread": 0.0,
+        "ProjectionConfig.option_fair_value_markup": 0.005,
+        "ProjectionConfig.hedge_reference_management_fee": 0.003,
         "MVASpec.cost_loading_per_remaining_year": 0.004,
         "MVASpec.cost_loading": 0.0,
         "CapitalStresses.coc_rate": 0.04,
@@ -77,7 +81,9 @@ EXPECTED_VALUES = {
         "ExpenseAssumptions.maintenance_pct_of_iv": 0.001,
         "ExpenseAssumptions.expense_inflation": 0.04,
         "ExpenseAssumptions.commission_pct_of_premium": 0.01,
-        "ProjectionConfig.hedge_vol_spread": 0.015,
+        "ProjectionConfig.hedge_vol_spread": 0.0,
+        "ProjectionConfig.option_fair_value_markup": 0.005,
+        "ProjectionConfig.hedge_reference_management_fee": 0.003,
         "MVASpec.cost_loading_per_remaining_year": 0.008,
         "MVASpec.cost_loading": 0.01,
         "CapitalStresses.coc_rate": 0.08,
@@ -109,6 +115,12 @@ def _configured_values(costs):
             costs.expenses.commission_pct_of_premium
         ),
         "ProjectionConfig.hedge_vol_spread": costs.projection.hedge_vol_spread,
+        "ProjectionConfig.option_fair_value_markup": (
+            costs.projection.option_fair_value_markup
+        ),
+        "ProjectionConfig.hedge_reference_management_fee": (
+            costs.projection.hedge_reference_management_fee
+        ),
         "MVASpec.cost_loading_per_remaining_year": (
             costs.product.mva.cost_loading_per_remaining_year
         ),
@@ -170,7 +182,11 @@ def test_exclusions_metadata_and_default_path_are_cwd_independent(
 
     assert Path(costs.source_path) == expected_path
     assert costs.assumption_set_id == "realistic_base_2026-07-12"
-    assert costs.effective_dates == ("2026-01-19", "2026-07-12")
+    assert costs.effective_dates == (
+        "2026-01-19",
+        "2026-07-12",
+        "2026-07-13",
+    )
     assert costs.source_sha256 == expected_digest
     assert costs.excluded_parameters == (
         "ongoing_adviser_service_fee",
@@ -270,7 +286,7 @@ def test_assumption_set_selection_is_unambiguous(tmp_path):
         load_cost_assumptions(path, assumption_set_id="missing_set")
 
 
-def test_hedge_vol_spread_is_a_nonnegative_cost_that_reduces_nav():
+def test_legacy_hedge_vol_spread_is_a_nonnegative_incremental_cost():
     costs = load_cost_assumptions()
     no_cost_projection = replace(
         costs.projection, hedge_vol_spread=0.0, record_paths=False
@@ -294,17 +310,13 @@ def test_hedge_vol_spread_is_a_nonnegative_cost_that_reduces_nav():
 
     hedge_cashflows = with_cost.projection.cashflows["hedge_costs"]
     assert np.all(hedge_cashflows >= 0.0)
-    assert no_cost.pv["hedge_costs"] == pytest.approx(0.0, abs=1e-12)
-    assert with_cost.pv["hedge_costs"] > 0.0
+    assert with_cost.pv["hedge_costs"] > no_cost.pv["hedge_costs"]
     assert with_cost.insurer_net_value < no_cost.insurer_net_value
     assert no_cost.insurer_net_value - with_cost.insurer_net_value == pytest.approx(
-        with_cost.pv["hedge_costs"], rel=1e-12, abs=1e-10
+        with_cost.pv["hedge_costs"] - no_cost.pv["hedge_costs"],
+        rel=1e-12,
+        abs=1e-10,
     )
-    for name in with_cost.pv:
-        if name != "hedge_costs":
-            assert with_cost.pv[name] == pytest.approx(
-                no_cost.pv[name], rel=1e-12, abs=1e-10
-            )
 
 
 def test_base_mva_loading_is_retained_and_increases_insurer_nav():
@@ -415,4 +427,3 @@ def test_greeks_reconcile_to_expense_aware_bump_and_revalue():
     assert direct.pv["expenses"] > 0.0
     assert without_expenses.insurer_net_value - direct.insurer_net_value \
         == pytest.approx(direct.pv["expenses"], rel=1e-12, abs=1e-10)
-

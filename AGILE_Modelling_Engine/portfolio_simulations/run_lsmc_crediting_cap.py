@@ -3,6 +3,11 @@
 When this file is executed it delegates to the canonical, monthly-engine-based
 ``optimize_crediting_rate_lsmc.py`` runner.  The legacy annual approximation
 below is retained only for audit history and must not be used for results.
+That canonical runner is a separate Stackelberg management-action study and
+is intentionally outside the joint Income-Election/Surrender enhancement: its
+customer response retains a fixed model-point Income Election.  Use
+``run_lsmc_cap_behaviour_scenarios.py`` for Cap×Stress refits of the combined
+Policyholder Behaviour policy.
 
 LSMC-Optimierung des jaehrlichen Crediting-Rate-Caps (Storage-Stil).
 
@@ -113,6 +118,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
+
+if __package__:
+    from ._run_logging import log_to_console
+else:
+    from _run_logging import log_to_console
 
 ENGINE_ROOT = Path(__file__).resolve().parents[1]
 if str(ENGINE_ROOT) not in sys.path:
@@ -1501,6 +1511,13 @@ def main(argv: Optional[Sequence[str]] = None) -> Optional[int]:
     directly, so a supplied argument sequence is installed only for the
     duration of that call and is restored afterwards.
     """
+    log_to_console(
+        "NOTICE: run_lsmc_crediting_cap.py is the separate Stackelberg cap-"
+        "control study with fixed model-point Income Election; it is not the "
+        "combined Policyholder Election/Surrender Cap×Stress runner.",
+        level="NOTICE",
+        stream=sys.stderr,
+    )
     if __package__:
         from .optimize_crediting_rate_lsmc import main as canonical_main
     else:

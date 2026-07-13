@@ -81,6 +81,7 @@ from agile_engine import (  # noqa: E402
     DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
     ExpenseAssumptions,
     FeeSpec,
+    HedgeCapLegMode,
     Index,
     IndexLinkedLifetimeIncomeProduct,
     Measure,
@@ -609,6 +610,13 @@ class PolicyholderFitSet:
                 for diagnostic in fit.diagnostics
                 if not bool(diagnostic.regression_accepted_for_exercise)
             }
+            if bool(fit.training_fallback_used):
+                # The training PV gate replaces the entire fitted policy by
+                # Continue, including individually stable decision steps.
+                rejected.update(
+                    int(diagnostic.decision_step)
+                    for diagnostic in fit.diagnostics
+                )
             if signature in self.validation_fallback_signatures:
                 rejected.update(int(step) for step in fit.policy.regressions)
                 rejected.update(
@@ -1109,27 +1117,111 @@ def _vector_intra_year_value_factor(
     return float(result) if scalar else np.asarray(result, dtype=float)
 
 
+def _vector_hedge_option_package_value(
+    x0: float | Array,
+    cap: float | Array,
+    tau: float,
+    rate: float | Array,
+    dividend_yield: float,
+    sigma: float | Array,
+    cap_leg_mode: HedgeCapLegMode | str = HedgeCapLegMode.SOLD,
+) -> float | Array:
+    """Array-cap equivalent of the insurer's option-hedge package."""
+    try:
+        mode = HedgeCapLegMode(cap_leg_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Unknown hedge cap-leg mode.") from exc
+
+    spot, caps, rates, vols = np.broadcast_arrays(
+        np.asarray(x0, dtype=float),
+        np.asarray(cap, dtype=float),
+        np.asarray(rate, dtype=float),
+        np.asarray(sigma, dtype=float),
+    )
+    tau = float(tau)
+    dividend_yield = float(dividend_yield)
+    if not np.all(np.isfinite(spot)) or np.any(spot < 0.0):
+        raise ValueError("x0 must be finite and non-negative.")
+    if np.any(np.isnan(caps)) or np.any(caps < 0.0):
+        raise ValueError("cap must be non-negative and not NaN.")
+    if not np.all(np.isfinite(rates)):
+        raise ValueError("r must be finite.")
+    if not np.all(np.isfinite(vols)) or np.any(vols < 0.0):
+        raise ValueError("sigma must be finite and non-negative.")
+    if not np.isfinite(tau) or tau < 0.0:
+        raise ValueError("tau must be finite and non-negative.")
+    if not np.isfinite(dividend_yield):
+        raise ValueError("q must be finite.")
+
+    long_call = np.asarray(_vector_bs_call(
+        spot, 1.0, tau, rates, dividend_yield, vols,
+    ))
+    if mode == HedgeCapLegMode.SOLD:
+        result = long_call - np.asarray(_vector_bs_call(
+            spot, 1.0 + caps, tau, rates, dividend_yield, vols,
+        ))
+    else:
+        result = long_call
+    scalar = all(np.ndim(value) == 0 for value in (x0, cap, rate, sigma))
+    return float(result) if scalar else np.asarray(result, dtype=float)
+
+
+def _vector_retained_excess_return(
+    index_return: float | Array,
+    cap: float | Array,
+    cap_leg_mode: HedgeCapLegMode | str = HedgeCapLegMode.SOLD,
+) -> float | Array:
+    """Array-cap equivalent of the insurer's retained excess payoff."""
+    try:
+        mode = HedgeCapLegMode(cap_leg_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Unknown hedge cap-leg mode.") from exc
+
+    returns, caps = np.broadcast_arrays(
+        np.asarray(index_return, dtype=float), np.asarray(cap, dtype=float)
+    )
+    if not np.all(np.isfinite(returns)):
+        raise ValueError("index_return must be finite.")
+    if np.any(np.isnan(caps)) or np.any(caps < 0.0):
+        raise ValueError("cap must be non-negative and not NaN.")
+    result = (
+        np.zeros_like(returns)
+        if mode == HedgeCapLegMode.SOLD
+        else np.maximum(returns - caps, 0.0)
+    )
+    scalar = np.ndim(index_return) == 0 and np.ndim(cap) == 0
+    return float(result) if scalar else np.asarray(result, dtype=float)
+
+
 @contextmanager
 def _pathwise_cap_adapter() -> Iterator[None]:
     """Temporarily vectorise projector calls reached by pathwise cap controls.
 
     The adapter is process-local and restored in ``finally``.  It vectorises
-    both the package pricer and the intra-year DVA factor so that the direct
-    monthly projection retains DVA and can include cap-dependent Crediting
-    Margin and hedge-execution cost.
+    customer and insurer option functions so that the direct monthly
+    projection retains DVA and includes pathwise cap-dependent hedge costs and
+    retained hedge gains.
     """
     original_return = projection_module.credited_return
     original_package = projection_module.crediting_package_value
     original_intra_year = projection_module.intra_year_value_factor
+    original_hedge_package = projection_module.hedge_option_package_value
+    original_retained_excess = projection_module.retained_excess_return
     projection_module.credited_return = _vector_credited_return
     projection_module.crediting_package_value = _vector_crediting_package_value
     projection_module.intra_year_value_factor = _vector_intra_year_value_factor
+    projection_module.hedge_option_package_value = (
+        _vector_hedge_option_package_value
+    )
+    projection_module.retained_excess_return = _vector_retained_excess_return
     try:
         yield
     finally:
         projection_module.credited_return = original_return
         projection_module.crediting_package_value = original_package
         projection_module.intra_year_value_factor = original_intra_year
+        projection_module.hedge_option_package_value = original_hedge_package
+        projection_module.retained_excess_return = original_retained_excess
 
 
 def _controlled_product(
@@ -1645,6 +1737,7 @@ def _aggregate_portfolio_paths(
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
     collect_stackelberg_primitives: bool = False,
     collect_policyholder_by_signature: bool = False,
+    collect_pre_action_states: bool = False,
 ) -> PortfolioPathData:
     """Project all model points under one pathwise cap schedule.
 
@@ -1660,8 +1753,14 @@ def _aggregate_portfolio_paths(
     n_years = caps.shape[1]
     point_count = len(model_points.model_points)
     LOGGER.info(
-        "%s | %d model points | %d market paths | %d policy years | states=%s",
-        progress_label, point_count, scenarios.n_paths, n_years, collect_states,
+        "%s | %d model points | %d market paths | %d policy years | "
+        "full_states=%s | pre_action_states=%s",
+        progress_label,
+        point_count,
+        scenarios.n_paths,
+        n_years,
+        collect_states,
+        collect_pre_action_states,
     )
     guarantee_claims = np.zeros((scenarios.n_paths, n_years))
     other_insurer_funded_benefits = np.zeros_like(guarantee_claims)
@@ -1719,6 +1818,11 @@ def _aggregate_portfolio_paths(
         raw_states = np.zeros(
             (scenarios.n_paths, n_years + 1, len(feature_names)), dtype=float
         )
+    if (
+        collect_states
+        or collect_pre_action_states
+        or collect_stackelberg_primitives
+    ):
         pre_action_feature_names = PORTFOLIO_CONTROL_STATE_FEATURE_NAMES
         pre_action_feature_index = {
             name: position
@@ -1732,6 +1836,14 @@ def _aggregate_portfolio_paths(
             ),
             dtype=float,
         )
+        for year in range(n_years + 1):
+            step = min(year * STEPS_PER_YEAR, scenarios.n_steps)
+            pre_action_states[
+                :, year, pre_action_feature_index["short_rate"]
+            ] = scenarios.short_rate[:, step]
+    if collect_states:
+        if raw_states is None:
+            raise RuntimeError("Full state storage was not initialised.")
         fund = scenarios.monthly_rebalanced_reference_fund_index(
             equity_index=product.reference_fund.equity_index,
             equity_weight=product.reference_fund.equity_weight,
@@ -1746,9 +1858,6 @@ def _aggregate_portfolio_paths(
                 0.0,
             )
             raw_states[:, year, feature_index["short_rate"]] = (
-                scenarios.short_rate[:, step]
-            )
-            pre_action_states[:, year, pre_action_feature_index["short_rate"]] = (
                 scenarios.short_rate[:, step]
             )
             raw_states[:, year, feature_index["zero_rate_5y"]] = (
@@ -1795,7 +1904,11 @@ def _aggregate_portfolio_paths(
                 )
                 cap_state_collector = (
                     _CapDecisionStateCollector()
-                    if collect_states or collect_stackelberg_primitives
+                    if (
+                        collect_states
+                        or collect_pre_action_states
+                        or collect_stackelberg_primitives
+                    )
                     else None
                 )
                 primitive_collector = (
@@ -2363,13 +2476,6 @@ def _aggregate_portfolio_paths(
                 "income_pv_proxy_over_account_value"
             ]],
         )
-        inforce_exposure = np.array(
-            pre_action_states[
-                :, :, pre_action_feature_index["inforce_exposure"]
-            ],
-            copy=True,
-        )
-
     if pre_action_states is not None:
         pre_action_monetary_columns = [
             pre_action_feature_index[name]
@@ -2385,6 +2491,12 @@ def _aggregate_portfolio_paths(
         )
         if not np.all(np.isfinite(pre_action_states)):
             raise RuntimeError("Pre-action portfolio states contain non-finite values.")
+        inforce_exposure = np.array(
+            pre_action_states[
+                :, :, pre_action_feature_index["inforce_exposure"]
+            ],
+            copy=True,
+        )
 
     return PortfolioPathData(
         guarantee_claims=guarantee_claims,
@@ -3667,7 +3779,6 @@ def _rollout_cap_policy_with_projected_states(
     model_point_log_interval: int,
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]],
     collect_policyholder_by_signature: bool = False,
-    maximum_iterations: int = 5,
 ) -> tuple[Array, PortfolioPathData, dict[str, object]]:
     """Roll out the rich-state policy causally, one frozen prefix at a time.
 
@@ -3678,8 +3789,6 @@ def _rollout_cap_policy_with_projected_states(
     and evaluation execute the same precommitted policy without either sample
     being allowed to choose a fallback.
     """
-    if maximum_iterations <= 0:
-        raise ValueError("maximum_iterations must be positive.")
     caps = np.full((scenarios.n_paths, inputs.n_years), fallback_cap, dtype=float)
     by_year = {policy.year: policy for policy in policy_years}
     fallback_action = int(np.argmin(np.abs(ACTION_CAPS - fallback_cap)))
@@ -3704,10 +3813,11 @@ def _rollout_cap_policy_with_projected_states(
             mortality=mortality,
             expenses=expenses,
             projection_config=projection_config,
-            collect_states=True,
+            collect_states=False,
             progress_label=f"Causal rich-state rollout year {year + 1}",
             model_point_log_interval=model_point_log_interval,
             surrender_policy_factory=surrender_policy_factory,
+            collect_pre_action_states=True,
         )
         rich, rich_names = _portfolio_state_extension(prefix_projected)
         if rich_names != expected_names:
@@ -3748,9 +3858,8 @@ def _rollout_cap_policy_with_projected_states(
     )
     return caps, projected, {
         "converged": True,
-        "iterations": inputs.n_years,
+        "causal_prefix_projection_count": inputs.n_years,
         "changed_action_counts": frozen_action_counts,
-        "maximum_iterations": inputs.n_years,
         "method": "exact_causal_prefix_rollout",
         "evaluation_sample_used_for_fallback": False,
     }
@@ -6665,6 +6774,30 @@ def _evaluate_fixed_lsmc_benchmarks(
                 - np.sum(continue_by_signature[signature], axis=1)[selection]
             )
             post_mean, post_se = _paired_mean_and_standard_error(post_delta)
+            fitted = getattr(fit_set, "fits", {}).get(signature)
+            training_fallback_steps = (
+                set()
+                if fitted is None
+                else {
+                    int(diagnostic.decision_step)
+                    for diagnostic in fitted.diagnostics
+                    if (
+                        bool(fitted.training_fallback_used)
+                        or not bool(
+                            diagnostic.regression_accepted_for_exercise
+                        )
+                    )
+                }
+            )
+            fallback_deployed = bool(
+                signature in failed_signatures or training_fallback_steps
+            )
+            deployed_fallback_steps = set(training_fallback_steps)
+            if signature in failed_signatures and fitted is not None:
+                deployed_fallback_steps.update(
+                    int(diagnostic.decision_step)
+                    for diagnostic in fitted.diagnostics
+                )
             by_fingerprint[fingerprint].update({
                 "deployed_policyholder_pv_difference_vs_continue_aud": (
                     post_mean
@@ -6674,7 +6807,13 @@ def _evaluate_fixed_lsmc_benchmarks(
                     post_mean - 1.96 * post_se
                 ),
                 "continue_fallback_deployed": (
-                    signature in failed_signatures
+                    fallback_deployed
+                ),
+                "training_continue_fallback_deployed": bool(
+                    training_fallback_steps
+                ),
+                "continue_fallback_decision_step_count": (
+                    len(deployed_fallback_steps)
                 ),
             })
         validation_rows.extend(cap_validation_rows)
@@ -6993,10 +7132,20 @@ def _policyholder_fit_set_payload(fit_set: object) -> dict[str, object]:
         )
         fallback_steps = {
             signature: tuple(sorted(
-                int(diagnostic.decision_step)
-                for diagnostic in fit.diagnostics
-                if not bool(
-                    diagnostic.regression_accepted_for_exercise
+                {
+                    int(diagnostic.decision_step)
+                    for diagnostic in fit.diagnostics
+                    if not bool(
+                        diagnostic.regression_accepted_for_exercise
+                    )
+                }
+                | (
+                    {
+                        int(diagnostic.decision_step)
+                        for diagnostic in fit.diagnostics
+                    }
+                    if bool(fit.training_fallback_used)
+                    else set()
                 )
             ))
             for signature, fit in fit_set.fits.items()
@@ -7020,6 +7169,16 @@ def _policyholder_fit_set_payload(fit_set: object) -> dict[str, object]:
             signature, default=str, separators=(",", ":")
         )
         trained_policy = policies[signature]
+        deployed_fallback_steps = tuple(fallback_steps.get(signature, ()))
+        trained_steps = set(getattr(trained_policy, "regressions"))
+        fallback_step_set = set(deployed_fallback_steps)
+        expected_steps = trained_steps | fallback_step_set
+        accepted_steps = (
+            set()
+            if signature in validation_fallbacks
+            else trained_steps - fallback_step_set
+        )
+        whole_signature_fallback = bool(expected_steps) and not accepted_steps
         # Deployment replaces a failed signature with Continue.  Persist that
         # switch explicitly while retaining the trained regression for audit.
         signatures.append({
@@ -7027,15 +7186,16 @@ def _policyholder_fit_set_payload(fit_set: object) -> dict[str, object]:
             "policy_signature_fingerprint": hashlib.sha256(
                 signature_text.encode("utf-8")
             ).hexdigest(),
-            "continue_fallback_deployed": signature in validation_fallbacks,
+            "continue_fallback_deployed": bool(deployed_fallback_steps),
+            "whole_signature_continue_fallback_deployed": (
+                whole_signature_fallback
+            ),
             "continue_fallback_decision_steps": list(
-                fallback_steps.get(signature, ())
+                deployed_fallback_steps
             ),
             "trained_policy": _surrender_policy_payload(trained_policy),
             "deployed_regression_count": (
-                0
-                if signature in validation_fallbacks
-                else len(getattr(trained_policy, "regressions"))
+                len(accepted_steps)
             ),
         })
     return {
@@ -8904,9 +9064,10 @@ def main() -> None:
             )
             evaluation_rollout_metadata = {
                 "converged": True,
-                "iterations": 0,
+                "causal_prefix_projection_count": 0,
                 "changed_action_counts": [],
-                "maximum_iterations": 0,
+                "method": "fixed_cap_direct_projection",
+                "evaluation_sample_used_for_fallback": False,
                 "fixed_cap_fallback": True,
             }
     first_year_caps = np.unique(flexible_cap_matrix[:, 0])

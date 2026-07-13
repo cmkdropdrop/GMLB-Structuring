@@ -67,6 +67,10 @@ _SUPPORTED_PARAMETERS = {
     "ExpenseAssumptions.expense_inflation": "decimal_per_year",
     "ExpenseAssumptions.commission_pct_of_premium": "decimal_of_single_premium",
     "ProjectionConfig.hedge_vol_spread": "absolute_volatility_add_on",
+    "ProjectionConfig.option_fair_value_markup":
+        "decimal_of_fair_option_package_value",
+    "ProjectionConfig.hedge_reference_management_fee":
+        "decimal_per_year_on_hedge_reference_notional",
     "MVASpec.cost_loading_per_remaining_year":
         "decimal_of_withdrawal_base_per_remaining_year",
     "MVASpec.cost_loading": "decimal_of_withdrawal_base",
@@ -305,6 +309,12 @@ def load_cost_assumptions(
     configured_projection = replace(
         base_projection,
         hedge_vol_spread=values["ProjectionConfig.hedge_vol_spread"],
+        option_fair_value_markup=values[
+            "ProjectionConfig.option_fair_value_markup"
+        ],
+        hedge_reference_management_fee=values[
+            "ProjectionConfig.hedge_reference_management_fee"
+        ],
     )
 
     base_capital = capital_stresses or CapitalStresses()

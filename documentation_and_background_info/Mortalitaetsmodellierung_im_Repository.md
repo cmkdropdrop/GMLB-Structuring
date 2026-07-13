@@ -43,7 +43,7 @@ Die wichtigsten Merkmale sind:
 | [`agile_engine/capital.py`](../AGILE_Modelling_Engine/agile_engine/capital.py) | Mortalitäts-, Langlebigkeits- und Katastrophenstress im Kapitalproxy |
 | [`agile_engine/sensitivities.py`](../AGILE_Modelling_Engine/agile_engine/sensitivities.py) | Standard-Sensitivitäten auf $q_x$ |
 | [`agile_engine/lsmc.py`](../AGILE_Modelling_Engine/agile_engine/lsmc.py) | Legacy-Research-Code; nicht im Portfolio-Bewertungspfad verwendet |
-| [`input_model_points_policyholders/model_points_policyholders.csv`](../input_model_points_policyholders/model_points_policyholders.csv) | Operative Quelle der demografischen New-Business-Modellpunktfelder |
+| [`input_model_points_policyholders/model_points_policyholders_4_point_proxy.csv`](../input_model_points_policyholders/model_points_policyholders_4_point_proxy.csv) | Operativer Default-Proxy der demografischen New-Business-Modellpunktfelder; die 48-Point-Datei bleibt als ausführliche Alternative verfügbar |
 | [`Code based on Papers/`](../Code%20based%20on%20Papers) | Methodenreferenzen mit weiteren Mortalitätsansätzen; nicht Teil der aktiven Engine |
 
 ## 2. Eingaben und Konstruktion der Mortalitätsbasis
@@ -668,7 +668,7 @@ beziehungsweise mit $N_i$ lebenden Verträgen. Die historische Survival-Wahrsche
 
 Ab dem Stichtag sind das heutige erreichte Alter, die heutige Policendauer und der heutige Vertrags- und Couple-Status zu verwenden. `commencement_year` bleibt für Kohorte, Improvements und vertragliche Vintage relevant, ist aber kein Grund, den bereits beobachteten Bestand erneut um frühere Todesfälle zu reduzieren.
 
-Für echte New-Business-Modelpoints am Issue Date startet die Projektion dagegen regulär mit dem gesamten Neugeschäftsexposure. Die derzeit vorhandenen 48 Modelpoints sind laut Begleitdokumentation New-Business-Modelpoints; eine spätere Erweiterung um In-force-Bestände benötigt zusätzliche aktuelle Zustandsfelder.
+Für echte New-Business-Modelpoints am Issue Date startet die Projektion dagegen regulär mit dem gesamten Neugeschäftsexposure. Sowohl der operative 4-Point-Proxy als auch die verfügbare 48-Point-Detailvariante sind laut Begleitdokumentation New-Business-Modelpoints; eine spätere Erweiterung um In-force-Bestände benötigt zusätzliche aktuelle Zustandsfelder.
 
 ### 11.5 Expected-Decrement-Projektion für Single Life
 

@@ -42,23 +42,23 @@ gibt es dort keinen neuen Hedge-/DVA-Start.
 
 ## Verbindliches Anniversary-Timing
 
-Die Zeilenverweise beziehen sich auf den bei Erstellung dieses Dokuments
-aktiven Monatsprojektor.
+Die Referenzen nennen stabile Ereignisblöcke und Hooks des Monatsprojektors;
+konkrete Zeilennummern werden bewusst nicht festgeschrieben.
 
 | Nr. | Ereignis am Anniversary `t_y` | Verwendeter Cap / Informationswirkung | Projektor-Referenz |
 |---:|---|---|---|
-| 0 | Start-of-month-Snapshots, darunter Phase, Locked Income, In-force Weight und Fee Base für das soeben beendete Monatsintervall | Noch keine neue Management Action | `projection.py:911-925` |
-| 1 | Annual Reference-Fund Return wird berechnet und dem Account Value gutgeschrieben | **Alter Cap `C_{y-1}`**. `year_idx = anniv_step // 12` wird vor dem Reset verwendet. Der vergangene Reference Return, Credited Return und Performance Gap werden jetzt beobachtbar. | `projection.py:927-970` |
-| 2 | Product Fee und Lifetime Income Premium werden für das letzte Intervall abgegrenzt und sämtliche accrued Fees gepostet | Die Fee Base des letzten Monats wurde vor dem Annual Credit fixiert. Posting erfolgt nach Credit und vor Election. | `projection.py:981-996` |
-| 3 | Gegebenenfalls wird der Age-Pension+-State aktualisiert und die neue jährliche Withdrawal Base fixiert | Transaktionszustand auf post-fee Account Value; keine Änderung der Cap-Reihenfolge | `projection.py:998-1009` |
-| 4 | Expected Mortality Decrement und Death Benefit für das beendete Intervall | Mortality verwendet den **pre-Election coverage state**. Death Benefit ist post-fee. Das In-force Weight wird vor allen Folgeereignissen reduziert. | `projection.py:1011-1046` |
-| 5 | Income Election der überlebenden, zulässigen Growth-Verträge | Election verwendet den post-credit, post-fee und post-mortality State. Der neue Cap ist nach dieser Konvention noch nicht bekannt. | `projection.py:1048-1061` |
-| 6 | Versicherung wählt und veröffentlicht `C_y` | Neuer, expliziter Control-/Announcement-Hook. Der reihenfolgeerhaltende Einfügepunkt liegt unmittelbar zwischen `elect_income(...)` und `restart_dva_period(step)`. | zwischen `projection.py:1061` und `projection.py:1062` |
-| 7 | Hedge Execution, Crediting-Margin und DVA-/Crediting-Period-Restart | **Neuer Cap `C_y`**. Die Buchungen erfolgen nur für die nach Mortality noch in force befindlichen Verträge. | `projection.py:707-760`, Aufruf `projection.py:1062` |
-| 8 | Monatliches Lifetime Income in arrears | Nur Lives, die bis zum Payment Date überlebt haben. Im Election Month erfolgt wegen `just_elected` noch keine Zahlung. | `projection.py:1065-1081` |
-| 9 | Zulässige Partial/Excess Withdrawals | Nach neuem DVA-Start und Income Payment | `projection.py:1083-1095` |
-| 10 | Full-Withdrawal-Entscheidung und Auszahlung | Nach Bekanntgabe von `C_y`, Hedge-/DVA-Restart, Income und Partial Withdrawals. Der Policyholder-Hook muss den aktuellen Cap explizit erhalten. | `projection.py:1097-1237` |
-| 11 | Expenses, erschöpfte Growth-Verträge, In-force- und Diagnosepfade | End-of-step-State; nicht als pre-action State für die Cap-Wahl wiederverwenden | `projection.py:1239-1278` |
+| 0 | Start-of-month-Snapshots, darunter Phase, Locked Income, In-force Weight und Fee Base für das soeben beendete Monatsintervall | Noch keine neue Management Action | Beginn der monatlichen Hauptschleife |
+| 1 | Annual Reference-Fund Return wird berechnet und dem Account Value gutgeschrieben | **Alter Cap `C_{y-1}`**. `year_idx = anniv_step // 12` wird vor dem Reset verwendet. Der vergangene Reference Return, Credited Return und Performance Gap werden jetzt beobachtbar. | Block `anniversary crediting` |
+| 2 | Product Fee und Lifetime Income Premium werden für das letzte Intervall abgegrenzt und sämtliche accrued Fees gepostet | Die Fee Base des letzten Monats wurde vor dem Annual Credit fixiert. Posting erfolgt nach Credit und vor Election. | `post_fee_subledger(step)` |
+| 3 | Gegebenenfalls wird der Age-Pension+-State aktualisiert und die neue jährliche Withdrawal Base fixiert | Transaktionszustand auf post-fee Account Value; keine Änderung der Cap-Reihenfolge | `activate_aps(...)` und Annual-Withdrawal-Base |
+| 4 | Expected Mortality Decrement und Death Benefit für das beendete Intervall | Mortality verwendet den **pre-Election coverage state**. Death Benefit ist post-fee. Das In-force Weight wird vor allen Folgeereignissen reduziert. | Block `death decrement before the payment date` |
+| 5 | Income Election der überlebenden, zulässigen Growth-Verträge | Election verwendet den post-credit, post-fee und post-mortality State. Der neue Cap ist nach dieser Konvention noch nicht bekannt. | `income_election_decision(...)`, `elect_income(...)` |
+| 6 | Versicherung wählt und veröffentlicht `C_y` | Expliziter, read-only Control-/Announcement-Hook unmittelbar zwischen `elect_income(...)` und `restart_dva_period(step)`. | `observe_cap_decision(...)` |
+| 7 | Hedge Execution, Crediting-Margin und DVA-/Crediting-Period-Restart | **Neuer Cap `C_y`**. Die Buchungen erfolgen nur für die nach Mortality noch in force befindlichen Verträge. | `restart_dva_period(step)` |
+| 8 | Monatliches Lifetime Income in arrears | Nur Lives, die bis zum Payment Date überlebt haben. Im Election Month erfolgt wegen `just_elected` noch keine Zahlung. | Block `income payment` |
+| 9 | Zulässige Partial/Excess Withdrawals | Nach neuem DVA-Start und Income Payment | `_apply_partial_withdrawals(...)` |
+| 10 | Full-Withdrawal-Entscheidung und Auszahlung | Nach Bekanntgabe von `C_y`, Hedge-/DVA-Restart, Income und Partial Withdrawals. Der Policyholder-Hook erhält den aktuellen Cap explizit. | `SurrenderDecisionContext` / `surrender_mask(...)` |
+| 11 | Expenses, erschöpfte Growth-Verträge, In-force- und Diagnosepfade | End-of-step-State; nicht als pre-action State für die Cap-Wahl wiederverwenden | End-of-step-Blöcke der Hauptschleife |
 
 ### Same-Anniversary-Beobachtbarkeit
 
@@ -290,6 +290,38 @@ An jedem rückwärts durchlaufenen Anniversary gilt:
 4. Der Cap mit dem höchsten Versichererwert bestimmt die Leader-Policy.
 5. Die ausgewählten Werte werden als Targets des vorherigen Jahres verwendet.
 
+### Implementierte fold-reine Rekursion
+
+Die Produktionsimplementierung bildet `K` voneinander getrennte äußere
+Policy-Ketten und zusätzlich eine Vollstichprobenkette. Für äußere Falte `k`
+werden sämtliche aktuellen **und zukünftigen** Follower- und Leader-Modelle
+ohne die vollständigen Pfade dieser Falte gefittet. Die OOF-Action-Values eines
+Pfads stammen damit aus einer gesamten Policy-Kette, die diesen Pfad nie als
+Trainingstarget gesehen hat; ein indirektes Leck über ein späteres Refit ist
+ausgeschlossen. Die separate Vollstichprobenkette liefert ausschließlich die
+eingefrorenen Deployment-Modelle.
+
+Je Policy-Signature werden ein pre-cap `CONTINUE`-Q, ein pre-cap
+`FULL_WITHDRAWAL`-Q und die kanonische after-cap Continuation-Regression
+geschätzt. Für den tatsächlich beobachteten Explorations-Cap verwendet die
+Rekursion den exakten post-DVA-Entscheidungszustand und die vertragliche
+Eligibility. Genau dasselbe after-cap Regressionsobjekt wird ohne nachträgliches
+Refit oder abweichendes Clipping im `OptimalSurrenderPolicy` gespeichert. Ist
+dieses Modell instabil, wird in der betroffenen Kette `CONTINUE` gesetzt. Fehlt
+für die Vollstichprobenkette ein endlicher OOF-RMSE, wird die Signatur bereits
+vor dem zugehörigen Leader-Fit auf `CONTINUE` eingefroren.
+
+Der Versicherer fittet Product/LIP Fees, Crediting Margin, MVA/APS retained,
+Claims und Kosten als getrennte Komponenten. Der CSM-Proxy wird erst danach
+mit den dokumentierten Vorzeichen hergeleitet; dadurch bleibt die
+Cashflow-Reconciliation prüfbar. Numerische Ties werden deterministisch zum
+niedrigeren Cap aufgelöst.
+
+Für jeden fixen Benchmark-Cap, einschließlich Null-Crediting und uncapped
+positive Crediting, wird ein neues cap-konsistentes Policyholder-LSMC auf dem
+Training-Sample geschätzt. Die adaptive und die fixe Policy werden anschließend
+mit Common Random Numbers direkt im Monatsprojektor validiert und evaluiert.
+
 Eine einmal unter einem Referenz-Cap trainierte Policyholder-Policy darf nicht
 unverändert auf andere fixe oder flexible Caps übertragen werden. Umgekehrt
 darf nicht für jede Kombination aus Pfad, Jahr und Cap ein vollständiger neuer
@@ -381,8 +413,11 @@ Tests einhalten:
 - Die Bewertung ist risikoneutral und verwendet standardmäßig
   Heston-Hull-White. Das Stackelberg-Ergebnis ist eine markt-konsistente
   Design-/Bewertungsgröße, keine Real-World-Verhaltensprognose.
-- Die Projektion läuft bis der jüngste Covered Policyholder 120 Jahre alt ist.
-  Das harte Horizon-Ende darf keinen zusätzlichen Cap-/Hedge-Start erzeugen.
+- Die Marktpfade laufen bis der jüngste Covered Policyholder 120 Jahre alt
+  wäre. Die bestehende Mortality-Tabelle besitzt jedoch den harten
+  `q_x=1`-Sentinel bei Alter 115; deshalb ist die vertragliche In-force-
+  Exposure danach null. Das Markt-Horizon-Ende erzeugt keinen zusätzlichen
+  Cap-/Hedge-Start.
 - Der DVA ist der bestehende moment-matched Proxy auf den vollständigen
   Reference Fund. Der Hedge-Volatility-Spread ist eine separate insurer-only
   Execution-Cost-Annahme.
@@ -396,6 +431,12 @@ Tests einhalten:
 - Regressionen approximieren das Gleichgewicht nur innerhalb der gewählten
   State-, Basis- und Policyklasse. Out-of-sample-Validation und Fallbacks sind
   deshalb Teil der Gleichgewichtsimplementierung, kein optionales Reporting.
+- Der direkt projizierte adaptive Rollout friert die Caps exakt kausal über
+  aufeinanderfolgende Zeitpräfixe ein. Das vermeidet Look-ahead, ist mit dem
+  derzeit monolithischen Projektor aber quadratisch in der Zahl der
+  Policyjahre. Ein schnellerer exakt äquivalenter Rollout würde einen
+  synchronisierten, checkpointbaren Monatsprojektor für alle Portfoliozweige
+  erfordern; diese Architektur ist noch nicht implementiert.
 - Joint-Life- und Single-Life-Fallback-Policys bleiben bis zu ihrer jeweiligen
   Best Response getrennt. Die bestehende Einschränkung fehlender separater
   p11/p10/p01 Account-Value-Kohorten ist offenzulegen.

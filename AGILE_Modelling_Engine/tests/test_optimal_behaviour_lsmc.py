@@ -7,18 +7,24 @@ from dataclasses import FrozenInstanceError, fields, replace
 import numpy as np
 import pytest
 
+import agile_engine.optimal_behaviour_lsmc as optimal_behaviour_module
 from agile_engine import (ESGConfig, IndexLinkedLifetimeIncomeProduct,
                           CreditingCapDecisionContext, MortalityTable,
                           PolicySpec, ProjectionConfig, ReferenceFundSpec,
                           SurrenderDecisionContext, YieldCurve,
+                          ValuationSettings,
                           credited_return,
-                          load_dynamic_behaviour_assumptions)
+                          load_dynamic_behaviour_assumptions,
+                          value_contract)
 from agile_engine.esg import Measure, simulate
 from agile_engine.optimal_behaviour_lsmc import (
+    ELECTION_FEATURE_NAMES,
     FEATURE_NAMES,
     OptimalBehaviourLSMCSettings,
+    build_income_election_regression_features,
     build_surrender_regression_features,
     build_surrender_regression_features_from_arrays,
+    fit_optimal_behaviour_policy,
     fit_optimal_surrender_policy,
     fit_surrender_continuation_policy,
     no_voluntary_action_behaviour,
@@ -30,6 +36,11 @@ from agile_engine.projection import project
 class _NeverSurrender:
     def surrender_mask(self, *, account_value, **_kwargs):
         return np.zeros_like(account_value, dtype=bool)
+
+
+class _TaggedNeverSurrender(_NeverSurrender):
+    def __init__(self, tag: str) -> None:
+        self.provenance_fingerprint = tag
 
 
 class _BadShapePolicy:
@@ -179,6 +190,42 @@ def test_never_surrender_hook_is_cashflow_identical_to_no_hook():
     np.testing.assert_array_equal(plain.inforce, hooked.inforce)
 
 
+def test_external_decision_policy_changes_valuation_provenance():
+    esg, scenarios = _setup(n_paths=16, seed=27, horizon=2.0)
+    product = IndexLinkedLifetimeIncomeProduct()
+    policy = PolicySpec(age=65, income_start_year=1)
+    settings = ValuationSettings(
+        model="black_scholes",
+        n_paths=16,
+        seed=27,
+        horizon_years=2.0,
+        projection=ProjectionConfig(record_paths=False, max_age=67.0),
+    )
+    first = value_contract(
+        product,
+        policy,
+        esg,
+        MortalityTable.gompertz_makeham(),
+        no_voluntary_action_behaviour(),
+        settings=settings,
+        scenarios=scenarios,
+        surrender_policy=_TaggedNeverSurrender("fit-A"),
+    )
+    second = value_contract(
+        product,
+        policy,
+        esg,
+        MortalityTable.gompertz_makeham(),
+        no_voluntary_action_behaviour(),
+        settings=settings,
+        scenarios=scenarios,
+        surrender_policy=_TaggedNeverSurrender("fit-B"),
+    )
+
+    assert first.provenance != second.provenance
+    assert first.pv == second.pv
+
+
 def test_never_surrender_hook_fully_replaces_dynamic_statistical_lapses():
     _, scenarios = _setup(n_paths=16, seed=19, horizon=4.0)
     product = IndexLinkedLifetimeIncomeProduct()
@@ -257,15 +304,20 @@ def test_lsmc_fit_is_finite_out_of_sample_and_respects_growth_gate():
     if fit.training_fallback_used:
         assert not fit.policy.regressions
     assert fit.diagnostics
-    assert all(np.isfinite(d.oof_rmse_aud) for d in fit.diagnostics)
-    assert all(np.isfinite(d.condition_number) for d in fit.diagnostics)
     for diagnostic in fit.diagnostics:
         if diagnostic.regression_accepted_for_exercise:
+            assert diagnostic.oof_rmse_aud is not None
+            assert diagnostic.condition_number is not None
+            assert np.isfinite(diagnostic.oof_rmse_aud)
+            assert np.isfinite(diagnostic.condition_number)
             assert diagnostic.matrix_rank == diagnostic.feature_count
             assert (
                 diagnostic.condition_number
                 <= fit.policy.settings.maximum_condition_number
             )
+            assert diagnostic.fallback_reason is None
+        else:
+            assert diagnostic.fallback_reason
 
     rollout = project(
         product,
@@ -285,6 +337,204 @@ def test_lsmc_fit_is_finite_out_of_sample_and_respects_growth_gate():
         assert step % 12 == 0
         assert step >= 36
         assert 0 <= stats["exercise_path_count"] <= stats["eligible_path_count"]
+
+
+def test_legacy_lsmc_failed_cross_fits_fall_back_to_continue(monkeypatch):
+    _, training = _setup(n_paths=96, seed=811, horizon=8.0)
+    attempts = 0
+
+    def fail_cross_fit(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("Insufficient observations in an LSMC cross-fit fold.")
+
+    monkeypatch.setattr(
+        optimal_behaviour_module,
+        "_cross_fitted_regression",
+        fail_cross_fit,
+    )
+    fit = fit_optimal_surrender_policy(
+        IndexLinkedLifetimeIncomeProduct(),
+        PolicySpec(age=65, income_start_year=2),
+        training,
+        MortalityTable.gompertz_makeham(),
+        projection_config=ProjectionConfig(record_paths=True, max_age=73.0),
+        settings=OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=7),
+    )
+
+    assert attempts > 0
+    assert not fit.policy.regressions
+    assert not fit.cross_fitted_training_policy.regressions_by_step
+    assert fit.diagnostics
+    assert all(
+        not diagnostic.regression_accepted_for_exercise
+        for diagnostic in fit.diagnostics
+    )
+    assert all(
+        diagnostic.fallback_reason is not None
+        and diagnostic.fallback_reason.startswith("cross_fit_failed:")
+        for diagnostic in fit.diagnostics
+    )
+    assert np.isfinite(fit.training_candidate_policyholder_value_aud)
+    assert fit.training_candidate_policyholder_value_aud == pytest.approx(
+        fit.training_no_action_policyholder_value_aud,
+        rel=2.0e-13,
+        abs=1.0e-8,
+    )
+
+
+def test_combined_lsmc_fits_election_and_surrender_and_rolls_out_from_issue():
+    _, training = _setup(n_paths=192, seed=1101, horizon=4.0)
+    _, evaluation = _setup(n_paths=192, seed=2202, horizon=4.0)
+    product = IndexLinkedLifetimeIncomeProduct(
+        automatic_income_start_age=67.0
+    )
+    policy = PolicySpec(age=65, income_start_year=1)
+    mortality = MortalityTable.gompertz_makeham()
+    config = ProjectionConfig(
+        record_paths=False,
+        max_age=69.0,
+        mortality_seed=3311,
+    )
+    fit = fit_optimal_behaviour_policy(
+        product,
+        policy,
+        training,
+        mortality,
+        projection_config=config,
+        settings=OptimalBehaviourLSMCSettings(
+            n_folds=3,
+            fold_seed=17,
+        ),
+        fit_basis_inputs={"crediting_cap_rate": 0.06, "stress": "base"},
+    )
+
+    assert fit.training_scenario_fingerprint == training.content_fingerprint
+    assert fit.fit_basis_fingerprint != fit.training_scenario_fingerprint
+    assert {diagnostic.action_type for diagnostic in fit.diagnostics} == {
+        "income_election",
+        "full_withdrawal",
+    }
+    assert all(
+        diagnostic.phase in {"growth", "income"}
+        for diagnostic in fit.diagnostics
+    )
+    assert all(
+        diagnostic.folds_used in {0, 3}
+        for diagnostic in fit.diagnostics
+        if diagnostic.action_type == "income_election"
+    )
+    assert fit.policy.provenance_fingerprint
+    assert fit.policy.surrender_policy.provenance_fingerprint
+
+    rollout = project(
+        product,
+        policy,
+        evaluation,
+        no_voluntary_action_behaviour(),
+        mortality,
+        config=replace(config, mortality_seed=4422),
+        income_election_policy=fit.policy,
+        surrender_policy=fit.policy,
+    )
+    assert evaluation.content_fingerprint != training.content_fingerprint
+    assert np.all(rollout.income_election_events[:, :12] == 0.0)
+    assert np.all(
+        np.sum(rollout.income_election_events[:, :37], axis=1) > 0.0
+    )
+    assert not np.any(
+        (rollout.income_election_events > 0.0)
+        & (rollout.lapse_events > 0.0)
+    )
+    assert np.isfinite(list(rollout.pv_by_component().values())).all()
+
+
+def test_combined_fit_identity_changes_for_each_cap_and_stress_basis():
+    _, training = _setup(n_paths=96, seed=5101, horizon=3.0)
+    product = IndexLinkedLifetimeIncomeProduct(
+        automatic_income_start_age=67.0
+    )
+    higher_cap_product = replace(
+        product,
+        reference_fund=replace(
+            product.reference_fund,
+            scenario_maximum_return=0.12,
+        ),
+    )
+    policy = PolicySpec(age=65, income_start_year=1)
+    mortality = MortalityTable.gompertz_makeham()
+    config = ProjectionConfig(record_paths=False, max_age=68.0)
+    settings = OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=29)
+
+    base = fit_optimal_behaviour_policy(
+        product,
+        policy,
+        training,
+        mortality,
+        projection_config=config,
+        settings=settings,
+        fit_basis_inputs={"crediting_cap_rate": 0.06, "stress": "base"},
+    )
+    cap = fit_optimal_behaviour_policy(
+        higher_cap_product,
+        policy,
+        training,
+        mortality,
+        projection_config=config,
+        settings=settings,
+        fit_basis_inputs={"crediting_cap_rate": 0.12, "stress": "base"},
+    )
+    stress = fit_optimal_behaviour_policy(
+        product,
+        policy,
+        training,
+        mortality,
+        projection_config=config,
+        settings=settings,
+        fit_basis_inputs={"crediting_cap_rate": 0.06, "stress": "longevity"},
+    )
+
+    assert len({
+        base.fit_basis_fingerprint,
+        cap.fit_basis_fingerprint,
+        stress.fit_basis_fingerprint,
+    }) == 3
+
+
+def test_income_election_features_use_only_the_decision_context():
+    _, scenarios = _setup(n_paths=16, seed=3303, horizon=3.0)
+
+    class _ElectionCapture:
+        anniversary_only = True
+
+        def __init__(self):
+            self.context = None
+
+        def start_income_mask(self, *, context):
+            self.context = context
+            return np.zeros(context.n_paths, dtype=bool)
+
+    capture = _ElectionCapture()
+    policy = PolicySpec(age=65, income_start_year=2)
+    project(
+        IndexLinkedLifetimeIncomeProduct(),
+        policy,
+        scenarios,
+        no_voluntary_action_behaviour(),
+        MortalityTable.gompertz_makeham(),
+        config=ProjectionConfig(record_paths=False, max_age=68.0),
+        income_election_policy=capture,
+    )
+    assert capture.context is not None
+    features = build_income_election_regression_features(
+        capture.context,
+        policy.net_initial_investment,
+        policy.age,
+    )
+    assert features.shape == (scenarios.n_paths, len(ELECTION_FEATURE_NAMES))
+    assert np.isfinite(features).all()
+    assert not hasattr(capture.context, "scenarios")
+    assert not hasattr(capture.context, "future_discount")
 
 
 def test_context_exposes_only_observable_read_only_state_and_rich_features():
@@ -409,6 +659,37 @@ def test_public_continuation_fitter_falls_back_to_continue_when_too_small():
     assert fit.diagnostics[0].fallback_reason.startswith(
         "too_few_observations"
     )
+    assert not np.any(fit.policy.surrender_mask(context=context))
+
+
+def test_public_continuation_fitter_handles_an_imbalanced_boundary_fold():
+    context = _synthetic_surrender_context(n_paths=60)
+    features = build_surrender_regression_features(context, 100_000.0)
+    # Modulo two gives 31 rows in fold 0 and 29 in fold 1.  Although the
+    # overall 60-row threshold is met, fold 0 leaves only 29 training rows for
+    # 29 raw features plus the intercept.
+    complete_path_ids = np.concatenate((
+        np.arange(59, dtype=np.int64),
+        np.array([60], dtype=np.int64),
+    ))
+
+    fit = fit_surrender_continuation_policy(
+        {context.step: features},
+        {context.step: np.zeros(context.n_paths)},
+        premium=100_000.0,
+        settings=OptimalBehaviourLSMCSettings(n_folds=2),
+        fold_ids_by_step={context.step: complete_path_ids},
+    )
+
+    assert fit.fallback_steps == (context.step,)
+    assert context.step not in fit.policy.regressions
+    assert context.step not in fit.oof_continuation_by_step
+    diagnostic = fit.diagnostics[0]
+    assert diagnostic.observations == 60
+    assert diagnostic.folds_used == 0
+    assert diagnostic.fallback_reason is not None
+    assert diagnostic.fallback_reason.startswith("cross_fit_failed:")
+    assert "Insufficient observations" in diagnostic.fallback_reason
     assert not np.any(fit.policy.surrender_mask(context=context))
 
 

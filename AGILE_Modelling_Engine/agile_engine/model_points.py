@@ -1,6 +1,7 @@
 """Strict loading of the repository policyholder model points.
 
-The source file is a legacy AGILE-shaped new-business grid.  Only demographic,
+The operational default is the fast four-point proxy; the legacy AGILE-shaped
+48-point new-business grid remains an explicit alternative.  Only demographic,
 premium and contractual election fields are mapped to :class:`PolicySpec`.
 The four legacy allocation columns are validated for source integrity but are
 deliberately ignored: the generic product's 50/50 reference fund is a
@@ -30,7 +31,7 @@ from .product import (
 DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH = (
     Path(__file__).resolve().parents[2]
     / "input_model_points_policyholders"
-    / "model_points_policyholders.csv"
+    / "model_points_policyholders_4_point_proxy.csv"
 )
 
 LEGACY_ALLOCATION_COLUMNS = (

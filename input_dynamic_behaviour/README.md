@@ -13,7 +13,8 @@ Der Loader ist
 
 ## Modellform
 
-Für jede versicherte Person werden drei erklärende Variablen gebildet:
+Als gemeinsame Kernsignale werden für jede versicherte Person drei erklärende
+Variablen gebildet:
 
 ```text
 m = clip(log(G / A), -log(2), log(2))
@@ -51,6 +52,12 @@ mu_takeup = -log(1 - p_base) * exp(
     + beta_gap * visible_performance_gap
 )
 ```
+
+Die Baseline `p_base` ist nach Policy Year gestaffelt und bildet damit die
+Vertragsdauer ab. Alter und vollständig absolvierte Growth-Dauer wirken zudem
+über die am tatsächlichen Election-Termin anwendbare prospektive Income Rate
+und das daraus berechnete prospektive Einkommen. Es wird keine zusätzliche
+Zukunftsinformation oder physische Kalibrierung eingeführt.
 
 Beim Income-Lapse kommt ein eigenständiger konkurrierender Performance-Hazard
 hinzu. Damit wird sichtbare Underperformance nicht mehr als Multiplikator der
@@ -110,11 +117,19 @@ Fee-Posting und Mortalität auf jedem zulässigen Policy Anniversary neu aus den
 dann sichtbaren Zuständen bestimmt. Für Joint Life werden Primary- und
 Spouse-Lebensstatus getrennt behandelt; eine nichtlineare Funktion wird nicht
 auf einen gemittelten `p11/p10/p01`-Zustand angewandt.
-Die dynamischen Koeffizienten wirken für Single Life, den Single-Life-Fallback
-und die Lump-Sum-Spouse-Ausprägung. Der bedingt gemeinsame Continue-Income-
-Joint-Zweig verwendet dagegen die geladenen statischen Basisraten, solange
-keine getrennten `p11/p10/p01`-AV-/Fee-Kohorten bestehen. Ein Full Surrender
-gegen einen vollständig erschöpften Surrender Value wird nicht zugelassen:
+Die dynamischen Koeffizienten wirken für Single Life und Joint Life. Bei
+zustandsabhängiger Election werden Primary- und Spouse-Lebensstatus mit einem
+separaten, reproduzierbaren Mortalitäts-Seed pfadweise fortgeschrieben. Nach
+Election werden Continue-Income-Entscheidungen damit auf dem tatsächlichen
+Status beider Leben und nicht auf einem gemittelten `p11/p10/p01`-Zustand
+ausgewertet. Der explizite deterministische Benchmark behält aus
+Rückwärtskompatibilität die Modellpunkt-Election-Regel. In den Portfolio-
+V00/V01/V10/V11-Vergleichen verwendet er jedoch dieselben pfadweisen
+Primary-/Spouse-Mortalitätsziehungen wie die übrigen Arme, damit die
+Behaviour-Zerlegung keinen Wechsel der Mortalitätsmethodik mitmisst. Nur der
+Standalone-Low-Level-Projektor behält standardmäßig den historischen Expected-
+Decrement-Fallback. Ein Full Surrender gegen einen vollständig
+erschöpften Surrender Value wird nicht zugelassen:
 Der Kunde würde sonst eine positive laufende Income-Garantie ohne Gegenleistung
 aufgeben.
 Sämtliche Behaviour-Parameter bleiben feste, nicht kalibrierte Proxy-Annahmen.
@@ -135,12 +150,16 @@ in dynamisch modellierten Income-/Single-Life-Zweigen.
 
 ## Mortalitätsabgrenzung
 
-Die Portfolio-Barwerte verwenden deterministische Expected Decrements je
-Modellpunkt. Mangels einer bereitgestellten, fachlich freigegebenen
-Mortalitätstafel bleibt die verwendete Gompertz-Makeham-Basis illustrativ.
-Ergebnisse sind deshalb als vereinfachte Expected-Decrement-Projektionen auf
-illustrativer Proxy-Mortalitätsbasis zu kennzeichnen und nicht als vollständig
-kalibrierte Best-Estimate-Mortalitätsprognose.
+Single-Life-Läufe verwenden Expected Decrements. Portfolio-Joint-Life-Läufe
+einschließlich der deterministischen Faktorbenchmarks verwenden getrennte
+pfadweise Primary-/Spouse-Lebensstatus und einen gemeinsamen Mortalitäts-Seed;
+die Resultate bleiben Monte-Carlo-Erwartungswerte. Mangels einer
+bereitgestellten, fachlich
+freigegebenen Mortalitätstafel bleibt die verwendete Gompertz-Makeham-Basis
+illustrativ.
+Ergebnisse sind deshalb als vereinfachte Projektionen auf illustrativer Proxy-
+Mortalitätsbasis zu kennzeichnen und nicht als vollständig kalibrierte Best-
+Estimate-Mortalitätsprognose.
 
 ## Einordnung und Governance
 

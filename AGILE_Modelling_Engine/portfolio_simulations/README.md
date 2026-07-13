@@ -10,6 +10,11 @@ Der Defaultlauf verwendet Heston-Hull-White unter dem risikoneutralen Maß und
 Plain Monte Carlo mit gemeinsamen Marktpfaden für alle Modellpunkte. COS und
 LSMC werden nicht verwendet.
 
+Auf Versichererseite ist das administrative Guthaben nicht im Reference Fund
+investiert. Es verdient ausschließlich den pfadweisen AUD-Overnight-Return aus
+der Hull-White-Zinssimulation. Die annualisierte Optionsreplikation wird davon
+getrennt als Hedge gebucht; Kunden-AV, Crediting und Claims bleiben unverändert.
+
 ## Defaultlauf
 
 Aus `AGILE_Modelling_Engine`:
@@ -64,22 +69,28 @@ Die Ergebnisse liegen standardmäßig unter
 - `scenarios/crediting_rate_*` enthält die vollständigen Ergebnisse jedes
   einzelnen Aufrufs von `run_portfolio_valuation.py`.
 
-Im Vergleichsoutput umfasst `pv_total_expenses_aud` sowohl die administrativen
-Expenses als auch den Hedge-Execution-/Basis-Proxy. Die beiden Rohkomponenten
-bleiben ausschließlich als Audit-Aufteilung in der CSV erhalten.
+Der Vergleichsoutput trennt administrative Expenses, gesamten Hedge Cost,
+fairen Optionspaketwert, 0,50%-Kaufmarge, 0,30%-Management-Fee-Drag,
+gegebenenfalls den Legacy-Execution-Proxy, Money-Market-Ertrag und optionalen
+Above-Cap-Hedge-Gewinn. Dadurch werden Kosten und Erträge nicht über ein
+irreführendes Total-Expense-Feld vermischt.
 
 ## Eingabedaten
 
 Der Runner verwendet standardmäßig genau diese Repository-Quellen:
 
-- `../../input_model_points_policyholders/model_points_policyholders.csv`;
+- `../../input_model_points_policyholders/model_points_policyholders_4_point_proxy.csv`;
 - `../../input_cost_assumptions/cost_assumptions.csv`;
 - `../../input_dynamic_behaviour/dynamic_behaviour_baselines.csv`;
 - `../../input_dynamic_behaviour/dynamic_behaviour_coefficients.csv`;
 - `../input_market_data/australian_zero_curve.csv`;
 - `../input_market_data/model_parameters.csv`.
 
-Die tatsächlichen Pfade, Annahmensatz-IDs und Source-Fingerprints werden im
+Die 4-Point-Datei ist der schnelle operative Default. Die ausführliche
+48-Point-Variante bleibt über
+`--model-points ../../input_model_points_policyholders/model_points_policyholders.csv`
+explizit verfügbar. Die tatsächlichen Pfade, Annahmensatz-IDs und
+Source-Fingerprints werden im
 Run-Manifest festgehalten. Die australische Zinskurve ist die laufend
 eingelesene Marktdatenquelle. Die bereits vorhandenen Equity-, Heston-,
 Hull-White- und Korrelationsparameter stammen aus `model_parameters.csv`.
@@ -118,9 +129,10 @@ normalised_average_PV = sum_i(contract_weight_i * per_contract_PV_i)
 ```
 
 Das ist ein gewichteter Durchschnittsvertrag, kein absoluter Bestand und keine
-einzige vor der Projektion zusammengefasste Police. Insbesondere werden die 48
-CSV-Zeilen nicht als 48 Policen interpretiert. Der Runner weist beim Start und
-in den Outputs ausdrücklich auf diese Basis hin.
+einzige vor der Projektion zusammengefasste Police. Insbesondere werden die
+Modellpunktzeilen — im Default vier Proxy-Zeilen — nicht als einzelne Policen
+interpretiert. Der Runner weist beim Start und in den Outputs ausdrücklich auf
+diese Basis hin.
 
 ### Absolute Portfoliobasis
 
@@ -173,6 +185,9 @@ Der Default-Ausgabeordner ist
 
 - `portfolio_valuation.log` enthält Zeitstempel, Eingabe- und Basisangaben,
   Fortschrittsmeldungen je Modellpunkt, Solver-Status und abschließende KPIs.
+- Eigene Konsolenmeldungen der Portfolio-, Szenario-, LSMC- und Risiko-Runner
+  beginnen einheitlich mit lokaler Zeit im Format
+  `YYYY-MM-DD HH:MM:SS | LEVEL | Meldung`.
 - `run_manifest.json` dokumentiert Engine-Version, Laufzeit, Methoden,
   Annahmensätze, Datenquellen, Szenario-Fingerprint, Gewichtungsregeln,
   Fair-Fee-Einstellungen, Outputs und Modellgrenzen.
@@ -205,7 +220,10 @@ Der Lauf berichtet insbesondere:
 - Gross Present Value of Policyholder Benefits;
 - Present Value of Future Charges, getrennt nach Product Fee und Lifetime
   Income Premium;
-- Present Value of Guarantee Claims, Expenses und Hedge Costs;
+- Present Value of Guarantee Claims, Expenses und Hedge Costs, einschließlich
+  fairem Optionspaket, Kaufmarge und Hedge-Management-Fee;
+- Present Value of stochastic Money-Market Income und des optionalen retained
+  Excess Hedge Gain;
 - Non-Unit Best Estimate Liability und Total Best Estimate Liability;
 - Market-Consistent Insurer Net Present Value before Risk Margin;
 - New Business Margin before Risk Margin;
@@ -219,6 +237,11 @@ vereinnahmbaren Product Fees und Lifetime Income Premiums.
 Guarantee Claims sind bereits der aus dem Account Value nicht finanzierte Teil
 des Income-Cashflows. Sie dürfen deshalb nicht zusätzlich zum Gross PV der
 Policyholder Benefits addiert werden.
+
+Das Money-Market Income wird auf dem administrativen Crediting-Frame am Beginn
+jedes Monatsintervalls gebildet. Der unterjährige DVA-Optionswert bleibt eine
+Liability-Größe und wird nicht als Backing-Asset behandelt; als Return dient
+ausschließlich die pfadweise AUD-Overnight-Akkumulation.
 
 Die Profitabilitätsklassifikation eines Modellpunkts verwendet standardmäßig
 eine Materialität von einem Basispunkt seiner Prämie. Der Grenzwert kann über
@@ -276,7 +299,12 @@ normalisierte Durchschnittsvertragsbasis. Eine Multiplikation mit `N_total`
 |---|---|
 | `--n-paths` | Anzahl gemeinsamer Q-Pfade; Default 2.000 |
 | `--seed` | Market-Scenario-Seed; Default 2026 |
+| `--take-up-seed` | separater Seed der pfadweisen Income-Election |
+| `--mortality-seed` | separater Seed für pfadweise Lebenszustände |
+| `--income-election-mode dynamic\|deterministic` | Dynamic-Hauptlauf oder expliziter Modellpunkt-Benchmark |
+| `--post-income-behaviour dynamic\|continue` | Post-Election-Behaviour oder No-Exit-Benchmark |
 | `--heston-substeps` | Heston-Substeps je Monat; Default 4 |
+| `--hedge-cap-leg-mode sold\|not_sold` | `sold` ist der Standard ohne Above-Cap-Gewinn; `not_sold` behält die Cap-Call-Leg |
 | `--portfolio-contract-count` | gesamte Anzahl repräsentierter Verträge |
 | `--fair-lip` | aktuariell faire LIP je Modellpunkt |
 | `--commercial-break-even-lip` | kommerzielle Break-even-LIP je Modellpunkt |
@@ -302,39 +330,61 @@ Der schlanke Research-Runner verwendet den ausdrücklich illustrativen
 Gompertz-Makeham-Proxy. Er approximiert lediglich die Form von ALT 2020-22 und
 ist keine kalibrierte oder freigegebene australische Insured-Lives-Basis.
 
-`income_start_year` ist im gelieferten Portfolio ein expliziter,
-deterministischer Election-Termin und hat Vorrang vor dem dynamischen Take-up-
-Hazard. Ein gegebenenfalls früherer automatischer Start nach Alter 100 wird
-überall als effektiver Election-Termin verwendet. Die Behaviour-CSVs bleiben
-Quelle für Income-Lapses und Withdrawals sowie für deren Provenienz.
+Im Dynamic-Hauptlauf ist die Income Election ab Vertragsbeginn eine
+zustandsabhängige pfadweise Take-up-Entscheidung. Auf jedem vertraglich
+zulässigen Policy Anniversary verwendet sie nur den dann bekannten Zustand,
+unter anderem Account Value, sofort erreichbares Lifetime Income,
+Garantie-Moneyness, bisherige Reference-/Credited Returns, sichtbaren
+Performance Gap, Alter und Vertragsdauer. Mindestwartezeit und Rate Card gelten
+am tatsächlichen Start. Ein noch lebender, nicht electeder Vertrag startet
+spätestens am ersten zulässigen Anniversary nach Erreichen des Alters 100.
 
-Für Joint-Life-Modellpunkte wird die Spouse-Survival-Wahrscheinlichkeit bis zur
-Election aus derselben Mortalitätsbasis fortgeschrieben. Der nicht mehr für
-Spouse Income qualifizierte Anteil wird als Single-Life-Fallback bewertet. Nach
-Election verwendet der bedingt gemeinsame Continue-Income-Zweig die
-state-unabhängigen statischen CSV-Basisraten für Income-Lapse und Excess
-Withdrawal; der Single-Life-Fallback bleibt dynamisch. Eine nichtlineare
-Behaviour-Funktion wird nicht auf einen gemittelten `p11/p10/p01`-Zustand
-angewandt. Getrennte Account-Value-/Fee-Kohorten, abhängige Leben sowie
-Scheidungs-, Removal- und Common-Shock-Logik bleiben Modellgrenzen.
+`income_start_year` des Modellpunkts ist deshalb im Dynamic-Hauptlauf kein
+realisierter Starttermin mehr. Es bleibt als rückwärtskompatibler Produktinput
+für `--income-election-mode deterministic` und für die expliziten
+2×2-Validierungsbenchmarks erhalten. Die Behaviour-CSVs sind die Parameterquelle
+für Dynamic Take-up sowie Ordinary-/Performance-Lapse und Withdrawals; es wird
+keine zusätzliche physische Kalibrierung eingeführt.
+
+Single-Life-Verträge verwenden erwartete Dekremente. Joint-Life-Verträge
+werden in den Portfolio-Hauptläufen und in allen V00/V01/V10/V11-Armen mit
+pfadweise getrennten Primary-/Spouse-Lebenszuständen fortgeschrieben. Die
+nichtlineare Take-up- oder Lapse-Funktion wird nicht auf einen gemittelten
+`p11/p10/p01`-Zustand angewandt; alle Faktor-Arme verwenden dieselben
+Mortalitätsziehungen. Der Standalone-Low-Level-Projektor behält für rein
+deterministische Joint-Life-Läufe standardmäßig den historischen Expected-
+Decrement-Fallback. Abhängige Leben, Scheidung, Removal und Common-Shock-
+Mortalität bleiben Modellgrenzen.
 
 Income-Lapse bleibt bei fortbestehender Income-Garantie auch nach Aufzehrung
 des Account Value aktiv. Der Surrender Benefit ist dann null; ein Lapse beendet
 aber die Garantie sowie künftige Garantieclaims und laufende Expenses.
+Ordinary Hazard, Performance Hazard und Gesamtwahrscheinlichkeit werden
+getrennt ausgewiesen. Income Election und Full Withdrawal am selben
+Entscheidungszeitpunkt sind nicht zulässig; die erste Income-Zahlung folgt der
+vertraglichen monatlichen Event-Reihenfolge nach der Election.
 
 ## Optimal-Behaviour-Portfoliobewertung mit LSMC
 
 `run_portfolio_valuation_lsmc.py` bewertet dasselbe generische Portfolio mit
 demselben Heston-Hull-White-Modell unter Q, denselben Markt-, Kosten-,
 Mortalitäts- und Produktannahmen sowie derselben Portfolioaggregation wie
-`run_portfolio_valuation.py`. Der modellpunktbezogene Income-Start bleibt wie
-im operativen Runner deterministisch. Ersetzt werden die dynamischen
-Income-Lapse- und Excess-Withdrawal-Proxys durch eine optimale jährliche
-LSMC-Entscheidung:
+`run_portfolio_valuation.py`. Die eingefrorene LSMC-Policy projiziert den
+Vertrag ab t=0 und optimiert Income Election und späteren Surrender in einer
+gemeinsamen phasenabhängigen Bellman-Rekursion:
 
 ```text
-CONTINUE | FULL_WITHDRAWAL
+Growth: WAIT | START_INCOME_NOW
+Income: CONTINUE | FULL_WITHDRAWAL
 ```
+
+`START_INCOME_NOW` ist ein Zustandsübergang, keine sofortige Auszahlung. Das
+Lifetime Income wird mit der Rate Card und dem am Election-Zeitpunkt bekannten
+Zustand fixiert; danach greift dieselbe optimierte Income-Phase-Policy. Income
+kann nur auf zulässigen Anniversaries und nicht vor der Mindestwartezeit
+beginnen. Bei einer instabilen Election-Regression ist WAIT der konservative
+Fallback, außer am Forced-Election-Termin, an dem Income zwingend startet. Eine
+instabile Surrender-Regression fällt auf CONTINUE zurück.
 
 Growth-Surrender und Growth-Withdrawals bleiben vertraglich verboten. Eine
 partielle Income-Entnahme reduziert im generischen Nicht-APS-Produkt Account
@@ -350,35 +400,52 @@ getrennte Evaluationspfade:
 python portfolio_simulations/run_portfolio_valuation_lsmc.py
 ```
 
-Die Backward-Induction verwendet fünfteilige Cross-Fits, standardisierte
-Zustände, Ridge-Regularisierung, ein Rang-/Konditions-Gate und standardmäßig
-einen konservativen OOF-RMSE-Puffer für eine Exercise-Entscheidung. Nur die auf dem
-Trainingssample eingefrorene Policy wird im unveränderten monatlichen
-Projektor out of sample bewertet. Unterperformt eine cross-fitted
-Modellpunkt-Policy bereits im Training die zulässige Continue-Policy, wird sie
-vor der Evaluation auf Continue zurückgesetzt. Es findet keine nachträgliche
+Die Backward-Induction verwendet für beide Aktionstypen fünfteilige Cross-Fits,
+standardisierte Zustände, Ridge-Regularisierung, Rang-/Konditions-Gates und
+einen konservativen OOF-RMSE-Puffer. Die Zustände enthalten nur am
+Entscheidungszeitpunkt bekannte Größen; zukünftige Returns, Caps,
+Diskontfaktoren oder Hedge-Ergebnisse sind ausgeschlossen. Nur die auf dem
+Trainingssample eingefrorene gemeinsame Policy wird im unveränderten
+monatlichen Projektor out of sample bewertet. Es findet keine nachträgliche
 Policy-Auswahl auf den Evaluationspfaden statt.
 
-Die Ausübung wird auf Policy Anniversaries diskretisiert. Das entspricht dem
-Jahresraster des LSMC-Research-Ansatzes und liefert gegenüber einem feineren
-monatlichen oder täglichen vertraglichen Exercise-Raster eine konservative
-Lower-Bound-Policy; diese Diskretisierung ist keine beobachtete
-Verhaltensannahme.
+Election und Surrender werden auf vertraglichen Policy Anniversaries
+diskretisiert. Das Jahresraster liefert gegenüber einem feineren zulässigen
+Exercise-Raster eine konservative Lower-Bound-Policy; diese Diskretisierung ist
+keine beobachtete Verhaltensannahme. Separate Training-/Evaluation-Seeds für
+Marktpfade, Take-up und Mortalität werden im Manifest ausgewiesen.
 
 Der Runner rechnet standardmäßig zusätzlich:
 
 - den unveränderten Dynamic-Behaviour-Benchmark auf exakt demselben
   Evaluationsszenariosatz;
-- einen Continue-Benchmark ohne freiwilligen Exit;
+- `deterministic_election_continue` (V00);
+- `deterministic_election_post_behaviour` (V01);
+- `variable_election_continue` (V10);
 - den LSMC-Out-of-sample-Rollout.
+
+Die drei fachlichen Benchmark-IDs werden physisch kompakt unter
+`bench/v00`, `bench/v01` und `bench/v10` abgelegt.
+
+V01 verwendet die Income-Surrender-Regel aus dem gemeinsamen Fit, ohne sie
+unter deterministischer Election separat neu zu fitten. V10 verwendet
+umgekehrt die Election-Regel aus dem gemeinsamen Fit und unterdrückt Surrender
+in der Evaluation, ohne eine Continue-only-Election-Policy neu zu optimieren.
+Beide Einschränkungen werden im Manifest ausgewiesen; die vier Werte bleiben
+eine transparente Faktorzerlegung der eingefrorenen gemeinsamen Policy und
+keine Sammlung vier unabhängig optimierter Verträge.
 
 Neben den vollständigen Portfolio- und Modellpunktergebnissen entstehen
 `comparison_summary.csv`, `model_point_comparison.csv`,
 `lsmc_vs_continue_summary.csv`, `lsmc_regression_diagnostics.csv` und
-`lsmc_action_summary.csv`. Das Manifest dokumentiert Training und Evaluation
-einschließlich separater Seeds und Szenario-Fingerprints. Mit
+`lsmc_action_summary.csv`. Regressionen, Fallbacks und Action-Anteile werden
+für `income_election` und `full_withdrawal` getrennt ausgewiesen. Das Manifest
+dokumentiert Training und Evaluation einschließlich separater Seeds,
+Szenario- und Fit-Basis-Fingerprints, Action Sets, Forced-Election-Regel,
+Joint-Life-Behandlung und Benchmark-Semantik. Mit
 `--no-dynamic-benchmark` kann nur der zusätzliche Originalvergleich
-abgeschaltet werden; der Continue-Benchmark bleibt als LSMC-Validierung aktiv.
+abgeschaltet werden; der Variable-Election/Continue-Benchmark bleibt als
+LSMC-Validierung aktiv.
 
 Fair-Fee-Solves sind in diesem Runner bewusst nicht freigeschaltet. Eine
 Gebührenänderung verändert die optimale Policy und würde deshalb bei jedem
@@ -386,22 +453,31 @@ Root-Finder-Schritt ein neues LSMC-Training erfordern.
 
 ### Sensitivität gegenüber dem Crediting Cap
 
-Der separate Szenario-Runner trainiert die optimale Policy für jedes Cap neu
-und bewertet alle Varianten mit Common Random Numbers auf einem vom Training
-getrennten Pfadsatz:
+Der separate Szenario-Runner trainiert die gemeinsame Election-/Post-Election-
+Policy für jede Cap×Stress-Zelle neu und bewertet Varianten innerhalb eines
+Stresses mit Common Random Numbers auf einem vom Training getrennten Pfadsatz:
 
 ```powershell
 python portfolio_simulations/run_lsmc_cap_behaviour_scenarios.py `
-  --cap-rates 4% 6% 12% 20% --no-dynamic-benchmark
+  --cap-rates 4% 6% 12% 20% `
+  --stress-scenarios base interest_up equity_level_down `
+  --no-dynamic-benchmark
 ```
 
 Er erzeugt `lsmc_cap_behaviour_comparison.csv`, einen kompakten Markdown-Bericht,
-eine Grafik, ein Manifest sowie die vollständigen Einzelergebnisse je Cap. Der
-Report zerlegt die Änderung der Policyholder Benefits relativ zum Vergleichs-
-Cap in den mechanischen Effekt unter Continue und die zusätzliche Interaktion
-mit der LSMC-Verhaltensoption. Die ausgewiesene Exercise-Rate ist nur ein
-ungewichteter Diagnoseanteil über Modellpunkt-/Pfad-/Entscheidungsereignisse;
-sie ist keine portfoliogewichtete Surrender-Rate. Da die Portfolioausgabe kein
+eine Grafik, ein Manifest sowie die vollständigen Einzelergebnisse je Zelle.
+Wiederverwendung wird erst nach Prüfung von Cap, Stress, Seeds, Action Sets,
+Benchmark-Semantik, Reconciliations und runner-erzeugtem Fit-Basis-Fingerprint
+zugelassen. Das Vergleichsmanifest belegt einen eindeutigen Joint-Policy-Fit je
+Cap×Stress-Zelle.
+
+Report und CSV zeigen Startjahr-Momente, Election-/Forced-Anteile,
+Growth-Dauer/-Exposure, Income-Lapse, separate ungewichtete Election- und
+Full-Withdrawal-Aktionsraten sowie Phasen-PVs. Die vier Benchmarks zerlegen den
+Behaviour-Effekt in Income-Election-Timing, Verhalten nach Election und deren
+Interaktion. Portfolio-Kennzahlen sind vertrags-, Q-pfad- und
+In-force-/Survival-gewichtet; Action-Raten bleiben ungewichtete
+Modellpunkt-/Pfad-/Entscheidungsdiagnostik. Da die Portfolioausgabe kein
 pfadweises gepaartes Konfidenzintervall enthält, sollten Aussagen zur Stabilität
 der Verhaltensoptionalität zusätzlich mit unabhängigen Trainings- und
 Evaluations-Seeds repliziert werden.
@@ -410,13 +486,41 @@ Evaluations-Seeds repliziert werden.
 
 `run_portfolio_risk_analysis.py` orchestriert für jedes Cap sowohl
 `run_portfolio_valuation.py` als auch `run_portfolio_valuation_lsmc.py` und
-ergänzt das Cap-Gitter um Markt-, biometrische und Expense-Einfaktorstresse.
-Die Ergebnisse werden als CSVs, Grafiken, Markdown-Bericht und auditiertes
-Manifest ausgegeben:
+untersucht standardmäßig nur Lapse-, Zins- und Longevity-Risiko. Das Lapse-
+Risiko wird über den Dynamic-/LSMC-Vergleich und die 2×2-Zerlegung von
+Election und Post-Election Behaviour gemessen; es wird nicht als zusätzlicher
+statistischer Lapse-Rate-Schock auf die LSMC-Policy angewandt. Die zusätzlichen
+Default-Einfaktorstresse sind deshalb `interest_up`, `interest_down` und
+`longevity`.
+
+Damit werden standardmäßig in jeder Cap×Stress-Zelle zwingend beide
+Hauptansätze gerechnet und verglichen: Dynamic Behaviour mit dynamischer Income
+Election und dynamischem Post-Election-Verhalten sowie die neu trainierte
+LSMC-Policy. Das intern an den LSMC-Child übergebene
+`--no-dynamic-benchmark` verhindert ausschließlich eine zweite, redundante
+Dynamic-Rechnung innerhalb dieses Childs; der separate Dynamic-Hauptlauf des
+Risiko-Runners bleibt immer aktiv.
+
+Equity-Level-, Equity-Volatility-, Mortality- und Expense-Stresse bleiben als
+explizite Forschungsoptionen über `--stress-scenarios` verfügbar, gehören aber
+nicht mehr zum Standardlauf. Die Ergebnisse werden als CSVs, Grafiken,
+Markdown-Bericht und auditiertes Manifest ausgegeben:
 
 ```powershell
 python portfolio_simulations/run_portfolio_risk_analysis.py
 ```
+
+Je Cap und Ansatz werden unter anderem mean/median/p10/p90 des Income-
+Startjahrs, Election-Anteile je Policy Year, verbleibende Growth-Exposures,
+Forced-Election-Anteil, mittlere Growth-Dauer, Ordinary-/Performance-/Total-
+Income-Lapse, Benefits vor/nach Election, Growth-Fees, Growth-Crediting-Margin,
+Post-Election-Guarantee-Claims, Money-Market-Ertrag, Hedgekosten-Komponenten,
+optionalem Hedge-Gewinn, BEL und Versicherer-NPV ausgewiesen. Dynamic
+und LSMC verwenden dieselben Evaluation-Szenarien; LSMC-Training bleibt davon
+getrennt. Das zusätzliche `behaviour_effect_decomposition.csv` enthält die
+2×2-Zerlegung in Election-, Post-Election- und Interaktionseffekt. Alte
+Fixed-Election-/Surrender-only-Ausgaben und Ausgaben mit abweichendem
+`hedge_cap_leg_mode` werden bei `--reuse-existing` abgelehnt.
 
 Unabhängige Kombinationen aus Cap und Stress werden in einer gemeinsamen Queue
 standardmäßig mit bis zu 16 Workern parallel gerechnet. Dadurch bleiben die
@@ -444,10 +548,18 @@ python portfolio_simulations/run_portfolio_risk_analysis.py `
 ```
 
 Jeder Child-Prozess schreibt seine Konsole isoliert nach
-`orchestrator_console.log` im jeweiligen Szenarioverzeichnis. Die feste
-Jobreihenfolge, Seeds und Common-Random-Number-Logik bleiben unabhängig von der
-Completion-Reihenfolge erhalten. Eine GPU wird nicht automatisch verwendet;
-der numerische Stack besitzt derzeit kein kompatibles GPU-Backend.
+`orchestrator_console.log` im jeweiligen Szenarioverzeichnis. Command-Header,
+Thread-Angabe und Child-Logging tragen dabei ebenfalls lokale Zeitstempel. Die
+feste Jobreihenfolge, Seeds und Common-Random-Number-Logik bleiben unabhängig
+von der Completion-Reihenfolge erhalten. Eine GPU wird nicht automatisch
+verwendet; der numerische Stack besitzt derzeit kein kompatibles GPU-Backend.
+
+Die physischen Verzeichnisse der drei Behaviour-Benchmarks heißen kompakt
+`bench/v00`, `bench/v01` und `bench/v10`. Ihre fachlichen Langnamen bleiben in
+Manifesten, Reports und Kennzahlen unverändert. Vor dem Start von Child-Runs
+prüft der Risiko-Runner unter Windows die längsten erwarteten CSV- und
+Grafikpfade gegen die 260-Zeichen-Grenze und verlangt bei Bedarf einen kürzeren
+`--output`-Pfad.
 
 ## Research-Runner fuer flexible Crediting-Caps
 
@@ -457,47 +569,84 @@ Die kanonische Cap-Optimierung wird aus `AGILE_Modelling_Engine` gestartet:
 python portfolio_simulations/optimize_crediting_rate_lsmc.py
 ```
 
-Sie ist kein American-Option-Stopping-Modell, sondern ein wiederholtes
-stochastisches Kontrollproblem im Gas-Storage-Stil. Das zulaessige Aktionsgitter
-ist `{0.25%, 1%, 2%, ..., 20%}`. Training, Auswahl des besten konstanten Caps
-und finale Bewertung verwenden getrennte Pfade. Der finale flexible CSM stammt
-ausschliesslich aus einem unabhaengigen Forward-Rollout durch denselben
-monatlichen Projector wie die Portfolio-Bewertung; Bellman-Werte werden nur als
-Regressionsdiagnostik gespeichert.
+Sie ist kein American-Option-Stopping-Modell, sondern ein dynamisches
+Stackelberg-/Bilevel-Kontrollproblem mit zwei getrennten Zielfunktionen. Der
+Versicherer wählt aus `{0.25%, 1%, 2%, ..., 20%}` den jährlichen Cap. Danach
+wählt jeder Policyholder getrennt nach Policy-Signature zwischen `CONTINUE`
+und `FULL_WITHDRAWAL`, um seinen eigenen risikoneutralen Leistungsbarwert zu
+maximieren. Erst nach dieser Best Response vergleicht der Versicherer seinen
+New-Business-CSM-Proxy. Der Default ist
+`--policyholder-behaviour lsmc`; `dynamic` und `continue` bleiben als
+reproduzierbare Vergleichsmodi verfügbar.
 
-Der Default nimmt die dokumentierte Cap-Setting-/Crediting-Margin als
-Hedge-Gewinn in die CSM-Proxy-Zielgroesse auf. `--no-hedge-gain` schaltet nur
-diesen Inflow aus; DVA und Hedge-Execution-Kosten bleiben davon getrennt. Ein
-blindes zusaetzliches Buchen von `max(Fundreturn - Cap, 0)` erfolgt nicht, weil
-dies die Call-Spread-/Crediting-Margin-Wirkung doppelt zaehlen wuerde.
+Diese unabhängige Stackelberg-/Management-Action-Studie gehört nicht zur oben
+beschriebenen Joint-Behaviour-Portfoliobewertung. Sie behält bewusst den
+modellpunktbezogenen festen Income-Election-Termin bei und optimiert als
+Policyholder-Best-Response nur das Verhalten nach Income Start. Ergebnisse
+daraus dürfen deshalb nicht als kombinierte Election-/Surrender-Sensitivität
+interpretiert werden. Der Wrapper `run_lsmc_crediting_cap.py` weist beim Start
+explizit auf diese Abgrenzung hin.
 
-Das dynamische Income-Lapse-Modell enthält zusätzlich einen verzögerten,
-realisierten Performance-Gap: den positiven logarithmischen Abstand zwischen
-Reference-Fund- und tatsächlich gutgeschriebenem Jahresreturn. Er wird erst
-nach dem Annual Crediting beobachtet und kann deshalb keine künftige
-Marktperformance in die Cap-Entscheidung leaken. Logisch wird er als
-eigenständiger Cause-specific Excess-Hazard modelliert und mit dem gewöhnlichen
-Moneyness-Lapse-Hazard als konkurrierendes Risiko kombiniert. Dadurch bleibt
-die Performance-Reaktion auch bei einer kleinen 0,5-%-Basislapse materiell;
-eine wertvolle Garantie reduziert sie separat über einen Retention-Faktor.
-`--behaviour-value-basis low|base|high` wählt das unkalibrierte Proxy-Band,
-und `--no-performance-gap-behaviour` deaktiviert ausschließlich diesen
-Performance-Hazard. Growth Surrender bleibt gemäß Produktdesign strukturell
-verboten. Eine neu gewählte Income-Option kann nicht am selben Anniversary
-sofort wieder lapsen. Sobald der Surrender Value null ist, ist Full Surrender
-ebenfalls ausgeschlossen, weil eine positive laufende Garantie sonst ohne
-Gegenleistung aufgegeben würde.
+Die dedizierte optimale Crediting-Rate-/Stackelberg-Logik und ihre
+Kommandozeilenschnittstelle werden in der vorliegenden Hedgekosten-Erweiterung
+bewusst nicht angepasst. Die gemeinsamen Core-Cashflows `crediting_margin` und
+`hedge_costs` bleiben jedoch die Eingangsgrößen ihres bestehenden CSM-Proxys;
+damit wirken zentral gebuchte Hedgekosten dort mit ihrem Versichererzeichen,
+ohne dass in diesem Schritt die Cap-Optimierungslogik geändert wird.
 
-Die Hauptgrafik `plots/00_flexibility_value.png` vergleicht keine
-Regressionswerte, sondern direkt projizierte Werte fuer Null-Crediting, den auf
-einem separaten Sample gewaehlten besten fixen Cap und die flexible Politik.
-Der untere Teil zeigt das gepaarte Delta zum besten fixen Cap samt
-95%-Intervall. Der kompakte Entscheidungszustand fasst Markt-, Cap- und
-Crediting-Historie zusammen; er ist eine dokumentierte Proxy-State-Grenze und
-keine zusaetzliche Kalibrierung. Insbesondere enthält er den trailing
-Performance-Gap explizit, aber keine vollständige Garantie-Moneyness-Verteilung
-über alle Modellpunkt-Kohorten. Die Holdout-Prüfung verhindert dadurch falsche
-positive Deployments, kann aber einen echten adaptiven Zusatzwert übersehen.
+Die gekoppelte Rückwärtsrechnung verwendet vollständige, fold-reine
+Markt-/Kontrollpfade. Jede äußere Falte besitzt ihre eigene zukünftige
+Leader-/Follower-Policy-Kette; eine separate Vollstichprobenkette liefert die
+eingefrorenen Deployment-Regressionen. Der Policyholder-State enthält unter
+anderem Account und Surrender Value, Locked Income, Garantie-PV/-Moneyness,
+Zinsen, Heston-Varianz, Duration, den angekündigten Cap und vergangene
+Reference-/Credited Returns. Der Leader-State ergänzt exakte pre-action
+Portfolioexposures. Joint-Life- und Single-Life-Fallback-Signatures werden vor
+der gewichteten Portfolioaggregation separat optimiert. `contract_weight`
+wird genau einmal verwendet; `premium_volume_weight` ist kein
+Bewertungsgewicht.
+
+Die Ereignisgrenze bleibt die des Monatsprojektors: zuerst Annual Credit unter
+dem alten Cap, Fee Posting, Mortality und Income Election; danach wird der neue
+Cap angekündigt und der DVA-/Hedge-Zeitraum neu gestartet; anschließend folgen
+Income, Partial Withdrawal und Full Withdrawal. Der Policyholder sieht daher
+den neuen Cap bei einer zulässigen Surrender-Entscheidung am selben
+Anniversary. Die normative Timing-Tabelle und die Gleichgewichtsdefinition
+stehen in `CREDITING_CAP_STACKELBERG.md`.
+
+Der bestehende Schalter `--no-hedge-gain` steuert weiterhin nur, ob das
+gemeinsame Core-Aggregat `crediting_margin` in den CSM-Proxy einfließt. Dieses
+Aggregat besteht nun aus Money-Market-Ertrag und einem nur bei nicht
+verkaufter Cap-Call-Leg zulässigen Above-Cap-Gewinn; die Hedgekosten bleiben
+davon getrennte Outflows. Der Optimierungs-Runner erhält in diesem Schritt
+keinen eigenen Schalter zur Wahl der Cap-Leg-Strategie.
+
+Training/Cross-Fitting, Validation und finale Evaluation sind drei disjunkte
+Samples mit berichteten Fingerprints. Für Null-Crediting, 0.25%, jeden fixen
+Cap von 1% bis 20% und uncapped Crediting wird das Policyholder-LSMC jeweils
+frisch und cap-konsistent trainiert. Der beste fixe Cap wird nur auf dem
+Validation-Sample gewählt. Eine adaptive Policy wird nur deployt, wenn ihr
+gepaartes CSM-Delta dort größer als 1.96 gepaarte Standardfehler ist und die
+Policyholder-/Numerik-Gates bestehen; sonst wird der vorab gewählte fixe Cap
+eingesetzt. Instabile Policyholder-Regressionen führen konservativ zu
+`CONTINUE`. Evaluationsergebnisse dürfen weder Policy noch Fallback ändern.
+
+Im LSMC-Modus ersetzt die optimale Full-Withdrawal-Policy die statistischen
+Ordinary-/Performance-Lapses; sie werden nicht parallel angewandt. Growth
+Surrender, Surrender am Election-Timestamp und die Aufgabe einer positiven
+Income-Garantie gegen Surrender Value null bleiben strukturell ausgeschlossen.
+Das bestehende dynamische Lapse-/Performance-Gap-Modell wird weiterhin als
+separater Benchmark ausgewiesen.
+
+Die eigentliche Ergebnisbewertung ist immer ein unabhängiger Forward-Rollout
+durch den monatlichen Produktprojektor; Bellman- oder Regressionswerte werden
+nur als Diagnostik gespeichert. Die Hauptgrafik
+`plots/00_flexibility_value.png` zeigt den direkt projizierten CSM des besten
+fixen Caps und der tatsächlich deployten Policy, das gepaarte Delta samt
+95%-Intervall, die Policyholder-Exercise-Rate sowie Rand-Cap-/Fallback-Hinweise.
+CSV/JSON-Ausgaben enthalten zusätzlich Policyholder-PV, Cap-Verteilungen,
+Cashflowzerlegung, getrennte Regressiondiagnostik, Sample-Fingerprints und die
+vollständige eingefrorene Policy-/Input-Provenienz.
 
 `run_lsmc_crediting_cap.py` ist nur noch ein veralteter Kompatibilitaets-
 Einstieg und delegiert bei direkter Ausfuehrung an diesen kanonischen Runner.
@@ -514,7 +663,13 @@ Einstieg und delegiert bei direkter Ausfuehrung an diesen kanonischen Runner.
   und Bond-Sleeve angewandt.
 - Bond Term Premium, Credit Spreads, Ausfälle, Ratingmigrationen,
   Inflation-Linked Bonds, eine separate FX-Schicht, Transaktionskosten und
-  fondsinterne Gebühren fehlen.
+  kundenbezogene fondsinterne Gebühren fehlen. Die separate fixe 0,30%-Fee auf
+  das Hedge-Notional ist dagegen als Versichererkosten enthalten.
+- Die 0,30%-Hedge-Management-Fee ist ein fixer jährlicher Notional-Kostenproxy
+  und kein Abzug vom Kunden-Reference-Fund. Nach einem unterjährigen Tod, Lapse
+  oder Withdrawal wird kein Options-Unwind beziehungsweise Recovery modelliert;
+  die jährlichen Anschaffungskosten gelten als versunkene Kosten und ein
+  `not_sold`-Gewinn nur für das am Settlement aktive Restnotional.
 - Die Dynamic-Behaviour-Annahmen sind unkalibrierte Proxys. Growth Withdrawals
   und Growth Surrender bleiben unabhängig davon produktseitig deaktiviert.
 - Alle Werte sind gross of reinsurance. Kapital, Risk Margin und PVFP werden im

@@ -37,6 +37,12 @@ In diesem Dokument gelten folgende Begriffe:
 - **Reference Fund** ist der synthetische Referenzfonds, dessen vollständige
   Rendite die jährliche Indexgutschrift bestimmt. Das AV ist kein direktes
   Depot aus Fondsanteilen; das Produkt ist index-linked und nicht unit-linked.
+- **Versicherer-Backing** ist davon getrennt. Für Kosten-, Performance- und
+  Profitabilitätsrechnungen wird der administrative Crediting-Frame in einem
+  Money-Market-Konto gehalten, das ausschließlich den stochastisch simulierten
+  AUD-Overnight-Zins täglich beziehungsweise kontinuierlich rollierend
+  akkumuliert. Der unterjährige DVA-Optionswert bleibt eine Liability-Größe und
+  ist kein Backing-Asset. Reference-Fund-Performance ist kein Backing-Ertrag.
 - **Policy Anniversary** ist jeder Jahrestag des Vertragsbeginns.
 
 # 2. Produktübersicht
@@ -280,16 +286,52 @@ werden. Ein budgetneutral gesetzter Cap erfüllt am Periodenbeginn
 p_y(T_{y-1})=1.
 \]
 
-Bei einem abweichenden Cap entsteht im Replikationsmodell die signierte
-Cap-Setting-Margin
+Bei einem abweichenden Cap entsteht für den markt-konsistenten
+Kunden-Cashflow-Identity-Check die signierte technische
+Contract-Financing-Margin
 
 \[
 CM_y=AV^{frame}_{T_{y-1}}
 \left[1-p_y(T_{y-1})\right].
 \]
 
-Ein positiver Wert ist ein Versichererinflow; ein negativer Wert bedeutet,
-dass das gewählte Paket mehr als die verfügbare Basis kostet.
+Ein positiver Wert bedeutet, dass der Kundenvertrag unter dieser
+Replikationssicht unter der verfügbaren Basis liegt; ein negativer Wert
+bedeutet, dass das gewählte Paket mehr kostet. Diese technische Größe wird
+nicht zusätzlich als Versichererprofit gebucht. Für Versicherer-P&L gelten die
+expliziten Money-Market- und Hedge-Cashflows aus Abschnitt 13.2.
+
+## 5.5 Versicherer-Hedge und Cap-Leg
+
+Zu Beginn jedes Crediting Years kauft der Versicherer eine positive
+Reference-Fund-Return-Option. In Return-Strike-Notation ist die
+Standardreplikation
+
+\[
+Call(R;K=0)-Call(R;K=C_y),
+\]
+
+äquivalent zu Gross-Return-Strikes 1 und \(1+C_y\). Die zweite, verkaufte Leg
+ist ökonomisch eine **Cap-Call-Leg**. Ein verkaufter Put am Cap würde einen
+anderen Downside-Payoff erzeugen und die Performance oberhalb des Caps nicht
+entfernen; die technische Bezeichnung folgt deshalb der tatsächlich benötigten
+Payoff-Wirkung.
+
+Im Standardmodus `sold` steht dem Versicherer oberhalb des Kundencaps kein
+Reference-Fund-Gewinn zu. Im ausdrücklichen Alternativmodus `not_sold` wird die
+Cap-Call-Leg nicht verkauft. Der Versicherer zahlt dann den höheren fairen Wert
+des uncapped Calls und erfasst am Settlement
+
+\[
+HG_y=AV^{frame}_{T_y^-}\max(R^F_y-C_y,0)
+\]
+
+als separaten Hedge-Gewinn. Kundengutschrift, AV und Claims bleiben in beiden
+Modi identisch.
+
+Der verwendete faire Paketwert ist mangels ausführbarer Preisfläche ein
+Moment-Matching-/Black-Scholes-Proxy auf den vollständigen 50/50-Reference-
+Fund und keine exakte Heston-Hull-White-Bewertung oder Marktquote.
 
 # 6. Account Value, Fee-Subledger und Ereignisreihenfolge
 
@@ -1022,33 +1064,28 @@ Versichereraufwendungen mindert das AV nochmals.
 
 | Annahme | Basis | Low | High | Einordnung |
 |---|---:|---:|---:|---|
-| Hedge-Execution-/Basis-Proxy | +0,005 absolute Volatilität | 0,0025 | 0,015 | Repricing-Proxy je Crediting Year, keine 50-bp-Cashkostenrate |
+| Optionskaufmarge | 0,005 (0,50 %) des fairen Paketwerts | 0,005 | 0,005 | zusätzlicher Versichereroutflow beim jährlichen Optionskauf |
+| Management-Fee-Drag | 0,003 (0,30 %) p.a. des Hedge-Notionals | 0,003 | 0,003 | zusätzlicher Versichereroutflow; kein Abzug vom Kunden-AV |
+| Legacy Hedge-Execution-/Basis-Proxy | 0 absolute Volatilität | 0 | 0 | aus Kompatibilitätsgründen vorhanden, im Standard deaktiviert |
 | MVA-Loading je Restjahr | 0,0061744444 (0,61744444 %) | 0,004 (0,40 %) | 0,008 (0,80 %) | Bestandteil des MVA-Faktors |
 | Zusätzliches fixes MVA-Loading | 0 | 0 | 0,01 (1,00 %) | nur Sensitivität |
 
-Mit dem szenarioabhängigen absoluten Volatilitätsaufschlag \(h\) wird der
-Hedge-Cost-Proxy am Beginn jedes Crediting Years als Differenz zweier
-Paketwerte erfasst:
+Sei \(V^{hedge}_y\) der faire Wert des gemäß Abschnitt 5.5 gewählten
+Optionspakets je Einheit Hedge-Notional. Die expliziten Hedgekosten am Beginn
+des Crediting Years sind
 
 \[
-HC_y
-=AV^{frame}_{T_{y-1}}
-\left|
-V_{pkg}(\sigma+h)-V_{pkg}(\sigma)
-\right|.
+HC_y=AV^{frame}_{T_{y-1}}
+\left[V^{hedge}_y(1+0{,}005)+0{,}003\right].
 \]
 
-Im Basisfall ist \(h=0{,}005\). Der Aufschlag ist kein Gebührensatz von 50 bp
-und kein direkter AV-Abzug, sondern ein Bewertungsproxy für Bid-Ask, Slippage,
-Volatilitätsbasis und Ausführungsfriktion. In der separaten
-Outflow-Darstellung ist er ein Versichereroutflow und verändert den
-kundenbezogenen Credit oder den unterjährigen AV-Wert nicht direkt. Wird der
-gleiche Volatilitätsaufschlag stattdessen bereits bei einer fairen
-Cap-Festsetzung vollständig im gesetzten Cap berücksichtigt, wirkt er indirekt
-über den Kundencredit; \(HC_y\) darf dann nicht zusätzlich als separater
-Outflow gebucht werden. Proxywirkung und Cashflow sind genau einmal zu
-erfassen. Vor einer Produktionsverwendung ist \(h\) gegen ausführbare
-Derivatequotes zu kalibrieren. Die MVA-Loadings werden nicht hier als laufender
+Der erste Summand ist der volle faire Paketwert; 0,005 ist ein relativer
+Aufschlag auf diesen fairen Wert, nicht 50 bp des AV. Der zweite Summand ist der
+jährliche Fee-Drag auf Hedge-Notional. Beide sind reine Versichererkosten und
+ändern weder Reference-Fund-Return noch Kundengutschrift, AV, Benefits oder
+Claims. Der frühere Volatilitäts-Repricing-Proxy \(h\) bleibt technisch
+verfügbar, ist im Standardinput jedoch null, damit dieselbe Ausführungsfriktion
+nicht doppelt erfasst wird. Die MVA-Loadings werden nicht hier als laufender
 Aufwand, sondern ausschließlich über den MVA-Faktor aus Abschnitt 10.2
 wirksam.
 
@@ -1170,10 +1207,14 @@ kein zweiter Abzug zulässig.
 | Product Fee | tatsächlich bei einem Fee-Event vereinnahmter Inflow \(F^{prod}_e\) |
 | Lifetime Income Premium | tatsächlich bei einem Fee-Event vereinnahmter Inflow \(F^{LIP}_e\) |
 | MVA-Retention | Inflow beziehungsweise Reduktion des Kundenoutflows |
-| Cap-Setting-/Crediting-Margin | Inflow, soweit der gesetzte Cap unter dem verfügbaren Hedge-Budget liegt |
+| Money-Market-Income | Inflow aus dem pfadweisen AUD-Overnight-Return auf den administrativen Crediting-Frame am Monatsanfang; der DVA-Optionswert ist kein Backing-Asset, keine Reference-Fund-Performance |
+| Retained Excess Hedge Gain | nur im Modus `not_sold`; \(\max(R^F-C,0)\) auf das verbleibende Hedge-Notional |
 | Guarantee Claim | Outflow |
 | Abschluss- und Verwaltungskosten | Outflow |
-| Hedge-Execution-/Basis-Proxy | Outflow |
+| Fairer Optionspaketwert | Hedge-Outflow zu Beginn jedes Crediting Years |
+| Optionskaufmarge | zusätzlicher Hedge-Outflow von 0,50 % des fairen Paketwerts |
+| Management-Fee-Drag | zusätzlicher Hedge-Outflow von 0,30 % p.a. des Hedge-Notionals |
+| Legacy Hedge-Execution-/Basis-Proxy | optionaler Outflow; im Standardinput null |
 | Provision | Outflow, im Basisfall null |
 | Adviser Service Fee | kein Versicherercashflow; gegebenenfalls Kundenoutflow an Adviser |
 | Persönliche Steuer/Withholding | kein Produktmargen-Cashflow; policenspezifisch abzuführen |
@@ -1195,8 +1236,31 @@ verwenden:
 
 Eine Kombination aus Nettoauszahlung und nochmaligem Abzug von \(MVA\) würde
 die Termination Margin doppelt zählen. Dasselbe Genau-einmal-Prinzip gilt für
-den Hedge-Volatilitätsproxy und eine darin bereits berücksichtigte
-Cap-Setting-Wirkung.
+die Hedgekomponenten. Der aggregierte `HedgeCosts`-Cashflow ist exakt die Summe
+aus fairem Paketwert, Kaufmarge, Management-Fee-Drag und optionalem
+Legacy-Execution-Proxy. Die aggregierte `CreditingMargin` ist aus
+Kompatibilitätsgründen die Summe aus Money-Market-Income und optionalem
+Retained Excess Hedge Gain. Detailkomponenten dürfen nicht zusätzlich zum
+Aggregat in NPV, BEL oder Profitabilität addiert werden.
+
+Der Payoff des Standard-Call-Spreads bis zum Cap ist kein zusätzlicher
+Versicherergewinn: Er finanziert genau die entsprechende Kundengutschrift und
+füllt damit das Money-Market-Backing auf das erhöhte AV auf. Asset-Payoff und
+AV-Erhöhung heben sich in dieser Margendarstellung auf. Nur ein im Modus
+`not_sold` tatsächlich nicht an den Kunden gebundener Payoff oberhalb des Caps
+wird separat als Hedge-Gewinn erfasst.
+
+Die jährlichen Optionsanschaffungskosten werden nach Kauf als versunkene
+Kosten behandelt. Bei Tod, Lapse oder Withdrawal innerhalb des Crediting Years
+wird kein Options-Unwind und keine Recovery beziehungsweise frei werdende
+Cap-Leg-Marktwertposition gebucht. Im Modus `not_sold` wird der Above-Cap-Gewinn
+nur auf dem am Settlement noch aktiven Restnotional erfasst. Dies ist eine
+konservative Hedge-P&L-Proxyannahme, keine vollständige Hedge-Asset-Bilanz.
+
+Der separate technische `contract_financing_margin` dient ausschließlich dem
+marktkonsistenten Kunden-Cashflow-Identity-Check. Er ist kein zusätzlicher
+Versichererprofit und wird weder in BEL noch CSM-/NPV-Proxys ein zweites Mal
+berücksichtigt.
 
 Ein vereinfachter Non-Unit-Best-Estimate-Liability-Ausdruck unter dem
 risikoneutralen Maß ist
@@ -1353,7 +1417,9 @@ kennzeichnen. Insbesondere gelten folgende Grenzen:
 5. Global Equity wird als AUD-Return-Index beziehungsweise als vollständig
    AUD-abgesichert behandelt; FX-Risiko und FX-Hedgekosten fehlen.
 6. Credit Spreads, Defaults, Ratingmigrationen, Inflation-Linked Bonds,
-   Transaktionskosten, taktische Allokation und fondsinterne Gebühren fehlen.
+   Transaktionskosten, taktische Allokation und kundenbezogene fondsinterne
+   Gebühren fehlen. Die 0,30%-Fee auf das Hedge-Notional ist als separate fixe
+   Versichererkosten-Proxyannahme enthalten.
 7. DVA und MVA sind Modellproxies und müssen für eine reale Administration
    vertraglich spezifiziert beziehungsweise kalibriert werden.
 8. Die Ratecard-Regeln für exakt gleich alte Ehegatten und nicht ganzzahlige
@@ -1377,9 +1443,14 @@ kennzeichnen. Insbesondere gelten folgende Grenzen:
 14. Die tägliche Fee-Basis, ACT/365F, die proportionale Aufteilung bei knapper
     Deckung und der Verzicht auf Fee-Arrears sind Fallstudienkonventionen, die
     vor administrativer Verwendung zu bestätigen sind.
-15. Acquisition, Maintenance, Commission, Hedge Execution, Kapital und
+15. Acquisition, Maintenance, Commission, Optionskaufmarge,
+    Hedge-Management-Fee, Hedge Execution, Kapital und
     Profitabilität beruhen auf Expert-, Research- oder Proxy-Annahmen und sind
     nicht auf interne Bestands-, Treaty- oder Expense-Study-Daten kalibriert.
+16. Der faire Hedgepaketwert ist ein Whole-Fund-Moment-Matching-Proxy ohne
+    ausführbare gemischte Fondsoptionsfläche. Intra-year Hedge-Unwinds,
+    Recoveries und freigesetzte Cap-Leg-Marktwerte nach Vertragsbeendigung sind
+    nicht modelliert; jährliche Optionskosten gelten nach Kauf als versunken.
 
 # 17. Technische Umsetzungsanforderungen
 

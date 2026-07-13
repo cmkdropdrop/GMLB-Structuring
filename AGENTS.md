@@ -113,3 +113,6 @@ dies im Repo noch nicht überall konsequent umgesetzt ist.
 Keine Scripte laufen lassen, ausser ich sage es spezifisch
 Der Stack wurde ursprünglich für das AGILE Produkt konzipiert, soll nun aber schrittweise auf ein generisches, aber sehr ähnliches Produkt umgestellt werden
 Die Produktlogik für das generische Produkt ist in Produktdesign_Index_Linked_Lifetime_Income_Fallbeispiel.md beschrieben
+
+
+Bei der Modellierung der Verhaltensweisen der Policyholder sollen 2 Arten im Vordergrund stehen: 1) optimales Verhalten nach LSMC und 2) dynamisches Verhalten. In beiden Fällen ist damit gemeint wann sich der Policyholder entscheidet die Growth Phase zu beenden und die Income Phase zu starten, und wann die Policyholder während der Income Phase mehr oder weniger entnehmen als vorgesehen, bzw. Lapsen. Bei 2) ist es wichtig, dass die Funktion dafür unter anderem von der Moneyness abhängt und in ähnlicher Form auch in der Praxis verwendet wird

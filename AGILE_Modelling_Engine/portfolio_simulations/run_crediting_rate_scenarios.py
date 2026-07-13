@@ -23,12 +23,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+if __package__:
+    from ._run_logging import log_to_console
+else:
+    from _run_logging import log_to_console
+
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 PORTFOLIO_RUNNER = SCRIPT_DIRECTORY / "run_portfolio_valuation.py"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "output" / "crediting_rate_scenarios"
 DEFAULT_CREDITING_RATES = (0.04, 0.06, 0.12, 0.20)
 DEFAULT_BASELINE_RATE = 0.06
+HEDGE_CAP_LEG_MODES = ("sold", "not_sold")
+DEFAULT_HEDGE_CAP_LEG_MODE = "sold"
 
 
 def _parse_rate(text: str) -> float:
@@ -72,6 +79,15 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--n-paths", type=int, default=2_000)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--heston-substeps", type=int, default=4)
+    parser.add_argument(
+        "--hedge-cap-leg-mode",
+        choices=HEDGE_CAP_LEG_MODES,
+        default=DEFAULT_HEDGE_CAP_LEG_MODE,
+        help=(
+            "sold uses the standard capped call spread; not_sold buys the "
+            "uncapped call and retains the hedge payoff above the customer cap"
+        ),
+    )
     parser.add_argument("--portfolio-contract-count", type=float, default=None)
     parser.add_argument("--profitability-materiality-bp", type=float, default=1.0)
     parser.add_argument("--model-points", type=Path, default=None)
@@ -188,6 +204,8 @@ def _portfolio_command(
         str(args.seed),
         "--heston-substeps",
         str(args.heston_substeps),
+        "--hedge-cap-leg-mode",
+        args.hedge_cap_leg_mode,
         "--profitability-materiality-bp",
         str(args.profitability_materiality_bp),
         "--log-level",
@@ -213,6 +231,7 @@ def _portfolio_command(
 def _scenario_result(
     requested_rate: float,
     scenario_output: Path,
+    expected_hedge_cap_leg_mode: str = DEFAULT_HEDGE_CAP_LEG_MODE,
 ) -> dict[str, object]:
     summary_path = scenario_output / "portfolio_summary.csv"
     manifest_path = scenario_output / "run_manifest.json"
@@ -227,6 +246,34 @@ def _scenario_result(
             f"requested {requested_rate}, reported {actual_rate}"
         )
 
+    summary_hedge_cap_leg_mode = str(summary.get("hedge_cap_leg_mode", ""))
+    if summary_hedge_cap_leg_mode != expected_hedge_cap_leg_mode:
+        raise ValueError(
+            f"Hedge cap-leg mode mismatch in {summary_path}: requested "
+            f"{expected_hedge_cap_leg_mode!r}, reported "
+            f"{summary_hedge_cap_leg_mode!r}."
+        )
+    manifest_modes: list[str] = []
+    for section_name in ("method", "valuation_settings"):
+        section = manifest.get(section_name)
+        if not isinstance(section, Mapping):
+            raise ValueError(
+                f"Missing {section_name!r} provenance section in {manifest_path}."
+            )
+        mode = section.get("hedge_cap_leg_mode")
+        if mode is None:
+            raise ValueError(
+                f"Missing hedge_cap_leg_mode in {section_name!r} provenance "
+                f"section of {manifest_path}."
+            )
+        manifest_modes.append(str(mode))
+    if set(manifest_modes) != {expected_hedge_cap_leg_mode}:
+        raise ValueError(
+            f"Hedge cap-leg mode provenance mismatch in {manifest_path}: "
+            f"requested {expected_hedge_cap_leg_mode!r}, reported "
+            f"{manifest_modes!r}."
+        )
+
     absolute = _as_bool(summary.get("absolute_portfolio_values_available"))
     prefix = "portfolio_total_" if absolute else "normalised_average_"
     basis = "absolute_portfolio" if absolute else "normalised_average_contract"
@@ -237,11 +284,56 @@ def _scenario_result(
 
     administrative_expenses = monetary("pv_expenses_aud")
     hedge_costs = monetary("pv_hedge_costs_aud")
+    hedge_option_fair_value_costs = monetary(
+        "pv_hedge_option_fair_value_costs_aud"
+    )
+    hedge_option_markup_costs = monetary("pv_hedge_option_markup_costs_aud")
+    hedge_management_fee_costs = monetary("pv_hedge_management_fee_costs_aud")
+    hedge_execution_costs = monetary("pv_hedge_execution_costs_aud")
+    hedge_component_sum = (
+        hedge_option_fair_value_costs
+        + hedge_option_markup_costs
+        + hedge_management_fee_costs
+        + hedge_execution_costs
+    )
+    if not math.isclose(
+        hedge_costs,
+        hedge_component_sum,
+        rel_tol=1.0e-10,
+        abs_tol=max(1.0e-8, 1.0e-10 * abs(hedge_costs)),
+    ):
+        raise ValueError(
+            f"Hedge-cost component reconciliation failed in {summary_path}: "
+            f"aggregate={hedge_costs}, components={hedge_component_sum}."
+        )
+    crediting_margin = monetary("pv_crediting_margin_aud")
+    money_market_income = monetary("pv_money_market_income_aud")
+    hedge_gain = monetary("pv_hedge_gain_aud")
+    if not math.isclose(
+        crediting_margin,
+        money_market_income + hedge_gain,
+        rel_tol=1.0e-10,
+        abs_tol=max(1.0e-8, 1.0e-10 * abs(crediting_margin)),
+    ):
+        raise ValueError(
+            f"Crediting-margin component reconciliation failed in "
+            f"{summary_path}: aggregate={crediting_margin}, "
+            f"components={money_market_income + hedge_gain}."
+        )
+    if (
+        expected_hedge_cap_leg_mode == "sold"
+        and not math.isclose(hedge_gain, 0.0, rel_tol=0.0, abs_tol=1.0e-8)
+    ):
+        raise ValueError(
+            f"Sold cap-leg mode reports an above-cap hedge gain in "
+            f"{summary_path}."
+        )
     insurer_npv = monetary("insurer_net_present_value_before_risk_margin_aud")
     premium = monetary("premium_aud")
     return {
         "crediting_rate": actual_rate,
         "crediting_rate_percent": 100.0 * actual_rate,
+        "hedge_cap_leg_mode": summary_hedge_cap_leg_mode,
         "valuation_basis": basis,
         "premium_aud": premium,
         "insurer_npv_before_risk_margin_aud": insurer_npv,
@@ -254,7 +346,14 @@ def _scenario_result(
         "bel_total_aud": monetary("bel_total_aud"),
         "pv_guarantee_claims_aud": monetary("pv_guarantee_claims_aud"),
         "pv_future_fees_aud": monetary("pv_future_fees_aud"),
-        "pv_crediting_margin_aud": monetary("pv_crediting_margin_aud"),
+        "pv_crediting_margin_aud": crediting_margin,
+        "pv_money_market_income_aud": money_market_income,
+        "pv_hedge_gain_aud": hedge_gain,
+        "pv_hedge_option_fair_value_costs_aud": hedge_option_fair_value_costs,
+        "pv_hedge_option_markup_costs_aud": hedge_option_markup_costs,
+        "pv_hedge_management_fee_costs_aud": hedge_management_fee_costs,
+        "pv_hedge_execution_costs_aud": hedge_execution_costs,
+        "pv_hedge_costs_aud": hedge_costs,
         "pv_total_expenses_aud": administrative_expenses + hedge_costs,
         "pv_administrative_expenses_aud_audit": administrative_expenses,
         "pv_hedge_costs_aud_audit": hedge_costs,
@@ -289,6 +388,7 @@ def _write_report(
     path: Path,
     rows: list[dict[str, object]],
     baseline_rate: float,
+    hedge_cap_leg_mode: str = DEFAULT_HEDGE_CAP_LEG_MODE,
 ) -> None:
     basis = str(rows[0]["valuation_basis"])
     lines = [
@@ -300,6 +400,7 @@ def _write_report(
         ),
         "",
         f"Bewertungsbasis: `{basis}`. Vergleichsbasis: {100.0 * baseline_rate:.2f} %.",
+        f"Hedge-Cap-Leg-Modus: `{hedge_cap_leg_mode}`.",
         "",
         "| Crediting Rate | Insurer NPV vor RM | New Business Margin vor RM | Delta NPV zur Basis | Klassifikation |",
         "|---:|---:|---:|---:|---|",
@@ -317,10 +418,37 @@ def _write_report(
         )
     lines.extend([
         "",
+        "## Hedge- und Money-Market-Audit",
+        "",
         (
-            "`pv_total_expenses_aud` umfasst Verwaltungskosten und den "
-            "Hedge-Execution-/Basis-Proxy. Die beiden Rohfelder bleiben nur als "
-            "Audit-Aufteilung in der Vergleichs-CSV erhalten."
+            "| Crediting Rate | Money-Market-Ertrag | Hedge-Gewinn oberhalb Cap | "
+            "Fairer Optionswert | Optionsmarge | Management Fee | "
+            "Execution-Kosten | Hedgekosten gesamt |"
+        ),
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in rows:
+        lines.append(
+            "| {rate:.2f} % | {money_market:,.2f} | {hedge_gain:,.2f} | "
+            "{fair_value:,.2f} | {markup:,.2f} | {management_fee:,.2f} | "
+            "{execution:,.2f} | {hedge_total:,.2f} |".format(
+                rate=float(row["crediting_rate_percent"]),
+                money_market=float(row["pv_money_market_income_aud"]),
+                hedge_gain=float(row["pv_hedge_gain_aud"]),
+                fair_value=float(row["pv_hedge_option_fair_value_costs_aud"]),
+                markup=float(row["pv_hedge_option_markup_costs_aud"]),
+                management_fee=float(row["pv_hedge_management_fee_costs_aud"]),
+                execution=float(row["pv_hedge_execution_costs_aud"]),
+                hedge_total=float(row["pv_hedge_costs_aud"]),
+            )
+        )
+    lines.extend([
+        "",
+        (
+            "`pv_total_expenses_aud` umfasst Verwaltungskosten sowie den fairen "
+            "Optionswert, die Optionsmarge, die Management Fee und etwaige "
+            "Execution-Kosten. Die Einzelkomponenten und der Money-Market-Ertrag "
+            "bleiben in der Vergleichs-CSV separat auditierbar."
         ),
         "",
         (
@@ -389,11 +517,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _rate_key(rate)
         for rate in [*args.crediting_rates, args.baseline_rate]
     })
-    print(
+    log_to_console(
         "Crediting-Rate-Szenarien: "
         + ", ".join(f"{100.0 * rate:.2f}%" for rate in rates)
     )
-    print(
+    log_to_console(
         "Common Random Numbers: "
         f"n_paths={args.n_paths}, seed={args.seed}, "
         f"heston_substeps={args.heston_substeps}"
@@ -405,7 +533,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scenario_output = output / "scenarios" / _rate_directory_name(rate)
         command = _portfolio_command(args, rate, scenario_output)
         commands.append(command)
-        print(
+        log_to_console(
             f"[{index}/{len(rates)}] Portfolio valuation for "
             f"Crediting Rate {100.0 * rate:.2f}%"
         )
@@ -415,7 +543,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"Portfolio valuation failed for {100.0 * rate:.4f}% "
                 f"with exit code {completed.returncode}."
             )
-        rows.append(_scenario_result(rate, scenario_output))
+        rows.append(
+            _scenario_result(rate, scenario_output, args.hedge_cap_leg_mode)
+        )
 
     bases = {str(row["valuation_basis"]) for row in rows}
     if len(bases) != 1:
@@ -433,7 +563,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     plot_path = output / "crediting_rate_profitability_comparison.png"
     manifest_path = output / "comparison_manifest.json"
     _write_csv(comparison_csv, rows)
-    _write_report(report_path, rows, args.baseline_rate)
+    _write_report(
+        report_path,
+        rows,
+        args.baseline_rate,
+        args.hedge_cap_leg_mode,
+    )
     plot_created = _write_comparison_plot(plot_path, rows, args.baseline_rate)
 
     manifest: Mapping[str, object] = {
@@ -442,6 +577,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "contractual_crediting_cap_rate": DEFAULT_BASELINE_RATE,
         "baseline_scenario_rate": args.baseline_rate,
         "scenario_rates": rates,
+        "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+        "hedge_cap_leg_interpretation": (
+            "short_cap_call_sold"
+            if args.hedge_cap_leg_mode == "sold"
+            else "cap_call_not_sold_and_excess_payoff_retained"
+        ),
         "common_random_numbers": {
             "n_paths": args.n_paths,
             "seed": args.seed,
@@ -459,19 +600,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Non-contractual constant Maximum-Return scenarios.",
             "Market-consistent Heston-Hull-White valuation under Q.",
             "Profitability is before Risk Margin and is not a full APRA/IFRS view.",
-            "Hedge costs are an execution/basis proxy and are included in total expenses.",
+            "The insurer backing account earns the stochastic AUD overnight money-market return.",
+            "Hedge costs include fair option value, purchase markup, management-fee drag and any execution proxy.",
         ],
     }
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, ensure_ascii=False, allow_nan=False)
         handle.write("\n")
 
-    print(f"Comparison CSV: {comparison_csv}")
-    print(f"Comparison report: {report_path}")
+    log_to_console(f"Comparison CSV: {comparison_csv}")
+    log_to_console(f"Comparison report: {report_path}")
     if plot_created:
-        print(f"Comparison plot: {plot_path}")
+        log_to_console(f"Comparison plot: {plot_path}")
     else:
-        print("Comparison plot skipped because Matplotlib is unavailable.")
+        log_to_console(
+            "Comparison plot skipped because Matplotlib is unavailable.",
+            level="WARNING",
+        )
     return 0
 
 

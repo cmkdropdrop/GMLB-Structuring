@@ -416,3 +416,47 @@ def test_disabled_policyholder_actions_reproduce_legacy_insurer_optimizer():
             eligible=False,
         )
         assert not np.any(policy.surrender_mask(context=context))
+
+
+def test_fold_local_instability_does_not_discard_stable_full_sample_policy():
+    fixture = _finite_state_fixture(policyholder_actions_enabled=True)
+    # 87 observations are enough for the full canonical fit (minimum 60),
+    # while at least one 3-fold outer training slice stays below 60 and must
+    # use its own conservative Continue fallback.
+    eligible_count = 87
+    eligible_indices = np.concatenate([
+        np.arange(action * PATHS_PER_ACTION, action * PATHS_PER_ACTION + count)
+        for action, count in enumerate(
+            [5] * 3 + [4] * (len(ACTION_CAPS) - 3)
+        )
+    ])
+    assert eligible_indices.size == eligible_count
+    for record in fixture.data.signature_control_paths[
+        fixture.signature
+    ].decision_years.values():
+        record.phase[:] = Phase.GROWTH.value
+        record.phase[eligible_indices] = Phase.INCOME.value
+        record.after_cap_core[:, 12] = 0.0
+        record.after_cap_core[eligible_indices, 12] = 1.0
+        record.full_withdrawal_eligible[:] = False
+        record.full_withdrawal_eligible[eligible_indices] = True
+
+    fitted = _coupled_result(fixture)
+    rows = [
+        row for row in fitted.follower_regression_rows
+        if row["policy_signature_fingerprint"]
+    ]
+
+    assert rows
+    assert all(row["outer_crossfit_stable"] is False for row in rows)
+    assert all(row["deployment_regression_stable"] is True for row in rows)
+    policy = fitted.follower_fit_set.policies[fixture.signature]
+    assert set(policy.regressions) == {
+        record.decision_step
+        for record in fixture.data.signature_control_paths[
+            fixture.signature
+        ].decision_years.values()
+    }
+    assert not fitted.follower_fit_set.fallback_steps_by_signature[
+        fixture.signature
+    ]

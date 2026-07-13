@@ -37,6 +37,15 @@ The customer credit is linked to one synthetic Reference Fund. It is not a
 unit-linked customer portfolio and it must not be confused with the insurer's
 backing or hedge assets.
 
+For insurer profitability, the administrative crediting frame is instead
+backed by the stochastic AUD overnight money-market account. The under-year
+DVA option mark remains a customer-liability value and is not treated as a
+backing asset. The insurer buys an annual option package on the Reference Fund.
+The standard package sells the cap call and retains no performance above the
+cap; `--hedge-cap-leg-mode not_sold` keeps that leg and reports the excess
+payoff as a separate hedge gain. Neither backing nor hedge cashflows alter
+customer Account Value, credited return or Guarantee Claims.
+
 - 50% Global Equity, treated as an AUD-denominated or AUD-hedged total-return
   index;
 - 50% nominal Australian-government bonds, represented by a monthly rolling
@@ -94,7 +103,7 @@ credit-spread curve or physical calibration file is requested.
 | Market-model parameters | `input_market_data/model_parameters.csv` | equity, Heston, Hull-White and correlations |
 | Cost assumptions | `../input_cost_assumptions/cost_assumptions.csv` | customer fees, expenses, MVA, hedge, capital and shareholder assumptions according to each row's status |
 | Dynamic behaviour | `../input_dynamic_behaviour/dynamic_behaviour_baselines.csv` and `dynamic_behaviour_coefficients.csv` | versioned behavioural proxies |
-| Policyholder model points | `../input_model_points_policyholders/model_points_policyholders.csv` | portfolio demographics, premiums, weights and elections |
+| Policyholder model points | `../input_model_points_policyholders/model_points_policyholders_4_point_proxy.csv` | default four-point proxy for portfolio demographics, premiums, weights and elections; the 48-point file remains an explicit full-grid alternative |
 
 The loaders validate schemas, units and identifiers and retain source paths,
 assumption-set IDs and SHA-256 fingerprints. A loaded proxy does not become an
@@ -140,7 +149,7 @@ is a reconciliation control and is not applied a second time. Each source row
 is valued independently before these weights are applied. Without an explicit
 portfolio contract count or source `exposure_count`, only a portfolio
 normalised to one representative contract is available; the runner does not
-mislabel the 48 source rows as 48 policies.
+mislabel model-point source rows as individual policies.
 
 Version 2.1 makes the aggregation basis explicit in the output schema. Former
 unprefixed monetary summary fields are replaced by
@@ -152,8 +161,9 @@ Default portfolio metrics include:
 
 - present value of policyholder benefits;
 - present value of future Product Fees and Lifetime Income Premiums;
-- present value of Guarantee Claims, expenses, hedge costs, crediting margin
-  and MVA retained;
+- present value of Guarantee Claims, expenses, stochastic money-market income,
+  optional retained hedge gain, fair option cost, 0.50% purchase markup, 0.30%
+  hedge-reference management-fee cost and MVA retained;
 - Non-Unit and Total Best Estimate Liability;
 - insurer net present value and new-business margin before risk margin; and
 - market-consistency and weight controls.
@@ -282,10 +292,14 @@ market-consistent values, as applicable. Material boundaries include:
 - the Real-World rate model has no bond term premium or separate price of rate
   risk;
 - Global Equity is treated as an AUD return index or fully AUD hedged;
-- mortality is deterministic-generational and the shipped
-  Gompertz-Makeham basis is illustrative, not a governed pricing table. Annual
-  `q_x` is anchored once per Policy Year, reconciled to twelve constant-force
-  monthly decrements and terminated no later than age 115;
+- mortality uses a generational annual-`q_x` basis and the shipped
+  Gompertz-Makeham table is illustrative, not a governed pricing table.
+  Single-Life values use expected decrements. Portfolio Dynamic/LSMC runs and
+  all V00/V01/V10/V11 factor arms sample separate Joint-Life status indicators
+  from the same rates and mortality seed; only the standalone low-level
+  deterministic API retains the historical expected-decrement fallback by
+  default. Annual `q_x` is reconciled to twelve constant-force monthly
+  decrements and terminated no later than age 115;
 - dynamic behaviour schedules and coefficients are explicitly
   `uncalibrated_proxy`; contractual eligibility overrides them, so they cannot
   create Growth lapse or Growth withdrawals. Dynamic Take-up is evaluated
@@ -294,14 +308,25 @@ market-consistent values, as applicable. Material boundaries include:
 - state-dependent Joint-Life runs carry separate pathwise Primary/Spouse life
   statuses. Election and post-Election behaviour therefore act on the actual
   `p11`, `p10` or `p01` path state rather than on a nonlinear function of an
-  averaged survivor state. The deterministic benchmark retains the former
-  spouse-survival-weighted Joint-/Single-Life split for exact backward
-  validation. Lives are independent; divorce/removal, common shocks and legal
-  eligibility changes are not modelled;
+  averaged survivor state. The deterministic Election benchmark retains its
+  former Election-date rule, while portfolio factor comparisons use the same
+  pathwise mortality basis in every arm. Lives are independent;
+  divorce/removal, common shocks and legal eligibility changes are not
+  modelled;
 - the intra-year DVA and hedge-package value use a Black-Scholes call-spread
   proxy with the complete Reference Fund volatility obtained by joint
   equity/Hull-White moment matching. This is not a calibration to mixed-fund
   option quotes and does not reproduce the full Heston distribution;
+- insurer hedge cost is explicit: fair annual package value plus 0.50% of fair
+  value and 0.30% p.a. of hedge notional. The former volatility-spread proxy is
+  retained but zero in the standard cost CSV to avoid double counting;
+- the Money-Market return is derived only from the simulated Hull-White
+  overnight-rate integral and is applied to the administrative crediting frame
+  at the monthly interval start. It never uses Reference-Fund performance or
+  the under-year DVA option mark;
+- annual hedge purchases are a conservative cash-cost proxy: no intra-year
+  option unwind/recovery is booked after termination, and retained excess in
+  `not_sold` is settled only on the active remaining notional;
 - the statistical Dynamic portfolio path rejects COS and does not use LSMC.
   The separate optimal-behaviour runner trains a combined Income-Election and
   Full-Withdrawal policy on independent paths and freezes it for out-of-sample

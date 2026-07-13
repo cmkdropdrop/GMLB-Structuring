@@ -315,6 +315,26 @@ class ScenarioSet:
     def n_steps(self) -> int:
         return len(self.times) - 1
 
+    def money_market_accumulation(self, start_step: int, end_step: int) -> Array:
+        """Pathwise accumulation of the continuously rolled AUD overnight account.
+
+        ``discount`` is constructed from the simulated integral of the short
+        rate.  Its reciprocal ratio is therefore the stochastic money-market
+        accumulation over the requested interval.  This is the daily-roll
+        economic equivalent on the engine's monthly cashflow grid and is
+        independent of every equity or Reference-Fund return.
+        """
+        for name, step in (("start_step", start_step), ("end_step", end_step)):
+            if isinstance(step, bool) or not isinstance(step, (int, np.integer)):
+                raise ValueError(f"{name} must be an integer scenario-grid index.")
+            if step < 0 or step > self.n_steps:
+                raise ValueError(f"{name} must be a valid scenario-grid index.")
+        if end_step < start_step:
+            raise ValueError("end_step must not precede start_step.")
+        return self.discount[:, start_step] / np.maximum(
+            self.discount[:, end_step], 1e-300,
+        )
+
     # ---------------- pathwise term structure (MVA, annuity factors) ------ #
 
     def zero_rate(self, step: int, tenor: float) -> Array:

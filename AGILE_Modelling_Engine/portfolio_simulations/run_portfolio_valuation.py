@@ -34,6 +34,7 @@ from agile_engine import (  # noqa: E402
     DEFAULT_MODEL_PARAMETERS_PATH,
     DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
     FeeSpec,
+    HedgeCapLegMode,
     IndexLinkedLifetimeIncomeProduct,
     MortalityTable,
     ProjectionConfig,
@@ -234,6 +235,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
+        "--hedge-cap-leg-mode",
+        choices=tuple(mode.value for mode in HedgeCapLegMode),
+        default=HedgeCapLegMode.SOLD.value,
+        help=(
+            "sold uses the standard capped call spread; not_sold buys the "
+            "uncapped call and records performance above the customer cap as "
+            "an insurer hedge gain"
+        ),
+    )
+    parser.add_argument(
         "--income-election-mode",
         choices=("dynamic", "deterministic"),
         default="dynamic",
@@ -263,8 +274,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=197,
         help=(
-            "independent life-status seed used only where pathwise Joint-Life "
-            "states are required by Dynamic Election"
+            "independent common-random-number life-status seed for pathwise "
+            "Joint-Life states in every portfolio Behaviour arm"
         ),
     )
     parser.add_argument(
@@ -482,7 +493,143 @@ def _build_aggregation_reconciliation(
             "normalised_average_/normalised_contribution_ result columns were "
             "not found."
         )
+    failed = [
+        row for row in reconciliation
+        if row.get("within_numerical_tolerance") is not True
+    ]
+    if failed:
+        labels = ", ".join(
+            f"{row['aggregation_basis']}:{row['metric']}"
+            for row in failed[:10]
+        )
+        raise ValueError(
+            "Portfolio aggregation reconciliation failed for " + labels
+        )
+
+    # These task-critical insurer fields must never disappear silently when a
+    # runner's summary/model-point schema changes.  Other non-additive summary
+    # diagnostics may legitimately have no contribution column.
+    required_metrics = {
+        "pv_crediting_margin_aud",
+        "pv_money_market_income_aud",
+        "pv_hedge_gain_aud",
+        "pv_hedge_costs_aud",
+        "pv_hedge_option_fair_value_costs_aud",
+        "pv_hedge_option_markup_costs_aud",
+        "pv_hedge_management_fee_costs_aud",
+        "pv_hedge_execution_costs_aud",
+        "pv_hedge_cost_reconciliation_gap_aud",
+        "pv_crediting_margin_reconciliation_gap_aud",
+    }
+    required_bases = {"normalised_weighted_average"}
+    if bool(summary.get("absolute_portfolio_values_available")):
+        required_bases.add("absolute_portfolio")
+        required_bases.add("absolute_vs_normalised_average")
+    available = {
+        (str(row["aggregation_basis"]), str(row["metric"]))
+        for row in reconciliation
+    }
+    missing = sorted(
+        (basis, metric)
+        for basis in required_bases
+        for metric in required_metrics
+        if (basis, metric) not in available
+    )
+    if missing:
+        labels = ", ".join(
+            f"{basis}:{metric}" for basis, metric in missing[:10]
+        )
+        raise ValueError(
+            "Portfolio aggregation reconciliation is incomplete for " + labels
+        )
     return reconciliation
+
+
+def _validate_hedge_backing_summary(
+    summary: Mapping[str, object],
+    hedge_cap_leg_mode: str,
+) -> None:
+    """Fail before output if insurer hedge/backing aggregates do not close."""
+    mode = HedgeCapLegMode(hedge_cap_leg_mode)
+    prefixes = ["normalised_average_"]
+    if bool(summary.get("absolute_portfolio_values_available")):
+        prefixes.append("portfolio_total_")
+
+    def value(prefix: str, metric: str) -> float:
+        field = f"{prefix}{metric}"
+        parsed = _as_float(summary.get(field))
+        if parsed is None:
+            raise ValueError(f"Missing hedge/backing audit field {field}.")
+        return parsed
+
+    for prefix in prefixes:
+        hedge_costs = value(prefix, "pv_hedge_costs_aud")
+        hedge_components = math.fsum((
+            value(prefix, "pv_hedge_option_fair_value_costs_aud"),
+            value(prefix, "pv_hedge_option_markup_costs_aud"),
+            value(prefix, "pv_hedge_management_fee_costs_aud"),
+            value(prefix, "pv_hedge_execution_costs_aud"),
+        ))
+        money_market_income = value(prefix, "pv_money_market_income_aud")
+        hedge_gain = value(prefix, "pv_hedge_gain_aud")
+        crediting_margin = value(prefix, "pv_crediting_margin_aud")
+        reported_hedge_gap = value(
+            prefix, "pv_hedge_cost_reconciliation_gap_aud")
+        reported_crediting_gap = value(
+            prefix, "pv_crediting_margin_reconciliation_gap_aud")
+        hedge_gap = hedge_costs - hedge_components
+        crediting_gap = crediting_margin - money_market_income - hedge_gain
+        tolerance = max(
+            1.0e-8,
+            1.0e-10 * max(
+                abs(hedge_costs), abs(crediting_margin), abs(hedge_gain), 1.0,
+            ),
+        )
+        if not math.isclose(
+            hedge_costs, hedge_components, rel_tol=1.0e-10, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} hedge costs do not reconcile to their components."
+            )
+        if not math.isclose(
+            reported_hedge_gap,
+            hedge_gap,
+            rel_tol=1.0e-10,
+            abs_tol=tolerance,
+        ) or not math.isclose(
+            reported_hedge_gap, 0.0, rel_tol=0.0, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} reported hedge-cost reconciliation gap is invalid."
+            )
+        if not math.isclose(
+            crediting_margin,
+            money_market_income + hedge_gain,
+            rel_tol=1.0e-10,
+            abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} crediting margin does not reconcile to Money-"
+                "Market income plus hedge gain."
+            )
+        if not math.isclose(
+            reported_crediting_gap,
+            crediting_gap,
+            rel_tol=1.0e-10,
+            abs_tol=tolerance,
+        ) or not math.isclose(
+            reported_crediting_gap, 0.0, rel_tol=0.0, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} reported crediting-margin reconciliation gap is "
+                "invalid."
+            )
+        if mode is HedgeCapLegMode.SOLD and not math.isclose(
+            hedge_gain, 0.0, rel_tol=0.0, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} sold cap-leg mode must not report an Above-Cap gain."
+            )
 
 
 def _build_fair_fee_rows(
@@ -547,10 +694,15 @@ def _plot_component_decomposition(
 ) -> Optional[Path]:
     definitions = (
         ("Guarantee Claims", ("pv_guarantee_claims_aud",), 1.0),
-        ("Expenses", ("pv_expenses_aud", "pv_hedge_costs_aud"), 1.0),
+        ("Operating Expenses", ("pv_expenses_aud",), 1.0),
+        ("Fair Option Package", ("pv_hedge_option_fair_value_costs_aud",), 1.0),
+        ("Option Purchase Markup", ("pv_hedge_option_markup_costs_aud",), 1.0),
+        ("Hedge Management Fee", ("pv_hedge_management_fee_costs_aud",), 1.0),
+        ("Legacy Execution Proxy", ("pv_hedge_execution_costs_aud",), 1.0),
         ("Product Fees", ("pv_product_fees_aud",), -1.0),
         ("LIP", ("pv_lifetime_income_premiums_aud",), -1.0),
-        ("Crediting Margin", ("pv_crediting_margin_aud",), -1.0),
+        ("Money-Market Income", ("pv_money_market_income_aud",), -1.0),
+        ("Retained Excess Hedge Gain", ("pv_hedge_gain_aud",), -1.0),
         ("MVA retained", ("pv_mva_retained_aud",), -1.0),
     )
     labels: list[str] = []
@@ -1041,6 +1193,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             heston_cos=False,
             take_up_seed=args.take_up_seed,
             mortality_seed=args.mortality_seed,
+            force_pathwise_joint_life=True,
+            hedge_cap_leg_mode=HedgeCapLegMode(args.hedge_cap_leg_mode),
         )
         costs = load_cost_assumptions(
             args.cost_assumptions,
@@ -1084,30 +1238,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             model_points.contract_weight_sum,
             model_points.premium_volume_weight_sum,
         )
-        if joint_continue_income_count and args.income_election_mode == "dynamic":
+        if joint_continue_income_count:
             logger.info(
                 "%d Continue-Income-Joint-Life-Modellpunkte: Primary- und "
                 "Spouse-Lebensstatus werden auf denselben Marktpfaden separat "
-                "gezogen; Election und spätere Behaviour-Funktionen werden "
-                "auf dem jeweils tatsächlich sichtbaren Lebensstatus "
-                "ausgewertet.",
-                joint_continue_income_count,
-            )
-        elif joint_continue_income_count:
-            logger.warning(
-                "%d Continue-Income-Joint-Life-Modellpunkte: Der bedingt "
-                "gemeinsame Zweig verwendet die aus den CSVs geladenen "
-                "statischen Basisraten für Income-Lapse und Excess Withdrawal; "
-                "der Single-Life-Fallback bleibt dynamisch. Damit wird keine "
-                "nichtlineare Behaviour-Funktion auf einen gemittelten "
-                "p11/p10/p01-Zustand angewandt.",
+                "gezogen. Alle Behaviour-Benchmark-Arme verwenden dieselben "
+                "Mortalitätsziehungen; zustandsabhängige Election- und "
+                "Post-Election-Funktionen wirken nur auf den tatsächlich "
+                "sichtbaren Lebensstatus.",
                 joint_continue_income_count,
             )
         if automatic_start_override_count and args.income_election_mode == "deterministic":
             logger.info(
                 "%d Modellpunkte starten wegen des vertraglichen "
                 "Automatic-Age-Backstops früher als income_start_year; der "
-                "effektive Termin gilt auch für Ratecard und Spouse-Survival.",
+                "effektive Termin gilt auch für Ratecard und den pfadweisen "
+                "Spouse-Lebensstatus.",
                 automatic_start_override_count,
             )
         source_contract_count = model_points.total_exposure_count
@@ -1204,6 +1350,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "take_up_seed": args.take_up_seed,
             "mortality_seed": args.mortality_seed,
             "post_income_behaviour": args.post_income_behaviour,
+            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+            "scenario_fingerprint": result.scenario_fingerprint,
         })
         model_point_rows = result.model_point_rows()
         if len(model_point_rows) != model_point_count:
@@ -1211,6 +1359,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "Portfolio result row count does not match loaded model-point "
                 f"count: {len(model_point_rows)} != {model_point_count}."
             )
+        _validate_hedge_backing_summary(summary, args.hedge_cap_leg_mode)
 
         logger.info("[4/6] CSV-Ergebnisse und Aggregationsabgleich schreiben")
         summary_path = output / "portfolio_summary.csv"
@@ -1277,17 +1426,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Research valuation gross of reinsurance.",
             "Mortality is illustrative and not an approved production basis.",
             "Joint-Life mortality uses independent Primary/Spouse life-status "
-            "draws for state-dependent Election and post-Election Behaviour; "
-            "divorce, removal, common shocks and legal eligibility changes "
-            "are not modelled.",
+            "draws in every portfolio Behaviour benchmark arm; divorce, "
+            "removal, common shocks and legal eligibility changes are not "
+            "modelled.",
             "Intra-year DVA is a moment-matched Black-Scholes proxy on the "
             "complete reference fund; COS is not used.",
             "Dynamic take-up, lapse and withdrawal inputs are uncalibrated "
             "Behaviour proxies rather than a fully calibrated forecast.",
             "The five-year government-bond sleeve and fixed 50/50 monthly "
             "rebalancing are product-model proxy conventions.",
-            "No bond term premium, credit spreads, defaults, FX layer, "
-            "transaction costs or fund-internal charges are modelled.",
+            "No bond term premium, credit spreads, defaults, FX layer or "
+            "transaction costs are modelled. The customer Reference Fund has "
+            "no internal charge; the insurer hedge reference carries the "
+            "separate fixed management-fee proxy from cost_assumptions.csv.",
         ]
         if not absolute:
             model_limitations.append(
@@ -1320,14 +1471,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "year_including_automatic_age_backstop"
                 ),
                 "spouse_election_eligibility": (
-                    "spouse_survival_to_election_with_single_life_fallback"
+                    "pathwise_primary_and_spouse_life_status_at_election"
                 ),
                 "joint_life_behaviour": (
                     "pathwise_primary_and_spouse_life_statuses_with_separate_"
-                    "state_dependent_decisions"
-                    if args.income_election_mode == "dynamic"
-                    else "deterministic_spouse_survival_weighted_joint_and_"
-                    "single_life_fallback_benchmark"
+                    "decisions;state_dependent_actions_when_enabled"
                 ),
                 "income_lapse_after_account_value_exhaustion": (
                     "remains_active_while_income_guarantee_is_in_force"
@@ -1361,6 +1509,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "intra_year_dva": (
                     "moment_matched_black_scholes_proxy_on_complete_reference_fund"
                 ),
+                "insurer_backing_asset": (
+                    "administrative_crediting_frame_in_stochastic_aud_"
+                    "overnight_money_market_account"
+                ),
+                "money_market_accrual": (
+                    "pathwise_integrated_short_rate_daily_roll_equivalent_on_"
+                    "monthly_cashflow_grid"
+                ),
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+                "hedge_cap_leg_interpretation": (
+                    "short_cap_call_sold"
+                    if args.hedge_cap_leg_mode == HedgeCapLegMode.SOLD.value
+                    else "cap_call_not_sold_and_excess_payoff_retained"
+                ),
+                "customer_liability_uses_performance_fund_as_backing": False,
                 "crediting_cap_rate": (
                     costs.product.reference_fund.effective_maximum_return
                 ),
@@ -1450,7 +1613,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "income_election_mode": args.income_election_mode,
                 "take_up_seed": args.take_up_seed,
                 "mortality_seed": args.mortality_seed,
+                "force_pathwise_joint_life": (
+                    result_settings.projection.force_pathwise_joint_life
+                ),
                 "post_income_behaviour": args.post_income_behaviour,
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+                "option_fair_value_markup": (
+                    result_settings.projection.option_fair_value_markup
+                ),
+                "hedge_reference_management_fee": (
+                    result_settings.projection.hedge_reference_management_fee
+                ),
+                "hedge_vol_spread": (
+                    result_settings.projection.hedge_vol_spread
+                ),
+                "crediting_margin_enabled": (
+                    result_settings.projection.crediting_margin_enabled
+                ),
                 "fair_lip_per_model_point_requested": args.fair_lip,
                 "commercial_break_even_lip_per_model_point_requested": (
                     args.commercial_break_even_lip
@@ -1480,11 +1659,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         ),
                         "single_life_and_lump_sum_spouse": (
                             "dynamic_income_lapse_and_withdrawal_coefficients"
+                            if args.post_income_behaviour == "dynamic"
+                            else "continue_benchmark_without_voluntary_exit"
                         ),
                         "joint_life": (
-                            "pathwise_separate_life_statuses"
-                            if args.income_election_mode == "dynamic"
-                            else "legacy_spouse_survival_weighted_benchmark"
+                            "pathwise_separate_primary_and_spouse_life_"
+                            "statuses_for_all_behaviour_benchmark_arms"
                         ),
                         "growth_lapse_and_withdrawals": (
                             "loaded_for_provenance_but_product_gate_forces_zero"

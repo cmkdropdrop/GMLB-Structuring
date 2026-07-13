@@ -18,7 +18,7 @@ from scipy.optimize import brentq
 
 from ._provenance import assumption_fingerprint
 from .behavior import BehaviourModel
-from .esg import ESGConfig, Measure, ScenarioSet
+from .esg import ESGConfig, Measure, ScenarioSet, STEPS_PER_YEAR
 from .model_points import PolicyholderModelPoint, PolicyholderModelPointSet
 from .mortality import MortalityTable
 from .pricing import (
@@ -30,12 +30,14 @@ from .pricing import (
 )
 from .product import (ExpenseAssumptions, IndexLinkedLifetimeIncomeProduct,
                       PolicySpec, SpouseDeathElection)
-from .projection import ProjectionConfig
+from .projection import ProjectionConfig, ProjectionResult
 
 
 _MONETARY_METRICS = (
     "premium_aud",
     "pv_policyholder_benefits_aud",
+    "pv_policyholder_benefits_pre_election_aud",
+    "pv_policyholder_benefits_post_election_aud",
     "pv_terminal_closeout_aud",
     "pv_future_fees_aud",
     "pv_product_fees_aud",
@@ -44,6 +46,17 @@ _MONETARY_METRICS = (
     "pv_expenses_aud",
     "pv_hedge_costs_aud",
     "pv_crediting_margin_aud",
+    "pv_money_market_income_aud",
+    "pv_hedge_gain_aud",
+    "pv_hedge_option_fair_value_costs_aud",
+    "pv_hedge_option_markup_costs_aud",
+    "pv_hedge_management_fee_costs_aud",
+    "pv_hedge_execution_costs_aud",
+    "pv_hedge_cost_reconciliation_gap_aud",
+    "pv_crediting_margin_reconciliation_gap_aud",
+    "pv_growth_fees_aud",
+    "pv_growth_crediting_margin_aud",
+    "pv_post_election_guarantee_claims_aud",
     "pv_mva_retained_aud",
     "pv_aps_retained_aud",
     "bel_nonunit_aud",
@@ -83,11 +96,229 @@ class _ScalarValuation:
     guarantee_value: float
     insurer_net_value: float
     identity_gap: float
+    behaviour_diagnostics: Mapping[str, object]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "pv", MappingProxyType({
             key: float(value) for key, value in self.pv.items()
         }))
+        object.__setattr__(
+            self,
+            "behaviour_diagnostics",
+            MappingProxyType(dict(self.behaviour_diagnostics)),
+        )
+
+
+def _discrete_timing_quantile(
+    years: np.ndarray,
+    masses: np.ndarray,
+    quantile: float,
+) -> Optional[float]:
+    total = float(np.sum(masses))
+    if total <= 0.0:
+        return None
+    threshold = float(quantile) * total
+    index = int(np.searchsorted(np.cumsum(masses), threshold, side="left"))
+    return float(years[min(index, len(years) - 1)])
+
+
+def _projection_behaviour_diagnostics(
+    projection: ProjectionResult,
+) -> dict[str, object]:
+    """Collapse path diagnostics before the portfolio drops projection arrays."""
+    required = (
+        projection.eligible_growth_exposure,
+        projection.income_take_up_probability,
+        projection.income_election_events,
+        projection.forced_income_election_events,
+        projection.growth_exposure,
+        projection.income_exposure,
+        projection.ordinary_lapse_probabilities,
+        projection.performance_lapse_probabilities,
+        projection.total_lapse_probabilities,
+        projection.ordinary_lapse_events,
+        projection.performance_lapse_events,
+    )
+    if any(value is None for value in required):
+        return {}
+
+    eligible = np.asarray(projection.eligible_growth_exposure, dtype=float)
+    take_up_probability = np.asarray(
+        projection.income_take_up_probability, dtype=float
+    )
+    election_events = np.asarray(projection.income_election_events, dtype=float)
+    forced_events = np.asarray(
+        projection.forced_income_election_events, dtype=float
+    )
+    growth_exposure = np.asarray(projection.growth_exposure, dtype=float)
+    income_exposure = np.asarray(projection.income_exposure, dtype=float)
+    post_action_income_exposure = np.maximum(
+        np.asarray(projection.inforce, dtype=float) - growth_exposure,
+        0.0,
+    )
+    ordinary_probability = np.asarray(
+        projection.ordinary_lapse_probabilities, dtype=float
+    )
+    performance_probability = np.asarray(
+        projection.performance_lapse_probabilities, dtype=float
+    )
+    total_probability = np.asarray(
+        projection.total_lapse_probabilities, dtype=float
+    )
+    n_steps = election_events.shape[1] - 1
+    anniversary_steps = np.arange(
+        STEPS_PER_YEAR,
+        n_steps + 1,
+        STEPS_PER_YEAR,
+        dtype=int,
+    )
+    years = anniversary_steps.astype(float) / STEPS_PER_YEAR
+    election_mass = np.asarray([
+        np.mean(election_events[:, step]) for step in anniversary_steps
+    ], dtype=float)
+    forced_mass = np.asarray([
+        np.mean(forced_events[:, step]) for step in anniversary_steps
+    ], dtype=float)
+    eligible_mass = np.asarray([
+        np.mean(eligible[:, step]) for step in anniversary_steps
+    ], dtype=float)
+    probability_numerator = np.asarray([
+        np.mean(eligible[:, step] * take_up_probability[:, step])
+        for step in anniversary_steps
+    ], dtype=float)
+
+    total_election_mass = float(np.sum(election_mass))
+    total_forced_mass = float(np.sum(forced_mass))
+    expected_year = (
+        None
+        if total_election_mass <= 0.0
+        else float(np.sum(years * election_mass) / total_election_mass)
+    )
+    median_year = _discrete_timing_quantile(years, election_mass, 0.50)
+    p10_year = _discrete_timing_quantile(years, election_mass, 0.10)
+    p90_year = _discrete_timing_quantile(years, election_mass, 0.90)
+    forced_share = (
+        None
+        if total_election_mass <= 0.0
+        else total_forced_mass / total_election_mass
+    )
+    dt = np.diff(np.asarray(projection.times, dtype=float))
+    growth_duration = float(np.sum(
+        np.mean(growth_exposure[:, :-1], axis=0) * dt
+    ))
+    income_duration = float(np.sum(
+        np.mean(post_action_income_exposure[:, :-1], axis=0) * dt
+    ))
+    total_income_exposure = float(np.sum(np.mean(income_exposure, axis=0)))
+    horizon = float(projection.horizon_years)
+
+    diagnostics: dict[str, object] = {
+        "income_election_event_mass": total_election_mass,
+        "income_election_share": total_election_mass,
+        "forced_income_election_event_mass": total_forced_mass,
+        "forced_income_election_share": forced_share,
+        "expected_income_start_year": expected_year,
+        "median_income_start_year": median_year,
+        "p10_income_start_year": p10_year,
+        "p90_income_start_year": p90_year,
+        "income_start_year_mean": expected_year,
+        "income_start_year_median": median_year,
+        "income_start_year_p10": p10_year,
+        "income_start_year_p90": p90_year,
+        "mean_growth_phase_duration_years": growth_duration,
+        "mean_growth_duration": growth_duration,
+        "unconditional_growth_exposure_years": growth_duration,
+        "unconditional_income_exposure_years": income_duration,
+        "income_exposure_months": total_income_exposure,
+        "growth_phase_exposure": (
+            0.0 if horizon <= 0.0 else growth_duration / horizon
+        ),
+        "income_phase_exposure": (
+            0.0 if horizon <= 0.0 else income_duration / horizon
+        ),
+    }
+
+    def exposure_weighted_probability(values: np.ndarray) -> Optional[float]:
+        if total_income_exposure <= 0.0:
+            return None
+        return float(np.sum(np.mean(income_exposure * values, axis=0))
+                     / total_income_exposure)
+
+    ordinary_lapse_rate = exposure_weighted_probability(ordinary_probability)
+    performance_lapse_rate = exposure_weighted_probability(
+        performance_probability
+    )
+    total_lapse_rate = exposure_weighted_probability(total_probability)
+    ordinary_event_mass = float(np.sum(np.mean(
+        income_exposure * ordinary_probability, axis=0
+    )))
+    performance_event_mass = float(np.sum(np.mean(
+        income_exposure * performance_probability, axis=0
+    )))
+    total_event_mass = float(np.sum(np.mean(
+        income_exposure * total_probability, axis=0
+    )))
+    diagnostics.update({
+        "ordinary_income_lapse_probability": ordinary_lapse_rate,
+        "performance_income_lapse_probability": performance_lapse_rate,
+        "total_income_lapse_probability": total_lapse_rate,
+        "ordinary_income_lapse_rate": ordinary_lapse_rate,
+        "performance_income_lapse_rate": performance_lapse_rate,
+        "total_income_lapse_rate": total_lapse_rate,
+        "ordinary_income_lapse_event_mass": ordinary_event_mass,
+        "performance_income_lapse_event_mass": performance_event_mass,
+        "total_income_lapse_event_mass": total_event_mass,
+    })
+
+    for index, (step, year) in enumerate(zip(anniversary_steps, years)):
+        label = int(round(float(year)))
+        annual_probability = (
+            None
+            if eligible_mass[index] <= 0.0
+            else probability_numerator[index] / eligible_mass[index]
+        )
+        election_rate_among_eligible = (
+            None
+            if eligible_mass[index] <= 0.0
+            else election_mass[index] / eligible_mass[index]
+        )
+        lo = max(step - STEPS_PER_YEAR + 1, 0)
+        hi = step + 1
+        diagnostics.update({
+            f"eligible_growth_exposure_policy_year_{label}": (
+                float(eligible_mass[index])
+            ),
+            f"annual_take_up_probability_policy_year_{label}": (
+                annual_probability
+            ),
+            # Share of the original issue cohort electing in this policy year.
+            # The conditional action rate remains available separately below.
+            f"income_election_share_policy_year_{label}": float(
+                election_mass[index]
+            ),
+            f"income_election_rate_among_eligible_policy_year_{label}": (
+                election_rate_among_eligible
+            ),
+            f"income_election_event_mass_policy_year_{label}": (
+                float(election_mass[index])
+            ),
+            f"forced_income_election_event_mass_policy_year_{label}": (
+                float(forced_mass[index])
+            ),
+            f"mean_growth_exposure_policy_year_{label}": float(np.mean(
+                growth_exposure[:, lo:hi]
+            )),
+            f"mean_income_exposure_policy_year_{label}": float(np.mean(
+                income_exposure[:, lo:hi]
+            )),
+            f"growth_phase_share_policy_year_{label}": float(np.mean(
+                growth_exposure[:, step]
+            )),
+            f"income_phase_share_policy_year_{label}": float(np.mean(
+                post_action_income_exposure[:, step]
+            )),
+        })
+    return diagnostics
 
 
 def _scalarize(valuation: ValuationResult) -> _ScalarValuation:
@@ -100,6 +331,9 @@ def _scalarize(valuation: ValuationResult) -> _ScalarValuation:
         guarantee_value=float(valuation.guarantee_value),
         insurer_net_value=float(valuation.insurer_net_value),
         identity_gap=float(valuation.identity_gap),
+        behaviour_diagnostics=_projection_behaviour_diagnostics(
+            valuation.projection
+        ),
     )
 
 
@@ -225,6 +459,9 @@ class ModelPointPortfolioValuation:
             "secondary_age": policy.spouse_age,
             "secondary_sex": None if policy.spouse_sex is None else policy.spouse_sex.value,
             "income_start_year": policy.income_start_year,
+            "deterministic_benchmark_income_start_year": (
+                policy.income_start_year
+            ),
             "effective_income_start_year": self.per_contract_metrics.get(
                 "effective_income_start_year"
             ),
@@ -428,9 +665,15 @@ def _valuation_metrics(
         profitability = "negative_value"
     else:
         profitability = "approximately_break_even"
-    return {
+    metrics: dict[str, object] = {
         "premium_aud": premium,
         "pv_policyholder_benefits_aud": benefits,
+        "pv_policyholder_benefits_pre_election_aud": (
+            pv["policyholder_benefits_pre_election"]
+        ),
+        "pv_policyholder_benefits_post_election_aud": (
+            pv["policyholder_benefits_post_election"]
+        ),
         "pv_terminal_closeout_aud": pv["terminal_closeout"],
         "pv_future_fees_aud": future_fees,
         "pv_product_fees_aud": pv["fees_product"],
@@ -439,6 +682,33 @@ def _valuation_metrics(
         "pv_expenses_aud": pv["expenses"],
         "pv_hedge_costs_aud": pv["hedge_costs"],
         "pv_crediting_margin_aud": pv["crediting_margin"],
+        "pv_money_market_income_aud": pv["money_market_income"],
+        "pv_hedge_gain_aud": pv["hedge_gain"],
+        "pv_hedge_option_fair_value_costs_aud": (
+            pv["hedge_option_fair_value_costs"]
+        ),
+        "pv_hedge_option_markup_costs_aud": pv["hedge_option_markup_costs"],
+        "pv_hedge_management_fee_costs_aud": (
+            pv["hedge_management_fee_costs"]
+        ),
+        "pv_hedge_execution_costs_aud": pv["hedge_execution_costs"],
+        "pv_hedge_cost_reconciliation_gap_aud": (
+            pv["hedge_costs"]
+            - pv["hedge_option_fair_value_costs"]
+            - pv["hedge_option_markup_costs"]
+            - pv["hedge_management_fee_costs"]
+            - pv["hedge_execution_costs"]
+        ),
+        "pv_crediting_margin_reconciliation_gap_aud": (
+            pv["crediting_margin"]
+            - pv["money_market_income"]
+            - pv["hedge_gain"]
+        ),
+        "pv_growth_fees_aud": pv["growth_fees"],
+        "pv_growth_crediting_margin_aud": pv["growth_crediting_margin"],
+        "pv_post_election_guarantee_claims_aud": (
+            pv["post_election_guarantee_claims"]
+        ),
         "pv_mva_retained_aud": pv["mva_retained"],
         "pv_aps_retained_aud": pv["aps_retained"],
         "bel_nonunit_aud": valuation.bel_nonunit,
@@ -452,10 +722,17 @@ def _valuation_metrics(
         "profitability_materiality_bp": profitability_materiality_bp,
         "profitability_materiality_aud": materiality_aud,
         "identity_gap": valuation.identity_gap,
+        "phase_policyholder_benefit_reconciliation_gap_aud": (
+            pv["policyholder_benefits_pre_election"]
+            + pv["policyholder_benefits_post_election"]
+            - benefits
+        ),
         "charged_product_fee_rate": float(product.fees.product_fee),
         "charged_lip_rate": float(product.fees.lifetime_income_premium),
         "profitability_classification": profitability,
     }
+    metrics.update(valuation.behaviour_diagnostics)
+    return metrics
 
 
 def _spouse_survival_to_election(
@@ -484,18 +761,25 @@ def _spouse_survival_to_election(
 def _model_point_behaviour_treatment(
     model_point: PolicyholderModelPoint,
     behaviour: BehaviourModel,
+    *,
+    force_pathwise_joint_life: bool = False,
 ) -> str:
     """Describe the effective behaviour basis used for one model point."""
     policy = model_point.policy
     dynamic_active = behaviour.use_dynamic or behaviour.use_dynamic_withdrawals
+    pathwise_behaviour = (
+        behaviour.take_up.mode != "deterministic"
+        or dynamic_active
+        or force_pathwise_joint_life
+    )
+    if policy.spouse and pathwise_behaviour:
+        return "pathwise_joint_life_state_dependent"
     if (
         policy.spouse
         and policy.spouse_death_election == SpouseDeathElection.CONTINUE_INCOME
     ):
         return (
-            "joint_branch_static_base_single_fallback_dynamic"
-            if dynamic_active
-            else "joint_and_single_branches_static_base"
+            "joint_and_single_branches_static_base"
         )
     if dynamic_active:
         return "dynamic_state_dependent"
@@ -522,6 +806,42 @@ def _combine_joint_and_single_fallback(
     if joint.pv.keys() != single.pv.keys():
         raise ValueError("Joint and Single-Life valuation components differ.")
     pv = {key: mixed(joint.pv[key], single.pv[key]) for key in joint.pv}
+    diagnostic_keys = (
+        set(joint.behaviour_diagnostics) | set(single.behaviour_diagnostics)
+    )
+    diagnostics: dict[str, object] = {}
+    for key in diagnostic_keys:
+        left = joint.behaviour_diagnostics.get(key)
+        right = single.behaviour_diagnostics.get(key)
+        if isinstance(left, (int, float, np.integer, np.floating)) \
+                and isinstance(right, (int, float, np.integer, np.floating)):
+            diagnostics[key] = mixed(float(left), float(right))
+        elif left is None and right is None:
+            diagnostics[key] = None
+        elif left == right:
+            diagnostics[key] = left
+        else:
+            # A ratio/quantile with no defined value in one conditional branch
+            # is not made precise by silently substituting the other branch.
+            diagnostics[key] = None
+    income_exposure = diagnostics.get("income_exposure_months")
+    if isinstance(income_exposure, (int, float)) and income_exposure > 0.0:
+        for cause in ("ordinary", "performance", "total"):
+            event = diagnostics.get(f"{cause}_income_lapse_event_mass")
+            if isinstance(event, (int, float)):
+                rate = float(event) / float(income_exposure)
+                diagnostics[f"{cause}_income_lapse_probability"] = rate
+                diagnostics[f"{cause}_income_lapse_rate"] = rate
+    election_mass = diagnostics.get("income_election_event_mass")
+    forced_mass = diagnostics.get("forced_income_election_event_mass")
+    if isinstance(election_mass, (int, float)):
+        diagnostics["income_election_share"] = float(election_mass)
+        diagnostics["forced_income_election_share"] = (
+            0.0
+            if float(election_mass) <= 0.0
+            or not isinstance(forced_mass, (int, float))
+            else float(forced_mass) / float(election_mass)
+        )
     return _ScalarValuation(
         pv=pv,
         premium=mixed(joint.premium, single.premium),
@@ -531,6 +851,7 @@ def _combine_joint_and_single_fallback(
         insurer_net_value=mixed(
             joint.insurer_net_value, single.insurer_net_value),
         identity_gap=mixed(joint.identity_gap, single.identity_gap),
+        behaviour_diagnostics=diagnostics,
     )
 
 
@@ -545,14 +866,37 @@ def _value_model_point(
     settings: ValuationSettings,
     scenarios: ScenarioSet,
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
+    combined_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
 ) -> _ScalarValuation:
     """Value a model point, including the pre-Election spouse-life split."""
+    combined_policy = (
+        None
+        if combined_policy_factory is None
+        else combined_policy_factory(model_point.policy)
+    )
+    surrender_policy = (
+        combined_policy
+        if combined_policy is not None
+        and callable(getattr(combined_policy, "surrender_mask", None))
+        else None
+        if surrender_policy_factory is None
+        else surrender_policy_factory(model_point.policy)
+    )
+    pathwise_behaviour = (
+        behaviour.take_up.mode != "deterministic"
+        or combined_policy_factory is not None
+        or surrender_policy_factory is not None
+        or behaviour.use_dynamic
+        or behaviour.use_dynamic_withdrawals
+        or settings.projection.force_pathwise_joint_life
+    )
     joint_behaviour = behaviour
     if (
         model_point.policy.spouse
         and model_point.policy.spouse_death_election
         == SpouseDeathElection.CONTINUE_INCOME
         and (behaviour.use_dynamic or behaviour.use_dynamic_withdrawals)
+        and not pathwise_behaviour
     ):
         # A nonlinear response to a mortality-state-averaged annuity factor is
         # not a valid substitute for separately projected p11/p10/p01 account
@@ -570,20 +914,11 @@ def _value_model_point(
         expenses=expenses,
         settings=settings,
         scenarios=scenarios,
-        surrender_policy=(
-            None
-            if surrender_policy_factory is None
-            else surrender_policy_factory(model_point.policy)
-        ),
+        surrender_policy=surrender_policy,
+        income_election_policy=combined_policy,
     ))
-    if not model_point.policy.spouse:
+    if not model_point.policy.spouse or pathwise_behaviour:
         return joint_or_single
-    if behaviour.take_up.mode != "deterministic":
-        raise ValueError(
-            "Joint-Life portfolio valuation requires deterministic model-point "
-            "Income Election so pre-Election spouse survival and the Single-"
-            "Life fallback can be valued without mixing incompatible states."
-        )
     fallback_policy = replace(
         model_point.policy,
         spouse=False,
@@ -891,6 +1226,7 @@ def value_policyholder_portfolio(
     profitability_materiality_bp: float = 1.0,
     progress_callback: Optional[Callable[[PortfolioProgress], None]] = None,
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
+    combined_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
     scenario_transform: Optional[Callable[[ScenarioSet], ScenarioSet]] = None,
 ) -> PortfolioValuationResult:
     """Value all model points under one shared risk-neutral scenario set.
@@ -905,6 +1241,11 @@ def value_policyholder_portfolio(
     ``scenario_transform`` may change path values after the shared scenario set
     is generated, but it may not change the market configuration, measure,
     model, seed, monthly grid or path dimensions.
+
+    ``combined_policy_factory`` supplies one frozen out-of-sample policy per
+    PolicySpec.  The object may implement both
+    ``start_income_mask(*, context=...)`` and ``surrender_mask(*, context=...)``;
+    the same instance is passed through pricing to both contractual gates.
     """
     total_model_points = len(model_points.model_points)
     if total_model_points == 0:
@@ -942,7 +1283,13 @@ def value_policyholder_portfolio(
     )
     if any(not isinstance(value, bool) for value in fair_fee_switches):
         raise ValueError("Fair-fee switches must be boolean.")
-    if surrender_policy_factory is not None and any(fair_fee_switches):
+    if surrender_policy_factory is not None and combined_policy_factory is not None:
+        raise ValueError(
+            "Use either surrender_policy_factory or combined_policy_factory, "
+            "not both."
+        )
+    if (surrender_policy_factory is not None
+            or combined_policy_factory is not None) and any(fair_fee_switches):
         raise ValueError(
             "Fair-fee solves with LSMC require refitting the exercise policy "
             "at every fee candidate and are not supported by this entry point."
@@ -955,6 +1302,17 @@ def value_policyholder_portfolio(
         raise ValueError("profitability_materiality_bp must be finite and non-negative.")
     has_joint_life = any(
         point.policy.spouse for point in model_points.model_points
+    )
+    uses_pathwise_joint_life = bool(
+        has_joint_life
+        and (
+            behaviour.take_up.mode != "deterministic"
+            or combined_policy_factory is not None
+            or surrender_policy_factory is not None
+            or behaviour.use_dynamic
+            or behaviour.use_dynamic_withdrawals
+            or valuation_settings.projection.force_pathwise_joint_life
+        )
     )
     joint_continue_income_count = sum(
         1
@@ -969,11 +1327,6 @@ def value_policyholder_portfolio(
         if point.policy.effective_income_start_year(product)
         != int(round(point.policy.income_start_year))
     )
-    if has_joint_life and behaviour.take_up.mode != "deterministic":
-        raise ValueError(
-            "Joint-Life portfolio model points require deterministic "
-            "model-point Income Election for the spouse-survival fallback split."
-        )
     if portfolio_contract_count is not None and (
         isinstance(portfolio_contract_count, bool)
         or not isfinite(portfolio_contract_count)
@@ -1070,6 +1423,8 @@ def value_policyholder_portfolio(
     )
 
     normalised_aggregate = {metric: 0.0 for metric in _MONETARY_METRICS}
+    behaviour_normalised_aggregate: dict[str, float] = {}
+    take_up_probability_numerator_by_year: dict[int, float] = {}
     portfolio_aggregate = (
         {metric: 0.0 for metric in _MONETARY_METRICS}
         if absolute_contract_count is not None else None
@@ -1096,25 +1451,73 @@ def value_policyholder_portfolio(
             settings=common_settings,
             scenarios=scenarios,
             surrender_policy_factory=surrender_policy_factory,
+            combined_policy_factory=combined_policy_factory,
         )
         metrics = _valuation_metrics(
             valuation,
             product,
             profitability_materiality_bp,
         )
-        metrics["income_take_up_mode"] = behaviour.take_up.mode
+        metrics["income_take_up_mode"] = (
+            "combined_policy"
+            if combined_policy_factory is not None
+            else behaviour.take_up.mode
+        )
+        deterministic_election = (
+            behaviour.take_up.mode == "deterministic"
+            and combined_policy_factory is None
+        )
+        deterministic_benchmark_year = point.policy.effective_income_start_year(
+            product
+        )
+        metrics["deterministic_benchmark_effective_income_start_year"] = (
+            deterministic_benchmark_year
+        )
         metrics["effective_income_start_year"] = (
-            point.policy.effective_income_start_year(product)
+            deterministic_benchmark_year if deterministic_election else None
         )
         metrics["behaviour_treatment"] = (
-            "lsmc_optimal_income_full_withdrawal"
+            "combined_policy_dynamic_income_election_and_full_withdrawal"
+            if combined_policy_factory is not None
+            else "lsmc_optimal_income_full_withdrawal"
             if surrender_policy_factory is not None
-            else _model_point_behaviour_treatment(point, behaviour)
+            else _model_point_behaviour_treatment(
+                point,
+                behaviour,
+                force_pathwise_joint_life=(
+                    common_settings.projection.force_pathwise_joint_life
+                ),
+            )
         )
         metrics["spouse_survival_to_income_election"] = (
             _spouse_survival_to_election(point, product, mortality)
-            if point.policy.spouse else None
+            if point.policy.spouse and deterministic_election else None
         )
+        for metric, value in valuation.behaviour_diagnostics.items():
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ):
+                continue
+            numeric = float(value)
+            if not isfinite(numeric):
+                continue
+            behaviour_normalised_aggregate[metric] = (
+                behaviour_normalised_aggregate.get(metric, 0.0)
+                + aggregation_weight * numeric
+            )
+        for key, value in valuation.behaviour_diagnostics.items():
+            prefix = "annual_take_up_probability_policy_year_"
+            if not key.startswith(prefix) or value is None:
+                continue
+            year = int(key[len(prefix):])
+            eligible_key = f"eligible_growth_exposure_policy_year_{year}"
+            eligible_value = valuation.behaviour_diagnostics.get(eligible_key)
+            if eligible_value is None:
+                continue
+            take_up_probability_numerator_by_year[year] = (
+                take_up_probability_numerator_by_year.get(year, 0.0)
+                + aggregation_weight * float(value) * float(eligible_value)
+            )
         normalised_contribution_metrics = {
             metric: aggregation_weight * float(metrics[metric])
             for metric in _MONETARY_METRICS
@@ -1311,6 +1714,98 @@ def value_policyholder_portfolio(
             detail=portfolio_commercial_break_even_lip.status,
         )
 
+    timing_years = sorted({
+        int(key.rsplit("_", 1)[1])
+        for key in behaviour_normalised_aggregate
+        if key.startswith("income_election_event_mass_policy_year_")
+    })
+    for year in timing_years:
+        eligible_key = f"eligible_growth_exposure_policy_year_{year}"
+        probability_key = f"annual_take_up_probability_policy_year_{year}"
+        election_key = f"income_election_event_mass_policy_year_{year}"
+        share_key = f"income_election_share_policy_year_{year}"
+        conditional_key = (
+            f"income_election_rate_among_eligible_policy_year_{year}"
+        )
+        exposure = behaviour_normalised_aggregate.get(eligible_key, 0.0)
+        behaviour_normalised_aggregate[probability_key] = (
+            0.0
+            if exposure <= 0.0
+            else take_up_probability_numerator_by_year.get(year, 0.0) / exposure
+        )
+        behaviour_normalised_aggregate[share_key] = (
+            behaviour_normalised_aggregate.get(election_key, 0.0)
+        )
+        behaviour_normalised_aggregate[conditional_key] = (
+            0.0 if exposure <= 0.0
+            else behaviour_normalised_aggregate.get(election_key, 0.0) / exposure
+        )
+
+    if timing_years:
+        year_values = np.asarray(timing_years, dtype=float)
+        event_values = np.asarray([
+            behaviour_normalised_aggregate.get(
+                f"income_election_event_mass_policy_year_{year}", 0.0
+            )
+            for year in timing_years
+        ], dtype=float)
+        forced_values = np.asarray([
+            behaviour_normalised_aggregate.get(
+                f"forced_income_election_event_mass_policy_year_{year}", 0.0
+            )
+            for year in timing_years
+        ], dtype=float)
+        election_total = float(np.sum(event_values))
+        forced_total = float(np.sum(forced_values))
+        behaviour_normalised_aggregate["income_election_event_mass"] = (
+            election_total
+        )
+        behaviour_normalised_aggregate["income_election_share"] = election_total
+        behaviour_normalised_aggregate[
+            "forced_income_election_event_mass"
+        ] = forced_total
+        if election_total > 0.0:
+            expected_year = float(
+                np.sum(year_values * event_values) / election_total
+            )
+            median_year = float(_discrete_timing_quantile(
+                year_values, event_values, 0.50
+            ))
+            p10_year = float(_discrete_timing_quantile(
+                year_values, event_values, 0.10
+            ))
+            p90_year = float(_discrete_timing_quantile(
+                year_values, event_values, 0.90
+            ))
+            behaviour_normalised_aggregate.update({
+                "expected_income_start_year": expected_year,
+                "median_income_start_year": median_year,
+                "p10_income_start_year": p10_year,
+                "p90_income_start_year": p90_year,
+                "income_start_year_mean": expected_year,
+                "income_start_year_median": median_year,
+                "income_start_year_p10": p10_year,
+                "income_start_year_p90": p90_year,
+                "forced_income_election_share": forced_total / election_total,
+            })
+        else:
+            behaviour_normalised_aggregate["forced_income_election_share"] = 0.0
+
+    income_exposure_total = behaviour_normalised_aggregate.get(
+        "income_exposure_months", 0.0
+    )
+    if income_exposure_total > 0.0:
+        for cause in ("ordinary", "performance", "total"):
+            event_key = f"{cause}_income_lapse_event_mass"
+            probability_key = f"{cause}_income_lapse_probability"
+            behaviour_normalised_aggregate[probability_key] = (
+                behaviour_normalised_aggregate.get(event_key, 0.0)
+                / income_exposure_total
+            )
+            behaviour_normalised_aggregate[
+                f"{cause}_income_lapse_rate"
+            ] = behaviour_normalised_aggregate[probability_key]
+
     premium = normalised_aggregate["premium_aud"]
     insurer_value = normalised_aggregate[
         "insurer_net_present_value_before_risk_margin_aud"
@@ -1341,6 +1836,21 @@ def value_policyholder_portfolio(
         f"normalised_average_{metric}": value
         for metric, value in normalised_aggregate.items()
     }
+    summary.update({
+        f"normalised_average_{metric}": value
+        for metric, value in behaviour_normalised_aggregate.items()
+    })
+    # Behaviour diagnostics are already contract-weighted portfolio averages
+    # (or event-mass ratios recomputed after aggregation).  Publish direct
+    # aliases for analysis runners and retain the explicit normalised prefix
+    # for schema continuity with monetary valuation fields.
+    summary.update(behaviour_normalised_aggregate)
+    if absolute_contract_count is not None:
+        for metric, value in behaviour_normalised_aggregate.items():
+            if "event_mass" in metric or "exposure" in metric:
+                summary[f"portfolio_total_{metric}"] = (
+                    float(absolute_contract_count) * value
+                )
     if portfolio_aggregate is not None:
         summary.update({
             f"portfolio_total_{metric}": value
@@ -1396,18 +1906,37 @@ def value_policyholder_portfolio(
         "heston_substeps": int(common_settings.heston_substeps),
         "record_paths": bool(common_settings.projection.record_paths),
         "heston_cos": bool(common_settings.projection.heston_cos),
-        "lsmc_used": surrender_policy_factory is not None,
-        "income_take_up_mode": behaviour.take_up.mode,
+        "lsmc_used": (
+            surrender_policy_factory is not None
+            or combined_policy_factory is not None
+        ),
+        "income_take_up_mode": (
+            "combined_policy"
+            if combined_policy_factory is not None
+            else behaviour.take_up.mode
+        ),
         "income_take_up_source": (
+            "frozen_combined_income_election_and_surrender_policy"
+            if combined_policy_factory is not None
+            else
             "effective_model_point_income_start_year_with_automatic_age_backstop"
             if behaviour.take_up.mode == "deterministic"
             else "dynamic_behaviour_assumptions"
         ),
         "automatic_income_start_override_model_point_count": (
             automatic_start_override_count
+            if behaviour.take_up.mode == "deterministic"
+            and combined_policy_factory is None
+            else None
+        ),
+        "deterministic_benchmark_automatic_income_start_override_"
+        "model_point_count": (
+            automatic_start_override_count
         ),
         "joint_life_election_treatment": (
-            "spouse_survival_weighted_joint_and_single_life_fallback"
+            "pathwise_primary_spouse_life_status_at_income_election"
+            if uses_pathwise_joint_life
+            else "spouse_survival_weighted_joint_and_single_life_fallback"
             if has_joint_life
             else "not_applicable_single_life_portfolio"
         ),
@@ -1415,6 +1944,16 @@ def value_policyholder_portfolio(
             "independent_lives" if has_joint_life else "not_applicable"
         ),
         "joint_life_behaviour_treatment": (
+            "pathwise_joint_life_combined_election_and_surrender_policy"
+            if uses_pathwise_joint_life and combined_policy_factory is not None
+            else "pathwise_joint_life_fitted_post_election_surrender_policy"
+            if uses_pathwise_joint_life and surrender_policy_factory is not None
+            else "pathwise_joint_life_dynamic_state_dependent"
+            if uses_pathwise_joint_life
+            and (behaviour.use_dynamic or behaviour.use_dynamic_withdrawals)
+            else "pathwise_joint_life_deterministic_election_continue_benchmark"
+            if uses_pathwise_joint_life
+            else
             "joint_and_single_fallback_branches_use_separately_fitted_lsmc_policies"
             if joint_continue_income_count and surrender_policy_factory is not None
             else
@@ -1433,6 +1972,9 @@ def value_policyholder_portfolio(
         "joint_continue_income_model_point_count": joint_continue_income_count,
         "joint_life_four_state_account_cohorts": (
             False if has_joint_life else None
+        ),
+        "joint_life_pathwise_mortality_states": (
+            uses_pathwise_joint_life if has_joint_life else None
         ),
         "fair_lip_requested": calculate_fair_lip,
         "fair_lip_solved_count": sum(

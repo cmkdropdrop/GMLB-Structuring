@@ -112,15 +112,14 @@ class TestGuaranteeMechanics:
         """PDS: IV 200k at 10.50% -> 21,000 p.a."""
         assert 200_000 * 0.105 == pytest.approx(21_000)
 
-    def test_off_anniversary_income_start_dva_reset(self):
-        """A mid-year election closes out the growth DVA and starts a fresh
-        income-phase annual crediting period from that month."""
+    def test_anniversary_income_start_dva_reset(self):
+        """Election uses the contractual Anniversary and starts a new DVA year."""
         product = AgileProduct(fees=FeeSpec(product_fee=0.0,
                                             lifetime_income_premium=0.0))
-        policy = PolicySpec(age=65, income_start_year=1.5)
+        policy = PolicySpec(age=65, income_start_year=2.0)
         scen = simulate("black_scholes", CFG, 4.0, 1, seed=31)
         res = project(product, policy, scen, no_lapse_behaviour(), MORT)
-        step = 18
+        step = 24
 
         assert res.phase_paths[0, step - 1] == 0
         assert res.phase_paths[0, step] == 1
@@ -128,21 +127,35 @@ class TestGuaranteeMechanics:
         assert res.cashflows["income_paid"][0, step] == pytest.approx(0.0)
         assert res.cashflows["income_paid"][0, step + 1] > 0.0
 
-        # The new income-period crediting cycle starts at 1.5y, so the next
-        # DVA margin appears at 2.5y, not at the original 2.0y anniversary.
-        assert res.cashflows["crediting_margin"][0, step] > 0.0
-        assert res.cashflows["crediting_margin"][0, 24] == pytest.approx(0.0)
-        assert res.cashflows["crediting_margin"][0, 30] > 0.0
+        # The insurer's crediting-margin aggregate now records monthly
+        # money-market backing income (plus an optional retained hedge gain),
+        # rather than an up-front DVA margin.  The customer-contract identity
+        # keeps the DVA financing margin in its separate diagnostic ledger.
+        np.testing.assert_allclose(
+            res.cashflows["crediting_margin"],
+            res.cashflows["money_market_income"] + res.cashflows["hedge_gain"],
+            rtol=0.0,
+            atol=1e-12,
+        )
+        assert res.cashflows["money_market_income"][0, step] > 0.0
+        assert res.cashflows["money_market_income"][0, 30] > 0.0
+
+        # Contract financing is an Anniversary-only identity ledger; it is
+        # distinct from monthly money-market P&L.
+        assert res.cashflows["contract_financing_margin"][0, step] > 0.0
+        assert res.cashflows["contract_financing_margin"][0, 30] \
+            == pytest.approx(0.0)
+        assert res.cashflows["contract_financing_margin"][0, 36] > 0.0
 
         rate = product.income_rates.lifetime_income_rate(
             policy.age, policy.sex, policy.income_type, policy.spouse,
-            1, policy.spouse_age, policy.spouse_sex, policy.age_pension_plus)
+            2, policy.spouse_age, policy.spouse_sex, policy.age_pension_plus)
         income_base = res.income_paths[0, step] / rate
         opt = InvestmentOption.AUS_TP
         r_cc = scen.forward_zero_cc(step, 1.0)[0]
         sigma = scen.effective_bs_vol(opt.index, step, 1.0)[0]
         pz_start = intra_year_value_factor(
-            1.0, opt.protection, product.caps.cap(opt, 1), 1.0,
+            1.0, opt.protection, product.caps.cap(opt, 2), 1.0,
             r_cc, product.dividend_yield[opt.index], sigma)
         assert res.iv_paths[0, step] == pytest.approx(income_base * pz_start,
                                                        rel=1e-10)

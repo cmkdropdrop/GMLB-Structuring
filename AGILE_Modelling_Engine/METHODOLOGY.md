@@ -15,7 +15,8 @@ The model separates four perspectives that must not be mixed:
    fees deducted from Account Value, lifetime income, withdrawals and death
    benefits.
 2. **Insurer non-unit cashflows** — collected fees, Guarantee Claims, expenses,
-   crediting margin, hedge costs and MVA retention.
+   stochastic overnight-backing income, option/hedge costs, optional retained
+   hedge gain and MVA retention.
 3. **Market-consistent valuation** — risk-neutral scenarios and pathwise
    money-market discounting.
 4. **Simplified Real-World projection** — physical equity premium with the
@@ -270,12 +271,16 @@ p_last_survivor = p_1 + p_2 - p_1 * p_2.
 governed valuation must load an approved table through
 `MortalityTable.from_qx(...)`, retain table provenance and review improvement,
 selection and longevity-stress assumptions. The baseline has no stochastic or
-systematic longevity factor and no mortality dependence between spouses. In
-the portfolio workflow the explicit model-point Election anniversary is used
-to split a Joint-Life point into spouse-survives and Single-Life-fallback
-values. That anniversary is resolved consistently with the contractual
-automatic-start rule. Divorce/removal, common shock and legal eligibility
-changes remain outside the model.
+systematic longevity factor and no mortality dependence between spouses.
+Single-Life runs use expected decrements. At the low-level API, a standalone
+deterministic Joint-Life projection also retains the historical expected-
+decrement Joint-/Single-Life split unless pathwise status is requested. The
+portfolio Dynamic, LSMC and V00/V01/V10/V11 factor runs force separately
+sampled Primary-/Spouse-alive indicators for every arm, using one dedicated
+common-random-number mortality seed. This prevents the Behaviour decomposition
+from mixing a change in Election/exit policy with a change in mortality
+estimator. Divorce/removal, common shock and legal eligibility changes remain
+outside the model.
 
 ## 9. Policyholder behaviour
 
@@ -309,23 +314,69 @@ and retained separately on each market path. A path on which the Spouse dies
 before Election uses the Single-Life fallback rate; after a valid Joint-Life
 Election, `p11`, `p10` and `p01` paths retain their own observable state. This
 avoids applying a nonlinear Behaviour function to a survivor-state average.
-The deterministic benchmark continues to use the historical expected spouse-
-survival split so its former Election mechanics remain reproducible.
+The deterministic benchmark continues to use the historical model-point
+Election date so its former Election mechanics remain reproducible. Portfolio
+factor runs nevertheless use the same pathwise Joint-Life mortality basis in
+V00/V01/V10/V11; only the standalone low-level deterministic API defaults to
+the former expected spouse-survival split.
 
 Every shipped behavioural value is labelled `uncalibrated_proxy`. The cited
 literature motivates functional form only and does not calibrate the numerical
 coefficients. Production use requires portfolio experience, segmentation,
-credibility analysis, backtesting and formal governance. LSMC is not an active
-behaviour regime.
+credibility analysis, backtesting and formal governance. LSMC is deliberately
+implemented as a separate fitted research policy, not as a statistical
+`BehaviourModel` regime.
 
-The dynamic-behaviour files are nevertheless loaded and hashed in the
-portfolio manifest. Their Income lapse and withdrawal assumptions remain
-active for Single Life, the Single-Life fallback and the lump-sum Spouse path.
-For a Continue-Income Joint-Life branch, a nonlinear response to an averaged
-`p11/p10/p01` state is not used: until separate state-specific Account-Value
-cohorts exist, that conditional joint branch uses the loaded static CSV base
-rates. Contractual Growth prohibitions and the effective model-point Election
-date take precedence over incompatible proxy rates.
+The dynamic-behaviour files are loaded and hashed in the Dynamic portfolio
+manifest. Their Income take-up, lapse and withdrawal functions are evaluated
+on the actual path state for Single and Joint Life. For Continue-Income Joint
+Life, the separately sampled `p11`, `p10` and `p01` paths retain their own
+Account Value, fee and life-status history; the nonlinear response is never
+applied to an averaged survivor state. Contractual Growth prohibitions and the
+automatic-start gate take precedence over proxy rates. The model-point
+`income_start_year` affects only the explicit deterministic validation
+benchmark.
+
+### 9.1 Combined optimal-behaviour policy
+
+The separate research LSMC entry point projects the same contract from issue
+and solves one phase-dependent Policyholder problem:
+
+```text
+Growth: WAIT | START_INCOME_NOW
+Income: CONTINUE | FULL_WITHDRAWAL
+```
+
+`START_INCOME_NOW` fixes annual income from the current post-credit,
+post-fee and post-mortality Account Value and the rate card then in force; it
+is a state transition and has no immediate payment. The first income payment
+is one month later. A newly elected path cannot also choose Full Withdrawal at
+the same timestamp. Growth surrender and Growth withdrawals remain excluded
+by the product gates.
+
+The Income subproblem is fitted on a stratified panel of admissible Election
+states. At every admissible Growth anniversary, backward induction then
+compares a complete START transition followed by the cross-fitted Income
+policy with WAIT followed by the already-solved later combined policy. Both
+regression surfaces receive only their read-only decision context. Future
+returns, discount factors, later caps, hedge results and backing-asset values
+are not part of either feature surface.
+
+Complete paths remain out of fold. Ridge regularisation, rank and condition
+gates and an out-of-fold RMSE action buffer apply to both action types. An
+unstable Election regression falls back to WAIT and an unstable Surrender
+regression to CONTINUE; the contractual automatic-age gate overrides WAIT.
+The final full-sample policy is frozen and valued on independent evaluation
+paths. Its fit-basis fingerprint includes training scenario content, Cap,
+stress, product and canonical policy basis, mortality, expenses, projection
+configuration and LSMC settings. A Cap×stress analysis must therefore refit,
+and evidence a distinct fit basis, for every cell.
+
+The V00/V01/V10/V11 report is a factor decomposition of that frozen joint
+policy. V01 deploys its Income rule under deterministic Election without a
+separate refit; V10 deploys its Election rule with Surrender suppressed without
+a Continue-only refit. These deliberate restrictions are manifest limitations,
+not four independently re-optimised contracts.
 
 ## 10. Market models and measures
 
@@ -406,15 +457,44 @@ the expression reduces to the engine's usual Merton/Hull-White adjustment for
 a pure-equity option.
 The DVA factor is the zero-bond leg to the next anniversary plus a
 Black-Scholes call spread at strikes `1` and `1.06` on the complete fund.
-Hedge-execution cost is the non-negative absolute change in that package value
-under the cost-file volatility add-on.
+This is a customer-liability value only; it is not the insurer backing asset.
+
+The insurer hedge and backing are recorded separately:
+
+- the administrative crediting frame at each monthly interval start is backed
+  by a continuously rolled AUD overnight account. The under-year DVA option
+  mark is a customer-liability value and is not treated as a backing asset.
+  The monthly cashflow-grid return is the pathwise ratio of Hull-White discount
+  factors. This is the daily-roll economic equivalent of accumulating the
+  simulated overnight short rate and contains no Reference-Fund return;
+- at the start of each crediting year the standard hedge is Long Call at return
+  strike 0 minus Short Call at return strike Cap (gross strikes `1` and
+  `1 + Cap`);
+- `hedge_cap_leg_mode=sold` is the default and leaves no insurer payoff above
+  the customer cap. `not_sold` buys only the uncapped long call; the additional
+  fair premium is paid and `max(R_reference - Cap, 0)` is recorded as a
+  separate insurer hedge gain;
+- the insurer pays the full fair option value, plus a purchase markup of 0.50%
+  of that fair value and an annual 0.30% management-fee proxy on hedge
+  notional. These two fixed inputs are in `cost_assumptions.csv` and never
+  reduce customer Account Value or Reference-Fund return; and
+- the former volatility-add-on execution proxy remains available for
+  compatibility but is zero in the standard cost assumption set, so it is not
+  layered on top of the new explicit costs by default.
+
+The user's description of a sold "Put at the Cap" is implemented by economic
+effect rather than label: a capped positive-return payoff requires a sold cap
+**Call**. Selling a Put at that strike would create a different downside payoff
+and would not remove the insurer's upside above the cap.
 
 This is **moment matching**, not a calibration to mixed-fund option quotes and
 not exact Heston-Hull-White pricing of the full fund distribution. It does not
 introduce a new volatility input, but it suppresses higher moments, stochastic
 volatility skew and some dynamic dependence. The portfolio path therefore sets
 and enforces `ProjectionConfig.heston_cos=False`. COS utilities retained for
-legacy equity options are not used. LSMC is also not used.
+legacy equity options are not used. LSMC does not replace or recalibrate this
+intra-year valuation proxy; it consumes the resulting current state only at
+its contractual decision times.
 
 ## 12. Cashflow and valuation definitions
 
@@ -433,6 +513,22 @@ Future fee income is based on collected event cashflows:
 ```text
 PV_future_fees = PV(Product Fees) + PV(Lifetime Income Premiums).
 ```
+
+The insurer hedge/backing aggregates reconcile exactly once:
+
+```text
+Crediting Margin = Money-Market Income + retained Excess Hedge Gain,
+
+Hedge Costs
+  = Fair Option Package Cost
+  + Option Purchase Markup
+  + Hedge-Reference Management-Fee Cost
+  + optional legacy Execution Cost.
+```
+
+The separate `contract_financing_margin` is used only by the customer-flow
+market-consistency identity. It is not added to insurer P&L or BEL. This keeps
+the liability reconciliation independent of the insurer's backing choice.
 
 For the gross-of-reinsurance baseline, the Non-Unit Best Estimate Liability is
 
@@ -459,8 +555,9 @@ The rider guarantee value is
 Guarantee Value = PV(Guarantee Claims) - PV(LIP).
 ```
 
-Insurer net present value before risk margin includes modelled fee and margin
-inflows less Guarantee Claims, expenses and hedge costs. Corporate tax,
+Insurer net present value before risk margin includes modelled fee, stochastic
+overnight-backing and optional excess-hedge inflows less Guarantee Claims,
+expenses and hedge costs. Corporate tax,
 shareholder hurdle rate, capital earning spread and cost of capital belong to
 their named capital/profitability layers and are not extra terms in BEL.
 
@@ -480,25 +577,30 @@ ignored; the generic 50/50 Reference Fund is a product-level rule.
 `value_policyholder_portfolio()` builds one common risk-neutral scenario set
 large enough for all model-point horizons, reuses it for all model points and
 optional fee solves, projects sequentially and retains scalar output. This is
-plain Monte Carlo with common random numbers; it uses neither COS nor LSMC.
+plain Monte Carlo with common random numbers and never uses COS. Without an
+external policy factory it uses statistical/static Behaviour; the combined
+LSMC runner injects one frozen out-of-sample policy through that explicit
+factory boundary.
 
 Only in the deterministic validation benchmark is `income_start_year` a fixed
 Election input, subject to the earlier contractual automatic-start
-anniversary. Let `s_2(T)` be spouse survival from issue to that effective
-anniversary under the same reconciled monthly mortality basis. Its model-point
-value is
+anniversary. At the low-level backward-compatibility API, let `s_2(T)` be
+spouse survival from issue to that effective anniversary under the same
+reconciled monthly mortality basis. Its expected-decrement model-point value
+is
 
 ```text
 V_joint_point = s_2(T) * V(both alive at Election)
               + (1 - s_2(T)) * V(Single-Life fallback).
 ```
 
-Both conditional benchmark projections have identical pre-Election cashflows,
-so the convex combination retains those cashflows once. Dynamic and optimal
-main runs do not use this fixed-date mixture: they use separate pathwise life
-statuses at every Election and later Behaviour decision. Lives remain
-independent; this is not a general couple-state model for divorce/removal or
-common mortality shocks.
+Both conditional low-level benchmark projections have identical pre-Election
+cashflows, so the convex combination retains those cashflows once. Portfolio
+factor runs retain the same deterministic Election rule for V00/V01 but use
+separate pathwise life statuses in all four cells. Dynamic and optimal main
+runs use those statuses at every Election and later Behaviour decision. Lives
+remain independent; this is not a general couple-state model for
+divorce/removal or common mortality shocks.
 
 Every model point is valued before any portfolio weighting. The result keeps
 three distinct layers:
@@ -552,7 +654,10 @@ separate:
   insurer inflows;
 - acquisition, commission and maintenance are insurer expenses and do not
   reduce Account Value again;
-- the volatility add-on is a package-repricing proxy, not a cash fee rate;
+- the option purchase markup is 0.50% of fair option value and the hedge-
+  reference management fee is 0.30% p.a. of hedge notional;
+- the volatility add-on is a legacy package-repricing proxy, not a cash fee
+  rate, and is zero in the standard assumptions;
 - MVA loadings affect only relevant withdrawal cashflows;
 - cost of capital affects the Risk Margin proxy; and
 - hurdle rate, corporate tax and capital earning spread affect shareholder
@@ -573,17 +678,24 @@ The active implementation remains a research baseline. Material limits are:
    executable mixed-fund hedge quotes.
 3. The DVA and hedge package use whole-fund moment matching and require
    validation against an administrative formula and market quotes.
-4. Fee day counts are calendar-exact under ACT/365F, but the administrative fee
+4. The 0.30% hedge-reference management fee is a fixed annual notional-cost
+   proxy. It does not reduce the customer Reference-Fund return or the option
+   payoff path. No separate hedge-fund NAV or fee term structure is calibrated.
+   An annual option cost is treated as sunk after purchase: no intra-year
+   unwind or recovery is recognised after death, lapse or withdrawal, and an
+   unsold-cap gain is recognised only on the active remaining notional at
+   settlement. This is a conservative hedge-P&L simplification.
+5. Fee day counts are calendar-exact under ACT/365F, but the administrative fee
    base is piecewise constant on the monthly grid and commencement dates are
    derived from fractional years.
-5. The shipped mortality and behaviour bases are proxies. Systematic mortality,
+6. The shipped mortality and behaviour bases are proxies. Systematic mortality,
    dependence between lives and Australian experience calibration are absent.
-6. Current portfolio loading is for duration-zero new business, not a complete
+7. Current portfolio loading is for duration-zero new business, not a complete
    in-force-state migration.
-7. Personal tax/withholding, adviser fees, reinsurance, FX, tactical allocation
-   and internal fund fees are excluded from the baseline.
-8. `capital.py` is a research capital proxy, not APRA/LAGIC prescribed capital.
-9. Portfolio arrays are not streamed or distributed; production scale requires
+8. Personal tax/withholding, adviser fees, reinsurance, FX, tactical allocation
+   and customer-Reference-Fund internal fees are excluded from the baseline.
+9. `capital.py` is a research capital proxy, not APRA/LAGIC prescribed capital.
+10. Portfolio arrays are not streamed or distributed; production scale requires
    batching, online aggregation and convergence controls.
 
 `AgileProduct` remains an import alias for compatibility. Legacy

@@ -4,8 +4,9 @@ Combines a real-world projection (expected experience) with market-consistent
 reserving (certainty-equivalent BEL run-off from the risk-neutral valuation)
 and the capital module to produce a shareholder view:
 
-* annual profit signature (fees + crediting margin + MVA/APS retained
-  - guarantee claims - hedge costs - expenses),
+* annual profit signature (fees + stochastic overnight backing income
+  + optional retained hedge gain + MVA/APS retained - guarantee claims
+  - option/hedge costs - expenses),
 * distributable earnings after reserve movements and cost of required capital,
 * PVFP at hurdle rate, new-business margin, IRR, payback year.
 
@@ -18,9 +19,11 @@ Methodological choices (documented limitations)
   (proportional driver approach).
 * Real-world experience uses ``settings.real_world_model`` (repository base:
   Black-Scholes-Hull-White), independently of the Q valuation model.
-* The crediting hedge is assumed effective: real-world crediting margins equal
-  the option-budget margin. Hedge slippage can be added via
-  ``ProjectionConfig.hedge_vol_spread``.
+* The insurer's administrative Account-Value backing earns the pathwise AUD
+  overnight rate and is independent of the customer Reference Fund.  Annual
+  option fair value, purchase markup and hedge-reference management fee are
+  explicit insurer costs.  ``ProjectionConfig.hedge_vol_spread`` remains a
+  disabled-by-default legacy execution proxy.
 """
 
 from __future__ import annotations

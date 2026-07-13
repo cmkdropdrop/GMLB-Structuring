@@ -2,18 +2,21 @@
 
 For every requested scenario Maximum Return, this orchestrator calls both
 ``run_portfolio_valuation.py`` (statistical/dynamic policyholder behaviour) and
-``run_portfolio_valuation_lsmc.py`` (fitted annual LSMC lower-bound Income
-surrender policy evaluated out of sample).
-The LSMC runner's no-voluntary-action Continue benchmark is retained to split
-the cap effect into the Continue-benchmark change and the change in each
-behaviour method's value gap versus Continue.
+``run_portfolio_valuation_lsmc.py`` (fitted annual joint Income-Election and
+post-Election Full-Withdrawal lower-bound policy evaluated out of sample).
+Phase-specific benchmarks are retained both for a 2x2 Election/post-Election
+Behaviour decomposition and to split cap effects against variable Election
+followed by no voluntary post-Election exit.
 
-The analysis includes symmetric one-factor shock-and-revalue runs for market,
-biometric and expense risks.  The portfolio runners deliberately retain
-expected present values and model-point scalars, not pathwise loss
-distributions.  Consequently this script does not label model-point dispersion
-as VaR/CTE and does not claim to calculate economic capital, Risk Margin or an
-APRA/LAGIC stress aggregation.
+The default risk scope is limited to Lapse, interest rates and Longevity.
+Lapse risk is assessed through the Dynamic/LSMC comparison and the 2x2
+Election/post-Election Behaviour decomposition.  The additional default
+one-factor shock-and-revalue runs are therefore interest up, interest down and
+Longevity.  Other research stresses remain available only when explicitly
+selected.  The portfolio runners deliberately retain expected present values
+and model-point scalars, not pathwise loss distributions.  Consequently this
+script does not label model-point dispersion as VaR/CTE and does not claim to
+calculate economic capital, Risk Margin or an APRA/LAGIC stress aggregation.
 
 Independent cap/stress scenario pairs are scheduled together in one parallel
 queue.  The default uses up to 16 workers with one BLAS/OpenMP thread per child
@@ -42,6 +45,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+if __package__:
+    from ._run_layout import behaviour_benchmark_directories
+    from ._run_logging import format_run_log_line, log_to_console
+else:
+    from _run_layout import behaviour_benchmark_directories
+    from _run_logging import format_run_log_line, log_to_console
+
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 ENGINE_ROOT = SCRIPT_DIRECTORY.parent
@@ -53,7 +63,7 @@ DEFAULT_MODEL_PARAMETERS_PATH = DEFAULT_MARKET_DATA_DIRECTORY / "model_parameter
 DEFAULT_MODEL_POINTS_PATH = (
     REPOSITORY_ROOT
     / "input_model_points_policyholders"
-    / "model_points_policyholders.csv"
+    / "model_points_policyholders_4_point_proxy.csv"
 )
 DEFAULT_COST_ASSUMPTIONS_PATH = (
     REPOSITORY_ROOT / "input_cost_assumptions" / "cost_assumptions.csv")
@@ -69,11 +79,18 @@ AUTO_WORKER_MEMORY_FRACTION = 0.65
 DEFAULT_MAX_WORKERS = 16
 AUTO_WORKER_MAXIMUM = 16
 AUTO_WORKER_FIXED_BYTES = 1_342_177_280  # 1.25 GiB process/projection overhead
-AUTO_WORKER_BYTES_PER_PATH_MONTH = 640
+# Includes the added Election, phase-exposure and cause-specific Behaviour
+# diagnostics retained by the enhanced training/evaluation projections.
+AUTO_WORKER_BYTES_PER_PATH_MONTH = 768
 AUTO_WORKER_SAFETY_MULTIPLIER = 1.25
 AUTO_WORKER_MINIMUM_MEMORY_RESERVE_BYTES = 2 * 1024 ** 3
 DEFAULT_HORIZON_MONTHS_FALLBACK = 70 * 12
 DEFAULT_PROJECTION_MAX_AGE = 115.0
+WINDOWS_LEGACY_MAX_PATH_CHARS = 259
+RECONCILIATION_FILE_NAME = "portfolio_aggregation_reconciliation.csv"
+LONGEST_SCENARIO_PLOT_RELATIVE_PATH = (
+    Path("figures") / "03_model_point_profitability_heatmaps.png"
+)
 
 MONETARY_METRICS = (
     "premium_aud",
@@ -86,6 +103,14 @@ MONETARY_METRICS = (
     "pv_expenses_aud",
     "pv_hedge_costs_aud",
     "pv_crediting_margin_aud",
+    "pv_money_market_income_aud",
+    "pv_hedge_gain_aud",
+    "pv_hedge_option_fair_value_costs_aud",
+    "pv_hedge_option_markup_costs_aud",
+    "pv_hedge_management_fee_costs_aud",
+    "pv_hedge_execution_costs_aud",
+    "pv_hedge_cost_reconciliation_gap_aud",
+    "pv_crediting_margin_reconciliation_gap_aud",
     "pv_mva_retained_aud",
     "pv_aps_retained_aud",
     "bel_nonunit_aud",
@@ -195,6 +220,12 @@ MODEL_POINT_COMPARISON_METRICS = (
     "pv_expenses_aud",
     "pv_hedge_costs_aud",
     "pv_crediting_margin_aud",
+    "pv_money_market_income_aud",
+    "pv_hedge_gain_aud",
+    "pv_hedge_option_fair_value_costs_aud",
+    "pv_hedge_option_markup_costs_aud",
+    "pv_hedge_management_fee_costs_aud",
+    "pv_hedge_execution_costs_aud",
     "bel_total_aud",
     "guarantee_value_aud",
     "insurer_net_present_value_before_risk_margin_aud",
@@ -214,6 +245,13 @@ DECOMPOSITION_METRICS = (
     "pv_future_fees_aud",
     "pv_growth_fees_aud",
     "pv_crediting_margin_aud",
+    "pv_money_market_income_aud",
+    "pv_hedge_gain_aud",
+    "pv_hedge_costs_aud",
+    "pv_hedge_option_fair_value_costs_aud",
+    "pv_hedge_option_markup_costs_aud",
+    "pv_hedge_management_fee_costs_aud",
+    "pv_hedge_execution_costs_aud",
     "pv_growth_crediting_margin_aud",
     "insurer_net_present_value_before_risk_margin_aud",
 )
@@ -273,7 +311,14 @@ STRESS_DEFINITIONS: dict[str, dict[str, object]] = {
         ),
     },
 }
-DEFAULT_STRESS_SCENARIOS = tuple(STRESS_DEFINITIONS)
+# Lapse risk is present in every base Cap run through the Behaviour comparison
+# and its exact 2x2 factor decomposition.  It is deliberately not represented
+# as a statistical lapse-rate shock because the LSMC method replaces those
+# rates with its joint action policy.  The default shock grid therefore adds
+# only the two interest-rate directions and Longevity.
+DEFAULT_RISK_SCOPE = ("lapse", "interest_rate", "longevity")
+DEFAULT_STRESS_SCENARIOS = ("interest_up", "interest_down", "longevity")
+DEFAULT_BEHAVIOUR_MODELS = ("dynamic_functions", "lsmc")
 
 
 def _parse_rate(text: str) -> float:
@@ -343,7 +388,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--mortality-seed", type=int, default=197)
     parser.add_argument("--n-train", type=int, default=4_000)
     parser.add_argument("--train-seed", type=int, default=12026)
+    parser.add_argument("--train-take-up-seed", type=int, default=10097)
+    parser.add_argument("--train-mortality-seed", type=int, default=10197)
     parser.add_argument("--heston-substeps", type=int, default=4)
+    parser.add_argument(
+        "--hedge-cap-leg-mode",
+        choices=("sold", "not_sold"),
+        default="sold",
+        help=(
+            "sold is the standard capped hedge; not_sold retains the uncapped "
+            "option payoff above the customer crediting cap"
+        ),
+    )
     parser.add_argument("--lsmc-folds", type=int, default=5)
     parser.add_argument("--lsmc-ridge", type=float, default=1.0e-6)
     parser.add_argument(
@@ -373,15 +429,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         metavar="STRESS",
         help=(
             "one-factor shock-and-revalue scenarios; each selected stress is "
-            "run for every cap and both policyholder-behaviour methods"
+            "run for every cap and both policyholder-behaviour methods. The "
+            "default adds only interest up/down and Longevity; Lapse risk is "
+            "always covered by the Behaviour comparison and 2x2 decomposition"
         ),
     )
     parser.add_argument(
         "--no-stress-analysis",
         action="store_true",
         help=(
-            "skip the market, biometric and expense shock-and-revalue grid; "
-            "the cap/behaviour exposure analysis is still produced"
+            "skip the selected shock-and-revalue grid; the Cap and Lapse-"
+            "Behaviour exposure analysis is still produced"
         ),
     )
     parser.add_argument(
@@ -454,11 +512,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             args.train_seed,
             args.take_up_seed,
             args.mortality_seed,
+            args.train_take_up_seed,
+            args.train_mortality_seed,
         )
     ):
         parser.error("seeds must be non-negative")
     if args.seed == args.train_seed:
         parser.error("--seed and --train-seed must be different")
+    if args.take_up_seed == args.train_take_up_seed:
+        parser.error("--take-up-seed and --train-take-up-seed must differ")
+    if args.mortality_seed == args.train_mortality_seed:
+        parser.error("--mortality-seed and --train-mortality-seed must differ")
     for name in ("lsmc_ridge", "exercise_buffer_rmse_multiplier"):
         value = float(getattr(args, name))
         if not math.isfinite(value) or value < 0.0:
@@ -535,6 +599,7 @@ def _dynamic_command(
         "--take-up-seed", str(args.take_up_seed),
         "--mortality-seed", str(args.mortality_seed),
         "--heston-substeps", str(args.heston_substeps),
+        "--hedge-cap-leg-mode", args.hedge_cap_leg_mode,
         "--profitability-materiality-bp",
         str(args.profitability_materiality_bp),
         "--log-level", args.log_level,
@@ -547,32 +612,11 @@ def _dynamic_command(
 
 
 def _dynamic_benchmark_directories(dynamic_output: Path) -> dict[str, Path]:
-    root = dynamic_output.parent / "dynamic_benchmarks"
-    return {
-        "deterministic_election_continue": (
-            root / "deterministic_election_continue"
-        ),
-        "deterministic_election_post_behaviour": (
-            root / "deterministic_election_post_behaviour"
-        ),
-        "variable_election_continue": root / "dynamic_election_continue",
-    }
+    return behaviour_benchmark_directories(dynamic_output.parent)
 
 
 def _lsmc_benchmark_directories(lsmc_output: Path) -> dict[str, Path]:
-    root = lsmc_output / "benchmarks"
-    return {
-        "deterministic_election_continue": (
-            root / "deterministic_election_continue"
-        ),
-        "deterministic_election_post_behaviour": (
-            root / "deterministic_election_post_behaviour"
-        ),
-        # The established Continue directory is retained as a compatibility
-        # output name, but its new semantics must be optimal Election followed
-        # by CONTINUE and are validated through the parent manifest.
-        "variable_election_continue": lsmc_output / "continue_benchmark",
-    }
+    return behaviour_benchmark_directories(lsmc_output)
 
 
 def _dynamic_benchmark_commands(
@@ -619,15 +663,23 @@ def _lsmc_command(
         "--stress-scenario", stress_scenario,
         "--n-paths", str(args.n_paths),
         "--seed", str(args.seed),
+        "--take-up-seed", str(args.take_up_seed),
+        "--mortality-seed", str(args.mortality_seed),
         "--n-train", str(args.n_train),
         "--train-seed", str(args.train_seed),
+        "--train-take-up-seed", str(args.train_take_up_seed),
+        "--train-mortality-seed", str(args.train_mortality_seed),
         "--heston-substeps", str(args.heston_substeps),
+        "--hedge-cap-leg-mode", args.hedge_cap_leg_mode,
         "--lsmc-folds", str(args.lsmc_folds),
         "--lsmc-ridge", str(args.lsmc_ridge),
         "--exercise-buffer-rmse-multiplier",
         str(args.exercise_buffer_rmse_multiplier),
         "--profitability-materiality-bp",
         str(args.profitability_materiality_bp),
+        # The full Dynamic-functions valuation is a separate required command
+        # in the same ScenarioJob.  Suppress only the duplicate Dynamic run
+        # embedded in the standalone LSMC runner.
         "--no-dynamic-benchmark",
         "--log-level", args.log_level,
         "--output", str(output),
@@ -655,6 +707,80 @@ class ScenarioJob:
     @property
     def label(self) -> str:
         return f"{self.stress_id} / cap {100.0 * self.rate:.2f}%"
+
+
+def _expected_job_artifact_paths(
+    job: ScenarioJob,
+    *,
+    include_plots: bool,
+) -> tuple[Path, ...]:
+    """Return the longest relevant files expected below one job layout."""
+    dynamic_benchmark_directories = tuple(
+        _dynamic_benchmark_directories(job.dynamic_output).values()
+    )
+    lsmc_benchmark_directories = tuple(
+        _lsmc_benchmark_directories(job.lsmc_output).values()
+    )
+    reconciliation_directories = (
+        job.dynamic_output,
+        *dynamic_benchmark_directories,
+        job.lsmc_output,
+        *lsmc_benchmark_directories,
+    )
+    paths = [
+        directory / RECONCILIATION_FILE_NAME
+        for directory in reconciliation_directories
+    ]
+    if include_plots:
+        paths.extend(
+            directory / LONGEST_SCENARIO_PLOT_RELATIVE_PATH
+            for directory in (
+                job.dynamic_output,
+                *dynamic_benchmark_directories,
+                job.lsmc_output,
+            )
+        )
+    return tuple(paths)
+
+
+def _validate_output_path_lengths(
+    jobs: Sequence[ScenarioJob],
+    *,
+    include_plots: bool,
+    max_path_chars: int,
+) -> None:
+    """Fail before valuation work if an expected artifact path is too long."""
+    paths = tuple(
+        path
+        for job in jobs
+        for path in _expected_job_artifact_paths(
+            job,
+            include_plots=include_plots,
+        )
+    )
+    if not paths:
+        return
+    longest = max(paths, key=lambda path: len(str(path)))
+    longest_length = len(str(longest))
+    if longest_length > max_path_chars:
+        raise ValueError(
+            "Risk-run output path exceeds the supported Windows MAX_PATH "
+            f"limit ({longest_length} > {max_path_chars} characters): "
+            f"{longest}. Choose a shorter --output path, for example C:\\risk."
+        )
+
+
+def _validate_windows_output_path_lengths(
+    jobs: Sequence[ScenarioJob],
+    *,
+    include_plots: bool,
+) -> None:
+    if os.name == "nt":
+        _validate_output_path_lengths(
+            jobs,
+            include_plots=include_plots,
+            max_path_chars=WINDOWS_LEGACY_MAX_PATH_CHARS,
+        )
 
 
 @dataclass(frozen=True)
@@ -1010,10 +1136,14 @@ def _run_logged_command(
     log_path = output / "orchestrator_console.log"
     environment = _child_environment(blas_threads, output)
     with log_path.open("w", encoding="utf-8", newline="") as log_handle:
-        log_handle.write("Command: ")
-        log_handle.write(subprocess.list2cmdline(list(command)))
+        log_handle.write(format_run_log_line(
+            "Command: " + subprocess.list2cmdline(list(command))
+        ))
         log_handle.write("\n")
-        log_handle.write(f"BLAS/OpenMP threads: {blas_threads}\n\n")
+        log_handle.write(format_run_log_line(
+            f"BLAS/OpenMP threads: {blas_threads}"
+        ))
+        log_handle.write("\n\n")
         log_handle.flush()
         try:
             completed = subprocess.run(
@@ -1076,23 +1206,20 @@ def _run_pending_jobs(
     )
     reused_count = len(jobs) - len(pending)
     if not pending:
-        print(
+        log_to_console(
             f"{phase_label}: all {reused_count} scenario pairs reused; "
-            "no child process started.",
-            flush=True,
+            "no child process started."
         )
         return
     effective_workers = min(worker_plan.selected_workers, len(pending))
-    print(
+    log_to_console(
         f"{phase_label}: {len(pending)} scenario pairs to run, "
-        f"{reused_count} reused, {effective_workers} worker(s).",
-        flush=True,
+        f"{reused_count} reused, {effective_workers} worker(s)."
     )
     if effective_workers == 1:
         for index, job in enumerate(pending, start=1):
-            print(
-                f"[{phase_label} {index}/{len(pending)}] Run {job.label}",
-                flush=True,
+            log_to_console(
+                f"[{phase_label} {index}/{len(pending)}] Run {job.label}"
             )
             _execute_scenario_job(job, worker_plan.blas_threads_per_child)
         return
@@ -1116,10 +1243,9 @@ def _run_pending_jobs(
             job = futures[future]
             future.result()
             completed_count += 1
-            print(
+            log_to_console(
                 f"[{phase_label} {completed_count}/{len(pending)}] "
-                f"Completed {job.label}",
-                flush=True,
+                f"Completed {job.label}"
             )
     except BaseException:
         failed = True
@@ -1246,13 +1372,35 @@ def _extract_behaviour_metrics(
 ) -> dict[str, float]:
     """Extract runner-aggregated Behaviour metrics without averaging tails."""
     metrics = {
-        canonical: _first_float(summary, aliases, label=f"{label} {canonical}")
+        canonical: _first_float(
+            summary,
+            (
+                *aliases,
+                *(f"normalised_average_{alias}" for alias in aliases),
+            ),
+            label=f"{label} {canonical}",
+        )
         for canonical, aliases in BEHAVIOUR_SCALAR_METRICS.items()
     }
     for key, value in summary.items():
         key_text = str(key)
-        if any(pattern.match(key_text) for pattern in BEHAVIOUR_POLICY_YEAR_PATTERNS):
-            metrics[key_text] = _as_float(value, f"{label} {key_text}")
+        canonical_key = (
+            key_text.removeprefix("normalised_average_")
+            if key_text.startswith("normalised_average_")
+            else key_text
+        )
+        if any(
+            pattern.match(canonical_key)
+            for pattern in BEHAVIOUR_POLICY_YEAR_PATTERNS
+        ):
+            parsed = _as_float(value, f"{label} {key_text}")
+            if canonical_key in metrics:
+                _require_close(
+                    float(metrics[canonical_key]),
+                    parsed,
+                    f"{label} direct/prefixed {canonical_key}",
+                )
+            metrics[canonical_key] = parsed
     if not any(key.startswith("income_election_share_policy_year_") for key in metrics):
         raise ValueError(
             f"{label} has no policy-year Income-Election distribution fields."
@@ -1354,6 +1502,15 @@ def _portfolio_metrics(
     future_fees = float(metrics["pv_future_fees_aud"])
     expenses = float(metrics["pv_expenses_aud"])
     hedge_costs = float(metrics["pv_hedge_costs_aud"])
+    money_market_income = float(metrics["pv_money_market_income_aud"])
+    hedge_gain = float(metrics["pv_hedge_gain_aud"])
+    hedge_components = (
+        float(metrics["pv_hedge_option_fair_value_costs_aud"])
+        + float(metrics["pv_hedge_option_markup_costs_aud"])
+        + float(metrics["pv_hedge_management_fee_costs_aud"])
+        + float(metrics["pv_hedge_execution_costs_aud"])
+    )
+    crediting_margin_components = money_market_income + hedge_gain
     claim_and_cost_outgo = claims + expenses + hedge_costs
     metrics.update({
         "new_business_margin_before_risk_margin": _as_float(
@@ -1374,6 +1531,9 @@ def _portfolio_metrics(
         "future_fees_to_premium": _safe_ratio(future_fees, premium),
         "crediting_margin_to_premium": _safe_ratio(
             float(metrics["pv_crediting_margin_aud"]), premium),
+        "money_market_income_to_premium": _safe_ratio(
+            money_market_income, premium),
+        "hedge_gain_to_premium": _safe_ratio(hedge_gain, premium),
         "expenses_to_premium": _safe_ratio(expenses, premium),
         "hedge_costs_to_premium": _safe_ratio(hedge_costs, premium),
         "claims_to_future_fees": _safe_ratio(claims, future_fees),
@@ -1386,6 +1546,27 @@ def _portfolio_metrics(
         float(metrics["pv_policyholder_benefits_pre_election_aud"])
         + float(metrics["pv_policyholder_benefits_post_election_aud"]),
         f"{label} pre/post-Election Policyholder-benefit PV",
+    )
+    _require_close(
+        hedge_costs,
+        hedge_components,
+        f"{label} hedge-cost component reconciliation",
+    )
+    _require_close(
+        float(metrics["pv_hedge_cost_reconciliation_gap_aud"]),
+        hedge_costs - hedge_components,
+        f"{label} reported hedge-cost reconciliation gap",
+    )
+    _require_close(
+        float(metrics["pv_crediting_margin_aud"]),
+        crediting_margin_components,
+        f"{label} backing-income/hedge-gain reconciliation",
+    )
+    _require_close(
+        float(metrics["pv_crediting_margin_reconciliation_gap_aud"]),
+        float(metrics["pv_crediting_margin_aud"])
+        - crediting_margin_components,
+        f"{label} reported crediting-margin reconciliation gap",
     )
     _require_close(
         float(metrics["pv_guarantee_claims_aud"]),
@@ -1563,11 +1744,20 @@ def _lsmc_diagnostic_metrics(
 ) -> dict[str, object]:
     if not action_rows or not diagnostic_rows:
         raise ValueError("LSMC action and regression diagnostics must be non-empty.")
-    if any(not str(row.get("action_type", "")).strip() for row in action_rows):
+    if any(
+        not str(row.get("action_type", "")).strip()
+        and _as_float(row.get("eligible_path_count", 0.0), "eligible_path_count")
+        > 0.0
+        for row in action_rows
+    ):
         raise ValueError(
             "LSMC action summary must distinguish income_election and "
             "full_withdrawal action types."
         )
+    action_rows = [
+        row for row in action_rows
+        if str(row.get("action_type", "")).strip()
+    ]
     if any(
         not str(row.get("action_type", "")).strip()
         for row in diagnostic_rows
@@ -1586,6 +1776,7 @@ def _lsmc_diagnostic_metrics(
             selected += int(_first_float(
                 row,
                 (
+                    "action_path_count",
                     "selected_action_path_count",
                     "exercise_path_count",
                     "start_income_path_count"
@@ -1598,10 +1789,15 @@ def _lsmc_diagnostic_metrics(
                 row.get("eligible_path_count"),
                 f"{action_type} eligible_path_count",
             ))
-            if row.get("forced_action_path_count") not in (None, ""):
+            forced_field = (
+                "forced_action_path_count"
+                if row.get("forced_action_path_count") not in (None, "")
+                else "forced_path_count"
+            )
+            if row.get(forced_field) not in (None, ""):
                 forced += int(_as_float(
-                    row.get("forced_action_path_count"),
-                    f"{action_type} forced_action_path_count",
+                    row.get(forced_field),
+                    f"{action_type} {forced_field}",
                 ))
         return selected, eligible, forced
 
@@ -1611,20 +1807,31 @@ def _lsmc_diagnostic_metrics(
     surrender_count, surrender_eligible, _ = action_totals("full_withdrawal")
     if election_eligible <= 0:
         raise ValueError("LSMC action summary has no eligible Election decisions.")
+    # A rejected action step may have no fitted regression at all (for
+    # example too few eligible paths).  Such rows are genuine conservative
+    # WAIT/CONTINUE fallbacks, not malformed diagnostics.  Keep them in the
+    # acceptance denominator while summarising numerical fit quality only
+    # over rows on which those quantities exist.
     r_squared = [
         _as_float(row.get("oof_r_squared"), "oof_r_squared")
         for row in diagnostic_rows
+        if row.get("oof_r_squared") not in (None, "")
     ]
     rmse = [
         _as_float(row.get("oof_rmse_aud"), "oof_rmse_aud")
         for row in diagnostic_rows
+        if row.get("oof_rmse_aud") not in (None, "")
     ]
     condition_numbers = [
         _as_float(row.get("condition_number"), "condition_number")
         for row in diagnostic_rows
+        if row.get("condition_number") not in (None, "")
     ]
     accepted = sum(
-        _as_bool(row.get("regression_accepted_for_exercise"))
+        _as_bool(row.get(
+            "regression_accepted_for_action",
+            row.get("regression_accepted_for_exercise"),
+        ))
         for row in diagnostic_rows
     )
     diagnostic_groups = {
@@ -1674,11 +1881,21 @@ def _lsmc_diagnostic_metrics(
         "regression_count": len(diagnostic_rows),
         "regression_accepted_count": accepted,
         "regression_accepted_share": accepted / len(diagnostic_rows),
-        "oof_r_squared_q25": _quantile(r_squared, 0.25),
-        "oof_r_squared_median": statistics.median(r_squared),
-        "oof_rmse_aud_median": statistics.median(rmse),
-        "condition_number_median": statistics.median(condition_numbers),
-        "condition_number_max": max(condition_numbers),
+        "numerical_regression_diagnostic_count": len(r_squared),
+        "oof_r_squared_q25": (
+            _quantile(r_squared, 0.25) if r_squared else 0.0
+        ),
+        "oof_r_squared_median": (
+            statistics.median(r_squared) if r_squared else 0.0
+        ),
+        "oof_rmse_aud_median": statistics.median(rmse) if rmse else 0.0,
+        "condition_number_median": (
+            statistics.median(condition_numbers)
+            if condition_numbers else 0.0
+        ),
+        "condition_number_max": (
+            max(condition_numbers) if condition_numbers else 0.0
+        ),
         "out_of_sample_policyholder_value_dominates_continue": _as_bool(
             settings.get("out_of_sample_policyholder_value_dominates_continue")
         ),
@@ -1690,13 +1907,18 @@ def _lsmc_diagnostic_metrics(
         group_r_squared = [
             _as_float(row.get("oof_r_squared"), "oof_r_squared")
             for row in rows
+            if row.get("oof_r_squared") not in (None, "")
         ]
         group_rmse = [
             _as_float(row.get("oof_rmse_aud"), "oof_rmse_aud")
             for row in rows
+            if row.get("oof_rmse_aud") not in (None, "")
         ]
         group_accepted = sum(
-            _as_bool(row.get("regression_accepted_for_exercise"))
+            _as_bool(row.get(
+                "regression_accepted_for_action",
+                row.get("regression_accepted_for_exercise"),
+            ))
             for row in rows
         )
         output.update({
@@ -1705,10 +1927,14 @@ def _lsmc_diagnostic_metrics(
             f"{prefix}_regression_accepted_share": (
                 group_accepted / len(rows)
             ),
-            f"{prefix}_oof_r_squared_median": statistics.median(
-                group_r_squared
+            f"{prefix}_numerical_diagnostic_count": len(group_r_squared),
+            f"{prefix}_oof_r_squared_median": (
+                statistics.median(group_r_squared)
+                if group_r_squared else 0.0
             ),
-            f"{prefix}_oof_rmse_aud_median": statistics.median(group_rmse),
+            f"{prefix}_oof_rmse_aud_median": (
+                statistics.median(group_rmse) if group_rmse else 0.0
+            ),
         })
     return output
 
@@ -1932,6 +2158,30 @@ def _manifest_stress_id(manifest: Mapping[str, object]) -> str:
     return stress_id
 
 
+def _manifest_hedge_cap_leg_mode(manifest: Mapping[str, object]) -> str:
+    """Return one internally consistent hedge mode from a runner manifest."""
+    values: list[str] = []
+    for section_name in (
+        "method",
+        "valuation_settings",
+        "lsmc_settings",
+        "evaluation_settings",
+    ):
+        section = manifest.get(section_name)
+        if isinstance(section, Mapping) and section.get("hedge_cap_leg_mode") not in (
+            None,
+            "",
+        ):
+            values.append(str(section["hedge_cap_leg_mode"]))
+    if not values:
+        raise ValueError("Runner manifest has no hedge_cap_leg_mode metadata.")
+    if len(set(values)) != 1:
+        raise ValueError("Runner manifest contains inconsistent hedge-cap-leg modes.")
+    if values[0] not in {"sold", "not_sold"}:
+        raise ValueError(f"Unknown runner hedge-cap-leg mode {values[0]!r}.")
+    return values[0]
+
+
 def _normalised_action_tokens(value: object) -> set[str]:
     if isinstance(value, Mapping):
         tokens: set[str] = set()
@@ -2014,7 +2264,11 @@ def _validate_behaviour_manifest(
     ).lower()
     if "annivers" not in decision_grid:
         raise ValueError(f"{label} does not document Anniversary-only Election.")
-    forced_rule = str(method.get("forced_income_start") or "").lower()
+    forced_rule = str(
+        method.get("forced_income_start")
+        or method.get("forced_income_election")
+        or ""
+    ).lower()
     if "100" not in forced_rule or "annivers" not in forced_rule:
         raise ValueError(
             f"{label} does not document the forced start after age 100."
@@ -2029,12 +2283,15 @@ def _validate_behaviour_manifest(
         }
     )
     actions = _normalised_action_tokens(action_value)
-    if expected_election_mode in {"dynamic", "optimal"} and not {
-        "wait",
-        "start_income_now",
-    }.issubset(actions):
+    if (
+        expected_election_mode in {"dynamic", "optimal"}
+        and (
+            "wait" not in actions
+            or not {"start_income", "start_income_now"}.intersection(actions)
+        )
+    ):
         raise ValueError(
-            f"{label} does not expose WAIT | START_INCOME_NOW in Growth."
+            f"{label} does not expose WAIT | START_INCOME in Growth."
         )
     if expected_post_income_mode == "continue":
         if "continue" not in actions:
@@ -2050,7 +2307,11 @@ def _validate_behaviour_manifest(
                 f"{label} does not expose CONTINUE | FULL_WITHDRAWAL in Income."
             )
 
-    joint = str(method.get("joint_life_behaviour") or "").lower()
+    joint = str(
+        method.get("joint_life_behaviour")
+        or method.get("joint_life_election_treatment")
+        or ""
+    ).lower()
     if expected_election_mode in {"dynamic", "optimal"} and not any(
         marker in joint for marker in ("pathwise", "separate", "cohort")
     ):
@@ -2072,6 +2333,7 @@ def _scenario_outputs_complete(
     dynamic_benchmark_directories = _dynamic_benchmark_directories(
         dynamic_output
     )
+    lsmc_benchmark_directories = _lsmc_benchmark_directories(lsmc_output)
     required = (
         dynamic_output / "portfolio_summary.csv",
         dynamic_output / "model_point_results.csv",
@@ -2083,10 +2345,6 @@ def _scenario_outputs_complete(
         lsmc_output / "run_manifest.json",
         lsmc_output / "lsmc_action_summary.csv",
         lsmc_output / "lsmc_regression_diagnostics.csv",
-        lsmc_output / "continue_benchmark" / "portfolio_summary.csv",
-        lsmc_output / "continue_benchmark" / "model_point_results.csv",
-        lsmc_output / "continue_benchmark"
-        / "portfolio_aggregation_reconciliation.csv",
         *(
             path / file_name
             for path in dynamic_benchmark_directories.values()
@@ -2095,6 +2353,15 @@ def _scenario_outputs_complete(
                 "model_point_results.csv",
                 "portfolio_aggregation_reconciliation.csv",
                 "run_manifest.json",
+            )
+        ),
+        *(
+            path / file_name
+            for path in lsmc_benchmark_directories.values()
+            for file_name in (
+                "portfolio_summary.csv",
+                "model_point_results.csv",
+                "portfolio_aggregation_reconciliation.csv",
             )
         ),
     )
@@ -2167,11 +2434,16 @@ def _load_scenario_result(
     lsmc_summary = _read_single_csv_row(lsmc_output / "portfolio_summary.csv")
     lsmc_rows = _read_csv(lsmc_output / "model_point_results.csv")
     lsmc_manifest = _read_json(lsmc_output / "run_manifest.json")
-    continue_summary = _read_single_csv_row(
-        lsmc_output / "continue_benchmark" / "portfolio_summary.csv")
-    continue_rows = _read_csv(
-        lsmc_output / "continue_benchmark" / "model_point_results.csv")
     lsmc_benchmark_directories = _lsmc_benchmark_directories(lsmc_output)
+    election_continue_directory = lsmc_benchmark_directories[
+        "variable_election_continue"
+    ]
+    continue_summary = _read_single_csv_row(
+        election_continue_directory / "portfolio_summary.csv"
+    )
+    continue_rows = _read_csv(
+        election_continue_directory / "model_point_results.csv"
+    )
     lsmc_benchmark_summaries: dict[str, dict[str, str]] = {
         "variable_election_continue": continue_summary,
     }
@@ -2188,15 +2460,57 @@ def _load_scenario_result(
         reconciliation_path = (
             directory / "portfolio_aggregation_reconciliation.csv"
         )
-        if all(path.is_file() for path in (
+        required_benchmark_paths = (
             summary_path,
             rows_path,
             reconciliation_path,
-        )):
-            lsmc_benchmark_summaries[benchmark_id] = _read_single_csv_row(
-                summary_path
+        )
+        if not all(path.is_file() for path in required_benchmark_paths):
+            raise ValueError(
+                f"LSMC factorial benchmark {benchmark_id} is incomplete."
             )
-            lsmc_benchmark_rows[benchmark_id] = _read_csv(rows_path)
+        lsmc_benchmark_summaries[benchmark_id] = _read_single_csv_row(
+            summary_path
+        )
+        lsmc_benchmark_rows[benchmark_id] = _read_csv(rows_path)
+
+    runner_manifests = (
+        ("Dynamic full policy", dynamic_manifest),
+        *(
+            (f"Dynamic benchmark {benchmark_id}", manifest)
+            for benchmark_id, manifest in dynamic_benchmark_manifests.items()
+        ),
+        ("LSMC full policy", lsmc_manifest),
+    )
+    for label, manifest in runner_manifests:
+        if _manifest_hedge_cap_leg_mode(manifest) != args.hedge_cap_leg_mode:
+            raise ValueError(
+                f"{label} hedge-cap-leg mode differs from the requested "
+                f"{args.hedge_cap_leg_mode!r}."
+            )
+    runner_summaries = (
+        ("Dynamic full policy", dynamic_summary),
+        *(
+            (f"Dynamic benchmark {benchmark_id}", summary)
+            for benchmark_id, summary in dynamic_benchmark_summaries.items()
+        ),
+        ("LSMC full policy", lsmc_summary),
+        *(
+            (f"LSMC benchmark {benchmark_id}", summary)
+            for benchmark_id, summary in lsmc_benchmark_summaries.items()
+        ),
+    )
+    for label, summary in runner_summaries:
+        if str(summary.get("hedge_cap_leg_mode")) != args.hedge_cap_leg_mode:
+            raise ValueError(
+                f"{label} summary has a different hedge-cap-leg mode."
+            )
+        if args.hedge_cap_leg_mode == "sold":
+            _require_close(
+                _monetary(summary, "pv_hedge_gain_aud"),
+                0.0,
+                f"{label} sold cap-leg Above-Cap hedge gain",
+            )
 
     _validate_behaviour_manifest(
         dynamic_manifest,
@@ -2230,6 +2544,12 @@ def _load_scenario_result(
         valuation_settings = manifest.get("valuation_settings")
         if not isinstance(valuation_settings, Mapping):
             raise ValueError(f"{label} has no valuation_settings metadata.")
+        if not _as_bool(
+            valuation_settings.get("force_pathwise_joint_life")
+        ):
+            raise ValueError(
+                f"{label} does not use the common pathwise Joint-Life basis."
+            )
         _require_close(
             _as_float(valuation_settings.get("take_up_seed"), "take_up_seed"),
             float(args.take_up_seed),
@@ -2252,6 +2572,18 @@ def _load_scenario_result(
     lsmc_method = lsmc_manifest.get("method")
     if not isinstance(lsmc_method, Mapping):
         raise ValueError("LSMC manifest has no method object.")
+    lsmc_training_settings = lsmc_manifest.get("lsmc_settings")
+    lsmc_evaluation_settings = lsmc_manifest.get("evaluation_settings")
+    if not isinstance(lsmc_training_settings, Mapping) or not isinstance(
+        lsmc_evaluation_settings, Mapping
+    ) or not _as_bool(
+        lsmc_training_settings.get("force_pathwise_joint_life")
+    ) or not _as_bool(
+        lsmc_evaluation_settings.get("force_pathwise_joint_life")
+    ):
+        raise ValueError(
+            "LSMC V00/V01/V10/V11 do not share the pathwise Joint-Life basis."
+        )
     benchmark_metadata = lsmc_method.get("behaviour_benchmarks")
     if not isinstance(benchmark_metadata, Mapping):
         benchmark_metadata = lsmc_manifest.get("behaviour_benchmarks")
@@ -2286,12 +2618,30 @@ def _load_scenario_result(
             (f"Dynamic benchmark {benchmark_id}", summary)
             for benchmark_id, summary in dynamic_benchmark_summaries.items()
         ),
+        *(
+            (f"LSMC benchmark {benchmark_id}", summary)
+            for benchmark_id, summary in lsmc_benchmark_summaries.items()
+        ),
     ):
         summary_stress = summary.get("stress_scenario_id")
         if summary_stress is not None and str(summary_stress) != expected_stress:
             raise ValueError(
                 f"{label} summary stress scenario differs from its manifest."
             )
+    evaluation_fingerprints = {
+        str(summary.get("scenario_fingerprint", "")).strip()
+        for summary in (
+            dynamic_summary,
+            lsmc_summary,
+            *dynamic_benchmark_summaries.values(),
+            *lsmc_benchmark_summaries.values(),
+        )
+    }
+    if "" in evaluation_fingerprints or len(evaluation_fingerprints) != 1:
+        raise ValueError(
+            "Dynamic/LSMC factor arms do not evidence one common evaluation "
+            "scenario fingerprint."
+        )
     if expected_stress != "base":
         for label, manifest, training_expected in (
             ("Dynamic", dynamic_manifest, False),
@@ -2441,11 +2791,6 @@ def _load_scenario_result(
         dynamic_output / "portfolio_aggregation_reconciliation.csv", "Dynamic")
     _validate_reconciliation(
         lsmc_output / "portfolio_aggregation_reconciliation.csv", "LSMC")
-    _validate_reconciliation(
-        lsmc_output / "continue_benchmark"
-        / "portfolio_aggregation_reconciliation.csv",
-        "Continue",
-    )
     for benchmark_id, directory in dynamic_benchmark_directories.items():
         _validate_reconciliation(
             directory / "portfolio_aggregation_reconciliation.csv",
@@ -2479,8 +2824,8 @@ def _load_scenario_result(
     _validate_summary_settings(
         lsmc_summary, args=args, rate=rate, expect_lsmc=True, label="LSMC")
     _validate_summary_settings(
-        continue_summary, args=args, rate=rate, expect_lsmc=False,
-        label="Continue")
+        continue_summary, args=args, rate=rate, expect_lsmc=True,
+        label="Variable-Election Continue benchmark")
     for benchmark_id, summary in dynamic_benchmark_summaries.items():
         _validate_summary_settings(
             summary,
@@ -2489,14 +2834,17 @@ def _load_scenario_result(
             expect_lsmc=False,
             label=f"Dynamic benchmark {benchmark_id}",
         )
+    expected_lsmc_by_benchmark = {
+        "deterministic_election_continue": False,
+        "deterministic_election_post_behaviour": True,
+        "variable_election_continue": True,
+    }
     for benchmark_id, summary in lsmc_benchmark_summaries.items():
-        # Restricted LSMC benchmarks can themselves contain a fitted policy;
-        # the valuation basis/settings checks are independent of that flag.
         _validate_summary_settings(
             summary,
             args=args,
             rate=rate,
-            expect_lsmc=_as_bool(summary.get("lsmc_used")),
+            expect_lsmc=expected_lsmc_by_benchmark[benchmark_id],
             label=f"LSMC benchmark {benchmark_id}",
         )
 
@@ -2617,6 +2965,21 @@ def _load_scenario_result(
         float(args.train_seed),
         "LSMC train_seed",
     )
+    for container, field, expected, label in (
+        (evaluation_settings, "take_up_seed", args.take_up_seed,
+         "LSMC evaluation take-up seed"),
+        (evaluation_settings, "mortality_seed", args.mortality_seed,
+         "LSMC evaluation mortality seed"),
+        (lsmc_settings, "train_take_up_seed", args.train_take_up_seed,
+         "LSMC training take-up seed"),
+        (lsmc_settings, "train_mortality_seed", args.train_mortality_seed,
+         "LSMC training mortality seed"),
+    ):
+        _require_close(
+            _as_float(container.get(field), field),
+            float(expected),
+            label,
+        )
     _require_close(
         _as_float(
             lsmc_summary.get("lsmc_training_paths"),
@@ -2749,6 +3112,7 @@ def _load_scenario_result(
         "stress_scenario_id": expected_stress,
         "crediting_cap_rate": rate,
         "crediting_cap_rate_percent": 100.0 * rate,
+        "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
         "below_contractual_minimum_crediting_cap": (
             rate < CONTRACTUAL_MINIMUM_CREDITING_CAP_RATE),
         "valuation_basis": dynamic_basis,
@@ -2795,6 +3159,8 @@ def _load_scenario_result(
         "bel_total_to_premium",
         "future_fees_to_premium",
         "crediting_margin_to_premium",
+        "money_market_income_to_premium",
+        "hedge_gain_to_premium",
         "expenses_to_premium",
         "hedge_costs_to_premium",
         "claims_to_future_fees",
@@ -2895,6 +3261,20 @@ CORE_BASELINE_FIELDS = (
     "lsmc_guarantee_value_aud",
     "dynamic_pv_future_fees_aud",
     "lsmc_pv_future_fees_aud",
+    "dynamic_pv_money_market_income_aud",
+    "lsmc_pv_money_market_income_aud",
+    "dynamic_pv_hedge_gain_aud",
+    "lsmc_pv_hedge_gain_aud",
+    "dynamic_pv_hedge_costs_aud",
+    "lsmc_pv_hedge_costs_aud",
+    "dynamic_pv_hedge_option_fair_value_costs_aud",
+    "lsmc_pv_hedge_option_fair_value_costs_aud",
+    "dynamic_pv_hedge_option_markup_costs_aud",
+    "lsmc_pv_hedge_option_markup_costs_aud",
+    "dynamic_pv_hedge_management_fee_costs_aud",
+    "lsmc_pv_hedge_management_fee_costs_aud",
+    "dynamic_pv_hedge_execution_costs_aud",
+    "lsmc_pv_hedge_execution_costs_aud",
     "dynamic_bel_total_aud",
     "lsmc_bel_total_aud",
     "dynamic_insurer_net_present_value_before_risk_margin_aud",
@@ -2947,11 +3327,17 @@ METHOD_SENSITIVITY_METRICS = (
     ("guarantee_value_aud", "AUD", "higher_is_adverse"),
     ("pv_future_fees_aud", "AUD", "lower_is_adverse"),
     ("pv_crediting_margin_aud", "AUD", "lower_is_adverse"),
+    ("pv_money_market_income_aud", "AUD", "lower_is_adverse"),
+    ("pv_hedge_gain_aud", "AUD", "lower_is_adverse"),
     ("pv_growth_fees_aud", "AUD", "diagnostic"),
     ("pv_growth_crediting_margin_aud", "AUD", "diagnostic"),
     ("pv_post_election_guarantee_claims_aud", "AUD", "higher_is_adverse"),
     ("pv_expenses_aud", "AUD", "higher_is_adverse"),
     ("pv_hedge_costs_aud", "AUD", "higher_is_adverse"),
+    ("pv_hedge_option_fair_value_costs_aud", "AUD", "higher_is_adverse"),
+    ("pv_hedge_option_markup_costs_aud", "AUD", "higher_is_adverse"),
+    ("pv_hedge_management_fee_costs_aud", "AUD", "higher_is_adverse"),
+    ("pv_hedge_execution_costs_aud", "AUD", "higher_is_adverse"),
     ("bel_nonunit_aud", "AUD", "higher_is_adverse"),
     ("bel_total_aud", "AUD", "higher_is_adverse"),
     (
@@ -2969,6 +3355,8 @@ METHOD_SENSITIVITY_METRICS = (
     ("bel_total_to_premium", "ratio", "higher_is_adverse"),
     ("expenses_to_premium", "ratio", "higher_is_adverse"),
     ("hedge_costs_to_premium", "ratio", "higher_is_adverse"),
+    ("money_market_income_to_premium", "ratio", "lower_is_adverse"),
+    ("hedge_gain_to_premium", "ratio", "lower_is_adverse"),
     ("claims_to_future_fees", "ratio", "higher_is_adverse"),
     ("fee_coverage_ratio", "ratio", "lower_is_adverse"),
     ("income_start_year_mean", "years", "diagnostic"),
@@ -2978,8 +3366,8 @@ METHOD_SENSITIVITY_METRICS = (
     ("income_election_share", "ratio", "diagnostic"),
     ("forced_income_election_share", "ratio", "diagnostic"),
     ("mean_growth_duration", "years", "diagnostic"),
-    ("growth_phase_exposure", "exposure_years", "diagnostic"),
-    ("income_phase_exposure", "exposure_years", "diagnostic"),
+    ("growth_phase_exposure", "ratio", "diagnostic"),
+    ("income_phase_exposure", "ratio", "diagnostic"),
     ("ordinary_income_lapse_rate", "ratio", "diagnostic"),
     ("performance_income_lapse_rate", "ratio", "diagnostic"),
     ("total_income_lapse_rate", "ratio", "diagnostic"),
@@ -3030,6 +3418,10 @@ BEHAVIOUR_SENSITIVITY_METRICS = (
     ),
     (
         "lsmc_unweighted_income_election_action_rate",
+        "ratio",
+        "diagnostic",
+    ),
+    (
         "lsmc_unweighted_full_withdrawal_action_rate",
         "ratio",
         "diagnostic",
@@ -3208,6 +3600,63 @@ def _build_decomposition_rows(
     return output
 
 
+def _build_behaviour_decomposition_rows(
+    rows: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Factor Election timing, post-Election behaviour and their interaction."""
+    output: list[dict[str, object]] = []
+    for row in rows:
+        for method in ("dynamic", "lsmc"):
+            for metric in DECOMPOSITION_METRICS:
+                field_00 = (
+                    f"{method}_benchmark_deterministic_election_continue_"
+                    f"{metric}"
+                )
+                field_01 = (
+                    f"{method}_benchmark_"
+                    f"deterministic_election_post_behaviour_{metric}"
+                )
+                field_10 = (
+                    f"{method}_benchmark_variable_election_continue_{metric}"
+                )
+                field_11 = f"{method}_{metric}"
+                required = (field_00, field_01, field_10, field_11)
+                if any(row.get(field) in (None, "") for field in required):
+                    continue
+                value_00, value_01, value_10, value_11 = (
+                    float(row[field]) for field in required
+                )
+                election_effect = value_10 - value_00
+                post_election_effect = value_01 - value_00
+                interaction = value_11 - value_10 - value_01 + value_00
+                total = value_11 - value_00
+                output.append({
+                    "stress_scenario_id": row.get("stress_scenario_id", "base"),
+                    "crediting_cap_rate": row["crediting_cap_rate"],
+                    "crediting_cap_rate_percent": row[
+                        "crediting_cap_rate_percent"
+                    ],
+                    "method": method,
+                    "metric": metric,
+                    "unit": "AUD",
+                    "deterministic_election_continue_aud": value_00,
+                    "deterministic_election_post_behaviour_aud": value_01,
+                    "variable_election_continue_aud": value_10,
+                    "full_policy_aud": value_11,
+                    "income_election_timing_effect_aud": election_effect,
+                    "post_election_behaviour_effect_aud": post_election_effect,
+                    "interaction_effect_aud": interaction,
+                    "total_behaviour_effect_aud": total,
+                    "decomposition_reconciliation_gap_aud": (
+                        total
+                        - election_effect
+                        - post_election_effect
+                        - interaction
+                    ),
+                })
+    return output
+
+
 def _validate_scenario_grid(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -3254,6 +3703,12 @@ STRESS_DELTA_METRICS = (
     "pv_policyholder_benefits_aud",
     "pv_expenses_aud",
     "pv_hedge_costs_aud",
+    "pv_money_market_income_aud",
+    "pv_hedge_gain_aud",
+    "pv_hedge_option_fair_value_costs_aud",
+    "pv_hedge_option_markup_costs_aud",
+    "pv_hedge_management_fee_costs_aud",
+    "pv_hedge_execution_costs_aud",
     "guarantee_value_aud",
 )
 
@@ -3390,6 +3845,7 @@ def _aud_axis(value: float, _position: object = None) -> str:
 def _create_plots(
     rows: list[dict[str, object]],
     decomposition_rows: list[dict[str, object]],
+    behaviour_decomposition_rows: list[dict[str, object]],
     stress_rows: list[dict[str, object]],
     output: Path,
     baseline_rate: float,
@@ -3460,7 +3916,7 @@ def _create_plots(
         (axes[1, 1], "fee_coverage_ratio", 1.0,
          "Future Fees / Claims and Costs", "ratio"),
         (axes[1, 2], "hedge_costs_to_premium", 100.0,
-         "Hedge-cost Proxy / Premium", "%"),
+         "Total Hedge Costs / Premium", "%"),
     )
     for axis, field, scale, title, ylabel in panels:
         plot_method_lines(
@@ -3483,48 +3939,195 @@ def _create_plots(
     finish(fig, exposure_path)
     figure_paths["valuation_exposure_risks"] = str(exposure_path)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0), sharex=True)
+    fig, axes = plt.subplots(2, 4, figsize=(18.0, 9.0), sharex=True)
     behaviour_panels = (
-        (
-            axes[0, 0], "behaviour_model_gap_to_premium",
-            "Insurer behaviour-model gap: Dynamic NPV - LSMC NPV", 100.0,
-        ),
-        (
-            axes[0, 1],
-            "lsmc_guarantee_claim_difference_vs_dynamic_to_premium",
-            "LSMC Guarantee-Claim Difference vs Dynamic", 100.0,
-        ),
-        (
-            axes[1, 0],
-            "lsmc_policyholder_benefit_difference_vs_dynamic_to_premium",
-            "LSMC Policyholder-Benefit Difference vs Dynamic", 100.0,
-        ),
-        (
-            axes[1, 1], "lsmc_unweighted_decision_event_exercise_rate",
-            "LSMC unweighted decision-event exercise rate", 100.0,
-        ),
+        (axes[0, 0], "income_start_year_mean", 1.0,
+         "Mean Income start year", "policy year"),
+        (axes[0, 1], "income_start_year_median", 1.0,
+         "Median Income start year", "policy year"),
+        (axes[0, 2], "income_election_share", 100.0,
+         "Income-Election share", "%"),
+        (axes[0, 3], "forced_income_election_share", 100.0,
+         "Forced Election share", "%"),
+        (axes[1, 0], "mean_growth_duration", 1.0,
+         "Mean Growth duration", "years"),
+        (axes[1, 1], "ordinary_income_lapse_rate", 100.0,
+         "Ordinary Income lapse rate", "%"),
+        (axes[1, 2], "performance_income_lapse_rate", 100.0,
+         "Performance Income lapse rate", "%"),
+        (axes[1, 3], "total_income_lapse_rate", 100.0,
+         "Total Income lapse / Full Withdrawal rate", "%"),
     )
-    for axis, field, title, scale in behaviour_panels:
-        axis.plot(
-            caps,
-            [scale * float(row[field]) for row in rows],
-            marker="o",
-            linewidth=2.0,
-            color="#9b2226" if "risk" in field or "claim" in field else "#0a9396",
-        )
-        axis.axhline(0.0, color="#1f2937", linewidth=0.8)
-        axis.axvline(baseline_percent, color="#9ca3af", linestyle="--")
+    for axis, field, scale, title, ylabel in behaviour_panels:
+        plot_method_lines(axis, field, scale=scale)
         axis.set_title(title, loc="left")
-        axis.set_ylabel("% of Premium" if "exercise" not in field else "%")
-        axis.grid(alpha=0.25)
+        axis.set_ylabel(ylabel)
+    axes[0, 0].legend()
     for axis in axes[1, :]:
         axis.set_xlabel("Scenario Maximum Return / Crediting Cap (%)")
     fig.suptitle(
-        "Behaviour-model scenario gap: fitted annual LSMC versus Dynamic"
+        "Income-Election timing and post-Election behaviour by crediting cap"
     )
-    behaviour_path = output / "02_behaviour_model_gap_by_crediting_cap.png"
+    behaviour_path = output / "02_income_election_behaviour_by_crediting_cap.png"
     finish(fig, behaviour_path)
-    figure_paths["behaviour_model_gap"] = str(behaviour_path)
+    figure_paths["income_election_behaviour"] = str(behaviour_path)
+
+    fig, axes = plt.subplots(2, 3, figsize=(15.0, 9.0), sharex=True)
+    phase_value_panels = (
+        (axes[0, 0], "pv_policyholder_benefits_pre_election_aud",
+         "Policyholder benefits before Election"),
+        (axes[0, 1], "pv_policyholder_benefits_post_election_aud",
+         "Policyholder benefits after Election"),
+        (axes[0, 2], "pv_growth_fees_aud", "Growth-phase fees"),
+        (axes[1, 0], "pv_growth_crediting_margin_aud",
+         "Growth-phase crediting margin"),
+        (axes[1, 1], "pv_post_election_guarantee_claims_aud",
+         "Post-Election guarantee claims"),
+    )
+    for axis, field, title in phase_value_panels:
+        plot_method_lines(axis, field, zero_line="margin" in field)
+        axis.set_title(title, loc="left")
+        axis.set_ylabel("AUD")
+        axis.yaxis.set_major_formatter(FuncFormatter(_aud_axis))
+    phase_axis = axes[1, 2]
+    for method in ("dynamic", "lsmc"):
+        for phase, linestyle in (("growth", "-"), ("income", "--")):
+            phase_axis.plot(
+                caps,
+                [
+                    100.0 * float(row[f"{method}_{phase}_phase_exposure"])
+                    for row in rows
+                ],
+                marker="o",
+                linewidth=2.0,
+                linestyle=linestyle,
+                color=colours[method],
+                label=f"{labels[method]} / {phase.title()}",
+            )
+    phase_axis.axvline(baseline_percent, color="#9ca3af", linestyle="--")
+    phase_axis.set_title("Growth/Income phase exposure", loc="left")
+    phase_axis.set_ylabel("% of projection horizon")
+    phase_axis.grid(alpha=0.25)
+    phase_axis.legend(fontsize=8)
+    axes[0, 0].legend()
+    for axis in axes[1, :]:
+        axis.set_xlabel("Scenario Maximum Return / Crediting Cap (%)")
+    fig.suptitle("Phase-specific valuation exposures by crediting cap")
+    phase_path = output / "03_phase_value_exposures_by_crediting_cap.png"
+    finish(fig, phase_path)
+    figure_paths["phase_value_exposures"] = str(phase_path)
+
+    policy_years = sorted({
+        int(match.group(1))
+        for row in rows
+        for key in row
+        for match in [re.match(
+            r"^(?:dynamic|lsmc)_(?:income_election_share|growth_phase_share)_policy_year_(\d+)$",
+            str(key),
+        )]
+        if match is not None
+    })
+    if policy_years:
+        fig, axes = plt.subplots(
+            2, 2, figsize=(15.0, 9.5), sharex=True, sharey="col"
+        )
+        for method_index, method in enumerate(("dynamic", "lsmc")):
+            for bucket_index, (bucket, title) in enumerate((
+                ("income_election_share", "Income Elections by policy year"),
+                ("growth_phase_share", "Growth-phase exposure by policy year"),
+            )):
+                axis = axes[method_index, bucket_index]
+                for row in rows:
+                    cap = float(row["crediting_cap_rate_percent"])
+                    linewidth = (
+                        2.8 if _rate_key(cap / 100.0) == _rate_key(baseline_rate)
+                        else 1.6
+                    )
+                    axis.plot(
+                        policy_years,
+                        [
+                            100.0 * float(row.get(
+                                f"{method}_{bucket}_policy_year_{year}",
+                                math.nan,
+                            ))
+                            for year in policy_years
+                        ],
+                        marker="o",
+                        linewidth=linewidth,
+                        label=f"{cap:.2f}% cap",
+                    )
+                axis.set_title(f"{labels[method]} — {title}", loc="left")
+                axis.set_xlabel("policy year")
+                axis.set_ylabel("%")
+                axis.grid(alpha=0.25)
+            axes[method_index, 0].legend(fontsize=8, ncol=2)
+        fig.suptitle("Policy-year Behaviour profile across crediting caps")
+        policy_year_path = output / "04_policy_year_behaviour_profile.png"
+        finish(fig, policy_year_path)
+        figure_paths["policy_year_behaviour_profile"] = str(policy_year_path)
+
+    if behaviour_decomposition_rows:
+        selected_metric = "insurer_net_present_value_before_risk_margin_aud"
+        fig, axes = plt.subplots(2, 1, figsize=(13.0, 9.5), sharex=True)
+        component_fields = (
+            ("income_election_timing_effect_aud", "Election timing", "#0a9396"),
+            ("post_election_behaviour_effect_aud", "Post-Election behaviour", "#ee9b00"),
+            ("interaction_effect_aud", "Interaction", "#9b2226"),
+        )
+        bar_width = min(
+            0.55,
+            max(0.18, 0.07 * (max(caps) - min(caps) or 1.0)),
+        )
+        for axis, method in zip(axes, ("dynamic", "lsmc")):
+            selected = [
+                item for item in behaviour_decomposition_rows
+                if item["method"] == method and item["metric"] == selected_metric
+            ]
+            selected_by_cap = {
+                _rate_key(float(item["crediting_cap_rate"])): item
+                for item in selected
+            }
+            for offset_index, (field, title, colour) in enumerate(component_fields):
+                offset = (offset_index - 1) * bar_width
+                axis.bar(
+                    [cap + offset for cap in caps],
+                    [
+                        float(selected_by_cap[
+                            _rate_key(float(row["crediting_cap_rate"]))
+                        ][field])
+                        for row, cap in zip(rows, caps)
+                    ],
+                    width=bar_width,
+                    color=colour,
+                    label=title,
+                )
+            axis.plot(
+                caps,
+                [
+                    float(selected_by_cap[
+                        _rate_key(float(row["crediting_cap_rate"]))
+                    ]["total_behaviour_effect_aud"])
+                    for row in rows
+                ],
+                marker="D",
+                color="#1f2937",
+                linewidth=1.5,
+                label="Total vs deterministic Election + Continue",
+            )
+            axis.axhline(0.0, color="#1f2937", linewidth=0.8)
+            axis.axvline(baseline_percent, color="#9ca3af", linestyle="--")
+            axis.yaxis.set_major_formatter(FuncFormatter(_aud_axis))
+            axis.set_ylabel("AUD")
+            axis.set_title(labels[method], loc="left")
+            axis.grid(axis="y", alpha=0.25)
+        axes[0].legend(ncol=4, fontsize=8)
+        axes[1].set_xlabel("Scenario Maximum Return / Crediting Cap (%)")
+        fig.suptitle(
+            "2x2 Election / post-Election Behaviour decomposition of insurer NPV"
+        )
+        factorial_path = output / "05_behaviour_factorial_decomposition.png"
+        finish(fig, factorial_path)
+        figure_paths["behaviour_factorial_decomposition"] = str(factorial_path)
 
     fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0), sharex=True)
     model_point_panels = (
@@ -3559,33 +4162,54 @@ def _create_plots(
     fig.suptitle(
         "Model-point heterogeneity and concentration (not a pathwise VaR/CTE)"
     )
-    model_point_path = output / "03_model_point_risk_by_crediting_cap.png"
+    model_point_path = output / "06_model_point_risk_by_crediting_cap.png"
     finish(fig, model_point_path)
     figure_paths["model_point_risk"] = str(model_point_path)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9.0), sharex=True)
+    fig, axes = plt.subplots(2, 4, figsize=(18.0, 9.0), sharex=True)
     quality_panels = (
         (
-            axes[0, 0], "lsmc_regression_accepted_share", 100.0,
-            "Accepted LSMC regressions", "%",
+            axes[0, 0], "lsmc_election_regression_accepted_share", 100.0,
+            "Accepted Election regressions", "%",
         ),
         (
-            axes[0, 1], "lsmc_oof_r_squared_median", 1.0,
-            "Median out-of-fold R-squared", "R-squared",
+            axes[0, 1], "lsmc_surrender_regression_accepted_share", 100.0,
+            "Accepted Full-Withdrawal regressions", "%",
         ),
         (
-            axes[1, 0], "lsmc_training_fallback_policy_share", 100.0,
+            axes[0, 2], "lsmc_election_oof_r_squared_median", 1.0,
+            "Election median out-of-fold R-squared", "R-squared",
+        ),
+        (
+            axes[0, 3], "lsmc_surrender_oof_r_squared_median", 1.0,
+            "Withdrawal median out-of-fold R-squared", "R-squared",
+        ),
+        (
+            axes[1, 0], "lsmc_unweighted_income_election_action_rate", 100.0,
+            "Unweighted Election action rate", "%",
+        ),
+        (
+            axes[1, 1], "lsmc_unweighted_full_withdrawal_action_rate", 100.0,
+            "Unweighted Full-Withdrawal action rate", "%",
+        ),
+        (
+            axes[1, 2], "lsmc_training_fallback_policy_share", 100.0,
             "Training fallback policy share", "%",
         ),
         (
-            axes[1, 1], "lsmc_condition_number_max", 1.0,
+            axes[1, 3], "lsmc_condition_number_max", 1.0,
             "Maximum regression condition number", "condition number",
         ),
     )
     for axis, field, scale, title, ylabel in quality_panels:
         axis.plot(
             caps,
-            [scale * float(row[field]) for row in rows],
+            [
+                math.nan
+                if row.get(field) is None
+                else scale * float(row[field])
+                for row in rows
+            ],
             marker="o",
             linewidth=2.0,
             color="#bb3e03",
@@ -3594,12 +4218,16 @@ def _create_plots(
         axis.set_title(title, loc="left")
         axis.set_ylabel(ylabel)
         axis.grid(alpha=0.25)
-    if all(float(row["lsmc_condition_number_max"]) > 0.0 for row in rows):
-        axes[1, 1].set_yscale("log")
+    if all(
+        row.get("lsmc_condition_number_max") is not None
+        and float(row["lsmc_condition_number_max"]) > 0.0
+        for row in rows
+    ):
+        axes[1, 3].set_yscale("log")
     for axis in axes[1, :]:
         axis.set_xlabel("Scenario Maximum Return / Crediting Cap (%)")
     fig.suptitle("LSMC model-risk diagnostics by crediting cap")
-    quality_path = output / "04_lsmc_model_risk_diagnostics.png"
+    quality_path = output / "07_lsmc_model_risk_diagnostics.png"
     finish(fig, quality_path)
     figure_paths["lsmc_model_risk_diagnostics"] = str(quality_path)
 
@@ -3773,6 +4401,7 @@ def _write_report(
     path: Path,
     rows: list[dict[str, object]],
     sensitivity_rows: list[dict[str, object]],
+    behaviour_decomposition_rows: list[dict[str, object]],
     stress_rows: list[dict[str, object]],
     baseline_rate: float,
     figure_paths: Mapping[str, str],
@@ -3793,8 +4422,11 @@ def _write_report(
         "# GMLB/GMWB-Portfolio-Risiko-, Cap- und Behaviour-Analyse",
         "",
         (
-            "Die Analyse vergleicht Dynamic Behaviour mit einer jährlich "
-            "entscheidenden, out-of-sample bewerteten LSMC-Policy. Die als "
+            "Die Analyse vergleicht eine pfadabhängige statistische Dynamic-"
+            "Policy mit einer jährlich entscheidenden, out-of-sample "
+            "bewerteten LSMC-Policy. Beide Ansätze modellieren die Income-"
+            "Election endogen; nach der Election werden Income-Lapse und "
+            "Full Withdrawal separat von der Growth-Phase behandelt. Die als "
             "Crediting Rate bezeichnete Eingabe ist technisch der Scenario "
             "Maximum Return beziehungsweise Crediting Cap auf dem vollständigen "
             "50/50-Referenzfondsreturn: `min(max(R_fund, 0), Cap)`. Nur 6 % "
@@ -3812,6 +4444,13 @@ def _write_report(
         "",
         f"Bewertungsbasis: **{monetary_description}**. Alle Läufe verwenden "
         "Heston-Hull-White unter Q und Common Random Numbers.",
+        (
+            "Income-Election-Verteilungen und Phasenexposures sind mit "
+            "Modellpunkt-/Vertragsgewicht, Q-Pfadwahrscheinlichkeit und "
+            "pfadweisem In-force-/Survival-Gewicht aggregiert. Die separat "
+            "ausgewiesenen LSMC-Action-Raten sind dagegen ungewichtete "
+            "Fit-Diagnostik über zulässige Entscheidungspunkte."
+        ),
         "",
         "## Ausführung",
         "",
@@ -3867,9 +4506,9 @@ def _write_report(
         (
             "| Cap | Guarantee Claims Dynamic | Guarantee Claims LSMC | "
             "Insurer NPV Dynamic | Insurer NPV LSMC | Behaviour-Model Gap | "
-            "LSMC Exercise-Diagnostik | OOS PH ≥ Continue |"
+            "OOS PH ≥ Continue |"
         ),
-        "|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        "|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for row in rows:
         lines.append(
@@ -3879,8 +4518,84 @@ def _write_report(
             f"{_format_money(float(row['dynamic_insurer_net_present_value_before_risk_margin_aud']))} | "
             f"{_format_money(float(row['lsmc_insurer_net_present_value_before_risk_margin_aud']))} | "
             f"{_format_money(float(row['behaviour_model_gap_to_insurer_aud']))} | "
-            f"{100.0 * float(row['lsmc_unweighted_decision_event_exercise_rate']):.3f}% | "
             f"{'ja' if row['lsmc_out_of_sample_policyholder_value_dominates_continue'] else 'NEIN'} |"
+        )
+
+    lines.extend([
+        "",
+        "## Versicherer-Backing und Hedgekosten",
+        "",
+        (
+            "Das administrative Guthaben verdient ausschließlich den "
+            "stochastischen AUD-Overnight-Return; die Kundenliability bleibt "
+            "vom Reference-Fund-Backing getrennt. Hedge-Cap-Leg-Modus: `"
+            f"{baseline['hedge_cap_leg_mode']}`."
+        ),
+        "",
+        (
+            "| Cap / Ansatz | Money-Market | Hedge Gain | Fair Option | "
+            "Kaufmarge | Management Fee | Legacy Execution | Hedge gesamt |"
+        ),
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in rows:
+        for method, method_label in (("dynamic", "Dynamic"), ("lsmc", "LSMC")):
+            lines.append(
+                f"| {float(row['crediting_cap_rate_percent']):.2f}% / {method_label} | "
+                f"{_format_money(float(row[f'{method}_pv_money_market_income_aud']))} | "
+                f"{_format_money(float(row[f'{method}_pv_hedge_gain_aud']))} | "
+                f"{_format_money(float(row[f'{method}_pv_hedge_option_fair_value_costs_aud']))} | "
+                f"{_format_money(float(row[f'{method}_pv_hedge_option_markup_costs_aud']))} | "
+                f"{_format_money(float(row[f'{method}_pv_hedge_management_fee_costs_aud']))} | "
+                f"{_format_money(float(row[f'{method}_pv_hedge_execution_costs_aud']))} | "
+                f"{_format_money(float(row[f'{method}_pv_hedge_costs_aud']))} |"
+            )
+
+    lines.extend([
+        "",
+        "## Income-Election- und Phasenprofil",
+        "",
+        (
+            "| Cap / Ansatz | Start mean | median | p10 | p90 | Election | "
+            "davon erzwungen | Growth-Dauer | Growth-Exposure | "
+            "Income-Exposure | Income-Lapse gesamt |"
+        ),
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in rows:
+        for method, method_label in (("dynamic", "Dynamic"), ("lsmc", "LSMC")):
+            lines.append(
+                f"| {float(row['crediting_cap_rate_percent']):.2f}% / {method_label} | "
+                f"{float(row[f'{method}_income_start_year_mean']):.3f} | "
+                f"{float(row[f'{method}_income_start_year_median']):.3f} | "
+                f"{float(row[f'{method}_income_start_year_p10']):.3f} | "
+                f"{float(row[f'{method}_income_start_year_p90']):.3f} | "
+                f"{100.0 * float(row[f'{method}_income_election_share']):.3f}% | "
+                f"{100.0 * float(row[f'{method}_forced_income_election_share']):.3f}% | "
+                f"{float(row[f'{method}_mean_growth_duration']):.3f} | "
+                f"{100.0 * float(row[f'{method}_growth_phase_exposure']):.3f}% | "
+                f"{100.0 * float(row[f'{method}_income_phase_exposure']):.3f}% | "
+                f"{100.0 * float(row[f'{method}_total_income_lapse_rate']):.3f}% |"
+            )
+
+    lines.extend([
+        "",
+        "### LSMC-Action- und Regressionsdiagnostik",
+        "",
+        (
+            "| Cap | Election action (ungewichtet) | Full Withdrawal action "
+            "(ungewichtet) | Election regressions accepted | Withdrawal "
+            "regressions accepted |"
+        ),
+        "|---:|---:|---:|---:|---:|",
+    ])
+    for row in rows:
+        lines.append(
+            f"| {float(row['crediting_cap_rate_percent']):.2f}% | "
+            f"{100.0 * float(row['lsmc_unweighted_income_election_action_rate']):.3f}% | "
+            f"{100.0 * float(row['lsmc_unweighted_full_withdrawal_action_rate']):.3f}% | "
+            f"{100.0 * float(row['lsmc_election_regression_accepted_share']):.3f}% | "
+            f"{100.0 * float(row['lsmc_surrender_regression_accepted_share']):.3f}% |"
         )
 
     failed_oos_caps = [
@@ -3969,10 +4684,86 @@ def _write_report(
             "Kennzahlidentitäten sind nicht als unabhängige Risiken zu lesen: "
             "Insurer NPV vor Risk Margin = − Non-unit BEL; Net Guarantee Value "
             "= Guarantee Claims − LIP Fees. Die Fee-Coverage-Kennzahl ist "
-            "`Future Fees / (Guarantee Claims + Expenses + Hedge-cost Proxy)` "
+            "`Future Fees / (Guarantee Claims + Expenses + Total Hedge Costs)` "
             "und lässt Crediting Margin sowie MVA-/APS-Retention bewusst außen vor."
         ),
     ])
+
+    lines.extend([
+        "",
+        "## Phasenwerte und Income-Lapse am Basis-Cap",
+        "",
+        "| Kennzahl | Dynamic | LSMC |",
+        "|---|---:|---:|",
+        (
+            "| PV Policyholder Benefits vor Election | "
+            f"{_format_money(float(baseline['dynamic_pv_policyholder_benefits_pre_election_aud']))} | "
+            f"{_format_money(float(baseline['lsmc_pv_policyholder_benefits_pre_election_aud']))} |"
+        ),
+        (
+            "| PV Policyholder Benefits nach Election | "
+            f"{_format_money(float(baseline['dynamic_pv_policyholder_benefits_post_election_aud']))} | "
+            f"{_format_money(float(baseline['lsmc_pv_policyholder_benefits_post_election_aud']))} |"
+        ),
+        (
+            "| PV Growth-Phase Fees | "
+            f"{_format_money(float(baseline['dynamic_pv_growth_fees_aud']))} | "
+            f"{_format_money(float(baseline['lsmc_pv_growth_fees_aud']))} |"
+        ),
+        (
+            "| PV Growth-Phase Crediting Margin | "
+            f"{_format_money(float(baseline['dynamic_pv_growth_crediting_margin_aud']))} | "
+            f"{_format_money(float(baseline['lsmc_pv_growth_crediting_margin_aud']))} |"
+        ),
+        (
+            "| PV Post-Election Guarantee Claims | "
+            f"{_format_money(float(baseline['dynamic_pv_post_election_guarantee_claims_aud']))} | "
+            f"{_format_money(float(baseline['lsmc_pv_post_election_guarantee_claims_aud']))} |"
+        ),
+        (
+            "| Ordinary Income-Lapse-Rate | "
+            f"{100.0 * float(baseline['dynamic_ordinary_income_lapse_rate']):.3f}% | "
+            f"{100.0 * float(baseline['lsmc_ordinary_income_lapse_rate']):.3f}% |"
+        ),
+        (
+            "| Performance Income-Lapse-Rate | "
+            f"{100.0 * float(baseline['dynamic_performance_income_lapse_rate']):.3f}% | "
+            f"{100.0 * float(baseline['lsmc_performance_income_lapse_rate']):.3f}% |"
+        ),
+    ])
+
+    selected_factorial_rows = [
+        row for row in behaviour_decomposition_rows
+        if _rate_key(float(row["crediting_cap_rate"]))
+        == _rate_key(baseline_rate)
+        and row["metric"] in {
+            "pv_policyholder_benefits_aud",
+            "insurer_net_present_value_before_risk_margin_aud",
+        }
+    ]
+    if selected_factorial_rows:
+        lines.extend([
+            "",
+            "## 2×2-Zerlegung von Election und Post-Election Behaviour",
+            "",
+            (
+                "Referenz ist deterministische Election mit anschließendem "
+                "Continue. `Election` ändert nur den Election-Mechanismus, "
+                "`Post` nur das Post-Election Behaviour; der Restterm ist die "
+                "Interaktion. Alle vier Zellen verwenden dieselben Q-Pfade."
+            ),
+            "",
+            "| Ansatz | Kennzahl | Election | Post | Interaktion | Gesamt |",
+            "|---|---|---:|---:|---:|---:|",
+        ])
+        for item in selected_factorial_rows:
+            lines.append(
+                f"| {str(item['method']).upper()} | {item['metric']} | "
+                f"{_format_money(float(item['income_election_timing_effect_aud']))} | "
+                f"{_format_money(float(item['post_election_behaviour_effect_aud']))} | "
+                f"{_format_money(float(item['interaction_effect_aud']))} | "
+                f"{_format_money(float(item['total_behaviour_effect_aud']))} |"
+            )
 
     if stress_rows:
         baseline_stresses = [
@@ -4012,10 +4803,11 @@ def _write_report(
         lines.extend([
             "",
             (
-                "Zins-Up und Zins-Down werden separat gezeigt; es wird weder das "
-                "Maximum automatisch ausgewählt noch eine Korrelationsaggregation "
-                "zu einem regulatorischen Kapitalbetrag vorgenommen. Der Einfluss "
-                "des Caps auf jeden Stressverlust steht vollständig in der Stress-CSV."
+                "Jeder ausgewählte Einfaktorstress wird separat gezeigt; es wird "
+                "weder das Maximum automatisch ausgewählt noch eine "
+                "Korrelationsaggregation zu einem regulatorischen Kapitalbetrag "
+                "vorgenommen. Der Einfluss des Caps auf jeden Stressverlust steht "
+                "vollständig in der Stress-CSV."
             ),
         ])
         if failed_stress_oos:
@@ -4091,19 +4883,33 @@ def _write_report(
         "",
         (
             "Das Delta ist ein Vergleich zweier vollständiger Behaviour-Ansätze: "
-            "monatliche statistische Lapse-/Withdrawal-Annahmen einerseits und "
-            "jährliches Continue/Full Withdrawal andererseits. Es ist deshalb "
-            "nicht als isolierter Effekt einer einzelnen Lapse-Rate zu lesen."
+            "pfadabhängige statistische Income-Election plus monatliche "
+            "Post-Election-Lapse-/Withdrawal-Annahmen einerseits und eine "
+            "gemeinsam gefittete jährliche LSMC-Policy andererseits. In der "
+            "Growth-Phase entscheidet LSMC zwischen WAIT und START_INCOME, in "
+            "der Income-Phase zwischen CONTINUE und FULL_WITHDRAWAL. Es ist "
+            "deshalb nicht als isolierter Effekt einer einzelnen Rate zu lesen."
         ),
         "",
         (
-            "Der Continue-Benchmark zerlegt den Cap-Effekt algebraisch in die "
+            "Entscheidungen liegen auf Vertragsjahrestagen; noch nicht "
+            "electede und lebende Verträge starten spätestens am ersten "
+            "Vertragsjahrestag nach Erreichen des Alters 100. Joint-Life-"
+            "Verträge verwenden pfadweise getrennte Primary-/Spouse-"
+            "Lebenszustände."
+        ),
+        "",
+        (
+            "Der Variable-Election/Continue-Benchmark zerlegt den Cap-Effekt "
+            "algebraisch in die "
             "Änderung unter Continue und die Änderung des jeweiligen Wert-Gaps "
             "gegen Continue. Letztere umfasst Refit, Zustands-/Payoff-Änderungen "
             "und Trainingsrauschen; sie ist kein isolierter kausaler "
-            "Reoptimierungseffekt. Die rohe "
-            "LSMC Exercise-Rate ist über Modellpunkt-/Pfad-/Entscheidungsereignisse "
-            "ungewichtet und keine Portfolio-Surrender-Rate."
+            "Reoptimierungseffekt. Die 2×2-Zerlegung ergänzt dies um getrennte "
+            "Election-, Post-Election- und Interaktionseffekte. Rohe Election- "
+            "und Full-Withdrawal-Action-Raten sind über Modellpunkt-/Pfad-/"
+            "Entscheidungsereignisse ungewichtet und keine portfolio-gewichteten "
+            "Take-up- oder Surrender-Raten."
         ),
         "",
         "## Modellgrenzen",
@@ -4114,23 +4920,28 @@ def _write_report(
             "CTE noch Cashflow-at-Risk berechnet."
         ),
         (
-            "- Die ausgewiesenen Markt-, biometrischen und Expense-Schocks sind "
+            "- Die ausgewählten Einfaktor-Schocks sind "
             "einzelne Research-Stresse. Sie sind weder kalibrierte Best-Estimate-"
             "Prognosen noch eine APRA/LAGIC- oder Solvency-II-Kapitalaggregation."
             if stress_rows
-            else "- Markt-, biometrische und Expense-Stresse wurden in diesem Lauf ausgelassen."
+            else "- Einfaktor-Shock-and-Revalue-Stresse wurden in diesem Lauf ausgelassen."
         ),
         (
             "- Der Equity-Level-Stress skaliert die simulierten Equity-Indizes ab "
             "Monat eins um 39%. Das t=0-Konto des Duration-zero-Neugeschäfts wird "
             "nicht wie ein Unit-Linked-Spotbestand geschockt."
-            if stress_rows
+            if any(
+                row["stress_scenario_id"] == "equity_level_down"
+                for row in stress_rows
+            )
             else "- Es liegt kein Equity-Level-Stressergebnis vor."
         ),
         (
-            "- Statistische Lapse-/Take-up-/Withdrawal-Stresse werden nicht als "
-            "symmetrische LSMC-Sensitivität ausgegeben: beim LSMC ersetzt das "
-            "Continue/Full-Withdrawal-Action-Set die statistische Income-Lapse-Rate."
+            "- Lapse-Risiko wird über Dynamic versus LSMC und die 2×2-Zerlegung "
+            "von Election und Post-Election Behaviour untersucht. Ein symmetrischer "
+            "statistischer Lapse-/Take-up-/Withdrawal-Schock wird nicht auf LSMC "
+            "angewandt, weil dessen phasenspezifisches Joint-Action-Set diese "
+            "statistischen Funktionen ersetzt."
         ),
         (
             "- Common Random Numbers reduzieren Vergleichsrauschen, ersetzen "
@@ -4140,8 +4951,9 @@ def _write_report(
         ),
         (
             "- Die LSMC-Policy ist ein konservativer Lower Bound auf einem "
-            "jährlichen Exercise-Grid mit Continue/Full Withdrawal; Partial "
-            "Withdrawal und Growth-Phase-Aktionen sind nicht Teil des Action Sets. "
+            "jährlichen Exercise-Grid mit WAIT/START_INCOME in Growth und "
+            "CONTINUE/FULL_WITHDRAWAL in Income; Partial Withdrawal ist nicht "
+            "Teil des Action Sets. "
             "Der Lower Bound gilt für den Policyholder-Wert und ist kein "
             "konservativer Upper Bound für Versichererkosten."
         ),
@@ -4174,10 +4986,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rate_directories = {_rate_directory_name(rate) for rate in rates}
     if len(rate_directories) != len(rates):
         raise ValueError("Crediting-cap rates map to non-unique scenario paths.")
-    print(
+    log_to_console(
         "Portfolio valuation-exposure analysis caps: "
-        + ", ".join(f"{100.0 * rate:.2f}%" for rate in rates),
-        flush=True,
+        + ", ".join(f"{100.0 * rate:.2f}%" for rate in rates)
+    )
+    log_to_console(
+        "Default behaviour comparison per cap/stress cell: Dynamic functions "
+        "(dynamic Income Election and dynamic post-Election behaviour) versus "
+        "LSMC; both valuations are required."
     )
 
     all_jobs: list[ScenarioJob] = []
@@ -4316,6 +5132,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ),
                 })
 
+    _validate_windows_output_path_lengths(
+        all_jobs,
+        include_plots=args.scenario_plots,
+    )
     worker_plan = _resolve_worker_plan(args, all_jobs)
     base_pending_count = sum(not job.reuse for job in base_jobs)
     stress_pending_count = sum(
@@ -4327,43 +5147,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_plan.selected_workers > 1
         and worker_plan.pending_job_count > 1
     )
-    print(
+    log_to_console(
         "Worker plan: "
         f"{worker_plan.selected_workers} selected "
         f"(safe auto {worker_plan.safe_auto_workers}, "
         f"{worker_plan.logical_cpu_count} logical CPUs, "
         f"available RAM {_format_gib(worker_plan.available_memory_bytes)}, "
         f"estimated peak {_format_gib(worker_plan.estimated_worker_bytes)} "
-        "per worker).",
-        flush=True,
+        "per worker)."
     )
     if (
         worker_plan.available_memory_bytes is None
         and worker_plan.pending_job_count > 0
         and args.max_workers is None
     ):
-        print(
-            "WARNING: available RAM could not be detected; automatic mode "
+        log_to_console(
+            "Available RAM could not be detected; automatic mode "
             "uses one worker.",
-            flush=True,
+            level="WARNING",
         )
     if (
         worker_plan.single_worker_estimate_exceeds_budget
         and worker_plan.pending_job_count > 0
         and args.max_workers is None
     ):
-        print(
-            "WARNING: no worker fits inside the conservative automatic RAM "
+        log_to_console(
+            "No worker fits inside the conservative automatic RAM "
             "budget. The script retains the serial one-worker fallback; close "
             "other applications or reduce path counts if memory is tight.",
-            flush=True,
+            level="WARNING",
         )
     if worker_plan.configured_workers_exceed_safe_auto:
-        print(
-            "WARNING: configured --max-workers exceeds the conservative "
+        log_to_console(
+            "Configured --max-workers exceeds the conservative "
             "automatic worker count and may exhaust RAM. Use --max-workers "
             "auto to enable RAM-gated scheduling.",
-            flush=True,
+            level="WARNING",
         )
 
     # Base and stress scenarios are independent.  A single queue avoids the
@@ -4373,9 +5192,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows: list[dict[str, object]] = []
     model_point_rows: list[dict[str, object]] = []
     for index, job in enumerate(base_jobs, start=1):
-        print(
-            f"[base validation {index}/{len(base_jobs)}] {job.label}",
-            flush=True,
+        log_to_console(
+            f"[base validation {index}/{len(base_jobs)}] {job.label}"
         )
         if job.sequence in validated_base_reuse_results:
             scenario_row, scenario_model_points = (
@@ -4416,10 +5234,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             stress_group: list[dict[str, object]] = []
             stress_group_jobs = stress_jobs_by_id[stress_id]
             for index, job in enumerate(stress_group_jobs, start=1):
-                print(
+                log_to_console(
                     f"[stress validation {index}/{len(stress_group_jobs)}] "
-                    f"{job.label}",
-                    flush=True,
+                    f"{job.label}"
                 )
                 if job.sequence in validated_stress_reuse_rows:
                     stress_row = validated_stress_reuse_rows[job.sequence]
@@ -4483,9 +5300,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"Non-market stress {stress_id!r} unexpectedly changed scenarios."
                 )
 
+    all_fit_rows = [*rows, *stressed_scenario_rows]
+    all_fit_fingerprints = {
+        str(row["lsmc_fit_basis_fingerprint"]) for row in all_fit_rows
+    }
+    if len(all_fit_fingerprints) != len(all_fit_rows):
+        raise ValueError(
+            "An LSMC Joint-Policy fit basis was reused across distinct "
+            "cap/stress cells. Every cell must be refitted independently."
+        )
+
     _add_baseline_deltas(rows, args.baseline_rate)
     sensitivity_rows = _build_sensitivity_rows(rows, args.baseline_rate)
     decomposition_rows = _build_decomposition_rows(rows, args.baseline_rate)
+    behaviour_decomposition_rows = _build_behaviour_decomposition_rows(rows)
     stress_loss_rows = _build_stress_loss_rows(
         rows,
         stressed_scenario_rows,
@@ -4507,10 +5335,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mechanical + dynamic_interaction,
         ):
             raise ValueError("Dynamic cap-effect decomposition does not reconcile.")
+    for row in behaviour_decomposition_rows:
+        if not _close(
+            float(row["decomposition_reconciliation_gap_aud"]),
+            0.0,
+        ):
+            raise ValueError(
+                "Election/post-Election Behaviour decomposition does not "
+                "reconcile."
+            )
 
     risk_csv = output / "portfolio_risk_by_crediting_cap.csv"
     sensitivity_csv = output / "crediting_cap_risk_sensitivities.csv"
     decomposition_csv = output / "crediting_cap_effect_decomposition.csv"
+    behaviour_decomposition_csv = (
+        output / "behaviour_effect_decomposition.csv"
+    )
     model_point_csv = output / "model_point_behaviour_model_gap.csv"
     stress_csv = output / "portfolio_stress_losses_by_crediting_cap.csv"
     report_path = output / "portfolio_risk_report.md"
@@ -4518,6 +5358,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _write_csv(risk_csv, rows)
     _write_csv(sensitivity_csv, sensitivity_rows)
     _write_csv(decomposition_csv, decomposition_rows)
+    if behaviour_decomposition_rows:
+        _write_csv(behaviour_decomposition_csv, behaviour_decomposition_rows)
     _write_csv(model_point_csv, model_point_rows)
     if stress_loss_rows:
         _write_csv(stress_csv, stress_loss_rows)
@@ -4528,6 +5370,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         figure_paths, matplotlib_version = _create_plots(
             rows,
             decomposition_rows,
+            behaviour_decomposition_rows,
             stress_loss_rows,
             output / "figures",
             args.baseline_rate,
@@ -4536,11 +5379,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report_path,
         rows,
         sensitivity_rows,
+        behaviour_decomposition_rows,
         stress_loss_rows,
         args.baseline_rate,
         figure_paths,
         worker_plan,
     )
+
+    effective_risk_scope = ["lapse"]
+    if not args.no_stress_analysis:
+        for stress_id in args.stress_scenarios:
+            risk_category = str(STRESS_DEFINITIONS[stress_id]["risk_category"])
+            if risk_category not in effective_risk_scope:
+                effective_risk_scope.append(risk_category)
 
     manifest = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -4555,13 +5406,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "valuation_measure": "risk_neutral",
             "market_model": "heston_hull_white",
             "dynamic_behaviour": (
-                "statistical_dynamic_lapse_and_withdrawal_with_deterministic_"
-                "model_point_income_election"
+                "path_dependent_statistical_income_election_then_dynamic_"
+                "post_election_lapse_and_withdrawal"
             ),
             "lsmc_behaviour": (
-                "annual_out_of_sample_lower_bound_continue_or_full_withdrawal"
+                "annual_out_of_sample_joint_income_election_and_full_"
+                "withdrawal_lower_bound"
             ),
-            "continue_benchmark_used_for_cap_decomposition": True,
+            "income_election_action_set": ["WAIT", "START_INCOME"],
+            "post_income_action_set": ["CONTINUE", "FULL_WITHDRAWAL"],
+            "income_election_decision_grid": "policy_anniversaries",
+            "minimum_income_start": "contractual_minimum_start_rule",
+            "forced_income_start": (
+                "first_policy_anniversary_after_primary_attains_age_100"
+            ),
+            "joint_life_behaviour": (
+                "pathwise_separate_primary_and_spouse_life_status"
+            ),
+            "insurer_backing_asset": (
+                "administrative_crediting_frame_in_stochastic_aud_"
+                "overnight_money_market_account"
+            ),
+            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+            "hedge_cap_leg_interpretation": (
+                "short_cap_call_sold"
+                if args.hedge_cap_leg_mode == "sold"
+                else "cap_call_not_sold_and_excess_payoff_retained"
+            ),
+            "money_market_accrual": (
+                "pathwise_integrated_short_rate_daily_roll_equivalent_on_"
+                "monthly_cashflow_grid"
+            ),
+            "customer_liability_uses_performance_fund_as_backing": False,
+            "behaviour_benchmarks": {
+                "deterministic_election_continue": (
+                    "deterministic Election; no voluntary post-Election exit"
+                ),
+                "deterministic_election_post_behaviour": (
+                    "deterministic Election; active post-Election behaviour"
+                ),
+                "variable_election_continue": (
+                    "variable/optimal Election; no voluntary post-Election exit"
+                ),
+                "full_policy": (
+                    "variable/optimal Election; active post-Election behaviour"
+                ),
+            },
+            "variable_election_continue_benchmark_used_for_cap_decomposition": True,
+            "two_by_two_behaviour_effect_decomposition": True,
             "lsmc_policy_refitted_for_every_crediting_cap": True,
             "lsmc_policy_refitted_for_every_stress_and_crediting_cap": (
                 not args.no_stress_analysis),
@@ -4571,17 +5463,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 not args.no_stress_analysis
             ),
             "runner_pair_execution_order": "dynamic_then_lsmc",
+            "behaviour_models_compared": list(DEFAULT_BEHAVIOUR_MODELS),
+            "separate_dynamic_full_policy_run_required": True,
+            "lsmc_internal_dynamic_benchmark_disabled_to_avoid_duplicate": True,
             "parallel_schedule_changes_random_seeds": False,
             "one_factor_shock_and_revalue": not args.no_stress_analysis,
+            "default_risk_scope": list(DEFAULT_RISK_SCOPE),
+            "effective_risk_scope": effective_risk_scope,
+            "lapse_risk_assessment": (
+                "dynamic_vs_lsmc_and_two_by_two_election_post_election_"
+                "behaviour_decomposition"
+            ),
             "stress_losses_are_not_regulatory_capital_aggregation": True,
             "portfolio_tail_distribution_calculated": False,
         },
         "settings": {
             "n_paths": args.n_paths,
             "seed": args.seed,
+            "take_up_seed": args.take_up_seed,
+            "mortality_seed": args.mortality_seed,
             "n_train": args.n_train,
             "train_seed": args.train_seed,
+            "train_take_up_seed": args.train_take_up_seed,
+            "train_mortality_seed": args.train_mortality_seed,
             "heston_substeps": args.heston_substeps,
+            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
             "lsmc_folds": args.lsmc_folds,
             "lsmc_ridge": args.lsmc_ridge,
             "exercise_buffer_rmse_multiplier": (
@@ -4622,6 +5528,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "source_identifiers_checked": True,
             "stress_application_checked_in_runner_manifests": (
                 not args.no_stress_analysis),
+            "joint_policy_fit_basis_unique_per_cap_stress_cell": True,
+            "lsmc_fit_basis_fingerprints_by_cell": {
+                (
+                    f"{row['stress_scenario_id']}|"
+                    f"{float(row['crediting_cap_rate_percent']):.8f}%"
+                ): row["lsmc_fit_basis_fingerprint"]
+                for row in all_fit_rows
+            },
             "commands": commands,
         },
         "risk_indicators": {
@@ -4634,8 +5548,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "fee_cost_and_profitability": [
                 "future_fees",
                 "crediting_margin",
+                "money_market_income",
+                "retained_excess_performance_hedge_gain",
                 "expenses",
-                "hedge_cost_proxy",
+                "fair_option_package_cost",
+                "option_purchase_markup_cost",
+                "hedge_reference_management_fee_cost",
+                "legacy_hedge_execution_proxy",
                 "insurer_npv_before_risk_margin",
                 "new_business_margin_before_risk_margin",
             ],
@@ -4643,7 +5562,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "behaviour_model_npv_gap_dynamic_minus_lsmc",
                 "lsmc_guarantee_claim_difference",
                 "lsmc_policyholder_value_difference_vs_continue",
-                "unweighted_lsmc_decision_event_exercise_rate",
+                "income_start_year_mean_median_p10_p90",
+                "income_election_and_forced_election_share",
+                "mean_growth_duration_and_phase_exposures",
+                "ordinary_performance_and_total_income_lapse_rates",
+                "unweighted_lsmc_income_election_action_rate",
+                "unweighted_lsmc_full_withdrawal_action_rate",
+                "policy_year_income_election_and_growth_phase_buckets",
+                "two_by_two_election_post_election_decomposition",
             ],
             "model_point_concentration": [
                 "negative_value_contract_share",
@@ -4681,12 +5607,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if stress_loss_rows
                 else "The explicit shock-and-revalue grid was skipped for this run."
             ),
-            "No symmetric statistical lapse/take-up/withdrawal stress because LSMC replaces the statistical Income-lapse function with its action set.",
+            "Lapse risk is assessed through Dynamic versus LSMC and the 2x2 Election/post-Election Behaviour decomposition; no symmetric statistical lapse/take-up/withdrawal shock is applied because LSMC replaces those functions with a phase-specific joint action set.",
             "No catastrophe, FX, credit-spread or correlation stress.",
             "Results are before Risk Margin and gross of reinsurance.",
             "Mortality is illustrative and not an approved production basis.",
-            "LSMC is an annual-grid lower-bound Continue/Full-Withdrawal policy.",
-            "The LSMC exercise diagnostic is not a portfolio-weighted surrender rate.",
+            "LSMC is an annual-grid lower-bound policy with WAIT/START_INCOME before Election and CONTINUE/FULL_WITHDRAWAL after Election.",
+            "Income is forced no later than the first policy anniversary after primary age 100 for an eligible surviving contract.",
+            "The LSMC Election and Full-Withdrawal action diagnostics are unweighted fit diagnostics, not portfolio-weighted take-up or surrender rates.",
             "Non-6% caps are non-contractual design sensitivities.",
             "Caps below 0.25% are technical sensitivities outside the contractual minimum.",
             "Crediting-cap variants hold all other terms fixed and are not budget-neutral repricings.",
@@ -4696,6 +5623,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "portfolio_risk_by_crediting_cap_csv": str(risk_csv),
             "crediting_cap_risk_sensitivities_csv": str(sensitivity_csv),
             "crediting_cap_effect_decomposition_csv": str(decomposition_csv),
+            "behaviour_effect_decomposition_csv": (
+                str(behaviour_decomposition_csv)
+                if behaviour_decomposition_rows else None
+            ),
             "model_point_behaviour_model_gap_csv": str(model_point_csv),
             "portfolio_stress_losses_by_crediting_cap_csv": (
                 str(stress_csv) if stress_loss_rows else None),
@@ -4709,6 +5640,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "reporting": {
             "plots_requested": not args.no_plots,
             "matplotlib_version": matplotlib_version,
+            "behaviour_metric_weighting": (
+                "model_point_contract_weight_x_q_path_probability_x_"
+                "pathwise_in_force_survival_weight"
+            ),
+            "lsmc_action_diagnostic_weighting": (
+                "unweighted_eligible_model_point_path_decision_events"
+            ),
         },
         "results": rows,
         "stress_results": stress_loss_rows,
@@ -4725,13 +5663,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         handle.write("\n")
 
-    print(f"Risk comparison CSV: {risk_csv}")
-    print(f"Sensitivity CSV: {sensitivity_csv}")
-    print(f"Model-point comparison CSV: {model_point_csv}")
+    log_to_console(f"Risk comparison CSV: {risk_csv}")
+    log_to_console(f"Sensitivity CSV: {sensitivity_csv}")
+    if behaviour_decomposition_rows:
+        log_to_console(
+            f"Behaviour decomposition CSV: {behaviour_decomposition_csv}"
+        )
+    log_to_console(f"Model-point comparison CSV: {model_point_csv}")
     if stress_loss_rows:
-        print(f"Stress-loss CSV: {stress_csv}")
-    print(f"Report: {report_path}")
-    print(f"Manifest: {manifest_path}")
+        log_to_console(f"Stress-loss CSV: {stress_csv}")
+    log_to_console(f"Report: {report_path}")
+    log_to_console(f"Manifest: {manifest_path}")
     return 0
 
 

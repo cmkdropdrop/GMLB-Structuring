@@ -1,11 +1,16 @@
 # Modellpunkte für die generische Portfoliobewertung
 
-`model_points_policyholders.csv` enthält 48 gewichtete New-Business-Modellpunkte
-für versicherte Personen in einem australischen Retirement-Umfeld. Die Datei
-stammt aus der früheren AGILE-Modellierung, wird nun aber als demografische und
-prämienbezogene Portfolioeingabe für das generische Produkt verwendet. Die 48
-Modellpunkte bilden vier Eintrittsalter, zwei Geschlechter, Single-/Joint-Life
-und drei Einmalbeiträge ab.
+`model_points_policyholders_4_point_proxy.csv` ist der operative Default für
+alle Portfolio-, Risiko- und Crediting-Strategy-Runner. Er enthält vier
+gewichtete New-Business-Modellpunkte für schnelle Research-Läufe und erhält
+den gewichteten durchschnittlichen Einmalbeitrag der ausführlichen Variante.
+
+`model_points_policyholders.csv` bleibt als explizit wählbare 48-Point-
+Detailvariante verfügbar. Sie stammt aus der früheren AGILE-Modellierung und
+bildet vier Eintrittsalter, zwei Geschlechter, Single-/Joint-Life und drei
+Einmalbeiträge ab. Beide Dateien werden ausschließlich als demografische und
+prämienbezogene Portfolioeingabe für das generische Produkt verwendet. Ein
+abweichender Bestand kann weiterhin über `--model-points` gewählt werden.
 
 ## Gewichtung
 
@@ -13,11 +18,12 @@ und drei Einmalbeiträge ab.
 - `premium_volume_weight` ist nur eine Exposure- und Kontrollgröße. Es darf
   nicht zusätzlich zum Vertragsgewicht zur Skalierung desselben Barwerts
   verwendet werden.
-- Die aus den ungerundeten Segmentannahmen berechneten Gewichte werden mit
-  zwölf Nachkommastellen gespeichert. Beide Gewichtsspalten summieren sich
-  exakt auf 1; der letzte Prämienanteil enthält dafür einen Rundungsausgleich
-  von 0,000000000003.
-- Der gewichtete durchschnittliche Einmalbeitrag beträgt AUD 336.982,1762.
+- Die Gewichte werden mit zwölf Nachkommastellen gespeichert. In beiden
+  gelieferten Dateien summieren sich `contract_weight` und
+  `premium_volume_weight` jeweils auf 1. Der Rundungsausgleich von
+  0,000000000003 im letzten Prämienanteil betrifft die 48-Point-Datei.
+- Der gewichtete durchschnittliche Einmalbeitrag beträgt in beiden Dateien
+  AUD 336.982,1762.
 - Da sich `contract_weight` auf 1 summiert, ergibt die unmittelbare Aggregation
   einen gewichteten Barwert je Durchschnittsvertrag. Absolute
   Portfoliobarwerte erfordern zusätzlich die gesamte Vertragsanzahl `N_total`:
@@ -39,9 +45,10 @@ interpretiert.
 ## Verwendung im generischen Portfolio-Runner
 
 Für die generische Portfoliobewertung werden insbesondere Demografie, Prämie,
-Single-/Joint-Life-Ausprägung und Spouse-Daten der 48 Modellpunkte verwendet.
-Alle Zeilen beschreiben derzeit New Business mit Policendauer null und Start in
-der Growth-Phase.
+Single-/Joint-Life-Ausprägung und Spouse-Daten verwendet. Standardmäßig sind
+dies die vier Proxy-Modellpunkte; für detailliertere Läufe können explizit die
+48 Modellpunkte geladen werden. Alle Zeilen beider Dateien beschreiben derzeit
+New Business mit Policendauer null und Start in der Growth-Phase.
 
 Der generische Reference Fund ist eine feste 50/50-Kombination aus Global
 Equity und nominalen australischen Staatsanleihen mit fünfjähriger konstanter

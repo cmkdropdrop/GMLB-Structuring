@@ -1,9 +1,12 @@
 """Focused regression tests for the annual crediting-cap LSMC helpers."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from agile_engine import (
+    HedgeCapLegMode,
     IndexLinkedLifetimeIncomeProduct,
     Measure,
     MortalityTable,
@@ -16,7 +19,12 @@ from agile_engine import (
     project,
     simulate,
 )
-from agile_engine.crediting import intra_year_value_factor
+from agile_engine.crediting import (hedge_option_package_value,
+                                    intra_year_value_factor)
+from agile_engine.optimal_behaviour_lsmc import (
+    OptimalBehaviourLSMCSettings,
+    OptimalSurrenderPolicy,
+)
 from agile_engine.product import Protection
 from portfolio_simulations.optimize_crediting_rate_lsmc import (
     ACTION_CAPS,
@@ -24,8 +32,10 @@ from portfolio_simulations.optimize_crediting_rate_lsmc import (
     CONTROL_STATE_FEATURE_NAMES,
     ControlStateInputs,
     PathwiseReferenceFundSpec,
+    PolicyholderFitSet,
     RegressionPolicyYear,
     _annual_start_discounted_paths,
+    _adaptive_policy_passes_validation,
     _annual_discounted_control_paths,
     _annual_discounted_paths,
     _constant_first_year_policy,
@@ -35,9 +45,12 @@ from portfolio_simulations.optimize_crediting_rate_lsmc import (
     _csm_benchmark_row,
     _pathwise_cap_adapter,
     _policy_payload,
+    _policyholder_fit_set_payload,
     _rollout_cap_policy,
     _slice_scenarios,
+    _vector_hedge_option_package_value,
     _vector_intra_year_value_factor,
+    _vector_retained_excess_return,
 )
 
 
@@ -79,6 +92,107 @@ def test_action_caps_are_minimum_plus_every_whole_percent_through_twenty():
 
     assert ACTION_CAPS.shape == (21,)
     np.testing.assert_allclose(ACTION_CAPS, expected, rtol=0.0, atol=1.0e-15)
+
+
+@pytest.mark.parametrize(
+    (
+        "insurer_stable",
+        "policyholder_passed",
+        "rollout_valid",
+        "delta",
+        "standard_error",
+        "expected",
+    ),
+    [
+        (True, True, True, 196.01, 100.0, True),
+        (True, True, True, 196.00, 100.0, False),
+        (False, True, True, 1_000.0, 1.0, False),
+        (True, False, True, 1_000.0, 1.0, False),
+        (True, True, False, 1_000.0, 1.0, False),
+        (True, True, True, float("nan"), 1.0, False),
+        (True, True, True, 1_000.0, -1.0, False),
+    ],
+)
+def test_adaptive_deployment_gate_is_validation_only_and_conservative(
+    insurer_stable,
+    policyholder_passed,
+    rollout_valid,
+    delta,
+    standard_error,
+    expected,
+):
+    assert _adaptive_policy_passes_validation(
+        insurer_regression_stable=insurer_stable,
+        policyholder_validation_passed=policyholder_passed,
+        causal_rollout_valid=rollout_valid,
+        csm_delta_aud=delta,
+        paired_standard_error_aud=standard_error,
+    ) is expected
+
+
+def test_whole_training_policy_fallback_serializes_every_continue_step():
+    policy = OptimalSurrenderPolicy(
+        regressions={},
+        settings=OptimalBehaviourLSMCSettings(),
+    )
+    fit = SimpleNamespace(
+        policy=policy,
+        training_fallback_used=True,
+        diagnostics=(
+            SimpleNamespace(
+                decision_step=24,
+                regression_accepted_for_exercise=True,
+            ),
+            SimpleNamespace(
+                decision_step=36,
+                regression_accepted_for_exercise=True,
+            ),
+        ),
+    )
+    fit_set = PolicyholderFitSet(
+        fits={("signature",): fit},
+        scenario_fingerprint="training",
+        cap_schedule_fingerprint="cap-schedule",
+    )
+
+    assert fit_set.fallback_count == 1
+    assert fit_set.fallback_step_count == 2
+    signature = _policyholder_fit_set_payload(fit_set)["signatures"][0]
+    assert signature["continue_fallback_deployed"] is True
+    assert signature["whole_signature_continue_fallback_deployed"] is True
+    assert signature["continue_fallback_decision_steps"] == [24, 36]
+    assert signature["deployed_regression_count"] == 0
+
+
+def test_step_cross_fit_fallback_is_counted_and_serialized():
+    policy = OptimalSurrenderPolicy(
+        regressions={},
+        settings=OptimalBehaviourLSMCSettings(),
+    )
+    fit_set = PolicyholderFitSet(
+        fits={
+            ("signature",): SimpleNamespace(
+                policy=policy,
+                training_fallback_used=False,
+                diagnostics=(SimpleNamespace(
+                    decision_step=48,
+                    regression_accepted_for_exercise=False,
+                    fallback_reason=(
+                        "cross_fit_failed:Insufficient observations"
+                    ),
+                ),),
+            )
+        },
+        scenario_fingerprint="training",
+        cap_schedule_fingerprint="cap-schedule",
+    )
+
+    assert fit_set.fallback_count == 1
+    assert fit_set.fallback_step_count == 1
+    signature = _policyholder_fit_set_payload(fit_set)["signatures"][0]
+    assert signature["continue_fallback_deployed"] is True
+    assert signature["whole_signature_continue_fallback_deployed"] is True
+    assert signature["continue_fallback_decision_steps"] == [48]
 
 
 @pytest.mark.parametrize(
@@ -277,6 +391,58 @@ def test_vector_intra_year_value_factor_matches_engine_scalar_and_vector(
 
     np.testing.assert_allclose(
         vector_actual, vector_expected, rtol=2.0e-13, atol=2.0e-13
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", [HedgeCapLegMode.SOLD, HedgeCapLegMode.NOT_SOLD]
+)
+def test_vector_hedge_package_supports_pathwise_caps_and_uncapped(mode):
+    x0 = np.array([0.88, 0.92, 1.00, 1.08, 1.16])
+    caps = np.array([0.0, 0.0025, 0.07, 0.20, np.inf])
+    rates = np.array([0.01, 0.02, 0.03, 0.05, 0.07])
+    sigmas = np.array([0.10, 0.12, 0.18, 0.24, 0.30])
+
+    actual = _vector_hedge_option_package_value(
+        x0, caps, 0.75, rates, 0.0, sigmas, mode
+    )
+    expected = np.array([
+        hedge_option_package_value(
+            spot,
+            cap if np.isfinite(cap) else 0.06,
+            0.75,
+            rate,
+            0.0,
+            sigma,
+            (
+                mode
+                if np.isfinite(cap) or mode == HedgeCapLegMode.NOT_SOLD
+                else HedgeCapLegMode.NOT_SOLD
+            ),
+        )
+        for spot, cap, rate, sigma in zip(x0, caps, rates, sigmas)
+    ])
+
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-13, atol=2.0e-13)
+
+
+def test_vector_retained_excess_supports_pathwise_caps_and_uncapped():
+    returns = np.array([0.02, -0.10, 0.05, 0.15, 0.30])
+    caps = np.array([0.0, 0.0025, 0.07, 0.10, np.inf])
+
+    np.testing.assert_array_equal(
+        _vector_retained_excess_return(
+            returns, caps, HedgeCapLegMode.SOLD
+        ),
+        np.zeros_like(returns),
+    )
+    np.testing.assert_allclose(
+        _vector_retained_excess_return(
+            returns, caps, HedgeCapLegMode.NOT_SOLD
+        ),
+        np.array([0.02, 0.0, 0.0, 0.05, 0.0]),
+        rtol=0.0,
+        atol=1.0e-15,
     )
 
 
@@ -584,3 +750,37 @@ def test_rollout_requires_significant_gain_and_has_one_first_year_action():
         atol=1.0e-15,
     )
     assert np.unique(significant[:, 0]).size == 1
+
+
+def test_flexible_policy_class_can_represent_one_fixed_cap_in_every_year():
+    n_paths = 7
+    n_years = 2
+    inputs = ControlStateInputs(
+        market_features=np.zeros((n_paths, n_years + 1, 5)),
+        annual_reference_fund_return=np.zeros((n_paths, n_years)),
+    )
+    fallback_cap = 0.06
+    fixed_cap = 0.08
+    fixed_action = int(np.flatnonzero(np.isclose(ACTION_CAPS, fixed_cap))[0])
+    raw = _control_state_paths(
+        inputs, np.full((n_paths, n_years), fallback_cap)
+    )
+    policies = []
+    for year in range(n_years):
+        values = np.full((len(ACTION_CAPS), 1), -1.0)
+        values[fixed_action, 0] = 1.0
+        policies.append(_constant_first_year_policy(
+            year=year,
+            raw_state=raw[:, year, :],
+            action_values=values,
+            action_standard_errors=np.zeros(len(ACTION_CAPS)),
+            feature_names=CONTROL_STATE_FEATURE_NAMES,
+        ))
+
+    caps = _rollout_cap_policy(
+        inputs,
+        policies,
+        CONTROL_STATE_FEATURE_NAMES,
+        fallback_cap=fallback_cap,
+    )
+    np.testing.assert_allclose(caps, fixed_cap, rtol=0.0, atol=1.0e-15)
