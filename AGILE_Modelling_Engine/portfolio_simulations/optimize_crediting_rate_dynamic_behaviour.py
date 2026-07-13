@@ -1,35 +1,25 @@
-"""Optimise annual Reference-Fund caps by control-randomisation LSMC.
+"""Optimise annual Reference-Fund caps under dynamic Policyholder behaviour.
 
-This is a standalone counterfactual management-action study.  It deliberately
-does not use the archived American-option-style ``agile_engine.lsmc`` module.
-Instead, it treats the annual cap as a repeated discrete Stackelberg control.
-Fixed-cap benchmarks and the coupled cap-randomised response-surface candidate
-use the same signature-specific combined-v2 follower through both
-``income_election_policy`` and
-``income_action_policy``.  That follower chooses Growth WAIT/START and monthly
-Income CONTINUE/PARTIAL/FULL.  For the coupled fit it is trained across the
-complete randomised cap paths; its complete-path out-of-fold policy generates
-the insurer Fitted-Q targets.  The response surface itself is validation-only
-until nested Leader/Follower folds, joint on-policy iteration and the full
-three-seed component gates are implemented.  The historical annual surrender
-recursion is retained only as an explicitly labelled benchmark and is
-structurally barred from deployment.
-The Policyholder and insurer objectives are never blended.
+This is a standalone counterfactual management-action study.  Policyholders
+follow the repository's statistical dynamic Behaviour model throughout the
+monthly projection; no Policyholder value-function regression or optimal-
+surrender LSMC is fitted or applied.  The insurer's annual cap remains a
+discrete control estimated by cross-fitted control-randomisation Fitted-Q.
 
 The market paths are simulated once without contractual crediting under
 risk-neutral Heston-Hull-White.  Exploratory cap paths then drive the existing
 generic monthly contract projector.  A cross-fitted Fitted-Q backward pass
 estimates, for every anniversary and admissible cap,
 
-    E[PV(collected fees + other insurer margins
-         - insurer-funded benefits - insurer costs)
+    E[PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)
       + optimal continuation value | information at the cap-setting time].
 
 The signed quantity is the repository's market-consistent insurer net value
 before Risk Margin and is used here as an approximate New Business CSM proxy.
 The optimisation selects the cap with the largest proxy value after the
-cap-aware customer best response.  ``--policyholder-behaviour`` retains
-reproducible ``dynamic`` and ``continue`` comparators; ``lsmc`` is the default.
+projector has applied dynamic Income lapse and withdrawal behaviour.  Income
+Election is also left in the loaded dynamic Behaviour mode, subject to the
+existing contractual eligibility and forced-start gates.
 
 The admissible action grid is ``{0.25%, 1%, 2%, ..., 20%}``, matching the
 documented Guaranteed Minimum Cap while replacing the case study's fixed 6%
@@ -41,20 +31,33 @@ Important timing convention
 The management action is selected after old-cap crediting, fee posting,
 mortality and Income Election and before the new DVA/hedge restart.  The
 optimisation uses a strictly pre-action market plus rich portfolio-exposure
-state; the newly announced cap is then observable to same-timestamp Income
-actions.  Collected Product/LIP Fees,
+state; the newly announced cap is then observable to a same-Anniversary Full
+Withdrawal.  Collected Product/LIP Fees,
 Crediting and retained margins, Guarantee Claims, operating expenses and
-hedge-execution costs enter the CSM proxy with their insurer cashflow signs.
-In LSMC mode statistical lapse and voluntary withdrawals are replaced by the
-combined customer-value policy.  Invalid combined fits fail before rollout;
-the legacy surrender API is benchmark-only.  Statistical behaviour remains
-active only in the separate dynamic comparator.  Full methodology and timing
-are documented in ``CREDITING_CAP_STACKELBERG.md``.
+full option/hedge costs enter the CSM proxy with their insurer cashflow signs.
+The standard insurer hedge is fixed to the complete bull call spread: the
+upper cap call is sold, so the insurer retains no Reference-Fund performance
+above the customer cap.  The crediting margin still includes the insurer's
+pathwise money-market backing income.
+Ordinary lapse, performance-sensitive lapse, Income Election and voluntary
+withdrawals are therefore driven only by the versioned assumptions under
+``input_dynamic_behaviour``.  The current announced cap has no separate direct
+coefficient in that Behaviour model; it affects behaviour through the
+projected Account Value, guarantee moneyness and realised performance history.
 
 When explicitly run, the script writes CSV/JSON results, a DEBUG ``run.log``
 and headless Matplotlib diagnostics below ``plots/`` while reporting concise
 progress to the console.  Merely importing it has no side effects.
 """
+
+# Algorithmic correction: 2026-07-13 16:16:45 CEST (Europe/Zurich).
+# Changed: recursive cross-fitting is now outer-fold-pure; CSM is derived from
+# bounded insurer-component fits; fixed-cap selection, adaptive validation and
+# final evaluation use three disjoint samples; numerical regression failures
+# deploy the preselected fixed-cap fallback instead of terminating the run.
+# Removed/replaced: the recursively leaky single-continuation chain, the
+# fold-zero pseudo-holdout interpretation and reuse of the fixed-selection
+# sample for the adaptive-policy confidence gate.
 
 from __future__ import annotations
 
@@ -121,7 +124,7 @@ from agile_engine.optimal_behaviour_lsmc import (  # noqa: E402
     OptimalSurrenderPolicy,
     build_surrender_regression_features,
     build_surrender_regression_features_from_arrays,
-    fit_optimal_behaviour_policy,
+    fit_optimal_surrender_policy,
     fit_surrender_continuation_regression,
     fit_surrender_continuation_policy,
     no_voluntary_action_behaviour,
@@ -175,18 +178,9 @@ FOLLOWER_PRE_CAP_FEATURE_NAMES = (
     "previous_cap",
 )
 DEFAULT_OUTPUT_DIRECTORY = (
-    Path(__file__).resolve().parent / "output" / "crediting_cap_lsmc"
+    Path(__file__).resolve().parent / "output" / "crediting_cap_dynamic_behaviour"
 )
-LOGGER = logging.getLogger("crediting_cap_lsmc")
-COMBINED_FOLLOWER_VERSION = "combined_optimal_behaviour_lsmc_v2"
-LEGACY_COUPLED_FOLLOWER_VERSION = "legacy_annual_surrender_benchmark_v1"
-COMBINED_FOLLOWER_ACTION_SET = (
-    "WAIT",
-    "START_INCOME_NOW",
-    "CONTINUE",
-    "PARTIAL_WITHDRAWAL",
-    "FULL_WITHDRAWAL",
-)
+LOGGER = logging.getLogger("crediting_cap_dynamic_behaviour")
 
 
 def _configure_logging(output: Path, level_name: str) -> Path:
@@ -243,7 +237,7 @@ class PathwiseReferenceFundSpec:
     equity_weight: float = 0.50
     bond_tenor_years: float = 5.0
     rebalance_frequency_months: int = 1
-    specification_vintage: str = "counterfactual-lsmc-control-grid"
+    specification_vintage: str = "counterfactual-dynamic-behaviour-control-grid"
 
     def __post_init__(self) -> None:
         caps = np.asarray(self.cap_matrix, dtype=float)
@@ -318,6 +312,8 @@ class PortfolioPathData:
     fees_product: Array
     fees_lip: Array
     crediting_margin: Array
+    money_market_income: Array
+    hedge_gain: Array
     mva_retained: Array
     aps_retained: Array
     expenses: Array
@@ -343,10 +339,12 @@ class PortfolioPathData:
 
     @property
     def new_business_csm_proxy(self) -> Array:
+        """User-defined CSM = fee income + other income - claims - costs."""
         return (
             self.fees_product
             + self.fees_lip
-            + self.crediting_margin
+            + self.money_market_income
+            + self.hedge_gain
             + self.mva_retained
             + self.aps_retained
             - self.guarantee_claims
@@ -580,79 +578,9 @@ def _follower_features_from_core(
     return raw
 
 
-def _diagnostic_action_accepted(diagnostic: object) -> bool:
-    """Read the v2 action gate and reject legacy fixed-cap diagnostics."""
-    if not hasattr(diagnostic, "regression_accepted_for_action"):
-        raise RuntimeError(
-            "Fixed-cap follower diagnostics do not implement the combined-v2 "
-            "action contract. Legacy surrender diagnostics are benchmark-only."
-        )
-    return bool(getattr(diagnostic, "regression_accepted_for_action"))
-
-
-def _require_combined_follower_fit_v2(
-    fit: object,
-    *,
-    context: str,
-) -> object:
-    """Return a deployable combined policy or fail before any rollout.
-
-    The old surrender-only policy happens to satisfy the Projector's legacy
-    ``surrender_policy`` hook, which makes accidental deployment otherwise too
-    easy.  This capability/version gate is deliberately structural as well as
-    metadata based: a deployable Stackelberg follower must own both phase
-    transitions and the unified monthly Income action surface.
-    """
-    version = getattr(fit, "fit_version", None)
-    if version != COMBINED_FOLLOWER_VERSION:
-        raise RuntimeError(
-            f"{context} produced follower version {version!r}; deployment "
-            f"requires {COMBINED_FOLLOWER_VERSION!r}."
-        )
-    invalid_reasons = tuple(getattr(fit, "invalid_reasons", ()))
-    if not bool(getattr(fit, "valid", False)) or invalid_reasons:
-        raise RuntimeError(
-            f"{context} produced an invalid combined follower: "
-            + (", ".join(map(str, invalid_reasons)) or "unspecified reason")
-        )
-    policy = getattr(fit, "policy", None)
-    required_hooks = ("start_income_mask", "choose_income_action")
-    missing_hooks = tuple(
-        name for name in required_hooks
-        if not callable(getattr(policy, name, None))
-    )
-    if missing_hooks:
-        raise RuntimeError(
-            f"{context} is missing combined follower hook(s): "
-            + ", ".join(missing_hooks)
-        )
-    policy_invalid_reasons = tuple(getattr(policy, "invalid_reasons", ()))
-    if not bool(getattr(policy, "valid", False)) or policy_invalid_reasons:
-        raise RuntimeError(
-            f"{context} contains an invalid frozen policy: "
-            + (
-                ", ".join(map(str, policy_invalid_reasons))
-                or "unspecified reason"
-            )
-        )
-    if not bool(getattr(policy, "monthly_income_actions_required", False)):
-        raise RuntimeError(
-            f"{context} does not require the unified monthly Income action surface."
-        )
-    legacy_surrender = getattr(policy, "surrender_policy", None)
-    if getattr(legacy_surrender, "regressions", {}):
-        raise RuntimeError(
-            f"{context} mixes the combined v2 action policy with deployable "
-            "legacy surrender regressions."
-        )
-    for diagnostic in tuple(getattr(fit, "diagnostics", ())):
-        _diagnostic_action_accepted(diagnostic)
-    return policy
-
-
 @dataclass
 class PolicyholderFitSet:
-    """Deployable combined-v2 followers separated by PolicySpec signature."""
+    """Cap-aware follower policies fitted separately by PolicySpec signature."""
 
     fits: dict[tuple[object, ...], object]
     scenario_fingerprint: str
@@ -665,44 +593,17 @@ class PolicyholderFitSet:
         key = _policy_signature(policy)
         if key not in self.fits:
             raise KeyError("No cap-consistent LSMC fit exists for PolicySpec.")
+        policy = self.fits[key].policy
         if key in self.validation_fallback_signatures:
-            raise RuntimeError(
-                "Invalid fixed-cap Policyholder LSMC cannot be deployed."
-            )
-        return _require_combined_follower_fit_v2(
-            self.fits[key],
-            context="Fixed-cap Policyholder LSMC",
-        )
+            return type(policy)(regressions={}, settings=policy.settings)
+        return policy
 
     def training_factory(self, policy: PolicySpec) -> object:
         """Return the complete-path out-of-fold policy for leader targets."""
         key = _policy_signature(policy)
         if key not in self.fits:
             raise KeyError("No cap-consistent LSMC fit exists for PolicySpec.")
-        _require_combined_follower_fit_v2(
-            self.fits[key],
-            context="Fixed-cap Policyholder training LSMC",
-        )
-        training_policy = self.fits[key].cross_fitted_training_policy
-        if not bool(getattr(training_policy, "valid", False)) \
-                or not callable(getattr(
-                    training_policy, "start_income_mask", None
-                )) \
-                or not callable(getattr(
-                    training_policy, "choose_income_action", None
-                )) \
-                or not bool(getattr(
-                    training_policy, "monthly_income_actions_required", False
-                )) \
-                or bool(getattr(
-                    getattr(training_policy, "surrender_policy", None),
-                    "regressions_by_step",
-                    {},
-                )):
-            raise RuntimeError(
-                "Invalid combined-v2 cross-fitted Policyholder policy."
-            )
-        return training_policy
+        return self.fits[key].cross_fitted_training_policy
 
     @property
     def fallback_count(self) -> int:
@@ -711,7 +612,7 @@ class PolicyholderFitSet:
             for signature, fit in self.fits.items()
             if bool(fit.training_fallback_used)
             or any(
-                not _diagnostic_action_accepted(diagnostic)
+                not bool(diagnostic.regression_accepted_for_exercise)
                 for diagnostic in fit.diagnostics
             )
         }
@@ -724,7 +625,7 @@ class PolicyholderFitSet:
             rejected = {
                 int(diagnostic.decision_step)
                 for diagnostic in fit.diagnostics
-                if not _diagnostic_action_accepted(diagnostic)
+                if not bool(diagnostic.regression_accepted_for_exercise)
             }
             if bool(fit.training_fallback_used):
                 # The training PV gate replaces the entire fitted policy by
@@ -734,12 +635,7 @@ class PolicyholderFitSet:
                     for diagnostic in fit.diagnostics
                 )
             if signature in self.validation_fallback_signatures:
-                rejected.update(
-                    int(step)
-                    for step in getattr(
-                        fit.policy, "income_action_regressions", {}
-                    )
-                )
+                rejected.update(int(step) for step in fit.policy.regressions)
                 rejected.update(
                     int(diagnostic.decision_step)
                     for diagnostic in fit.diagnostics
@@ -779,7 +675,7 @@ class _FollowerDeploymentRegression:
 
 @dataclass
 class CoupledOptimalSurrenderPolicy:
-    """Benchmark-only annual response from the coupled two-value recursion."""
+    """Frozen follower best response from the coupled two-value recursion."""
 
     regressions: Mapping[int, _FollowerDeploymentRegression]
     settings: OptimalBehaviourLSMCSettings
@@ -826,29 +722,17 @@ class CoupledOptimalSurrenderPolicy:
 
 @dataclass
 class CoupledPolicyholderFitSet:
-    """Cap-randomised combined-v2 follower plus optional legacy benchmarks.
-
-    ``fits`` is authoritative for the coupled response-surface rollouts.  It
-    contains exactly the same combined Election/monthly-action fit objects as
-    :class:`PolicyholderFitSet`, except that the training product exposes the
-    complete randomised cap schedule.  ``policies`` is retained solely for the
-    historical annual surrender benchmark returned by
-    :meth:`benchmark_factory`; those objects can never make this fit set
-    structurally eligible.  The runner separately hard-gates productive
-    adaptive deployment until its nested-fit and validation contract exists.
-    """
+    """Signature-separated follower policies produced inside leader recursion."""
 
     policies: dict[tuple[object, ...], object]
     scenario_fingerprint: str
     cap_schedule_fingerprint: str
-    fits: dict[tuple[object, ...], object] = field(default_factory=dict)
     fallback_signatures: set[tuple[object, ...]] = field(default_factory=set)
     fallback_steps_by_signature: dict[
         tuple[object, ...], tuple[int, ...]
     ] = field(default_factory=dict)
 
-    def benchmark_factory(self, policy: PolicySpec) -> object:
-        """Return the legacy policy only for candidate/benchmark rollouts."""
+    def factory(self, policy: PolicySpec) -> object:
         key = _policy_signature(policy)
         if key not in self.policies:
             raise KeyError("No coupled follower policy exists for PolicySpec.")
@@ -859,79 +743,10 @@ class CoupledPolicyholderFitSet:
             )
         return self.policies[key]
 
-    def factory(self, policy: PolicySpec) -> object:
-        """Return the cap-randomised combined-v2 response policy."""
-        key = _policy_signature(policy)
-        if key not in self.fits:
-            raise RuntimeError(
-                "The coupled follower contains only the annual surrender "
-                "benchmark and cannot be deployed."
-            )
-        return _require_combined_follower_fit_v2(
-            self.fits[key],
-            context="Coupled Stackelberg Policyholder LSMC",
-        )
-
-    def training_factory(self, policy: PolicySpec) -> object:
-        """Return the complete-path out-of-fold combined-v2 policy."""
-        key = _policy_signature(policy)
-        if key not in self.fits:
-            raise RuntimeError(
-                "No combined-v2 coupled follower fit exists for PolicySpec."
-            )
-        fit = self.fits[key]
-        _require_combined_follower_fit_v2(
-            fit,
-            context="Coupled Stackelberg training Policyholder LSMC",
-        )
-        training_policy = getattr(fit, "cross_fitted_training_policy", None)
-        if not bool(getattr(training_policy, "valid", False)) \
-                or not callable(getattr(
-                    training_policy, "start_income_mask", None
-                )) \
-                or not callable(getattr(
-                    training_policy, "choose_income_action", None
-                )) \
-                or not bool(getattr(
-                    training_policy, "monthly_income_actions_required", False
-                )):
-            raise RuntimeError(
-                "Invalid combined-v2 cross-fitted coupled follower policy."
-            )
-        return training_policy
-
-    @property
-    def follower_contract_version(self) -> str:
-        return (
-            COMBINED_FOLLOWER_VERSION
-            if self.fits else LEGACY_COUPLED_FOLLOWER_VERSION
-        )
-
-    @property
-    def deployment_eligible(self) -> bool:
-        if not self.fits:
-            return False
-        try:
-            for fit in self.fits.values():
-                _require_combined_follower_fit_v2(
-                    fit,
-                    context="Coupled Stackelberg deployment gate",
-                )
-        except RuntimeError:
-            return False
-        return True
-
     @property
     def fallback_count(self) -> int:
-        invalid_fits = {
-            signature
-            for signature, fit in self.fits.items()
-            if not bool(getattr(fit, "valid", False))
-            or bool(tuple(getattr(fit, "invalid_reasons", ())))
-        }
         return len(
-            invalid_fits
-            | self.fallback_signatures
+            self.fallback_signatures
             | {
                 signature
                 for signature, steps in self.fallback_steps_by_signature.items()
@@ -941,20 +756,11 @@ class CoupledPolicyholderFitSet:
 
     @property
     def fallback_step_count(self) -> int:
-        legacy = sum(
-            len(steps) for steps in self.fallback_steps_by_signature.values()
-        )
-        combined = sum(
-            1
-            for fit in self.fits.values()
-            for diagnostic in tuple(getattr(fit, "diagnostics", ()))
-            if not _diagnostic_action_accepted(diagnostic)
-        )
-        return legacy + combined
+        return sum(len(steps) for steps in self.fallback_steps_by_signature.values())
 
     @property
     def signature_count(self) -> int:
-        return len(self.fits) if self.fits else len(self.policies)
+        return len(self.policies)
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
@@ -1026,16 +832,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--behaviour-assumption-set", default=None)
     parser.add_argument(
-        "--policyholder-behaviour",
-        choices=("lsmc", "dynamic", "continue"),
-        default="lsmc",
-        help=(
-            "policyholder response used by the cap control: coupled LSMC "
-            "best response (default), the existing statistical dynamic "
-            "Behaviour model, or the admissible always-Continue policy"
-        ),
-    )
-    parser.add_argument(
         "--behaviour-value-basis",
         choices=("low", "base", "high"),
         default="base",
@@ -1068,35 +864,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--benchmark-paths", type=int, default=500,
         help=(
-            "paths in each independent fixed-cap selection and final evaluation "
-            "sample"
+            "paths in each independent fixed-cap selection, adaptive-policy "
+            "validation and final evaluation sample"
         ),
     )
     parser.add_argument(
         "--benchmark-batch-size", type=int, default=4,
-        help="number of fixed-cap cases projected together",
+        help=(
+            "retained for CLI compatibility; dynamic-Behaviour fixed-cap cases "
+            "are projected separately to preserve common Behaviour draws"
+        ),
     )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument("--cross-fit-folds", type=int, default=5)
-    parser.add_argument(
-        "--policyholder-lsmc-folds",
-        type=int,
-        default=5,
-        help="complete-path cross-fitting folds for the follower value function",
-    )
-    parser.add_argument(
-        "--policyholder-lsmc-ridge",
-        type=float,
-        choices=(0.0, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2),
-        default=1.0e-6,
-    )
-    parser.add_argument(
-        "--policyholder-exercise-buffer-rmse-multiplier",
-        type=float,
-        default=0.25,
-        help="conservative follower Full-Withdrawal screen",
-    )
     parser.add_argument(
         "--ridge", type=float, default=1.0e-4,
         help="dimensionless ridge multiplier for the regression normal matrix",
@@ -1106,15 +887,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "fraction of paths assigned a constant exploratory cap history "
             "to cover low/high endogenous credited-index states"
-        ),
-    )
-    parser.add_argument(
-        "--hedge-gain",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "include the engine's cap-setting/crediting margin in CSM "
-            "(default: enabled; disable with --no-hedge-gain)"
         ),
     )
     parser.add_argument(
@@ -1139,9 +911,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path, default=DEFAULT_OUTPUT_DIRECTORY,
-        help="output directory",
+        help=(
+            "base output directory; each run is written to a new UTC timestamp "
+            "subdirectory"
+        ),
     )
     args = parser.parse_args(argv)
+    # Kept as an internal provenance field so shared reporting helpers can use
+    # one stable schema.  It is intentionally not user-configurable here.
+    args.policyholder_behaviour = "dynamic"
 
     if args.n_paths <= 0 or args.benchmark_paths <= 0:
         parser.error("--n-paths and --benchmark-paths must be positive")
@@ -1155,23 +933,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("seed must be non-negative and Heston substeps positive")
     if args.cross_fit_folds < 3:
         parser.error("--cross-fit-folds must be at least three")
-    if args.policyholder_lsmc_folds < 2:
-        parser.error("--policyholder-lsmc-folds must be at least two")
     if not np.isfinite(args.ridge) or args.ridge <= 0.0:
         parser.error("--ridge must be finite and strictly positive")
-    if (
-        not np.isfinite(args.policyholder_lsmc_ridge)
-        or args.policyholder_lsmc_ridge < 0.0
-    ):
-        parser.error("--policyholder-lsmc-ridge must be finite and non-negative")
-    if (
-        not np.isfinite(args.policyholder_exercise_buffer_rmse_multiplier)
-        or args.policyholder_exercise_buffer_rmse_multiplier < 0.0
-    ):
-        parser.error(
-            "--policyholder-exercise-buffer-rmse-multiplier must be "
-            "finite and non-negative"
-        )
     if not 0.0 <= args.persistent_exploration_fraction < 1.0:
         parser.error("--persistent-exploration-fraction must be in [0, 1)")
     if (args.portfolio_contract_count is not None
@@ -1473,24 +1236,17 @@ def _fit_cap_aware_policyholder_policies(
     settings: OptimalBehaviourLSMCSettings,
     progress_label: str,
 ) -> PolicyholderFitSet:
-    """Fit one deployable combined-v2 policy per PolicySpec signature.
+    """Fit one follower policy per economic PolicySpec signature.
 
     The complete pathwise cap schedule is part of the training sample.  Caps
     enter the observable follower state in ``optimal_behaviour_lsmc``; a fit
     is therefore never trained under one reference cap and reused as if it
     were cap invariant.  Joint and Single-Life fallback branches are fitted
-    before any spouse-survival or portfolio weighting is applied.  Every fit
-    is capability/version checked immediately; invalid fits never reach a
-    validation or evaluation rollout.
+    before any spouse-survival or portfolio weighting is applied.
     """
     caps = np.asarray(cap_matrix, dtype=float)
-    expected_years = int(math.ceil(scenarios.n_steps / STEPS_PER_YEAR))
-    expected_shape = (scenarios.n_paths, expected_years)
-    if caps.shape != expected_shape:
-        raise ValueError(
-            "Follower cap matrix must cover the complete training horizon with "
-            f"shape {expected_shape}; got {caps.shape}."
-        )
+    if caps.ndim != 2 or caps.shape[0] != scenarios.n_paths:
+        raise ValueError("Follower cap matrix must match the training paths.")
     if np.any(np.isnan(caps)) or np.any(caps < 0.0):
         raise ValueError("Follower cap schedules must be non-negative and not NaN.")
     controlled = _controlled_product(product, caps)
@@ -1524,7 +1280,7 @@ def _fit_cap_aware_policyholder_policies(
                 policy.initial_investment,
                 policy.spouse,
             )
-            fitted = fit_optimal_behaviour_policy(
+            fits[signature] = fit_optimal_surrender_policy(
                 controlled,
                 policy,
                 scenarios,
@@ -1532,99 +1288,12 @@ def _fit_cap_aware_policyholder_policies(
                 expenses=expenses,
                 projection_config=follower_projection,
                 settings=settings,
-                fit_basis_inputs={
-                    "stackelberg_cap_schedule_fingerprint": (
-                        _array_fingerprint(caps)
-                    ),
-                    "stackelberg_follower": COMBINED_FOLLOWER_VERSION,
-                },
             )
-            _require_combined_follower_fit_v2(
-                fitted,
-                context=(
-                    f"Fixed-cap fit {number}/{len(policies)} "
-                    f"for signature {signature!r}"
-                ),
-            )
-            fits[signature] = fitted
     return PolicyholderFitSet(
         fits=fits,
         scenario_fingerprint=scenarios.content_fingerprint,
         cap_schedule_fingerprint=_array_fingerprint(caps),
     )
-
-
-def _combined_v2_complete_path_fold_ids(
-    n_paths: int,
-    settings: OptimalBehaviourLSMCSettings,
-) -> IntArray:
-    """Reproduce combined-v2 folds for consistent own-path OOF targets.
-
-    This keeps every action replica of one market/mortality path in the same
-    Policyholder and insurer fold.  It is not a nested Leader-outerfold fit:
-    follower models generating targets for other folds may still have seen a
-    Leader holdout fold.  The adaptive response surface is therefore retained
-    as a non-deployable diagnostic until nested fitting is implemented.
-    """
-    if n_paths < settings.n_folds:
-        raise ValueError("Each combined-v2 outer fold requires at least one path.")
-    shuffled = np.arange(n_paths, dtype=np.int64)
-    rng = np.random.default_rng(settings.fold_seed)
-    rng.shuffle(shuffled)
-    fold_ids = np.mod(shuffled, settings.n_folds).astype(np.int64)
-    if any(
-        not np.any(fold_ids == fold) for fold in range(settings.n_folds)
-    ):
-        raise RuntimeError("Combined-v2 complete-path fold assignment is empty.")
-    return fold_ids
-
-
-def _fit_coupled_policyholder_policies_v2(
-    *,
-    cap_matrix: Array,
-    scenarios: ScenarioSet,
-    product: IndexLinkedLifetimeIncomeProduct,
-    model_points: PolicyholderModelPointSet,
-    mortality: MortalityTable,
-    expenses: ExpenseAssumptions,
-    projection_config: ProjectionConfig,
-    settings: OptimalBehaviourLSMCSettings,
-    progress_label: str,
-) -> CoupledPolicyholderFitSet:
-    """Fit a structurally v2-capable response surface across randomised caps.
-
-    This intentionally delegates every Policyholder regression and action to
-    the fixed-cap combined-v2 fitter.  The only difference is the training
-    support: ``cap_matrix`` contains all leader actions and histories rather
-    than one constant cap.  Consequently an identical cap, observable state
-    and action set is evaluated by the identical frozen Policyholder code in
-    fixed-cap, coupled-training and validation projections.  Productive
-    adaptive deployment is gated separately because this fit is not yet a
-    nested, jointly iterated Leader/Follower solution.
-    """
-    base = _fit_cap_aware_policyholder_policies(
-        cap_matrix=cap_matrix,
-        scenarios=scenarios,
-        product=product,
-        model_points=model_points,
-        mortality=mortality,
-        expenses=expenses,
-        projection_config=projection_config,
-        settings=settings,
-        progress_label=progress_label,
-    )
-    coupled = CoupledPolicyholderFitSet(
-        policies={},
-        fits=dict(base.fits),
-        scenario_fingerprint=base.scenario_fingerprint,
-        cap_schedule_fingerprint=base.cap_schedule_fingerprint,
-    )
-    if not coupled.deployment_eligible:
-        raise RuntimeError(
-            "The cap-randomised combined-v2 follower failed its structural "
-            "combined-policy capability gate."
-        )
-    return coupled
 
 
 def _youngest_covered_age(model_points: PolicyholderModelPointSet) -> float:
@@ -1675,23 +1344,17 @@ def _model_point_behaviour_treatment(
     point: PolicyholderModelPoint,
     behaviour: BehaviourModel,
 ) -> str:
-    """Describe the effective branch treatment used by the active Engine."""
-    dynamic_active = behaviour.use_dynamic or behaviour.use_dynamic_withdrawals
-    if (
-        point.policy.spouse
-        and point.policy.spouse_death_election
-        == SpouseDeathElection.CONTINUE_INCOME
-    ):
-        return (
-            "joint_branch_static_base_single_fallback_dynamic"
-            if dynamic_active
-            else "joint_and_single_branches_static_base"
-        )
+    """Describe the effective dynamic treatment used by this runner."""
+    dynamic_active = (
+        behaviour.use_dynamic
+        or behaviour.use_dynamic_take_up
+        or behaviour.use_dynamic_withdrawals
+    )
     if point.policy.spouse:
         return (
-            "spouse_lump_sum_joint_and_fallback_dynamic"
+            "pathwise_joint_life_state_dependent"
             if dynamic_active
-            else "spouse_lump_sum_joint_and_fallback_static_base"
+            else "pathwise_joint_life_static_base"
         )
     if dynamic_active:
         return "dynamic_state_dependent"
@@ -1704,7 +1367,7 @@ def _projection_branches(
     mortality: MortalityTable,
     behaviour: BehaviourModel,
 ) -> tuple[ProjectionBranch, ...]:
-    """Match the portfolio wrapper's Election split and Behaviour treatment."""
+    """Use the projector's pathwise Joint-Life dynamic-behaviour treatment."""
     if not point.policy.spouse:
         return (ProjectionBranch(
             policy=point.policy,
@@ -1712,49 +1375,15 @@ def _projection_branches(
             behaviour=behaviour,
             label="single",
         ),)
-    if behaviour.take_up.mode != "deterministic":
-        raise ValueError(
-            "Joint-Life LSMC model points require deterministic model-point "
-            "Income Election for the spouse-survival fallback split."
-        )
-    joint_behaviour = behaviour
-    if (
-        point.policy.spouse_death_election
-        == SpouseDeathElection.CONTINUE_INCOME
-        and (behaviour.use_dynamic or behaviour.use_dynamic_withdrawals)
-    ):
-        joint_behaviour = replace(behaviour, regime="static")
-    spouse_survival = _spouse_survival_to_election(point, product, mortality)
-    fallback = replace(
-        point.policy,
-        spouse=False,
-        spouse_age=None,
-        spouse_sex=None,
-        spouse_death_election=SpouseDeathElection.CONTINUE_INCOME,
-    )
-    return (
-        ProjectionBranch(
-            policy=point.policy,
-            probability=spouse_survival,
-            behaviour=joint_behaviour,
-            label=(
-                "joint_dynamic_state_dependent"
-                if joint_behaviour.use_dynamic
-                or joint_behaviour.use_dynamic_withdrawals
-                else "joint_static_base"
-            ),
-        ),
-        ProjectionBranch(
-            policy=fallback,
-            probability=1.0 - spouse_survival,
-            behaviour=behaviour,
-            label=(
-                "single_fallback_dynamic"
-                if behaviour.use_dynamic or behaviour.use_dynamic_withdrawals
-                else "single_fallback_static_base"
-            ),
-        ),
-    )
+    # ``project`` maintains the primary/spouse life-state cohorts internally
+    # whenever dynamic Behaviour or non-deterministic Take-up is active.  A
+    # deterministic spouse-survival split would suppress that state dependence.
+    return (ProjectionBranch(
+        policy=point.policy,
+        probability=1.0,
+        behaviour=behaviour,
+        label="pathwise_joint_life_state_dependent",
+    ),)
 
 
 def _model_point_treatment_rows(
@@ -1764,15 +1393,11 @@ def _model_point_treatment_rows(
     behaviour: BehaviourModel,
     source_behaviour: BehaviourModel,
 ) -> list[dict[str, object]]:
-    """Audit the effective Election, mortality split and Behaviour overlay."""
+    """Audit dynamic Election and pathwise Behaviour treatment by model point."""
     rows: list[dict[str, object]] = []
     for point in model_points.model_points:
         policy = point.policy
         scheduled = int(round(float(policy.income_start_year)))
-        effective = policy.effective_income_start_year(product)
-        minimum_adjusted_start = max(
-            scheduled, int(product.min_years_before_income)
-        )
         years_to_automatic_age = max(
             float(product.automatic_income_start_age) - float(policy.age),
             0.0,
@@ -1782,31 +1407,19 @@ def _model_point_treatment_rows(
             int(product.min_years_before_income),
             1,
         )
-        if effective == scheduled:
-            override_reason = "none"
-        elif (
-            effective == automatic_start_anniversary
-            and automatic_start_anniversary < minimum_adjusted_start
-        ):
-            override_reason = "automatic_age_backstop"
-        elif scheduled < product.min_years_before_income:
-            override_reason = "minimum_wait"
-        else:
-            override_reason = "combined_product_constraints"
-        dynamic_active = behaviour.use_dynamic or behaviour.use_dynamic_withdrawals
-        joint_static = bool(
-            policy.spouse
-            and policy.spouse_death_election
-            == SpouseDeathElection.CONTINUE_INCOME
-            and dynamic_active
+        dynamic_active = (
+            behaviour.use_dynamic
+            or behaviour.use_dynamic_take_up
+            or behaviour.use_dynamic_withdrawals
         )
         rows.append({
             "model_point_id": point.model_point_id,
             "contract_weight": float(point.contract_weight),
             "scheduled_income_start_year": scheduled,
-            "effective_income_start_year": effective,
-            "effective_start_overrides_scheduled_start": effective != scheduled,
-            "effective_start_override_reason": override_reason,
+            "scheduled_income_start_year_used_for_dynamic_take_up": False,
+            "effective_income_start_year": None,
+            "effective_start_overrides_scheduled_start": None,
+            "effective_start_override_reason": "not_applicable_dynamic_take_up",
             "product_min_years_before_income": int(
                 product.min_years_before_income
             ),
@@ -1816,34 +1429,23 @@ def _model_point_treatment_rows(
             "automatic_start_anniversary": automatic_start_anniversary,
             "source_income_take_up_mode": source_behaviour.take_up.mode,
             "effective_income_take_up_mode": behaviour.take_up.mode,
-            "dynamic_take_up_coefficients_applied": False,
-            "take_up_override_reason": (
-                "deterministic effective model-point Election; Joint-Life "
-                "fallback compatibility where applicable"
+            "dynamic_take_up_coefficients_applied": bool(
+                behaviour.use_dynamic_take_up
             ),
+            "take_up_override_reason": None,
             "spouse": bool(policy.spouse),
             "spouse_death_election": (
                 policy.spouse_death_election.value if policy.spouse else None
             ),
-            "spouse_survival_to_effective_income_election": (
-                _spouse_survival_to_election(point, product, mortality)
-                if policy.spouse else None
-            ),
+            "spouse_survival_to_effective_income_election": None,
             "behaviour_treatment": _model_point_behaviour_treatment(
                 point, behaviour
             ),
             "joint_branch_behaviour_regime": (
-                (
-                    "static"
-                    if joint_static or not dynamic_active
-                    else "dynamic"
-                )
-                if policy.spouse else None
-            ),
-            "single_fallback_behaviour_regime": (
                 ("dynamic" if dynamic_active else "static")
                 if policy.spouse else None
             ),
+            "single_fallback_behaviour_regime": None,
         })
     return rows
 
@@ -1871,15 +1473,10 @@ def _state_layout(
         (float(p.policy.age), p.policy.sex.value, bool(p.policy.spouse))
         for p in model_points.model_points
     }
-    cohort_set.update(
-        (float(p.policy.age), p.policy.sex.value, False)
-        for p in model_points.model_points if p.policy.spouse
-    )
     cohorts = tuple(sorted(cohort_set))
-    effective_income_starts = tuple(sorted({
-        point.policy.effective_income_start_year(product)
-        for point in model_points.model_points
-    }))
+    # Dynamic Take-up makes the realised Income start path-dependent; a
+    # deterministic model-point start cohort would misstate the control state.
+    effective_income_starts: tuple[int, ...] = ()
     names = [
         "short_rate",
         "zero_rate_5y",
@@ -2041,7 +1638,6 @@ def _aggregate_portfolio_paths(
     progress_label: str,
     model_point_log_interval: int,
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
-    combined_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
     collect_stackelberg_primitives: bool = False,
     collect_policyholder_by_signature: bool = False,
     collect_pre_action_states: bool = False,
@@ -2052,9 +1648,7 @@ def _aggregate_portfolio_paths(
     applied exactly once and ``premium_volume_weight`` is never a valuation
     weight.  Joint-Life points use the same spouse-survival-conditioned joint/
     Single-Life fallback mix and branch-specific Behaviour basis as the active
-    Engine 2.2 portfolio wrapper.  ``surrender_policy_factory`` is retained
-    solely for explicit coupled-candidate benchmarks; deployable fixed-cap LSMC
-    must enter through ``combined_policy_factory``.
+    Engine 2.2 portfolio wrapper.
     """
     caps = np.asarray(cap_matrix, dtype=float)
     if caps.shape[0] != scenarios.n_paths:
@@ -2076,6 +1670,8 @@ def _aggregate_portfolio_paths(
     fees_product = np.zeros_like(guarantee_claims)
     fees_lip = np.zeros_like(guarantee_claims)
     crediting_margin = np.zeros_like(guarantee_claims)
+    money_market_income = np.zeros_like(guarantee_claims)
+    hedge_gain = np.zeros_like(guarantee_claims)
     mva_retained = np.zeros_like(guarantee_claims)
     aps_retained = np.zeros_like(guarantee_claims)
     projected_expenses = np.zeros_like(guarantee_claims)
@@ -2096,24 +1692,6 @@ def _aggregate_portfolio_paths(
         raise ValueError(
             "Stackelberg primitive collection requires the no-action recorder; "
             "an external surrender policy cannot be supplied simultaneously."
-        )
-    if surrender_policy_factory is not None and combined_policy_factory is not None:
-        raise ValueError(
-            "surrender_policy_factory and combined_policy_factory are mutually "
-            "exclusive."
-        )
-    if surrender_policy_factory is not None:
-        owner = getattr(surrender_policy_factory, "__self__", None)
-        method_name = getattr(surrender_policy_factory, "__name__", None)
-        if not isinstance(owner, CoupledPolicyholderFitSet) \
-                or method_name != "benchmark_factory":
-            raise RuntimeError(
-                "The legacy surrender hook is restricted to the explicit coupled "
-                "benchmark factory and cannot be used for deployment."
-            )
-    if collect_stackelberg_primitives and combined_policy_factory is not None:
-        raise ValueError(
-            "Stackelberg primitive collection cannot deploy a combined policy."
         )
 
     representative_premium = float(sum(
@@ -2242,11 +1820,6 @@ def _aggregate_portfolio_paths(
                     _StackelbergPrimitiveCollector()
                     if collect_stackelberg_primitives else None
                 )
-                combined_policy = (
-                    None
-                    if combined_policy_factory is None
-                    else combined_policy_factory(policy)
-                )
                 result = projection_module.project(
                     controlled,
                     policy,
@@ -2262,8 +1835,6 @@ def _aggregate_portfolio_paths(
                         if surrender_policy_factory is None
                         else surrender_policy_factory(policy)
                     ),
-                    income_election_policy=combined_policy,
-                    income_action_policy=combined_policy,
                     cap_decision_observer=cap_state_collector,
                     surrender_decision_observer=primitive_collector,
                 )
@@ -2305,6 +1876,12 @@ def _aggregate_portfolio_paths(
                     "crediting_margin"
                 )
                 crediting_margin += branch_weight * annual_crediting_margin
+                money_market_income += branch_weight * annual_control_cashflow(
+                    "money_market_income"
+                )
+                hedge_gain += branch_weight * annual_control_cashflow(
+                    "hedge_gain"
+                )
                 mva_retained += branch_weight * annual_control_cashflow(
                     "mva_retained"
                 )
@@ -2832,12 +2409,31 @@ def _aggregate_portfolio_paths(
             copy=True,
         )
 
+    if not np.allclose(
+        crediting_margin,
+        money_market_income + hedge_gain,
+        rtol=1.0e-12,
+        atol=1.0e-8,
+    ):
+        raise RuntimeError(
+            "Crediting margin does not reconcile to money-market income plus "
+            "retained hedge gain."
+        )
+    if projection_config.hedge_cap_leg_mode == HedgeCapLegMode.SOLD \
+            and not np.allclose(hedge_gain, 0.0, rtol=0.0, atol=1.0e-10):
+        raise RuntimeError(
+            "The standard sold cap leg must not retain Reference-Fund "
+            "performance above the customer cap."
+        )
+
     return PortfolioPathData(
         guarantee_claims=guarantee_claims,
         other_insurer_funded_benefits=other_insurer_funded_benefits,
         fees_product=fees_product,
         fees_lip=fees_lip,
         crediting_margin=crediting_margin,
+        money_market_income=money_market_income,
+        hedge_gain=hedge_gain,
         mva_retained=mva_retained,
         aps_retained=aps_retained,
         expenses=projected_expenses,
@@ -4111,12 +3707,7 @@ def _rollout_cap_policy_with_projected_states(
     expenses: ExpenseAssumptions,
     projection_config: ProjectionConfig,
     model_point_log_interval: int,
-    benchmark_surrender_policy_factory: Optional[
-        Callable[[PolicySpec], object]
-    ],
-    combined_policy_factory: Optional[
-        Callable[[PolicySpec], object]
-    ] = None,
+    surrender_policy_factory: Optional[Callable[[PolicySpec], object]],
     collect_policyholder_by_signature: bool = False,
 ) -> tuple[Array, PortfolioPathData, dict[str, object]]:
     """Roll out the rich-state policy causally, one frozen prefix at a time.
@@ -4126,16 +3717,8 @@ def _rollout_cap_policy_with_projected_states(
     sufficient to freeze cap ``y`` exactly.  This removes the former
     full-horizon fixed-point convergence selector and ensures that validation
     and evaluation execute the same precommitted policy without either sample
-    being allowed to choose a fallback.  Productive LSMC supplies the frozen
-    combined follower factory for both Projector hooks.  A supplied surrender
-    factory is explicitly benchmark-only and mutually exclusive.
+    being allowed to choose a fallback.
     """
-    if benchmark_surrender_policy_factory is not None \
-            and combined_policy_factory is not None:
-        raise ValueError(
-            "Benchmark surrender and combined follower factories are mutually "
-            "exclusive."
-        )
     caps = np.full((scenarios.n_paths, inputs.n_years), fallback_cap, dtype=float)
     by_year = {policy.year: policy for policy in policy_years}
     fallback_action = int(np.argmin(np.abs(ACTION_CAPS - fallback_cap)))
@@ -4163,8 +3746,7 @@ def _rollout_cap_policy_with_projected_states(
             collect_states=False,
             progress_label=f"Causal rich-state rollout year {year + 1}",
             model_point_log_interval=model_point_log_interval,
-            surrender_policy_factory=benchmark_surrender_policy_factory,
-            combined_policy_factory=combined_policy_factory,
+            surrender_policy_factory=surrender_policy_factory,
             collect_pre_action_states=True,
         )
         rich, rich_names = _portfolio_state_extension(prefix_projected)
@@ -4201,8 +3783,7 @@ def _rollout_cap_policy_with_projected_states(
         collect_states=True,
         progress_label="Causal rich-state rollout final projection",
         model_point_log_interval=model_point_log_interval,
-        surrender_policy_factory=benchmark_surrender_policy_factory,
-        combined_policy_factory=combined_policy_factory,
+        surrender_policy_factory=surrender_policy_factory,
         collect_policyholder_by_signature=collect_policyholder_by_signature,
     )
     return caps, projected, {
@@ -4315,9 +3896,7 @@ def _policyholder_exercise_rows(
 
 
 def _policyholder_regression_rows(
-    fit_sets: Mapping[
-        str, PolicyholderFitSet | CoupledPolicyholderFitSet
-    ],
+    fit_sets: Mapping[str, PolicyholderFitSet],
 ) -> list[dict[str, object]]:
     """Flatten follower-value diagnostics without mixing insurer regressions."""
     rows: list[dict[str, object]] = []
@@ -4346,15 +3925,6 @@ def _policyholder_regression_rows(
                     "mean_continuation_target_aud": None,
                     "training_exercise_rate": 0.0,
                     "regression_accepted_for_exercise": False,
-                    "action_type": None,
-                    "regression_accepted_for_action": False,
-                    "follower_contract_version": getattr(
-                        fit, "fit_version", None
-                    ),
-                    "fit_valid": bool(getattr(fit, "valid", False)),
-                    "fit_invalid_reasons": "|".join(
-                        map(str, getattr(fit, "invalid_reasons", ()))
-                    ),
                     "training_policyholder_value_aud": (
                         fit.training_policyholder_value_aud
                     ),
@@ -4395,13 +3965,6 @@ def _policyholder_regression_rows(
                         fit.training_optionality_uplift_aud
                     ),
                     "training_fallback_used": fit.training_fallback_used,
-                    "follower_contract_version": getattr(
-                        fit, "fit_version", None
-                    ),
-                    "fit_valid": bool(getattr(fit, "valid", False)),
-                    "fit_invalid_reasons": "|".join(
-                        map(str, getattr(fit, "invalid_reasons", ()))
-                    ),
                     "training_scenario_fingerprint": (
                         fit.training_scenario_fingerprint
                     ),
@@ -6292,9 +5855,19 @@ def _backward_induction(
     folds: int,
     ridge: float,
     seed: int,
-    complete_path_fold_ids: Optional[IntArray] = None,
 ) -> BackwardResult:
-    """Cross-fitted Fitted-Q recursion for a repeated discrete control."""
+    """Outer-fold-pure Fitted-Q recursion for the insurer cap control.
+
+    Every outer fold owns a complete future-value chain trained without that
+    fold.  Therefore a path used to diagnose year ``y`` cannot influence its
+    own target indirectly through a regression fitted at year ``y + 1``.  A
+    separate full-sample chain supplies the frozen deployment coefficients.
+
+    The regressions fit the nine auditable insurer components, bound only
+    numerical extrapolation outside the observed component envelope and derive
+    CSM from those components.  The objective remains the signed New Business
+    CSM proxy used throughout this study.
+    """
     if data.raw_states is None:
         raise ValueError("Backward induction requires recorded state paths.")
     if data.inforce_exposure is None:
@@ -6303,69 +5876,70 @@ def _backward_induction(
     if action_indices.shape != (n_paths, n_years):
         raise ValueError("Action indices and projected rewards are inconsistent.")
     LOGGER.info(
-        "Backward induction | %d years | %d actions | %d paths | %d folds",
-        n_years, len(ACTION_CAPS), n_paths, folds,
+        "Outer-fold-pure backward induction | %d years | %d actions | "
+        "%d paths | %d folds plus deployment chain",
+        n_years,
+        len(ACTION_CAPS),
+        n_paths,
+        folds,
     )
-    rng = np.random.default_rng(seed)
-    if complete_path_fold_ids is None:
-        # Stratify complete-path folds by the first action so the cap-selection
-        # sample and held-out first-year CSM sample both contain every cap.
-        fold_ids = np.empty(n_paths, dtype=np.int64)
-        for action in range(len(ACTION_CAPS)):
-            rows = np.flatnonzero(action_indices[:, 0] == action)
-            assigned = np.resize(np.arange(folds, dtype=np.int64), len(rows))
-            fold_ids[rows] = rng.permutation(assigned)
-    else:
-        fold_ids = np.asarray(complete_path_fold_ids, dtype=np.int64)
-        if fold_ids.shape != (n_paths,) \
-                or np.any(fold_ids < 0) or np.any(fold_ids >= folds):
-            raise ValueError(
-                "complete_path_fold_ids must contain one valid fold per path."
-            )
-        if any(not np.any(fold_ids == fold) for fold in range(folds)):
-            raise ValueError("Every requested complete-path fold must be present.")
-        fold_ids = fold_ids.copy()
 
-    # Columns: CSM proxy, Product Fees, LIP Fees, Crediting Margin,
-    # MVA retained, APS retained, Guarantee Claims, other insurer-funded
-    # benefits, operating expenses and hedge-execution costs.
-    continuation = np.zeros((n_paths, 10), dtype=float)
+    rng = np.random.default_rng(seed)
+    # One complete market/control trajectory always remains in one fold.  The
+    # first action is stratified because the time-zero state is common across
+    # paths and its direct action means require every cap in every outer fold.
+    fold_ids = np.full(n_paths, -1, dtype=np.int64)
+    for action in range(len(ACTION_CAPS)):
+        action_rows = np.flatnonzero(action_indices[:, 0] == action)
+        assigned = np.resize(np.arange(folds, dtype=np.int64), len(action_rows))
+        fold_ids[action_rows] = rng.permutation(assigned)
+    if np.any(fold_ids < 0) or set(np.unique(fold_ids)) != set(range(folds)):
+        raise RuntimeError("Complete-path outer-fold assignment is incomplete.")
+
+    _, _, basis_names = _basis_specification(data.state_feature_names)
+    minimum_training_count = max(30, 3 * len(basis_names))
+    for year in range(1, n_years):
+        for action, cap in enumerate(ACTION_CAPS):
+            for fold in range(folds):
+                count = int(np.count_nonzero(
+                    (action_indices[:, year] == action) & (fold_ids != fold)
+                ))
+                if count < minimum_training_count:
+                    raise ValueError(
+                        "Too few outer-fold training paths for policy year "
+                        f"{year + 1}, cap {cap:.4%}, fold {fold}: "
+                        f"{count} < {minimum_training_count}. Increase --n-paths."
+                    )
+
+    # Columns: CSM proxy plus the nine signed/unsigned insurer components in
+    # the stable public output order used by _fit_outer_leader_model().
+    immediate = _portfolio_continue_component_tensor(data)
+    deployment_chain = folds
+    continuations = np.zeros((folds + 1, n_paths, 10), dtype=float)
     policy_years: list[RegressionPolicyYear] = []
     regression_rows: list[dict[str, object]] = []
     policy_year_rows: list[dict[str, object]] = []
     first_year_action_rows: list[dict[str, object]] = []
     active_policy_years: list[int] = []
+    numerical_reasons: set[str] = set()
     first_cap = float("nan")
     first_outputs = np.zeros(10)
     first_se = float("nan")
+    rows_index = np.arange(n_paths)
 
     for year in range(n_years - 1, -1, -1):
-        if (year == n_years - 1 or year == 0 or (year + 1) % 5 == 0):
+        if year == n_years - 1 or year == 0 or (year + 1) % 5 == 0:
             LOGGER.info(
-                "Backward induction | processing policy year %d/%d",
-                year + 1, n_years,
+                "Outer-fold-pure backward induction | policy year %d/%d",
+                year + 1,
+                n_years,
             )
-        year_exposure = data.inforce_exposure[:, year]
+        year_exposure = np.asarray(data.inforce_exposure[:, year], dtype=float)
         if not np.any(year_exposure > 0.0):
             residual_magnitude = max(
-                float(np.max(np.abs(data.new_business_csm_proxy[:, year]))),
-                float(np.max(np.abs(data.guarantee_claims[:, year]))),
-                float(np.max(np.abs(
-                    data.other_insurer_funded_benefits[:, year]
-                ))),
-                float(np.max(np.abs(data.fees_product[:, year]))),
-                float(np.max(np.abs(data.fees_lip[:, year]))),
-                float(np.max(np.abs(data.crediting_margin[:, year]))),
-                float(np.max(np.abs(data.mva_retained[:, year]))),
-                float(np.max(np.abs(data.aps_retained[:, year]))),
-                float(np.max(np.abs(data.expenses[:, year]))),
-                float(np.max(np.abs(data.hedge_costs[:, year]))),
-                float(np.max(np.abs(continuation))),
+                float(np.max(np.abs(immediate[:, year, :]))),
+                float(np.max(np.abs(continuations))),
             )
-            # Split Anniversary ledgers can leave cancellation noise of a few
-            # 1e-10 of premium once all in-force mass is exactly zero.  A one
-            # part in 1e8 audit threshold still rejects any economically
-            # relevant tail while avoiding a false failure on that arithmetic.
             materiality = 1.0e-8 * data.representative_initial_premium
             if residual_magnitude > materiality:
                 raise RuntimeError(
@@ -6373,124 +5947,106 @@ def _backward_induction(
                     "objective magnitude %.6g. Refusing to discard a material "
                     "continuation value." % (year + 1, residual_magnitude)
                 )
-            continuation.fill(0.0)
+            continuations.fill(0.0)
             LOGGER.debug(
-                "Backward induction | policy year %d economically inactive; "
-                "no cap regression fitted.",
+                "Outer-fold-pure backward induction | policy year %d "
+                "economically inactive; no cap regression fitted.",
                 year + 1,
             )
             continue
+
         active_policy_years.append(year + 1)
-        targets = np.column_stack((
-            data.new_business_csm_proxy[:, year] + continuation[:, 0],
-            data.fees_product[:, year] + continuation[:, 1],
-            data.fees_lip[:, year] + continuation[:, 2],
-            data.crediting_margin[:, year] + continuation[:, 3],
-            data.mva_retained[:, year] + continuation[:, 4],
-            data.aps_retained[:, year] + continuation[:, 5],
-            data.guarantee_claims[:, year] + continuation[:, 6],
-            data.other_insurer_funded_benefits[:, year] + continuation[:, 7],
-            data.expenses[:, year] + continuation[:, 8],
-            data.hedge_costs[:, year] + continuation[:, 9],
-        ))
         observed = action_indices[:, year]
 
         if year == 0:
-            # Fold zero is never used to select the first cap.  Its paths get
-            # continuation estimates from regressions trained without fold
-            # zero and provide an honest holdout CSM after the cap is frozen.
-            selection_paths = fold_ids != 0
-            holdout_paths = fold_ids == 0
-            selection_values = np.zeros((len(ACTION_CAPS), 10), dtype=float)
-            holdout_values = np.zeros((len(ACTION_CAPS), 10), dtype=float)
-            selection_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
-            holdout_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
+            # The time-zero state is common.  Use the actually randomised cap
+            # cell and a fold-pure future target for every path; no regression
+            # is needed for this decision.  Independent validation later owns
+            # the deploy/fallback decision, so there is no pseudo holdout fold.
+            oof_targets = np.zeros((n_paths, 10), dtype=float)
+            for fold in range(folds):
+                held_out = fold_ids == fold
+                oof_targets[held_out] = (
+                    immediate[held_out, year, :]
+                    + continuations[fold, held_out, :]
+                )
+            oof_targets[:, 0] = _csm_from_component_values(oof_targets[:, 1:])
+            action_values = np.zeros((len(ACTION_CAPS), 10), dtype=float)
+            action_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
+            action_counts = np.zeros(len(ACTION_CAPS), dtype=np.int64)
             for action, cap in enumerate(ACTION_CAPS):
-                selection = selection_paths & (observed == action)
-                holdout = holdout_paths & (observed == action)
-                if not selection.any() or not holdout.any():
+                selected = observed == action
+                count = int(np.count_nonzero(selected))
+                if count == 0:
                     raise RuntimeError(
-                        f"First-year selection/holdout coverage is missing for cap {cap}."
+                        f"First-year outer-fold coverage is missing for cap {cap}."
                     )
-                selection_values[action] = np.mean(targets[selection], axis=0)
-                holdout_values[action] = np.mean(targets[holdout], axis=0)
-                selection_standard_errors[action] = _standard_error(
-                    targets[selection, 0]
+                action_counts[action] = count
+                action_values[action] = np.mean(oof_targets[selected], axis=0)
+                action_standard_errors[action] = _standard_error(
+                    oof_targets[selected, 0]
                 )
-                holdout_standard_errors[action] = _standard_error(
-                    targets[holdout, 0]
-                )
-            chosen_action = int(_lower_cap_argmax(selection_values[:, 0]))
+            chosen_action = int(_lower_cap_argmax(action_values[:, 0]))
             first_cap = float(ACTION_CAPS[chosen_action])
-            first_outputs = holdout_values[chosen_action]
-            first_se = holdout_standard_errors[chosen_action]
+            first_outputs = action_values[chosen_action]
+            first_se = float(action_standard_errors[chosen_action])
             LOGGER.info(
-                "First-year decision (unscaled representative contract) | "
-                "cap %.2f%% | selection Q-CSM %.2f | holdout CSM %.2f | "
-                "holdout SE %.2f",
+                "First-year outer-fold-pure Bellman diagnostic | cap %.2f%% | "
+                "Q-CSM %.2f | SE %.2f",
                 100.0 * first_cap,
-                selection_values[chosen_action, 0],
                 first_outputs[0],
                 first_se,
             )
             for action, cap in enumerate(ACTION_CAPS):
+                values = action_values[action]
                 first_year_action_rows.append({
                     "cap": float(cap),
                     "cap_percent": 100.0 * float(cap),
                     "selection_estimated_q_new_business_csm_proxy": float(
-                        selection_values[action, 0]
+                        values[0]
                     ),
                     "selection_standard_error_new_business_csm_proxy": float(
-                        selection_standard_errors[action]
+                        action_standard_errors[action]
                     ),
-                    "holdout_estimated_q_new_business_csm_proxy": float(
-                        holdout_values[action, 0]
-                    ),
-                    "holdout_estimated_q_fees_product": float(
-                        holdout_values[action, 1]
-                    ),
-                    "holdout_estimated_q_fees_lip": float(
-                        holdout_values[action, 2]
-                    ),
-                    "holdout_estimated_q_crediting_margin": float(
-                        holdout_values[action, 3]
-                    ),
-                    "holdout_estimated_q_mva_retained": float(
-                        holdout_values[action, 4]
-                    ),
-                    "holdout_estimated_q_aps_retained": float(
-                        holdout_values[action, 5]
-                    ),
-                    "holdout_estimated_q_guarantee_claims": float(
-                        holdout_values[action, 6]
-                    ),
+                    "holdout_estimated_q_new_business_csm_proxy": float(values[0]),
+                    "holdout_estimated_q_fees_product": float(values[1]),
+                    "holdout_estimated_q_fees_lip": float(values[2]),
+                    "holdout_estimated_q_crediting_margin": float(values[3]),
+                    "holdout_estimated_q_mva_retained": float(values[4]),
+                    "holdout_estimated_q_aps_retained": float(values[5]),
+                    "holdout_estimated_q_guarantee_claims": float(values[6]),
                     "holdout_estimated_q_other_insurer_funded_benefits": float(
-                        holdout_values[action, 7]
+                        values[7]
                     ),
-                    "holdout_estimated_q_expenses": float(
-                        holdout_values[action, 8]
-                    ),
-                    "holdout_estimated_q_hedge_costs": float(
-                        holdout_values[action, 9]
-                    ),
+                    "holdout_estimated_q_expenses": float(values[8]),
+                    "holdout_estimated_q_hedge_costs": float(values[9]),
                     "holdout_standard_error_new_business_csm_proxy": float(
-                        holdout_standard_errors[action]
+                        action_standard_errors[action]
                     ),
-                    "selection_path_count": int(np.sum(
-                        selection_paths & (observed == action)
-                    )),
-                    "holdout_path_count": int(np.sum(
-                        holdout_paths & (observed == action)
-                    )),
+                    "selection_path_count": int(action_counts[action]),
+                    "holdout_path_count": int(action_counts[action]),
+                    "observed_control_action_path_count": int(
+                        action_counts[action]
+                    ),
+                    "selection_value_semantics": (
+                        "complete-path outer-fold-pure direct action target"
+                    ),
+                    "holdout_value_semantics": (
+                        "legacy output alias of the same outer-fold-pure target; "
+                        "deployment is decided on the independent validation sample"
+                    ),
                     "economically_active": True,
                     "is_optimal_first_year_cap": action == chosen_action,
+                    "outer_fold_pure": True,
+                    "csm_derived_from_components": True,
                 })
             first_policy = _constant_first_year_policy(
-                year,
-                data.raw_states[selection_paths, year, :],
-                selection_values,
-                selection_standard_errors,
-                data.state_feature_names,
+                year=0,
+                raw_state=data.raw_states[:, 0, :],
+                action_values=action_values,
+                action_standard_errors=action_standard_errors,
+                feature_names=data.state_feature_names,
+                numerically_stable=not numerical_reasons,
             )
             policy_years.append(first_policy)
             policy_year_rows.append({
@@ -6502,36 +6058,126 @@ def _backward_induction(
                 "median_selected_cap": first_cap,
                 "p90_selected_cap": first_cap,
                 "economically_active": True,
-                "mean_inforce_exposure": float(np.mean(
-                    data.inforce_exposure[:, year]
-                )),
+                "mean_inforce_exposure": float(np.mean(year_exposure)),
+                "outer_fold_pure": True,
             })
             continue
 
-        predictions, fitted_policy, diagnostics = _cross_fitted_action_values(
-            year=year,
-            raw_state=data.raw_states[:, year, :],
-            targets=targets,
-            observed_actions=observed,
-            fold_ids=fold_ids,
-            n_folds=folds,
-            ridge=ridge,
-            feature_names=data.state_feature_names,
+        chain_fits: list[_OuterLeaderFit] = []
+        chain_targets: list[Array] = []
+        for chain in range(folds + 1):
+            train_mask = (
+                fold_ids != chain
+                if chain < folds
+                else np.ones(n_paths, dtype=bool)
+            )
+            targets = immediate[:, year, :] + continuations[chain]
+            targets[:, 0] = _csm_from_component_values(targets[:, 1:])
+            fit = _fit_outer_leader_model(
+                year=year,
+                raw_state=data.raw_states[:, year, :],
+                targets=targets,
+                observed_actions=observed,
+                train_mask=train_mask,
+                ridge=ridge,
+                feature_names=data.state_feature_names,
+            )
+            chain_fits.append(fit)
+            chain_targets.append(targets)
+            chosen_chain_action = _lower_cap_argmax(
+                fit.predictions[:, :, 0], axis=1
+            )
+            continuations[chain] = fit.predictions[
+                rows_index, chosen_chain_action
+            ]
+
+        oof = np.zeros((n_paths, len(ACTION_CAPS), 10), dtype=float)
+        for fold in range(folds):
+            held_out = fold_ids == fold
+            oof[held_out] = chain_fits[fold].predictions[held_out]
+        if not np.all(np.isfinite(oof)):
+            raise RuntimeError("Outer-fold insurer Q predictions are non-finite.")
+
+        year_reasons = {
+            f"outer_fold_{fold}::{reason}"
+            for fold, fit in enumerate(chain_fits[:folds])
+            for reason in fit.instability_reasons
+        }
+        year_reasons.update(
+            f"deployment::{reason}"
+            for reason in chain_fits[deployment_chain].instability_reasons
         )
-        chosen = _lower_cap_argmax(predictions[:, :, 0], axis=1)
-        rows = np.arange(n_paths)
-        continuation = predictions[rows, chosen, :]
+        numerical_reasons.update(
+            f"policy_year_{year + 1}::{reason}" for reason in year_reasons
+        )
+
+        action_standard_errors = np.zeros(len(ACTION_CAPS), dtype=float)
+        diagnostics: list[dict[str, object]] = []
+        deployment_fit = chain_fits[deployment_chain]
+        for action, cap in enumerate(ACTION_CAPS):
+            residual_parts: list[Array] = []
+            target_parts: list[Array] = []
+            for fold in range(folds):
+                selected = (fold_ids == fold) & (observed == action)
+                if np.any(selected):
+                    residual_parts.append(
+                        chain_targets[fold][selected, 0]
+                        - oof[selected, action, 0]
+                    )
+                    target_parts.append(chain_targets[fold][selected, 0])
+            residual = np.concatenate(residual_parts)
+            observed_target = np.concatenate(target_parts)
+            rmse = float(np.sqrt(np.mean(residual * residual)))
+            variance = float(np.var(observed_target))
+            action_standard_errors[action] = rmse / np.sqrt(
+                max(observed_target.size, 1)
+            )
+            diagnostics.append({
+                "policy_year": year + 1,
+                "cap": float(cap),
+                "observed_path_count": int(observed_target.size),
+                "basis_dimension": int(
+                    deployment_fit.policy.coefficients.shape[1]
+                ),
+                "ridge_multiplier": float(ridge),
+                "out_of_fold_rmse_new_business_csm_proxy": rmse,
+                "out_of_fold_r_squared_new_business_csm_proxy": (
+                    1.0 - rmse * rmse / variance
+                    if variance > 1.0e-20 else 1.0
+                ),
+                "in_sample_component_clip_fraction": float(
+                    deployment_fit.clip_fractions[action]
+                ),
+                "maximum_fold_component_clip_fraction": float(max(
+                    fit.clip_fractions[action] for fit in chain_fits[:folds]
+                )),
+                "regularized_normal_matrix_condition_number": float(
+                    deployment_fit.conditions[action]
+                ),
+                "design_condition_number": float(
+                    deployment_fit.conditions[action]
+                ),
+                "csm_derived_from_components": True,
+                "outer_fold_pure": True,
+            })
+
+        fitted_policy = replace(
+            deployment_fit.policy,
+            action_value_standard_error=action_standard_errors,
+            numerically_stable=not year_reasons,
+        )
+        chosen = _lower_cap_argmax(oof[:, :, 0], axis=1)
         selected_caps = ACTION_CAPS[chosen]
         LOGGER.debug(
-            "Backward induction | year %d | mean selected cap %.3f%% | "
-            "maximum Q-CSM %.2f (unscaled representative contract)",
+            "Outer-fold-pure backward induction | year %d | mean selected "
+            "cap %.3f%% | mean maximum Q-CSM %.2f",
             year + 1,
             100.0 * float(np.mean(selected_caps)),
-            float(np.mean(continuation[:, 0])),
+            float(np.mean(oof[rows_index, chosen, 0])),
         )
         mean_cap = float(np.mean(selected_caps))
         quantiles = np.quantile(selected_caps, (0.10, 0.50, 0.90))
-        mean_inforce = float(np.mean(data.inforce_exposure[:, year]))
+        mean_inforce = float(np.mean(year_exposure))
         for action, cap in enumerate(ACTION_CAPS):
             fraction = float(np.mean(chosen == action))
             diagnostics[action]["selected_fraction_cross_fitted"] = fraction
@@ -6546,6 +6192,7 @@ def _backward_induction(
                 "p90_selected_cap": float(quantiles[2]),
                 "economically_active": True,
                 "mean_inforce_exposure": mean_inforce,
+                "outer_fold_pure": True,
             })
         regression_rows.extend(diagnostics)
         policy_years.append(fitted_policy)
@@ -6553,24 +6200,16 @@ def _backward_induction(
     policy_years.sort(key=lambda item: item.year)
     active_policy_years.sort()
     if not active_policy_years or active_policy_years[0] != 1:
-        raise RuntimeError("The LSMC portfolio has no active first policy year.")
+        raise RuntimeError(
+            "The control-randomisation portfolio has no active first policy year."
+        )
     expected_active_years = list(range(1, active_policy_years[-1] + 1))
     if active_policy_years != expected_active_years:
         raise RuntimeError(
             "In-force exposure becomes positive after an inactive policy year; "
             "the economic policy horizon is not contiguous."
         )
-    component_csm = (
-        first_outputs[1]
-        + first_outputs[2]
-        + first_outputs[3]
-        + first_outputs[4]
-        + first_outputs[5]
-        - first_outputs[6]
-        - first_outputs[7]
-        - first_outputs[8]
-        - first_outputs[9]
-    )
+    component_csm = _csm_from_component_values(first_outputs[1:][None, :])[0]
     return BackwardResult(
         first_year_cap=first_cap,
         pv_new_business_csm_proxy=float(first_outputs[0]),
@@ -6597,6 +6236,8 @@ def _backward_induction(
         reconciliation_gap=float(first_outputs[0] - component_csm),
         economically_active_policy_years=tuple(active_policy_years),
         inactive_market_tail_year_count=n_years - len(active_policy_years),
+        numerically_stable=not numerical_reasons,
+        numerical_fallback_reasons=tuple(sorted(numerical_reasons)),
     )
 
 
@@ -6638,6 +6279,8 @@ def _summed_csm_components(
         "fees_product",
         "fees_lip",
         "crediting_margin",
+        "money_market_income",
+        "hedge_gain",
         "mva_retained",
         "aps_retained",
         "guarantee_claims",
@@ -6679,19 +6322,25 @@ def _csm_benchmark_row(
     def mean_pv(name: str) -> float:
         return portfolio_scale * float(np.mean(component(name)))
 
-    future_fees = components["fees_product"] + components["fees_lip"]
-    other_margins = (
-        components["crediting_margin"]
+    fee_income = components["fees_product"] + components["fees_lip"]
+    other_income = (
+        components["money_market_income"]
+        + components["hedge_gain"]
         + components["mva_retained"]
         + components["aps_retained"]
     )
-    total_benefits = (
+    claims = (
         components["guarantee_claims"]
         + components["other_insurer_funded_benefits"]
     )
-    total_costs = components["expenses"] + components["hedge_costs"]
-    reconstructed_csm = future_fees + other_margins - total_benefits - total_costs
+    costs = components["expenses"] + components["hedge_costs"]
+    reconstructed_csm = fee_income + other_income - claims - costs
     reconciliation = csm_paths - reconstructed_csm
+    crediting_margin_reconciliation = (
+        components["crediting_margin"]
+        - components["money_market_income"]
+        - components["hedge_gain"]
+    )
     lapse_events = np.asarray(
         components.get("lapse_events", np.zeros_like(csm_paths)),
         dtype=float,
@@ -6710,26 +6359,32 @@ def _csm_benchmark_row(
         "definition": definition,
         "pv_product_fees_aud": mean_pv("fees_product"),
         "pv_lip_fees_aud": mean_pv("fees_lip"),
-        "pv_future_fees_aud": portfolio_scale * float(np.mean(future_fees)),
+        "pv_fee_income_aud": portfolio_scale * float(np.mean(fee_income)),
+        "pv_future_fees_aud": portfolio_scale * float(np.mean(fee_income)),
         "pv_crediting_margin_aud": mean_pv("crediting_margin"),
+        "pv_money_market_income_aud": mean_pv("money_market_income"),
+        "pv_hedge_gain_aud": mean_pv("hedge_gain"),
         "pv_mva_retained_aud": mean_pv("mva_retained"),
         "pv_aps_retained_aud": mean_pv("aps_retained"),
+        "pv_other_income_aud": portfolio_scale * float(np.mean(other_income)),
         "pv_other_insurer_margins_aud": portfolio_scale * float(
-            np.mean(other_margins)
+            np.mean(other_income)
         ),
         "pv_total_insurer_inflows_aud": portfolio_scale * float(np.mean(
-            future_fees + other_margins
+            fee_income + other_income
         )),
         "pv_guarantee_claims_aud": mean_pv("guarantee_claims"),
         "pv_other_insurer_funded_benefits_aud": mean_pv(
             "other_insurer_funded_benefits"
         ),
+        "pv_claims_aud": portfolio_scale * float(np.mean(claims)),
         "pv_total_insurer_funded_benefits_aud": portfolio_scale * float(
-            np.mean(total_benefits)
+            np.mean(claims)
         ),
         "pv_expenses_aud": mean_pv("expenses"),
         "pv_hedge_costs_aud": mean_pv("hedge_costs"),
-        "pv_total_costs_aud": portfolio_scale * float(np.mean(total_costs)),
+        "pv_costs_aud": portfolio_scale * float(np.mean(costs)),
+        "pv_total_costs_aud": portfolio_scale * float(np.mean(costs)),
         "estimated_new_business_csm_proxy_aud": portfolio_scale * float(
             np.mean(csm_paths)
         ),
@@ -6741,6 +6396,14 @@ def _csm_benchmark_row(
         ),
         "new_business_csm_component_reconciliation_max_absolute_aud": (
             portfolio_scale * float(np.max(np.abs(reconciliation)))
+        ),
+        "crediting_margin_reconciliation_gap_aud": (
+            portfolio_scale * float(np.mean(crediting_margin_reconciliation))
+        ),
+        "crediting_margin_reconciliation_max_absolute_aud": (
+            portfolio_scale * float(
+                np.max(np.abs(crediting_margin_reconciliation))
+            )
         ),
         "pv_terminal_closeout_excluded_aud": mean_pv("terminal_closeout"),
         "pv_policyholder_benefits_aud": portfolio_scale * float(
@@ -6800,16 +6463,21 @@ def _evaluate_fixed_benchmarks(
         )
     path_values: dict[str, Array] = {}
     component_paths: dict[str, dict[str, Array]] = {}
-    batch_count = int(np.ceil(len(cases) / batch_size))
+    # Dynamic Take-up and pathwise Joint-Life mortality use seeded projector
+    # draws.  Project cases separately so every cap sees the same draws; simply
+    # stacking repeated market paths would generate different Behaviour draws
+    # for each stacked block and would not be a true CRN comparison.
+    effective_batch_size = 1
+    batch_count = int(np.ceil(len(cases) / effective_batch_size))
     LOGGER.info(
         "Fixed-cap benchmarks | %d cases | %d batches | %d CRN paths/case",
         len(cases), batch_count, base_scenarios.n_paths,
     )
 
     for batch_number, start in enumerate(
-        range(0, len(cases), batch_size), start=1
+        range(0, len(cases), effective_batch_size), start=1
     ):
-        batch = cases[start:start + batch_size]
+        batch = cases[start:start + effective_batch_size]
         labels = ", ".join(label for label, _, _ in batch)
         batch_started = time.perf_counter()
         LOGGER.info(
@@ -6903,13 +6571,13 @@ def _evaluate_fixed_benchmarks(
         row["n_final_evaluation_paths"] = base_scenarios.n_paths - selection_path_count
         rows.append(row)
         LOGGER.debug(
-            "Benchmark result | %s | future fees=%.2f | other margins=%.2f | "
-            "benefits=%.2f | expenses=%.2f | hedge costs=%.2f | "
+            "Benchmark result | %s | fee income=%.2f | other income=%.2f | "
+            "claims=%.2f | expenses=%.2f | hedge costs=%.2f | "
             "CSM proxy=%.2f | SE=%.2f | terminal closeout excluded=%.2f",
             label,
-            row["pv_future_fees_aud"],
-            row["pv_other_insurer_margins_aud"],
-            row["pv_total_insurer_funded_benefits_aud"],
+            row["pv_fee_income_aud"],
+            row["pv_other_income_aud"],
+            row["pv_claims_aud"],
             row["pv_expenses_aud"],
             row["pv_hedge_costs_aud"],
             row["estimated_new_business_csm_proxy_aud"],
@@ -6952,7 +6620,6 @@ def _policyholder_signature_validation(
         )
     rows: list[dict[str, object]] = []
     failed: set[tuple[object, ...]] = set()
-    fixed_combined_policy = policy_label.startswith("fixed_lsmc::")
     for signature in sorted(candidate_keys, key=repr):
         candidate_paths = np.sum(
             candidate.policyholder_benefits_by_signature[signature], axis=1
@@ -6985,13 +6652,8 @@ def _policyholder_signature_validation(
             "confidence_95pct_lower_aud": lower,
             "confidence_95pct_upper_aud": mean + 1.96 * standard_error,
             "continue_fallback_required": rejected,
-            "hard_failure_required": bool(rejected and fixed_combined_policy),
             "selection_rule": (
-                "fixed combined-v2 fit is invalid if the paired 95% lower "
-                "confidence bound is negative"
-                if fixed_combined_policy
-                else "reject the benchmark-only adaptive candidate if the "
-                "paired 95% lower confidence bound is negative"
+                "fallback if the paired 95% lower confidence bound is negative"
             ),
         })
     return rows, failed
@@ -7044,13 +6706,12 @@ def _evaluate_fixed_lsmc_benchmarks(
         evaluation_scenarios, 0, selection_path_count
     ).content_fingerprint
     LOGGER.info(
-        "Fixed-cap combined-v2 follower LSMC | %d separately trained "
-        "fixed/sanity caps",
+        "Fixed-cap follower LSMC | %d separately trained fixed/sanity caps",
         len(cases),
     )
     for number, (label, cap, definition) in enumerate(cases, start=1):
         LOGGER.info(
-            "Fixed-cap combined-v2 follower LSMC %d/%d | cap=%.2f%%",
+            "Fixed-cap follower LSMC %d/%d | cap=%.2f%%",
             number,
             len(cases),
             100.0 * cap,
@@ -7085,7 +6746,7 @@ def _evaluate_fixed_lsmc_benchmarks(
             collect_states=True,
             progress_label=f"Fixed follower evaluation {100.0 * cap:g}%",
             model_point_log_interval=model_point_log_interval,
-            combined_policy_factory=fit_set.factory,
+            surrender_policy_factory=fit_set.factory,
             collect_policyholder_by_signature=True,
         )
         continue_projected = _aggregate_portfolio_paths(
@@ -7117,16 +6778,28 @@ def _evaluate_fixed_lsmc_benchmarks(
         )
         fit_set.validation_fallback_signatures.update(failed_signatures)
         if failed_signatures:
-            raise RuntimeError(
-                "Fixed-cap combined Policyholder LSMC failed independent "
-                "validation for "
-                f"{len(failed_signatures)} signature(s) at cap "
-                + (
-                    "uncapped"
-                    if np.isposinf(cap)
-                    else f"{100.0 * cap:g}%"
-                )
-                + "; a silent Continue fallback is prohibited."
+            LOGGER.warning(
+                "Fixed-cap follower validation | cap=%s | %d signature(s) "
+                "replaced by Continue before final evaluation",
+                "uncapped" if np.isposinf(cap) else f"{100.0 * cap:g}%",
+                len(failed_signatures),
+            )
+            projected = _aggregate_portfolio_paths(
+                scenarios=evaluation_scenarios,
+                cap_matrix=evaluation_caps,
+                product=product,
+                model_points=model_points,
+                behaviour=no_actions,
+                mortality=mortality,
+                expenses=expenses,
+                projection_config=projection_config,
+                collect_states=True,
+                progress_label=(
+                    f"Validated fixed follower evaluation {100.0 * cap:g}%"
+                ),
+                model_point_log_interval=model_point_log_interval,
+                surrender_policy_factory=fit_set.factory,
+                collect_policyholder_by_signature=True,
             )
         deployed_by_signature = projected.policyholder_benefits_by_signature
         continue_by_signature = (
@@ -7157,7 +6830,9 @@ def _evaluate_fixed_lsmc_benchmarks(
                     for diagnostic in fitted.diagnostics
                     if (
                         bool(fitted.training_fallback_used)
-                        or not _diagnostic_action_accepted(diagnostic)
+                        or not bool(
+                            diagnostic.regression_accepted_for_exercise
+                        )
                     )
                 }
             )
@@ -7247,16 +6922,6 @@ def _evaluate_fixed_lsmc_benchmarks(
         row.update({
             "fixed_cap_base_case": label,
             "policyholder_behaviour": "lsmc",
-            "policyholder_follower_contract_version": (
-                COMBINED_FOLLOWER_VERSION
-            ),
-            "policyholder_projector_hooks": (
-                "income_election_policy|income_action_policy"
-            ),
-            "policyholder_action_set": "|".join(
-                COMBINED_FOLLOWER_ACTION_SET
-            ),
-            "invalid_follower_handling": "hard_error_before_rollout",
             "fixed_cap_selection_sample_csm_aud": (
                 portfolio_scale * float(np.mean(all_paths[label][selection]))
             ),
@@ -7373,7 +7038,6 @@ def _evaluate_pathwise_policy_benchmark(
     comparison_paths: Array,
     model_point_log_interval: int,
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
-    combined_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
 ) -> tuple[dict[str, object], Array, PortfolioPathData]:
     """Directly project a frozen pathwise feedback-policy schedule."""
     caps = np.asarray(cap_matrix, dtype=float)
@@ -7394,7 +7058,6 @@ def _evaluate_pathwise_policy_benchmark(
         progress_label=label,
         model_point_log_interval=model_point_log_interval,
         surrender_policy_factory=surrender_policy_factory,
-        combined_policy_factory=combined_policy_factory,
     )
     components = _summed_csm_components(projected, slice(None))
     csm_paths = np.sum(projected.new_business_csm_proxy, axis=1)
@@ -7467,236 +7130,123 @@ def _adaptive_policy_passes_validation(
     )
 
 
-def _regression_payload(regression: object) -> dict[str, object]:
-    """Serialize one frozen follower regression without making it deployable."""
-    orthogonal = getattr(regression, "orthogonal_components", None)
-    return {
-        "premium": float(getattr(regression, "premium")),
-        "raw_feature_count": (
-            None
-            if not hasattr(regression, "raw_feature_count")
-            else int(getattr(regression, "raw_feature_count"))
-        ),
-        "active_feature_indices": np.asarray(
-            getattr(regression, "active_feature_indices"), dtype=int
-        ).tolist(),
-        "orthogonal_components": (
-            None
-            if orthogonal is None
-            else np.asarray(orthogonal, dtype=float).tolist()
-        ),
-        "centre": np.asarray(getattr(regression, "centre"), dtype=float).tolist(),
-        "scale": np.asarray(getattr(regression, "scale"), dtype=float).tolist(),
-        "coefficients": np.asarray(
-            getattr(regression, "coefficients"), dtype=float
-        ).tolist(),
-        "condition_number": float(getattr(regression, "condition_number")),
-        "matrix_rank": int(getattr(regression, "matrix_rank")),
-        "oof_rmse_aud": float(getattr(regression, "oof_rmse_aud")),
-        "selected_ridge": (
-            None
-            if not hasattr(regression, "selected_ridge")
-            else float(getattr(regression, "selected_ridge"))
-        ),
-        "effective_rank": (
-            None
-            if not hasattr(regression, "effective_rank")
-            else int(getattr(regression, "effective_rank"))
-        ),
-        "basis_level": getattr(regression, "basis_level", None),
-        "clip_non_negative": getattr(regression, "clip_non_negative", None),
-    }
-
-
 def _surrender_policy_payload(policy: object) -> dict[str, object]:
-    """Serialize the benchmark-only annual surrender follower."""
+    """Serialize the frozen context-only follower policy used in rollout."""
     settings = getattr(policy, "settings")
     regressions = getattr(policy, "regressions")
     return {
-        "follower_contract_version": LEGACY_COUPLED_FOLLOWER_VERSION,
-        "deployment_eligible": False,
-        "usage": "coupled_candidate_benchmark_only",
-        "settings": dict(vars(settings)),
+        "settings": {
+            key: value
+            for key, value in vars(settings).items()
+        },
         "feature_names": list(POLICYHOLDER_FEATURE_NAMES),
         "regressions_by_decision_step": [
             {
                 "decision_step": int(step),
-                **_regression_payload(regression),
+                "premium": float(regression.premium),
+                "active_feature_indices": (
+                    regression.active_feature_indices.tolist()
+                ),
+                "orthogonal_components": (
+                    regression.orthogonal_components.tolist()
+                ),
+                "centre": regression.centre.tolist(),
+                "scale": regression.scale.tolist(),
+                "coefficients": regression.coefficients.tolist(),
+                "condition_number": float(regression.condition_number),
+                "matrix_rank": int(regression.matrix_rank),
+                "oof_rmse_aud": float(regression.oof_rmse_aud),
             }
             for step, regression in sorted(regressions.items())
         ],
     }
 
 
-def _combined_policy_payload(fit: object) -> dict[str, object]:
-    """Serialize the deployable Election plus monthly Income-action policy."""
-    policy = _require_combined_follower_fit_v2(
-        fit,
-        context="Combined follower policy serialization",
-    )
-    election = getattr(policy, "election_regressions")
-    income_actions = getattr(policy, "income_action_regressions")
-    legacy_surrender = getattr(policy, "surrender_policy")
-    if getattr(legacy_surrender, "regressions", {}):
-        raise RuntimeError(
-            "Combined follower serialization found authoritative legacy surrender "
-            "regressions."
-        )
-    return {
-        "follower_contract_version": COMBINED_FOLLOWER_VERSION,
-        "deployment_eligible": True,
-        "valid": True,
-        "invalid_reasons": [],
-        "action_set": list(COMBINED_FOLLOWER_ACTION_SET),
-        "projector_hooks": ["income_election_policy", "income_action_policy"],
-        "monthly_income_actions_required": True,
-        "provenance_fingerprint": getattr(
-            policy, "provenance_fingerprint", None
-        ),
-        "fit_basis_fingerprint": getattr(fit, "fit_basis_fingerprint", None),
-        "settings": dict(vars(getattr(policy, "settings"))),
-        "election_advantage_regressions_by_decision_step": [
-            {
-                "decision_step": int(step),
-                **_regression_payload(getattr(pair, "advantage")),
-            }
-            for step, pair in sorted(election.items())
-        ],
-        "income_action_advantage_regressions_by_decision_step": [
-            {
-                "decision_step": int(step),
-                "full_withdrawal": (
-                    None
-                    if getattr(models, "full_withdrawal_advantage") is None
-                    else _regression_payload(
-                        getattr(models, "full_withdrawal_advantage")
-                    )
-                ),
-                "partial_withdrawal": (
-                    None
-                    if getattr(models, "partial_withdrawal_advantage") is None
-                    else _regression_payload(
-                        getattr(models, "partial_withdrawal_advantage")
-                    )
-                ),
-            }
-            for step, models in sorted(income_actions.items())
-        ],
-        "legacy_surrender_compatibility": {
-            "authoritative_for_deployment": False,
-            "regression_count": 0,
-            "provenance_fingerprint": getattr(
-                legacy_surrender, "provenance_fingerprint", None
-            ),
-        },
-    }
-
-
 def _policyholder_fit_set_payload(fit_set: object) -> dict[str, object]:
     """Persist every signature-specific frozen follower regression."""
-    if isinstance(fit_set, CoupledPolicyholderFitSet) and not fit_set.fits:
-        signatures: list[dict[str, object]] = []
-        for signature in sorted(fit_set.policies, key=repr):
-            signature_text = json.dumps(
-                signature, default=str, separators=(",", ":")
-            )
-            fallback_steps = tuple(
-                fit_set.fallback_steps_by_signature.get(signature, ())
-            )
-            signatures.append({
-                "policy_signature": signature_text,
-                "policy_signature_fingerprint": hashlib.sha256(
-                    signature_text.encode("utf-8")
-                ).hexdigest(),
-                "benchmark_continue_fallback_decision_steps": list(
-                    fallback_steps
-                ),
-                "benchmark_policy": _surrender_policy_payload(
-                    fit_set.policies[signature]
-                ),
-            })
-        return {
-            "source": "coupled_two_value_backward_induction_benchmark_only",
-            "follower_contract_version": LEGACY_COUPLED_FOLLOWER_VERSION,
-            "deployment_eligible": False,
-            "deployment_block_reason": (
-                "coupled primitives omit Growth Election and monthly Partial-"
-                "Withdrawal counterfactuals"
-            ),
-            "training_scenario_fingerprint": fit_set.scenario_fingerprint,
-            "training_cap_schedule_fingerprint": (
-                fit_set.cap_schedule_fingerprint
-            ),
-            "signature_count": fit_set.signature_count,
-            "fallback_signature_count": fit_set.fallback_count,
-            "signatures": signatures,
+    if isinstance(fit_set, CoupledPolicyholderFitSet):
+        policies = fit_set.policies
+        validation_fallbacks = set(fit_set.fallback_signatures)
+        fallback_steps = dict(fit_set.fallback_steps_by_signature)
+        source = "coupled_two_value_backward_induction"
+    elif isinstance(fit_set, PolicyholderFitSet):
+        policies = {
+            signature: fit.policy
+            for signature, fit in fit_set.fits.items()
         }
-    if not isinstance(
-        fit_set, (PolicyholderFitSet, CoupledPolicyholderFitSet)
-    ):
+        validation_fallbacks = set(
+            fit_set.validation_fallback_signatures
+        )
+        fallback_steps = {
+            signature: tuple(sorted(
+                {
+                    int(diagnostic.decision_step)
+                    for diagnostic in fit.diagnostics
+                    if not bool(
+                        diagnostic.regression_accepted_for_exercise
+                    )
+                }
+                | (
+                    {
+                        int(diagnostic.decision_step)
+                        for diagnostic in fit.diagnostics
+                    }
+                    if bool(fit.training_fallback_used)
+                    else set()
+                )
+            ))
+            for signature, fit in fit_set.fits.items()
+        }
+        for signature in validation_fallbacks:
+            fit = fit_set.fits[signature]
+            fallback_steps[signature] = tuple(sorted(
+                set(fallback_steps.get(signature, ()))
+                | {int(step) for step in fit.policy.regressions}
+                | {
+                    int(diagnostic.decision_step)
+                    for diagnostic in fit.diagnostics
+                }
+            ))
+        source = "fresh_fixed_cap_policyholder_lsmc"
+    else:
         raise TypeError("Unsupported Policyholder fit-set type.")
-
-    is_coupled = isinstance(fit_set, CoupledPolicyholderFitSet)
-
-    signatures = []
-    for signature in sorted(fit_set.fits, key=repr):
+    signatures: list[dict[str, object]] = []
+    for signature in sorted(policies, key=repr):
         signature_text = json.dumps(
             signature, default=str, separators=(",", ":")
         )
-        fit = fit_set.fits[signature]
-        _require_combined_follower_fit_v2(
-            fit,
-            context=(
-                "Coupled follower payload"
-                if is_coupled else "Fixed-cap follower payload"
-            ),
+        trained_policy = policies[signature]
+        deployed_fallback_steps = tuple(fallback_steps.get(signature, ()))
+        trained_steps = set(getattr(trained_policy, "regressions"))
+        fallback_step_set = set(deployed_fallback_steps)
+        expected_steps = trained_steps | fallback_step_set
+        accepted_steps = (
+            set()
+            if signature in validation_fallbacks
+            else trained_steps - fallback_step_set
         )
-        if signature in getattr(
-            fit_set, "validation_fallback_signatures", set()
-        ):
-            raise RuntimeError(
-                "A validation-invalid fixed-cap follower reached serialization."
-            )
-        fallback_steps = tuple(sorted({
-            int(diagnostic.decision_step)
-            for diagnostic in fit.diagnostics
-            if not _diagnostic_action_accepted(diagnostic)
-        }))
-        policy = fit.policy
-        deployed_regression_count = (
-            len(policy.election_regressions)
-            + sum(
-                int(models.full_withdrawal_advantage is not None)
-                + int(models.partial_withdrawal_advantage is not None)
-                for models in policy.income_action_regressions.values()
-            )
-        )
+        whole_signature_fallback = bool(expected_steps) and not accepted_steps
+        # Deployment replaces a failed signature with Continue.  Persist that
+        # switch explicitly while retaining the trained regression for audit.
         signatures.append({
             "policy_signature": signature_text,
             "policy_signature_fingerprint": hashlib.sha256(
                 signature_text.encode("utf-8")
             ).hexdigest(),
-            "valid": True,
-            "hard_failure_on_invalid": True,
-            "no_action_fallback_decision_steps": list(fallback_steps),
-            "deployed_regression_count": deployed_regression_count,
-            "trained_policy": _combined_policy_payload(fit),
+            "continue_fallback_deployed": bool(deployed_fallback_steps),
+            "whole_signature_continue_fallback_deployed": (
+                whole_signature_fallback
+            ),
+            "continue_fallback_decision_steps": list(
+                deployed_fallback_steps
+            ),
+            "trained_policy": _surrender_policy_payload(trained_policy),
+            "deployed_regression_count": (
+                len(accepted_steps)
+            ),
         })
     return {
-        "source": (
-            "cap_randomised_coupled_combined_policyholder_lsmc"
-            if is_coupled
-            else "fresh_fixed_cap_combined_policyholder_lsmc"
-        ),
-        "follower_contract_version": COMBINED_FOLLOWER_VERSION,
-        "combined_v2_capability_complete": True,
-        "deployment_eligible": not is_coupled,
-        "deployment_block_reason": (
-            "cap-randomised response surface lacks nested Leader/Follower "
-            "folds, joint on-policy iteration and three-seed component validation"
-            if is_coupled else None
-        ),
-        "invalid_fit_handling": "hard_error_before_rollout",
+        "source": source,
         "training_scenario_fingerprint": fit_set.scenario_fingerprint,
         "training_cap_schedule_fingerprint": (
             fit_set.cap_schedule_fingerprint
@@ -7723,14 +7273,14 @@ def _policy_payload(
     deployed_rule = (
         "Apply the year-specific fitted-Q coefficients, choose the maximum "
         "CSM action with the lower-cap tie-break, and use the same rule as "
-        "the coupled backward recursion."
+        "the insurer backward recursion under dynamic Behaviour."
         if adaptive_policy_selected
         else "Ignore the fitted-Q coefficients for deployment and apply the "
         "fixed fallback cap in every policy year."
     )
     return {
         "engine_version": ENGINE_VERSION,
-        "method": "cross_fitted_control_randomisation_fitted_q",
+        "method": "outer_fold_pure_control_randomisation_fitted_q",
         "optimization_direction": "maximize",
         "numerically_stable": bool(result.numerically_stable),
         "numerical_fallback_reasons": list(
@@ -7742,6 +7292,8 @@ def _policy_payload(
             "product_fees",
             "lip_fees",
             "crediting_margin",
+            "money_market_income",
+            "hedge_gain",
             "mva_retained",
             "aps_retained",
             "guarantee_claims",
@@ -7784,8 +7336,7 @@ def _policy_payload(
             ),
             "adaptive_validation_rule": (
                 "Select the adaptive candidate only when its paired direct-"
-                "projection validation delta exceeds 1.96 standard errors and "
-                "its follower satisfies the deployable combined-v2 contract."
+                "projection validation delta exceeds 1.96 standard errors."
             ),
             "local_action_advantage_screen_applied": False,
             "advantage_screen_is_confidence_interval": False,
@@ -7937,7 +7488,8 @@ def _plot_flexibility_value(
         if row.get("is_best_fixed_cap_requested_1_to_20_grid", False)
     )
     flexible = next(
-        row for row in benchmark_rows if row["case"] == "flexible_lsmc_policy"
+        row for row in benchmark_rows
+        if row["case"] == "flexible_dynamic_behaviour_policy"
     )
     rows = (no_credit, requested_fixed, best_fixed, flexible)
     labels = (
@@ -8092,9 +7644,13 @@ def _plot_first_year_choice(
     chosen = next(row for row in ordered if row["is_optimal_first_year_cap"])
     chosen_cap = float(chosen["cap_percent"])
     deployed_cap = float(summary["optimal_first_year_cap_percent"])
-    coupled_oof = any(
+    single_oof_series = any(
         bool(row.get("two_value_stackelberg_recursion", False))
+        or bool(row.get("outer_fold_pure", False))
         for row in ordered
+    )
+    outer_fold_pure = any(
+        bool(row.get("outer_fold_pure", False)) for row in ordered
     )
 
     figure, axis = pyplot.subplots(figsize=(10.5, 6.2))
@@ -8102,11 +7658,14 @@ def _plot_first_year_choice(
         caps, selection, yerr=1.96 * selection_se,
         marker="o", markersize=4, linewidth=1.5, capsize=2,
         label=(
-            "Complete-path OOF coupled Q"
-            if coupled_oof else "Selection folds: estimated Q"
+            "Complete-path outer-fold-pure OOF Q"
+            if outer_fold_pure
+            else "Complete-path OOF coupled Q"
+            if single_oof_series
+            else "Selection folds: estimated Q"
         ),
     )
-    if not coupled_oof:
+    if not single_oof_series:
         axis.errorbar(
             caps, holdout, yerr=1.96 * holdout_se,
             marker="s", markersize=3.5, linewidth=1.2, capsize=2,
@@ -8194,7 +7753,7 @@ def _plot_fixed_cap_checks(
     )
     special_styles = {
         "uncapped_positive_credit": ("No upper cap", "tab:green", "--"),
-        "flexible_lsmc_policy": (
+        "flexible_dynamic_behaviour_policy": (
             "Flexible annual cap policy (direct rollout)", "tab:purple", "-."
         ),
     }
@@ -8258,15 +7817,11 @@ def _plot_fixed_cap_decomposition(
     lip_fees = np.asarray([
         float(row["pv_lip_fees_aud"]) for row in numeric
     ])
-    other_margins = np.asarray([
-        float(row["pv_other_insurer_margins_aud"]) for row in numeric
+    other_income = np.asarray([
+        float(row["pv_other_income_aud"]) for row in numeric
     ])
     claims = -np.asarray([
-        float(row["pv_guarantee_claims_aud"]) for row in numeric
-    ])
-    other_benefits = -np.asarray([
-        float(row["pv_other_insurer_funded_benefits_aud"])
-        for row in numeric
+        float(row["pv_claims_aud"]) for row in numeric
     ])
     expenses = -np.asarray([
         float(row["pv_expenses_aud"]) for row in numeric
@@ -8285,15 +7840,10 @@ def _plot_fixed_cap_decomposition(
     figure, axis = pyplot.subplots(figsize=(11.5, 7.0))
     axis.plot(caps, product_fees, marker="s", label="+ Product fees")
     axis.plot(caps, lip_fees, marker="^", label="+ LIP fees")
-    axis.plot(caps, other_margins, marker="D", label="+ Other insurer margins")
-    axis.plot(caps, claims, marker="o", label="− Guarantee claims")
-    if np.any(np.abs(other_benefits) > 0.0):
-        axis.plot(
-            caps, other_benefits, marker="v",
-            label="− Other insurer-funded benefits",
-        )
+    axis.plot(caps, other_income, marker="D", label="+ Other income")
+    axis.plot(caps, claims, marker="o", label="− Claims")
     axis.plot(caps, expenses, marker="P", label="− Operating expenses")
-    axis.plot(caps, hedge_costs, marker="X", label="− Hedge execution costs")
+    axis.plot(caps, hedge_costs, marker="X", label="− Option/hedge costs")
     axis.plot(
         caps, csm, color="black", linewidth=2.0,
         label="Approximate New Business CSM",
@@ -8614,15 +8164,21 @@ def _generate_plots(
 def main() -> None:
     args = parse_args()
     run_started = time.perf_counter()
-    run_created_utc = datetime.now(timezone.utc).isoformat()
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    run_created = datetime.now(timezone.utc)
+    run_created_utc = run_created.isoformat()
+    run_id = run_created.strftime("%Y%m%dT%H%M%S.%fZ")
     script_path = Path(__file__).resolve()
     script_sha256 = hashlib.sha256(script_path.read_bytes()).hexdigest()
-    output = args.output.expanduser().resolve()
-    preexisting_outputs = list(output.glob("*")) if output.is_dir() else []
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = args.output.expanduser().resolve()
+    output = output_root / run_id
+    output.mkdir(parents=True, exist_ok=False)
     log_path = _configure_logging(output, args.log_level)
-    LOGGER.info("Crediting-cap LSMC run started | output=%s", output)
+    LOGGER.info(
+        "Crediting-cap dynamic-Behaviour run started | output root=%s | "
+        "run directory=%s",
+        output_root,
+        output,
+    )
     LOGGER.info(
         "Controls | training paths=%d | benchmark paths=%d | seed=%d | "
         "folds=%d | Heston substeps=%d | caps=%s",
@@ -8633,16 +8189,9 @@ def main() -> None:
         args.heston_substeps,
         ",".join(f"{100.0 * cap:g}%" for cap in ACTION_CAPS),
     )
-    if preexisting_outputs:
-        LOGGER.warning(
-            "Output directory already contains %d item(s); matching result "
-            "files and plots will be overwritten.",
-            len(preexisting_outputs),
-        )
-    # Invalidate any completed summary from an earlier run before the first
-    # fallible stage.  If this process stops unexpectedly, consumers see an
-    # explicit non-completed status and the current run id, never stale results
-    # presented as the outcome of the new invocation.
+    # Mark the new timestamped run before the first fallible stage.  If this
+    # process stops unexpectedly, consumers see an explicit non-completed
+    # status and the current run id in that run's own directory.
     running_summary = {
         "status": "running",
         "run_id": run_id,
@@ -8689,13 +8238,9 @@ def main() -> None:
             assumption_set_id=args.behaviour_assumption_set,
             value_basis=args.behaviour_value_basis,
         )
-    # Resolve Take-up deterministically from each model point's effective
-    # Election anniversary.  Branch-specific dynamic/static treatment is
-    # applied below exactly as in the active portfolio wrapper.
-    dynamic_behaviour = replace(
-        loaded_behaviour.behaviour,
-        take_up=replace(loaded_behaviour.behaviour.take_up, mode="deterministic"),
-    )
+    # This dedicated runner deliberately preserves the complete loaded dynamic
+    # Behaviour model, including state-dependent Income Election.
+    dynamic_behaviour = loaded_behaviour.behaviour
     if not args.performance_gap_behaviour:
         dynamic_behaviour = replace(
             dynamic_behaviour,
@@ -8707,11 +8252,7 @@ def main() -> None:
                 ),
             ),
         )
-    behaviour = (
-        dynamic_behaviour
-        if args.policyholder_behaviour == "dynamic"
-        else no_voluntary_action_behaviour(dynamic_behaviour)
-    )
+    behaviour = dynamic_behaviour
     with _logged_stage("Load and validate policyholder model points"):
         model_points = load_policyholder_model_points(
             args.model_points,
@@ -8727,10 +8268,6 @@ def main() -> None:
         behaviour,
         loaded_behaviour.behaviour,
     )
-    effective_start_override_count = sum(
-        bool(row["effective_start_overrides_scheduled_start"])
-        for row in treatment_rows
-    )
     joint_life_count = sum(bool(row["spouse"]) for row in treatment_rows)
     joint_continue_income_count = sum(
         point.policy.spouse
@@ -8740,86 +8277,36 @@ def main() -> None:
     )
     joint_lump_sum_count = joint_life_count - joint_continue_income_count
     dynamic_behaviour_active = (
-        behaviour.use_dynamic or behaviour.use_dynamic_withdrawals
+        behaviour.use_dynamic
+        or behaviour.use_dynamic_take_up
+        or behaviour.use_dynamic_withdrawals
     )
     base_branch_behaviour = (
         "dynamic_state_dependent" if dynamic_behaviour_active else "static_base"
     )
     behaviour_treatment_by_branch = {
         "single_life": base_branch_behaviour,
-        "continue_income_joint_conditional": (
-            "static_base" if joint_continue_income_count else "not_applicable"
-        ),
-        "continue_income_single_fallback": (
-            base_branch_behaviour
-            if joint_continue_income_count else "not_applicable"
-        ),
-        "lump_sum_spouse_joint_and_single_fallback": (
-            base_branch_behaviour if joint_lump_sum_count else "not_applicable"
+        "joint_life": (
+            "pathwise_joint_life_state_dependent"
+            if joint_life_count else "not_applicable"
         ),
     }
     joint_life_behaviour_treatment = (
-        "mixed_by_spouse_election: Continue-Income joint static with base "
-        "Single fallback; Lump-Sum joint and fallback use base Behaviour"
-        if joint_continue_income_count and joint_lump_sum_count
-        else "joint_branch_static_base_single_fallback_dynamic_for_continue_income"
-        if joint_continue_income_count and dynamic_behaviour_active
-        else "joint_and_single_branches_static_base_for_continue_income"
-        if joint_continue_income_count
-        else "dynamic_joint_and_fallback_for_lump_sum_spouse_option"
-        if joint_life_count and dynamic_behaviour_active
-        else "static_base_for_lump_sum_spouse_option"
-        if joint_life_count
-        else "not_applicable"
+        "pathwise_joint_life_state_dependent"
+        if joint_life_count else "not_applicable"
     )
     projection_semantics: dict[str, object] = {
         "engine_version": ENGINE_VERSION,
         "policyholder_behaviour_mode": args.policyholder_behaviour,
         "statistical_lapse_applied_alongside_lsmc": False,
-        "policyholder_lsmc_replaces_statistical_voluntary_actions": (
-            args.policyholder_behaviour == "lsmc"
-        ),
-        "fixed_cap_lsmc_follower_contract_version": (
-            COMBINED_FOLLOWER_VERSION
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "fixed_cap_lsmc_projector_hooks": (
-            ["income_election_policy", "income_action_policy"]
-            if args.policyholder_behaviour == "lsmc" else []
-        ),
-        "fixed_cap_lsmc_action_set": (
-            list(COMBINED_FOLLOWER_ACTION_SET)
-            if args.policyholder_behaviour == "lsmc" else []
-        ),
-        "coupled_candidate_follower_contract_version": (
-            COMBINED_FOLLOWER_VERSION
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "coupled_candidate_follower_deployment_eligible": (
-            False
-        ),
-        "coupled_candidate_combined_v2_capability_complete": (
-            args.policyholder_behaviour == "lsmc"
-        ),
-        "coupled_candidate_deployment_block_reason": (
-            "missing_nested_leader_follower_folds_on_policy_iteration_and_"
-            "three_seed_component_validation"
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "coupled_candidate_lsmc_projector_hooks": (
-            ["income_election_policy", "income_action_policy"]
-            if args.policyholder_behaviour == "lsmc" else []
-        ),
-        "coupled_candidate_lsmc_action_set": (
-            list(COMBINED_FOLLOWER_ACTION_SET)
-            if args.policyholder_behaviour == "lsmc" else []
-        ),
-        "invalid_fixed_cap_follower_treatment": "hard_error_before_rollout",
+        "policyholder_lsmc_replaces_statistical_voluntary_actions": False,
+        "policyholder_lsmc_used": False,
+        "dynamic_income_election_used": bool(behaviour.use_dynamic_take_up),
         "leader_state_timing": (
             "after old-cap credit, fee posting, mortality and Election; before "
             "new-cap DVA/hedge restart"
         ),
-        "announced_cap_observable_to_same_anniversary_income_action": True,
+        "announced_cap_observable_to_same_anniversary_surrender": True,
         "source_behaviour_regime": loaded_behaviour.behaviour.regime,
         "base_behaviour_regime": behaviour.regime,
         "dynamic_lapse_or_withdrawal_active_on_base_behaviour": (
@@ -8863,49 +8350,31 @@ def main() -> None:
         "behaviour_treatment_by_branch": behaviour_treatment_by_branch,
         "source_income_take_up_mode": loaded_behaviour.behaviour.take_up.mode,
         "effective_income_take_up_mode": behaviour.take_up.mode,
-        "dynamic_take_up_coefficients_applied": False,
-        "external_combined_income_election_policy_on_fixed_cap_lsmc": (
-            args.policyholder_behaviour == "lsmc"
+        "dynamic_take_up_coefficients_applied": bool(
+            behaviour.use_dynamic_take_up
         ),
-        "take_up_override_reason": (
-            "combined-v2 follower chooses Growth WAIT/START in fixed-cap and "
-            "cap-randomised coupled LSMC"
-            if args.policyholder_behaviour == "lsmc"
-            else "deterministic effective model-point Election convention; "
-            "also required for Joint-Life spouse-survival fallback compatibility"
-        ),
+        "take_up_override_reason": None,
         "income_take_up_source": (
-            "combined_v2_income_election_policy_with_contractual_minimum_wait_"
-            "and_automatic_age_backstop"
-            if args.policyholder_behaviour == "lsmc"
-            else "effective_model_point_income_start_year_with_minimum_wait_"
-            "and_automatic_age_backstop"
+            "dynamic_behaviour_hazard_with_contractual_minimum_wait_and_"
+            "automatic_age_backstop"
         ),
-        "effective_income_start_override_model_point_count": (
-            effective_start_override_count
-        ),
+        "effective_income_start_override_model_point_count": None,
         "product_min_years_before_income": int(
             costs.product.min_years_before_income
         ),
         "product_automatic_income_start_age": float(
             costs.product.automatic_income_start_age
         ),
-        "distinct_effective_income_start_years": sorted({
-            int(row["effective_income_start_year"])
-            for row in treatment_rows
-        }),
-        "effective_income_start_state_cohorts_added": len({
-            int(row["effective_income_start_year"])
-            for row in treatment_rows
-        }) > 1,
+        "distinct_effective_income_start_years": [],
+        "effective_income_start_state_cohorts_added": False,
         "effective_income_start_state_cohorts": (
-            "included when more than one effective start year is present"
+            "not applicable; Income Election is path-dependent under dynamic Take-up"
         ),
         "joint_life_model_point_count": joint_life_count,
         "joint_continue_income_model_point_count": joint_continue_income_count,
         "joint_lump_sum_model_point_count": joint_lump_sum_count,
         "joint_life_election_treatment": (
-            "spouse_survival_weighted_joint_and_single_life_fallback"
+            "pathwise_primary_and_spouse_life_state"
             if joint_life_count else "not_applicable_single_life_portfolio"
         ),
         "joint_life_dependence": (
@@ -8913,7 +8382,7 @@ def main() -> None:
         ),
         "joint_life_behaviour_treatment": joint_life_behaviour_treatment,
         "joint_life_four_state_account_cohorts": (
-            False if joint_life_count else None
+            True if joint_life_count else None
         ),
         "income_lapse_after_account_value_exhaustion": (
             "full surrender is ineligible once the customer surrender value "
@@ -8931,19 +8400,24 @@ def main() -> None:
         ),
         "mortality_terminal_age": float(MORTALITY_TERMINAL_AGE),
         "scalar_behaviour_schedule_validation": "strict_engine_loader",
+        "csm_definition": (
+            "PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)"
+        ),
         "new_business_csm_proxy_scope": (
-            "Product Fees + LIP Fees "
-            + ("+ Crediting Margin " if args.hedge_gain else "")
-            + "+ MVA/APS retained "
-            "minus Guarantee Claims, other insurer-funded benefits, operating "
-            "expenses and hedge-execution costs"
+            "Fee Income = Product Fees + LIP Fees; Other Income = pathwise "
+            "Money-Market Income + retained Hedge Gain + MVA/APS retained; "
+            "Claims = Guarantee Claims + other insurer-funded benefits; "
+            "Costs = acquisition/maintenance/other operating expenses + full "
+            "option/hedge costs"
         ),
         "other_insurer_funded_benefit_cashflow_keys": list(
             OTHER_INSURER_FUNDED_BENEFIT_KEYS
         ),
         "account_value_funded_policyholder_benefits_in_csm_proxy": False,
-        "crediting_margin_in_csm_proxy": bool(args.hedge_gain),
-        "hedge_gain_toggle": bool(args.hedge_gain),
+        "crediting_margin_in_csm_proxy": True,
+        "money_market_income_in_csm_proxy": True,
+        "hedge_cap_leg_mode": HedgeCapLegMode.SOLD.value,
+        "retained_above_cap_hedge_gain_in_csm_proxy": False,
         "operating_expenses_in_csm_proxy": True,
         "hedge_costs_in_csm_proxy": True,
         "hedge_volatility_spread": float(costs.projection.hedge_vol_spread),
@@ -8963,24 +8437,12 @@ def main() -> None:
     )
     projection_config = replace(
         costs.projection,
-        crediting_margin_enabled=bool(args.hedge_gain),
+        crediting_margin_enabled=True,
+        hedge_cap_leg_mode=HedgeCapLegMode.SOLD,
         record_paths=True,
         heston_cos=False,
+        force_pathwise_joint_life=True,
     )
-    follower_settings = OptimalBehaviourLSMCSettings(
-        ridge=args.policyholder_lsmc_ridge,
-        n_folds=args.policyholder_lsmc_folds,
-        exercise_buffer_rmse_multiplier=(
-            args.policyholder_exercise_buffer_rmse_multiplier
-        ),
-    )
-    if args.policyholder_behaviour == "lsmc" \
-            and args.cross_fit_folds != follower_settings.n_folds:
-        raise ValueError(
-            "Coupled v2 requires insurer and Policyholder complete-path folds "
-            "to be identical; --cross-fit-folds must equal "
-            "--policyholder-lsmc-folds."
-        )
     LOGGER.info(
         "Inputs ready | engine=%s | model points=%d | youngest covered age=%.1f | "
         "market horizon=%.2f years | policy years=%d | behaviour=%s | "
@@ -8995,18 +8457,12 @@ def main() -> None:
     )
     LOGGER.info(
         "Income Election | source take-up=%s | effective take-up=%s | "
-        "effective-start overrides=%d/%d | convention=%s",
+        "dynamic covariates active=%s | contractual minimum wait and "
+        "automatic-age-%.1f backstop",
         loaded_behaviour.behaviour.take_up.mode,
         behaviour.take_up.mode,
-        effective_start_override_count,
-        len(treatment_rows),
-        (
-            "combined-v2 WAIT/START for deployable fixed-cap LSMC; model-point "
-            "Election only in the coupled benchmark"
-            if args.policyholder_behaviour == "lsmc"
-            else "model point/minimum wait/automatic-age-"
-            f"{float(costs.product.automatic_income_start_age):g} backstop"
-        ),
+        behaviour.use_dynamic_take_up,
+        float(costs.product.automatic_income_start_age),
     )
     LOGGER.info(
         "Joint-Life application | model points=%d | Continue-Income=%d | "
@@ -9020,11 +8476,10 @@ def main() -> None:
         "Behaviour treatment by branch | %s", behaviour_treatment_by_branch
     )
     LOGGER.info(
-        "Behaviour feedback | mode=%s | LSMC uses a signature-specific "
-        "customer-value function with explicit announced cap and no parallel "
-        "statistical lapse; leader state is the exact pre-cap aggregate "
-        "portfolio exposure plus adapted market/cap history.",
-        args.policyholder_behaviour,
+        "Behaviour feedback | dynamic statistical Income Election, lapse and "
+        "withdrawals are applied directly by the monthly projector; no "
+        "Policyholder LSMC is fitted. Leader state is the exact pre-cap "
+        "aggregate portfolio exposure plus adapted market/cap history."
     )
     LOGGER.info(
         "Performance-gap lapse proxy | enabled=%s | basis=%s | competing-risk "
@@ -9043,12 +8498,13 @@ def main() -> None:
         MORTALITY_TERMINAL_AGE,
     )
     LOGGER.info(
-        "Objective | MAX New Business CSM proxy | +Product/LIP Fees "
-        "+%sCrediting Margin +MVA/APS margins -Guarantee/other insurer benefits "
-        "-Expenses -Hedge costs | DVA=%s | hedge vol spread=%.6f",
-        "" if args.hedge_gain else "NO ",
+        "Objective | MAX CSM = PV(Fee Income) + PV(Other Income) - "
+        "PV(Claims) - PV(Costs) | Other Income includes Money-Market backing "
+        "and zero retained above-cap gain | DVA=%s | hedge vol spread=%.6f | "
+        "hedge cap leg=%s (no retained above-cap performance)",
         projection_config.dva_enabled,
         projection_config.hedge_vol_spread,
+        projection_config.hedge_cap_leg_mode.value,
     )
     LOGGER.info(
         "Cost timing | time-zero acquisition cost -> first control year | "
@@ -9090,24 +8546,6 @@ def main() -> None:
         exploration_metadata["persistent_path_count"],
         exploration_metadata["minimum_action_count_in_any_year"],
     )
-    exploratory_follower_fits: Optional[CoupledPolicyholderFitSet] = None
-    if args.policyholder_behaviour == "lsmc":
-        with _logged_stage(
-            "Fit combined-v2 follower across randomised cap paths"
-        ):
-            exploratory_follower_fits = (
-                _fit_coupled_policyholder_policies_v2(
-                    cap_matrix=exploratory_caps,
-                    scenarios=training_scenarios,
-                    product=costs.product,
-                    model_points=model_points,
-                    mortality=mortality,
-                    expenses=costs.expenses,
-                    projection_config=projection_config,
-                    settings=follower_settings,
-                    progress_label="Coupled cap-randomised follower",
-                )
-            )
     with _logged_stage("Project control-randomisation training portfolio"):
         training_data = _aggregate_portfolio_paths(
             scenarios=training_scenarios,
@@ -9122,11 +8560,6 @@ def main() -> None:
             progress_label="Control-randomisation training projection",
             model_point_log_interval=args.model_point_log_interval,
             surrender_policy_factory=None,
-            combined_policy_factory=(
-                None
-                if exploratory_follower_fits is None
-                else exploratory_follower_fits.training_factory
-            ),
             collect_stackelberg_primitives=False,
         )
     with _logged_stage("Merge adapted market history and rich portfolio states"):
@@ -9172,35 +8605,17 @@ def main() -> None:
             "the full lifetime horizon | maximum absolute=%.6g",
             training_closeout_max_abs,
         )
-    with _logged_stage("Run cross-fitted Fitted-Q backward induction"):
+    with _logged_stage("Run outer-fold-pure Fitted-Q backward induction"):
         backward = _backward_induction(
             training_data,
             action_indices,
             folds=args.cross_fit_folds,
             ridge=args.ridge,
             seed=args.seed + 130_363,
-            complete_path_fold_ids=(
-                None
-                if exploratory_follower_fits is None
-                else _combined_v2_complete_path_fold_ids(
-                    training_scenarios.n_paths, follower_settings
-                )
-            ),
         )
-        if exploratory_follower_fits is not None:
-            if not exploratory_follower_fits.deployment_eligible:
-                raise RuntimeError(
-                    "Cap-randomised combined-v2 follower is not deployable."
-                )
-            backward.follower_fit_set = exploratory_follower_fits
-            backward.follower_regression_rows = (
-                _policyholder_regression_rows({
-                    "coupled_cap_randomisation": exploratory_follower_fits,
-                })
-            )
     LOGGER.info(
-        "Backward diagnostic | first-year cap=%.2f%% | held-out Bellman value=%.2f | "
-        "future fees=%.2f | other margins=%.2f | benefits=%.2f | "
+        "Backward diagnostic | first-year cap=%.2f%% | outer-fold OOF Bellman value=%.2f | "
+        "fee income=%.2f | other income=%.2f | claims=%.2f | "
         "expenses=%.2f | hedge costs=%.2f | MC SE=%.2f",
         100.0 * backward.first_year_cap,
         portfolio_scale * backward.pv_new_business_csm_proxy,
@@ -9237,22 +8652,29 @@ def main() -> None:
         for row in backward.regression_rows
     ])
     unstable = (~np.isfinite(condition_values)) | (condition_values > 1.0e10)
-    if np.any(unstable) and args.policyholder_behaviour != "lsmc":
-        raise RuntimeError(
-            "Regression health gate failed: %d/%d regularised year-action "
-            "normal matrices exceed 1e10 or are non-finite (maximum=%s)."
+    if np.any(unstable):
+        health_reason = (
+            "regression_health_gate:%d_of_%d_regularised_year_action_"
+            "matrices_exceed_1e10_or_are_nonfinite:max_%s"
             % (
                 int(np.sum(unstable)),
                 len(condition_values),
                 str(np.max(condition_values)),
             )
         )
-    if args.policyholder_behaviour == "lsmc" and not backward.numerically_stable:
+        backward.numerically_stable = False
+        backward.numerical_fallback_reasons = tuple(sorted({
+            *backward.numerical_fallback_reasons,
+            health_reason,
+        }))
         LOGGER.warning(
-            "Coupled insurer regression failed one or more numerical gates; "
-            "the adaptive policy is ineligible and validation may only confirm "
-            "the precommitted best fixed cap. Reasons=%d",
-            len(backward.numerical_fallback_reasons),
+            "Regression health gate rejected adaptive deployment: %d/%d "
+            "regularised year-action matrices exceed 1e10 or are non-finite "
+            "(maximum=%s). The independently selected fixed-cap fallback "
+            "remains executable.",
+            int(np.sum(unstable)),
+            len(condition_values),
+            str(np.max(condition_values)),
         )
     if backward.regression_rows:
         oof_r2 = np.asarray([
@@ -9271,7 +8693,7 @@ def main() -> None:
             "heston_hull_white",
             market.esg,
             horizon_years,
-            2 * args.benchmark_paths,
+            3 * args.benchmark_paths,
             measure=Measure.RISK_NEUTRAL,
             seed=args.seed + 1,
             substeps=args.heston_substeps,
@@ -9282,7 +8704,14 @@ def main() -> None:
         benchmark_scenarios.n_paths,
         benchmark_scenarios.n_steps,
     )
-    validation_scenarios = _slice_scenarios(
+    # The fixed-cap comparator is selected on the first block and reported on
+    # the second block.  The adaptive-versus-fixed deployment gate uses the
+    # third, independent block.  This avoids post-selection inference on the
+    # same paths that chose the fixed comparator.
+    fixed_benchmark_scenarios = _slice_scenarios(
+        benchmark_scenarios, 0, 2 * args.benchmark_paths
+    )
+    fixed_selection_scenarios = _slice_scenarios(
         benchmark_scenarios, 0, args.benchmark_paths
     )
     evaluation_scenarios = _slice_scenarios(
@@ -9290,41 +8719,34 @@ def main() -> None:
         args.benchmark_paths,
         2 * args.benchmark_paths,
     )
+    validation_scenarios = _slice_scenarios(
+        benchmark_scenarios,
+        2 * args.benchmark_paths,
+        3 * args.benchmark_paths,
+    )
     sample_fingerprints = {
         "training": training_scenarios.content_fingerprint,
+        "fixed_cap_selection": fixed_selection_scenarios.content_fingerprint,
         "validation": validation_scenarios.content_fingerprint,
         "evaluation": evaluation_scenarios.content_fingerprint,
     }
-    if len(set(sample_fingerprints.values())) != 3:
+    if len(set(sample_fingerprints.values())) != 4:
         raise RuntimeError(
-            "Training, validation and evaluation ScenarioSets must be disjoint."
+            "Training, fixed-cap selection, adaptive validation and final "
+            "evaluation ScenarioSets must be pairwise disjoint."
         )
     LOGGER.info(
-        "Disjoint samples | training=%s | validation=%s | evaluation=%s",
+        "Disjoint samples | training=%s | fixed selection=%s | "
+        "adaptive validation=%s | evaluation=%s",
         sample_fingerprints["training"],
+        sample_fingerprints["fixed_cap_selection"],
         sample_fingerprints["validation"],
         sample_fingerprints["evaluation"],
     )
 
-    continue_behaviour = no_voluntary_action_behaviour(dynamic_behaviour)
-    with _logged_stage("Evaluate always-Continue fixed-cap benchmarks"):
-        continue_results = _evaluate_fixed_benchmarks(
-            base_scenarios=benchmark_scenarios,
-            n_years=n_years,
-            batch_size=args.benchmark_batch_size,
-            product=costs.product,
-            model_points=model_points,
-            behaviour=continue_behaviour,
-            mortality=mortality,
-            expenses=costs.expenses,
-            projection_config=projection_config,
-            portfolio_scale=portfolio_scale,
-            model_point_log_interval=args.model_point_log_interval,
-            selection_path_count=args.benchmark_paths,
-        )
     with _logged_stage("Evaluate existing dynamic-Behaviour fixed-cap benchmarks"):
         dynamic_results = _evaluate_fixed_benchmarks(
-            base_scenarios=benchmark_scenarios,
+            base_scenarios=fixed_benchmark_scenarios,
             n_years=n_years,
             batch_size=args.benchmark_batch_size,
             product=costs.product,
@@ -9338,68 +8760,25 @@ def main() -> None:
             selection_path_count=args.benchmark_paths,
         )
 
-    fixed_lsmc_fit_sets: dict[str, PolicyholderFitSet] = {}
     fixed_policyholder_exercise_rows: list[dict[str, object]] = []
     policyholder_validation_rows: list[dict[str, object]] = []
-    if args.policyholder_behaviour == "lsmc":
-        with _logged_stage(
-            "Fit and evaluate a fresh policyholder LSMC under every fixed cap"
-        ):
-            (
-                benchmark_rows,
-                benchmark_path_values,
-                fixed_selection_path_values,
-                best_fixed_label,
-                fixed_selection_metadata,
-                fixed_lsmc_fit_sets,
-                fixed_policyholder_exercise_rows,
-                policyholder_validation_rows,
-            ) = _evaluate_fixed_lsmc_benchmarks(
-                training_scenarios=training_scenarios,
-                evaluation_scenarios=benchmark_scenarios,
-                n_years=n_years,
-                product=costs.product,
-                model_points=model_points,
-                mortality=mortality,
-                expenses=costs.expenses,
-                projection_config=projection_config,
-                portfolio_scale=portfolio_scale,
-                model_point_log_interval=args.model_point_log_interval,
-                selection_path_count=args.benchmark_paths,
-                follower_settings=follower_settings,
-            )
-    elif args.policyholder_behaviour == "dynamic":
-        (
-            benchmark_rows,
-            benchmark_path_values,
-            fixed_selection_path_values,
-            best_fixed_label,
-            fixed_selection_metadata,
-        ) = dynamic_results
-        for row in benchmark_rows:
-            row["policyholder_behaviour"] = "dynamic"
-    else:
-        (
-            benchmark_rows,
-            benchmark_path_values,
-            fixed_selection_path_values,
-            best_fixed_label,
-            fixed_selection_metadata,
-        ) = continue_results
-        for row in benchmark_rows:
-            row["policyholder_behaviour"] = "continue"
+    (
+        benchmark_rows,
+        benchmark_path_values,
+        _fixed_selection_path_values,
+        best_fixed_label,
+        fixed_selection_metadata,
+    ) = dynamic_results
+    for row in benchmark_rows:
+        row["policyholder_behaviour"] = "dynamic"
 
     behaviour_benchmark_rows: list[dict[str, object]] = []
-    for mode, result in (
-        ("continue", continue_results),
-        ("dynamic", dynamic_results),
-    ):
-        for source in result[0]:
-            row = dict(source)
-            row["fixed_cap_base_case"] = source["case"]
-            row["case"] = f"{source['case']}__{mode}"
-            row["policyholder_behaviour"] = mode
-            behaviour_benchmark_rows.append(row)
+    for source in dynamic_results[0]:
+        row = dict(source)
+        row["fixed_cap_base_case"] = source["case"]
+        row["case"] = f"{source['case']}__dynamic"
+        row["policyholder_behaviour"] = "dynamic"
+        behaviour_benchmark_rows.append(row)
 
     best_fixed_row = next(
         row for row in benchmark_rows
@@ -9430,12 +8809,30 @@ def main() -> None:
             100.0 * best_fixed_cap,
         )
 
-    coupled_follower_fit = exploratory_follower_fits
-    coupled_follower_factory = (
-        None
-        if coupled_follower_fit is None
-        else coupled_follower_fit.factory
-    )
+    with _logged_stage("Project paired validation fixed-cap fallback"):
+        validation_best_fixed_caps = np.full(
+            (validation_scenarios.n_paths, n_years),
+            best_fixed_cap,
+            dtype=float,
+        )
+        validation_best_fixed_projected = _aggregate_portfolio_paths(
+            scenarios=validation_scenarios,
+            cap_matrix=validation_best_fixed_caps,
+            product=costs.product,
+            model_points=model_points,
+            behaviour=behaviour,
+            mortality=mortality,
+            expenses=costs.expenses,
+            projection_config=projection_config,
+            collect_states=False,
+            progress_label="Paired validation fixed-cap fallback",
+            model_point_log_interval=args.model_point_log_interval,
+        )
+        validation_best_fixed_paths = np.sum(
+            validation_best_fixed_projected.new_business_csm_proxy,
+            axis=1,
+        )
+
     policyholder_validation_fallback_used = False
     policyholder_validation_failed_signature_count = 0
     policyholder_validation_uplift_aud: float | None = None
@@ -9461,160 +8858,33 @@ def main() -> None:
             expenses=costs.expenses,
             projection_config=projection_config,
             model_point_log_interval=args.model_point_log_interval,
-            benchmark_surrender_policy_factory=None,
-            combined_policy_factory=coupled_follower_factory,
-            collect_policyholder_by_signature=(
-                args.policyholder_behaviour == "lsmc"
-            ),
+            surrender_policy_factory=None,
+            collect_policyholder_by_signature=False,
         )
-        if args.policyholder_behaviour == "lsmc":
-            validation_rollout_metadata.update({
-                "follower_contract_version": (
-                    COMBINED_FOLLOWER_VERSION
-                ),
-                "follower_usage": "validation_diagnostic_only",
-                "follower_combined_v2_capability_complete": True,
-                "follower_deployment_eligible": False,
-                "follower_deployment_block_reason": (
-                    "missing nested Leader/Follower folds, joint on-policy "
-                    "iteration and three-seed component validation"
-                ),
-                "follower_projector_hooks": [
-                    "income_election_policy", "income_action_policy",
-                ],
-            })
         validation_row, _ = _projected_policy_benchmark_row(
             label="adaptive_policy_validation",
             definition=(
-                "validation-only coupled cap candidate with exact pre-cap "
-                "portfolio state and combined-v2 Policyholder follower"
+                "validation-only adaptive cap policy under dynamic statistical "
+                "Policyholder behaviour and exact pre-cap portfolio state"
             ),
             projected=validation_projected,
-            comparison_paths=fixed_selection_path_values[best_fixed_label],
+            comparison_paths=validation_best_fixed_paths,
             portfolio_scale=portfolio_scale,
         )
 
-        if args.policyholder_behaviour == "lsmc":
-            validation_continue = _aggregate_portfolio_paths(
-                scenarios=validation_scenarios,
-                cap_matrix=validation_cap_matrix,
-                product=costs.product,
-                model_points=model_points,
-                behaviour=continue_behaviour,
-                mortality=mortality,
-                expenses=costs.expenses,
-                projection_config=projection_config,
-                collect_states=False,
-                progress_label="Policyholder validation Continue comparator",
-                model_point_log_interval=args.model_point_log_interval,
-                collect_policyholder_by_signature=True,
-            )
-            adaptive_signature_rows, failed_signatures = (
-                _policyholder_signature_validation(
-                    candidate=validation_projected,
-                    comparator=validation_continue,
-                    path_slice=slice(None),
-                    policy_label="adaptive_coupled_combined_v2_follower",
-                    cap=None,
-                    portfolio_scale=portfolio_scale,
-                    sample_fingerprint=sample_fingerprints["validation"],
-                )
-            )
-            policyholder_validation_rows.extend(adaptive_signature_rows)
-            policyholder_validation_failed_signature_count = len(
-                failed_signatures
-            )
-            if failed_signatures:
-                policyholder_validation_fallback_used = True
-                LOGGER.warning(
-                    "Adaptive Policyholder validation failed for %d/%d "
-                    "PolicySpec signature(s); rejecting the complete coupled "
-                    "leader/follower policy before final evaluation.",
-                    len(failed_signatures),
-                    len(adaptive_signature_rows),
-                )
-            policyholder_uplift_paths = portfolio_scale * (
-                np.sum(validation_projected.policyholder_benefits, axis=1)
-                - np.sum(validation_continue.policyholder_benefits, axis=1)
-            )
-            (
-                policyholder_validation_uplift_aud,
-                policyholder_validation_uplift_se_aud,
-            ) = _paired_mean_and_standard_error(policyholder_uplift_paths)
-            if (
-                policyholder_validation_uplift_aud
-                - 1.96 * policyholder_validation_uplift_se_aud
-                < -1.0e-10
-            ):
-                policyholder_validation_fallback_used = True
-                LOGGER.warning(
-                    "Policyholder LSMC did not establish non-negative value "
-                    "versus Continue on validation paths (delta %.2f, paired "
-                    "SE %.2f); rejecting the adaptive leader/follower policy.",
-                    policyholder_validation_uplift_aud,
-                    policyholder_validation_uplift_se_aud,
-                )
     validation_delta = float(validation_row[
         "new_business_csm_difference_vs_best_fixed_admissible_aud"
     ])
     validation_delta_se = float(validation_row[
         "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
     ])
-    validation_adaptive_policy_passed_economic_gates = (
-        _adaptive_policy_passes_validation(
-            insurer_regression_stable=backward.numerically_stable,
-            policyholder_validation_passed=(
-                not policyholder_validation_fallback_used
-            ),
-            causal_rollout_valid=bool(
-                validation_rollout_metadata["converged"]
-            ),
-            csm_delta_aud=validation_delta,
-            paired_standard_error_aud=validation_delta_se,
-        )
+    validation_adaptive_policy_selected = _adaptive_policy_passes_validation(
+        insurer_regression_stable=backward.numerically_stable,
+        policyholder_validation_passed=True,
+        causal_rollout_valid=bool(validation_rollout_metadata["converged"]),
+        csm_delta_aud=validation_delta,
+        paired_standard_error_aud=validation_delta_se,
     )
-    coupled_follower_uses_unified_income_actions = bool(
-        args.policyholder_behaviour != "lsmc"
-        or (
-            coupled_follower_fit is not None
-            and coupled_follower_fit.deployment_eligible
-            and coupled_follower_fit.follower_contract_version
-            == COMBINED_FOLLOWER_VERSION
-            and all(
-                callable(getattr(fit.policy, "start_income_mask", None))
-                and callable(getattr(
-                    fit.policy, "choose_income_action", None
-                ))
-                for fit in coupled_follower_fit.fits.values()
-            )
-        )
-    )
-    # The cap-randomised response surface now shares the complete v2 action and
-    # regression layer, but this research runner does not yet perform the
-    # required joint Leader/Follower on-policy iteration nor the three-seed,
-    # Election/Income/Combined validation suite.  It may be evaluated on the
-    # validation sample, but cannot be selected for productive deployment.
-    coupled_response_surface_full_validation_complete = False
-    adaptive_candidate_blocked_by_follower_contract = bool(
-        args.policyholder_behaviour == "lsmc"
-        and (
-            not coupled_follower_uses_unified_income_actions
-            or not coupled_response_surface_full_validation_complete
-        )
-    )
-    validation_adaptive_policy_selected = bool(
-        validation_adaptive_policy_passed_economic_gates
-        and not adaptive_candidate_blocked_by_follower_contract
-    )
-    if validation_adaptive_policy_passed_economic_gates \
-            and adaptive_candidate_blocked_by_follower_contract:
-        LOGGER.warning(
-            "Adaptive cap response surface is not deployable: the combined-v2 "
-            "capability is present, but joint on-policy iteration and the full "
-            "three-seed component validation contract are not implemented in "
-            "this runner. The prevalidated fixed-cap combined follower is used."
-        )
-        validation_adaptive_policy_selected = False
     adaptive_policy_selected = validation_adaptive_policy_selected
     LOGGER.info(
         "Adaptive-policy validation | delta vs fixed fallback=%.2f | paired "
@@ -9627,39 +8897,9 @@ def main() -> None:
         validation_adaptive_policy_selected,
     )
 
-    best_fixed_follower_factory = (
-        fixed_lsmc_fit_sets[best_fixed_label].factory
-        if args.policyholder_behaviour == "lsmc"
-        else None
-    )
-    if args.policyholder_behaviour == "lsmc":
-        deployed_follower_fit_set = (
-            coupled_follower_fit
-            if adaptive_policy_selected
-            else fixed_lsmc_fit_sets[best_fixed_label]
-        )
-        if not isinstance(
-            deployed_follower_fit_set,
-            (PolicyholderFitSet, CoupledPolicyholderFitSet),
-        ) or not bool(getattr(
-            deployed_follower_fit_set, "deployment_eligible", True
-        )):
-            raise RuntimeError(
-                "LSMC deployment requires a valid combined-v2 fit set."
-            )
-        deployed_policyholder_continue_fallback_used = bool(
-            deployed_follower_fit_set.fallback_count
-        )
-        deployed_policyholder_fallback_signature_count = int(
-            deployed_follower_fit_set.fallback_count
-        )
-        deployed_policyholder_fallback_step_count = int(
-            deployed_follower_fit_set.fallback_step_count
-        )
-    else:
-        deployed_policyholder_continue_fallback_used = False
-        deployed_policyholder_fallback_signature_count = 0
-        deployed_policyholder_fallback_step_count = 0
+    deployed_policyholder_continue_fallback_used = False
+    deployed_policyholder_fallback_signature_count = 0
+    deployed_policyholder_fallback_step_count = 0
     # Frozen before the final sample: evaluation can measure or fail, but can
     # never change the selected policy or any fallback.
     evaluation_rollout_fallback_used = False
@@ -9685,9 +8925,7 @@ def main() -> None:
                 expenses=costs.expenses,
                 projection_config=projection_config,
                 model_point_log_interval=args.model_point_log_interval,
-                benchmark_surrender_policy_factory=None,
-                combined_policy_factory=coupled_follower_factory,
-                collect_policyholder_by_signature=True,
+                surrender_policy_factory=None,
             )
             if not evaluation_rollout_metadata["converged"]:
                 raise RuntimeError(
@@ -9712,7 +8950,7 @@ def main() -> None:
                 collect_states=True,
                 progress_label="Deployed fixed-cap fallback",
                 model_point_log_interval=args.model_point_log_interval,
-                combined_policy_factory=best_fixed_follower_factory,
+                surrender_policy_factory=None,
             )
             evaluation_rollout_metadata = {
                 "converged": True,
@@ -9721,15 +8959,57 @@ def main() -> None:
                 "method": "fixed_cap_direct_projection",
                 "evaluation_sample_used_for_fallback": False,
                 "fixed_cap_fallback": True,
-                "follower_contract_version": (
-                    COMBINED_FOLLOWER_VERSION
-                    if args.policyholder_behaviour == "lsmc" else None
-                ),
-                "follower_projector_hooks": (
-                    ["income_election_policy", "income_action_policy"]
-                    if args.policyholder_behaviour == "lsmc" else []
-                ),
             }
+    with _logged_stage("Project paired final fixed-cap comparator"):
+        if adaptive_policy_selected:
+            evaluation_best_fixed_projected = _aggregate_portfolio_paths(
+                scenarios=evaluation_scenarios,
+                cap_matrix=np.full(
+                    (evaluation_scenarios.n_paths, n_years),
+                    best_fixed_cap,
+                    dtype=float,
+                ),
+                product=costs.product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=projection_config,
+                collect_states=False,
+                progress_label="Paired final fixed-cap comparator",
+                model_point_log_interval=args.model_point_log_interval,
+            )
+        else:
+            evaluation_best_fixed_projected = flexible_projected
+        evaluation_best_fixed_paths = np.sum(
+            evaluation_best_fixed_projected.new_business_csm_proxy,
+            axis=1,
+        )
+        direct_best_fixed_row = _csm_benchmark_row(
+            label=best_fixed_label,
+            cap=best_fixed_cap,
+            definition=str(best_fixed_row["definition"]),
+            components=_summed_csm_components(
+                evaluation_best_fixed_projected, slice(None)
+            ),
+            csm_paths=evaluation_best_fixed_paths,
+            best_fixed_paths=evaluation_best_fixed_paths,
+            portfolio_scale=portfolio_scale,
+            is_best_fixed=True,
+        )
+        selection_fields = {
+            key: best_fixed_row.get(key)
+            for key in (
+                "fixed_cap_selection_sample_csm_aud",
+                "n_fixed_cap_selection_paths",
+                "n_final_evaluation_paths",
+                "is_best_fixed_cap_requested_1_to_20_grid",
+                "policyholder_behaviour",
+            )
+        }
+        best_fixed_row.update(direct_best_fixed_row)
+        best_fixed_row.update(selection_fields)
+        benchmark_path_values[best_fixed_label] = evaluation_best_fixed_paths
     first_year_caps = np.unique(flexible_cap_matrix[:, 0])
     if first_year_caps.size != 1:
         raise RuntimeError(
@@ -9738,14 +9018,12 @@ def main() -> None:
     selected_first_year_cap = float(first_year_caps[0])
     with _logged_stage("Report direct flexible/fallback projection"):
         flexible_row, flexible_csm_paths = _projected_policy_benchmark_row(
-            label="flexible_lsmc_policy",
+            label="flexible_dynamic_behaviour_policy",
             definition=(
-                "validated deployable policy in an independent monthly-projector "
-                "rollout; LSMC uses the combined-v2 follower for both adaptive "
-                "and fixed-cap deployment"
-                if args.policyholder_behaviour == "lsmc"
-                else "actual deployed annual cap policy in an independent monthly-"
-                "projector rollout, or fixed-cap fallback when validation rejects it"
+                "actual deployed annual cap policy under dynamic statistical "
+                "Policyholder behaviour; independent monthly-projector rollout, "
+                "or independently selected fixed-cap fallback when validation "
+                "rejects the adaptive policy"
             ),
             projected=flexible_projected,
             portfolio_scale=portfolio_scale,
@@ -9757,14 +9035,6 @@ def main() -> None:
         validation_adaptive_policy_selected
     )
     flexible_row["policyholder_behaviour"] = args.policyholder_behaviour
-    flexible_row["deployed_follower_contract_version"] = (
-        COMBINED_FOLLOWER_VERSION
-        if args.policyholder_behaviour == "lsmc" else None
-    )
-    flexible_row["adaptive_candidate_blocked_by_follower_contract"] = (
-        adaptive_candidate_blocked_by_follower_contract
-    )
-    flexible_row["legacy_surrender_follower_deployed"] = False
     flexible_row["policyholder_continue_fallback_used"] = (
         deployed_policyholder_continue_fallback_used
     )
@@ -9817,28 +9087,22 @@ def main() -> None:
         np.isclose(selected_first_year_cap, ACTION_CAPS[0])
         or np.isclose(selected_first_year_cap, ACTION_CAPS[-1])
     )
-    policyholder_fit_sets_for_diagnostics: dict[str, PolicyholderFitSet] = {
-        f"fixed_cap::{label}": fit_set
-        for label, fit_set in fixed_lsmc_fit_sets.items()
-    }
-    policyholder_regression_rows = list(backward.follower_regression_rows)
-    for row in policyholder_regression_rows:
-        row.setdefault("fit_label", "coupled_control_randomisation")
-    policyholder_regression_rows.extend(_policyholder_regression_rows(
-        policyholder_fit_sets_for_diagnostics
-    ))
-    if not policyholder_regression_rows:
-        policyholder_regression_rows = [{
-            "fit_label": "not_applicable",
-            "policyholder_behaviour": args.policyholder_behaviour,
-            "reason": "No Policyholder LSMC regression in this legacy mode.",
-        }]
-    if not policyholder_validation_rows:
-        policyholder_validation_rows = [{
-            "policy": "not_applicable",
-            "policyholder_behaviour": args.policyholder_behaviour,
-            "reason": "No Policyholder LSMC validation in this legacy mode.",
-        }]
+    policyholder_regression_rows = [{
+        "fit_label": "not_applicable",
+        "policyholder_behaviour": "dynamic",
+        "reason": (
+            "Policyholder outcomes use the configured statistical dynamic "
+            "Behaviour model; no Policyholder LSMC regression is fitted."
+        ),
+    }]
+    policyholder_validation_rows = [{
+        "policy": "not_applicable",
+        "policyholder_behaviour": "dynamic",
+        "reason": (
+            "There is no fitted Policyholder policy to validate; the adaptive "
+            "insurer cap policy is validated directly against the best fixed cap."
+        ),
+    }]
 
     direct_nonnegative_fields = (
         "pv_guarantee_claims_aud",
@@ -9915,15 +9179,14 @@ def main() -> None:
             "study under fixed proxy product and behaviour assumptions"
         ),
         "method": (
-            "Stackelberg/bilevel cap study: the same combined-v2 Policyholder "
-            "LSMC for fixed caps and the cap-randomised insurer Fitted-Q policy"
-            if args.policyholder_behaviour == "lsmc"
-            else "annual control-randomisation insurer Fitted-Q with "
-            f"{args.policyholder_behaviour} comparison behaviour"
+            "outer-fold-pure control-randomisation insurer Fitted-Q with "
+            "statistical dynamic Policyholder Income Election, lapse and "
+            "withdrawal feedback"
         ),
         "estimate_type": (
             "frozen Fitted-Q policy evaluated by an independent direct monthly-"
-            "projector rollout; fixed cap selected on a separate validation sample"
+            "projector rollout; fixed cap selected on its own sample and adaptive "
+            "deployment tested on a second sample"
         ),
         "csm_measurement_label": (
             "approximate market-consistent New Business CSM proxy; aligned "
@@ -9936,11 +9199,9 @@ def main() -> None:
         ),
         "objective_direction": "maximize",
         "objective": (
-            "maximise PV(collected Product and LIP Fees"
-            + (" + Crediting Margin" if args.hedge_gain else "")
-            + " + "
-            "MVA/APS retained) - PV(Guarantee Claims + other insurer-funded "
-            "benefits + operating expenses + hedge-execution costs)"
+            "maximise PV(Fee Income) + PV(Other Income) - PV(Claims) - "
+            "PV(Costs), where Other Income includes pathwise Money-Market "
+            "Income and Costs include the complete option spread cost"
         ),
         "terminal_closeout_in_objective": False,
         "training_exploration_terminal_closeout_mean_pv_aud": (
@@ -9978,9 +9239,18 @@ def main() -> None:
         "estimated_optimal_pv_future_fees_aud": flexible_row[
             "pv_future_fees_aud"
         ],
+        "estimated_optimal_pv_fee_income_aud": flexible_row[
+            "pv_fee_income_aud"
+        ],
         "estimated_optimal_pv_crediting_margin_aud": (
             flexible_row["pv_crediting_margin_aud"]
         ),
+        "estimated_optimal_pv_money_market_income_aud": flexible_row[
+            "pv_money_market_income_aud"
+        ],
+        "estimated_optimal_pv_hedge_gain_aud": flexible_row[
+            "pv_hedge_gain_aud"
+        ],
         "estimated_optimal_pv_mva_retained_aud": (
             flexible_row["pv_mva_retained_aud"]
         ),
@@ -9990,12 +9260,16 @@ def main() -> None:
         "estimated_optimal_pv_other_insurer_margins_aud": flexible_row[
             "pv_other_insurer_margins_aud"
         ],
+        "estimated_optimal_pv_other_income_aud": flexible_row[
+            "pv_other_income_aud"
+        ],
         "estimated_optimal_pv_total_insurer_inflows_aud": flexible_row[
             "pv_total_insurer_inflows_aud"
         ],
         "estimated_optimal_pv_total_insurer_funded_benefits_aud": (
             flexible_row["pv_total_insurer_funded_benefits_aud"]
         ),
+        "estimated_optimal_pv_claims_aud": flexible_row["pv_claims_aud"],
         "estimated_optimal_pv_expenses_aud": (
             flexible_row["pv_expenses_aud"]
         ),
@@ -10005,6 +9279,7 @@ def main() -> None:
         "estimated_optimal_pv_total_costs_aud": flexible_row[
             "pv_total_costs_aud"
         ],
+        "estimated_optimal_pv_costs_aud": flexible_row["pv_costs_aud"],
         "estimated_optimal_policyholder_pv_aud": flexible_row[
             "pv_policyholder_benefits_aud"
         ],
@@ -10017,9 +9292,6 @@ def main() -> None:
         "estimated_optimal_policyholder_surrender_benefit_pv_aud": flexible_row[
             "pv_policyholder_surrender_benefits_aud"
         ],
-        "estimated_optimal_policyholder_partial_withdrawals_pv_aud": (
-            flexible_row["pv_policyholder_partial_withdrawals_aud"]
-        ),
         "deployed_policyholder_exercise_rate_over_income_exposure": flexible_row[
             "policyholder_full_withdrawal_exercise_rate_over_income_exposure"
         ],
@@ -10032,8 +9304,8 @@ def main() -> None:
             ]
         ),
         "optimal_csm_evaluation_sample": (
-            "independent direct rollout sample, disjoint from training and "
-            "fixed-cap selection"
+            "independent direct rollout sample, disjoint from training, fixed-"
+            "cap selection and adaptive-policy validation"
         ),
         "direct_rollout_csm_mc_interval_95pct_lower_aud": (
             optimal_csm - 1.96 * optimal_se
@@ -10050,6 +9322,12 @@ def main() -> None:
                 "new_business_csm_component_reconciliation_gap_aud"
             ]
         ),
+        "crediting_margin_reconciliation_gap_aud": flexible_row[
+            "crediting_margin_reconciliation_gap_aud"
+        ],
+        "crediting_margin_reconciliation_max_absolute_aud": flexible_row[
+            "crediting_margin_reconciliation_max_absolute_aud"
+        ],
         "best_fixed_cap_admissible_case": best_fixed_row["case"],
         "best_fixed_cap_admissible_percent": best_fixed_row["cap_percent"],
         "best_fixed_cap_requested_1_to_20_case": (
@@ -10075,40 +9353,6 @@ def main() -> None:
         "adaptive_policy_selected_on_validation_sample": (
             validation_adaptive_policy_selected
         ),
-        "adaptive_policy_passed_economic_validation_before_contract_gate": (
-            validation_adaptive_policy_passed_economic_gates
-        ),
-        "adaptive_candidate_blocked_by_follower_contract": (
-            adaptive_candidate_blocked_by_follower_contract
-        ),
-        "coupled_candidate_follower_contract_version": (
-            COMBINED_FOLLOWER_VERSION
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "coupled_candidate_follower_deployment_eligible": (
-            False if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "coupled_candidate_combined_v2_capability_complete": (
-            bool(coupled_follower_uses_unified_income_actions)
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "coupled_candidate_full_validation_complete": (
-            coupled_response_surface_full_validation_complete
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "deployed_follower_contract_version": (
-            COMBINED_FOLLOWER_VERSION
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "deployed_follower_policy_source": (
-            (
-                "validation_selected_coupled_cap_randomised_combined_v2"
-                if adaptive_policy_selected
-                else "validation_selected_fixed_cap_combined_v2"
-            )
-            if args.policyholder_behaviour == "lsmc"
-            else args.policyholder_behaviour
-        ),
         "adaptive_policy_actually_deployed": adaptive_policy_selected,
         "adaptive_policy_evaluation_operational_fallback_used": (
             evaluation_rollout_fallback_used
@@ -10123,15 +9367,13 @@ def main() -> None:
         ),
         "adaptive_policy_validation_selection_rule": (
             "deploy adaptive rule only if validation delta exceeds 1.96 paired SE; "
-            "the coupled follower also must implement the combined-v2 Election "
-            "and monthly Income-action contract; otherwise deploy the admissible "
-            "fixed fallback"
+            "otherwise deploy the admissible fixed fallback"
         ),
         "flexible_policy_deviation_rule": (
             "if paired validation selects the complete adaptive rule, choose "
             "the fitted maximum-CSM action at every state with the lower-cap "
-            "tie-break used in backward induction, but only with a deployable "
-            "combined-v2 follower; otherwise deploy the fixed fallback in every year"
+            "tie-break used in backward induction; otherwise deploy the fixed "
+            "fallback in every year"
         ),
         "best_fixed_cap_new_business_csm_proxy_aud": best_fixed_csm,
         "best_fixed_cap_new_business_csm_proxy_standard_error_aud": (
@@ -10172,10 +9414,10 @@ def main() -> None:
         "bellman_value_diagnostic_standard_error_aud": (
             portfolio_scale * backward.standard_error_new_business_csm_proxy
         ),
-        "coupled_insurer_regressions_numerically_stable": (
+        "insurer_regressions_numerically_stable": (
             backward.numerically_stable
         ),
-        "coupled_numerical_fallback_reasons": list(
+        "insurer_numerical_fallback_reasons": list(
             backward.numerical_fallback_reasons
         ),
         "action_caps": ACTION_CAPS.tolist(),
@@ -10200,9 +9442,10 @@ def main() -> None:
         "valuation_measure": Measure.RISK_NEUTRAL.value,
         "market_model": "heston_hull_white",
         "policyholder_behaviour_mode": args.policyholder_behaviour,
-        "policyholder_objective": (
-            "maximise risk-neutral PV of Income, Death, Surrender, permitted "
-            "Withdrawal and Terminal-Closeout cashflows; issue premium is sunk"
+        "policyholder_behaviour_basis": (
+            "versioned statistical dynamic Behaviour proxy using Income Take-up, "
+            "ordinary/performance lapse and partial/excess withdrawal functions; "
+            "not a Policyholder value maximisation"
         ),
         "policyholder_validation_continue_fallback_used": (
             policyholder_validation_fallback_used
@@ -10225,48 +9468,23 @@ def main() -> None:
         "policyholder_validation_paired_standard_error_aud": (
             policyholder_validation_uplift_se_aud
         ),
-        "policyholder_training_signature_count": (
-            0 if exploratory_follower_fits is None
-            else exploratory_follower_fits.signature_count
-        ),
-        "policyholder_training_signature_fallback_count": (
-            0 if exploratory_follower_fits is None
-            else exploratory_follower_fits.fallback_count
-        ),
-        "policyholder_training_cap_schedule_fingerprint": (
-            None if exploratory_follower_fits is None
-            else exploratory_follower_fits.cap_schedule_fingerprint
-        ),
-        "coupled_follower_contract_version": (
-            COMBINED_FOLLOWER_VERSION
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "deployed_fixed_cap_follower_contract_version": (
-            COMBINED_FOLLOWER_VERSION
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "deployed_fixed_cap_follower_signature_count": (
-            fixed_lsmc_fit_sets[best_fixed_label].signature_count
-            if args.policyholder_behaviour == "lsmc" else 0
-        ),
-        "deployed_fixed_cap_follower_training_scenario_fingerprint": (
-            fixed_lsmc_fit_sets[best_fixed_label].scenario_fingerprint
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "deployed_fixed_cap_follower_cap_schedule_fingerprint": (
-            fixed_lsmc_fit_sets[best_fixed_label].cap_schedule_fingerprint
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
+        "policyholder_lsmc_training_signature_count": 0,
+        "policyholder_lsmc_training_signature_fallback_count": 0,
+        "policyholder_lsmc_training_cap_schedule_fingerprint": None,
         "sample_fingerprints": sample_fingerprints,
         "n_control_randomisation_paths": args.n_paths,
         "n_fixed_cap_selection_paths_per_case": args.benchmark_paths,
+        "n_adaptive_policy_validation_paths": args.benchmark_paths,
         "n_final_evaluation_paths_per_case": args.benchmark_paths,
         "fixed_cap_selection_metadata": fixed_selection_metadata,
         "cross_fit_folds": args.cross_fit_folds,
         "ridge_multiplier": args.ridge,
         "dva_enabled": bool(projection_config.dva_enabled),
-        "hedge_gain_enabled": bool(args.hedge_gain),
-        "crediting_margin_in_objective": bool(args.hedge_gain),
+        "hedge_gain_enabled": False,
+        "retained_above_cap_hedge_gain_enabled": False,
+        "money_market_backing_income_enabled": True,
+        "hedge_cap_leg_mode": projection_config.hedge_cap_leg_mode.value,
+        "crediting_margin_in_objective": True,
         "mva_and_aps_retained_in_objective": True,
         "hedge_costs_in_objective": True,
         "expenses_in_objective": True,
@@ -10303,13 +9521,12 @@ def main() -> None:
         "behaviour_treatment_by_branch": behaviour_treatment_by_branch,
         "source_income_take_up_mode": loaded_behaviour.behaviour.take_up.mode,
         "income_take_up_mode": behaviour.take_up.mode,
-        "effective_income_start_override_model_point_count": (
-            effective_start_override_count
-        ),
+        "effective_income_start_override_model_point_count": None,
         "joint_life_behaviour_treatment": joint_life_behaviour_treatment,
         "mortality_application": (
-            "deterministic expected decrements from one annual q_x per Policy "
-            "Year, converted to twelve reconciled monthly probabilities"
+            "single-life expected decrements and pathwise primary/spouse life "
+            "states for Joint-Life contracts; both use annual q_x converted "
+            "to twelve reconciled monthly probabilities"
         ),
         "projection_semantics": projection_semantics,
         "aggregation_basis": (
@@ -10334,68 +9551,18 @@ def main() -> None:
         validation_delta_aud=validation_delta,
         validation_paired_standard_error_aud=validation_delta_se,
     )
-    policy_payload["stackelberg_control"] = {
-        "leader": "insurer annual cap chosen first",
-        "follower": (
-            "The same combined-v2 Policyholder policy jointly chooses Growth "
-            "WAIT/START and monthly Income CONTINUE/PARTIAL/FULL for fixed-cap "
-            "and coupled cap-randomised policies"
-            if args.policyholder_behaviour == "lsmc"
-            else f"{args.policyholder_behaviour} comparison behaviour"
-        ),
-        "deployable_follower_contract_version": (
-            COMBINED_FOLLOWER_VERSION
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "deployable_follower_projector_hooks": (
-            ["income_election_policy", "income_action_policy"]
-            if args.policyholder_behaviour == "lsmc" else []
-        ),
-        "invalid_combined_follower_handling": (
-            "hard_error_before_rollout"
-            if args.policyholder_behaviour == "lsmc" else "not_applicable"
-        ),
-        "legacy_surrender_api_usage": (
-            "coupled_candidate_benchmark_only"
-            if args.policyholder_behaviour == "lsmc" else "not_applicable"
-        ),
-        "adaptive_candidate_blocked_by_follower_contract": (
-            adaptive_candidate_blocked_by_follower_contract
+    policy_payload["dynamic_behaviour_control"] = {
+        "controller": "insurer annual cap Fitted-Q policy",
+        "policyholder_response": (
+            "statistical dynamic Behaviour applied inside the monthly projector; "
+            "no separate Policyholder value function or LSMC exercise policy"
         ),
         "policyholder_behaviour_mode": args.policyholder_behaviour,
-        "objectives_mixed": False,
-        "policyholder_training_scenario_fingerprint": (
-            None if exploratory_follower_fits is None
-            else exploratory_follower_fits.scenario_fingerprint
-        ),
-        "policyholder_training_cap_schedule_fingerprint": (
-            None if exploratory_follower_fits is None
-            else exploratory_follower_fits.cap_schedule_fingerprint
-        ),
-        "policyholder_signature_count": (
-            0 if exploratory_follower_fits is None
-            else exploratory_follower_fits.signature_count
-        ),
-        "policyholder_training_fallback_signature_count": (
-            0 if exploratory_follower_fits is None
-            else exploratory_follower_fits.fallback_count
-        ),
-        "coupled_follower_training_scenario_fingerprint": (
-            None if coupled_follower_fit is None
-            else coupled_follower_fit.scenario_fingerprint
-        ),
-        "coupled_follower_training_cap_schedule_fingerprint": (
-            None if coupled_follower_fit is None
-            else coupled_follower_fit.cap_schedule_fingerprint
-        ),
-        "deployed_fixed_cap_training_scenario_fingerprint": (
-            fixed_lsmc_fit_sets[best_fixed_label].scenario_fingerprint
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
-        "deployed_fixed_cap_training_cap_schedule_fingerprint": (
-            fixed_lsmc_fit_sets[best_fixed_label].cap_schedule_fingerprint
-            if args.policyholder_behaviour == "lsmc" else None
-        ),
+        "policyholder_lsmc_used": False,
+        "policyholder_training_scenario_fingerprint": None,
+        "policyholder_training_cap_schedule_fingerprint": None,
+        "policyholder_signature_count": 0,
+        "policyholder_training_fallback_signature_count": 0,
         "policyholder_validation_continue_fallback_used": (
             policyholder_validation_fallback_used
         ),
@@ -10418,33 +9585,10 @@ def main() -> None:
             policyholder_validation_uplift_se_aud
         ),
         "sample_fingerprints": sample_fingerprints,
-        "anniversary_timing_document": "CREDITING_CAP_STACKELBERG.md",
+        "dynamic_behaviour_assumptions": loaded_behaviour.source_metadata(),
     }
-    if args.policyholder_behaviour == "lsmc":
-        if coupled_follower_fit is None:
-            raise RuntimeError("Coupled follower policy payload is missing.")
-        fixed_fallback_fit = fixed_lsmc_fit_sets[best_fixed_label]
-        policy_payload["stackelberg_control"].update({
-            "coupled_candidate_follower_policy": (
-                _policyholder_fit_set_payload(coupled_follower_fit)
-            ),
-            "fixed_fallback_follower_policy": (
-                _policyholder_fit_set_payload(fixed_fallback_fit)
-            ),
-            "deployed_follower_policy_source": (
-                "coupled_candidate_follower_policy"
-                if adaptive_policy_selected
-                else "fixed_fallback_follower_policy"
-            ),
-            "coupled_candidate_combined_v2_capability_complete": True,
-            "coupled_candidate_deployment_eligible": False,
-            "coupled_candidate_deployment_block_reason": (
-                "missing nested Leader/Follower folds, joint on-policy "
-                "iteration and three-seed Election/Income/Combined validation"
-            ),
-        })
     manifest = {
-        "output_schema_version": "crediting-cap-lsmc-2.2",
+        "output_schema_version": "crediting-cap-dynamic-behaviour-1.2",
         "run_id": run_id,
         "created_utc": run_created_utc,
         "engine_version": ENGINE_VERSION,
@@ -10453,7 +9597,7 @@ def main() -> None:
         "summary_file": "optimization_summary.json",
         "output_inventory": {
             "summary": "optimization_summary.json",
-            "policy": "lsmc_policy.json",
+            "policy": "dynamic_cap_policy.json",
             "manifest": "run_manifest.json",
             "csv_tables": [
                 "first_year_action_values.csv",
@@ -10491,6 +9635,9 @@ def main() -> None:
             ),
         },
         "training_scenario_fingerprint": sample_fingerprints["training"],
+        "fixed_cap_selection_scenario_fingerprint": (
+            sample_fingerprints["fixed_cap_selection"]
+        ),
         "validation_scenario_fingerprint": sample_fingerprints["validation"],
         "evaluation_scenario_fingerprint": sample_fingerprints["evaluation"],
         "benchmark_parent_scenario_fingerprint": (
@@ -10501,83 +9648,32 @@ def main() -> None:
         "benchmark_seed": args.seed + 1,
         "heston_substeps": args.heston_substeps,
         "exploration": exploration_metadata,
-        "follower_policy_contract": {
-            "fixed_cap_fit_version": (
-                COMBINED_FOLLOWER_VERSION
-                if args.policyholder_behaviour == "lsmc" else None
-            ),
-            "fixed_cap_deployment_eligible": (
-                args.policyholder_behaviour == "lsmc"
-            ),
-            "fixed_cap_projector_hooks": (
-                ["income_election_policy", "income_action_policy"]
-                if args.policyholder_behaviour == "lsmc" else []
-            ),
-            "fixed_cap_action_set": (
-                list(COMBINED_FOLLOWER_ACTION_SET)
-                if args.policyholder_behaviour == "lsmc" else []
-            ),
-            "fixed_cap_invalid_fit_handling": (
-                "hard_error_before_rollout"
-                if args.policyholder_behaviour == "lsmc" else "not_applicable"
-            ),
-            "coupled_candidate_fit_version": (
-                COMBINED_FOLLOWER_VERSION
-                if args.policyholder_behaviour == "lsmc" else None
-            ),
-            "coupled_candidate_usage": (
-                "training_validation_and_deployment_when_selected"
-                if args.policyholder_behaviour == "lsmc" else "not_applicable"
-            ),
-            "coupled_candidate_deployment_eligible": (
-                False
-            ),
-            "coupled_candidate_combined_v2_capability_complete": (
-                args.policyholder_behaviour == "lsmc"
-            ),
-            "coupled_candidate_deployment_block_reason": (
-                "missing_nested_leader_follower_folds_on_policy_iteration_and_"
-                "three_seed_component_validation"
-                if args.policyholder_behaviour == "lsmc" else None
-            ),
-            "coupled_candidate_projector_hooks": (
-                ["income_election_policy", "income_action_policy"]
-                if args.policyholder_behaviour == "lsmc" else []
-            ),
-            "coupled_candidate_action_set": (
-                list(COMBINED_FOLLOWER_ACTION_SET)
-                if args.policyholder_behaviour == "lsmc" else []
-            ),
-            "adaptive_candidate_passed_economic_gates": (
-                validation_adaptive_policy_passed_economic_gates
-            ),
-            "adaptive_candidate_blocked_by_contract_gate": (
-                adaptive_candidate_blocked_by_follower_contract
-            ),
-            "deployed_fit_version": (
-                COMBINED_FOLLOWER_VERSION
-                if args.policyholder_behaviour == "lsmc" else None
-            ),
-            "legacy_surrender_factory_can_deploy": (
-                False if args.policyholder_behaviour == "lsmc" else None
-            ),
-        },
         "objective_scope": {
             "measurement": (
                 "approximate market-consistent New Business CSM proxy aligned "
                 "with insurer net value before Risk Margin; not IFRS 17 CSM"
             ),
+            "definition": (
+                "PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)"
+            ),
             "optimization_direction": "maximize",
-            "included_fee_inflows": ["fees_product", "fees_lip"],
-            "included_other_insurer_margins": [
-                *(["crediting_margin"] if args.hedge_gain else []),
-                "mva_retained", "aps_retained",
+            "fee_income": ["fees_product", "fees_lip"],
+            "other_income": [
+                "money_market_income",
+                "hedge_gain",
+                "mva_retained",
+                "aps_retained",
             ],
-            "included_insurer_funded_benefits": [
+            "crediting_margin_composition": (
+                "pathwise money-market backing income; no retained above-cap "
+                "Reference-Fund performance under the standard sold cap leg"
+            ),
+            "hedge_cap_leg_mode": projection_config.hedge_cap_leg_mode.value,
+            "claims": [
                 "guarantee_claims",
                 *OTHER_INSURER_FUNDED_BENEFIT_KEYS,
             ],
-            "included_costs": ["expenses", "hedge_costs"],
+            "costs": ["expenses", "hedge_costs"],
             "expense_timing": (
                 "time-zero acquisition/commission expense is assigned to the "
                 "first control year; maintenance expense follows payment time"
@@ -10623,15 +9719,14 @@ def main() -> None:
                 "only through year y-1"
             ),
             "fold_unit": "complete market/control path",
-            "first_cap_selection_folds": (
-                "complete-path out-of-fold fitted action values across every fold"
-                if args.policyholder_behaviour == "lsmc"
-                else "all folds except fold zero in the legacy control fit"
+            "recursive_cross_fit_rule": (
+                "each outer fold owns a complete future-value chain fitted "
+                "without that fold; a separate full-sample chain supplies "
+                "deployment coefficients"
             ),
-            "first_cap_bellman_diagnostic_fold": (
-                "complete-path OOF mean across every fold"
-                if args.policyholder_behaviour == "lsmc"
-                else "fold zero only in the legacy control fit"
+            "first_cap_bellman_diagnostic": (
+                "direct randomised action-cell means with fold-pure future "
+                "continuation targets across all outer folds"
             ),
             "realised_csm_evaluation_sample": (
                 "independent final ScenarioSet; no control-fit fold"
@@ -10648,32 +9743,22 @@ def main() -> None:
             "exposures plus market and crediting history. It remains an aggregate "
             "Markov compression rather than the complete model-point distribution, "
             "so a useful adaptive rule can still be missed.",
-            "The deployable combined-v2 follower is fitted separately by economic "
-            "PolicySpec signature both for every fixed cap and across the complete "
-            "randomised cap paths used by the coupled policy. The resulting "
-            "Stackelberg solution is a fitted bilevel approximation, not a proof of the global "
-            "continuous-state subgame-perfect optimum.",
+            "Policyholder behaviour is an exogenous statistical response model, "
+            "not an individually optimal or equilibrium best response. Every "
+            "reported insurer value is checked in an independent direct rollout.",
             "The monthly product rollout retains DVA, fee subledger, mortality, "
             "expenses, crediting margin and hedge-cost logic. No new calibrated "
             "Behaviour or market parameter is introduced.",
-            "In LSMC mode statistical Ordinary/Performance lapse and scheduled "
-            "voluntary withdrawals are replaced in fixed-cap and coupled deployment "
-            "by the combined-v2 Election and monthly Continue/Partial/Full policy. In the "
-            "separately reported dynamic benchmark, the existing Behaviour model "
-            "still has no direct announced-cap elasticity.",
-            "The cap-randomised combined-v2 follower is trained on the exploratory "
-            "leader-action distribution. Its response away from well represented "
-            "cap/state combinations is therefore regression extrapolation and must "
-            "pass the independent Policyholder and insurer validation gates.",
-            "The retained historical annual Continue/Full two-value recursion is an "
-            "explicit diagnostic benchmark only. It is not invoked by the productive "
-            "LSMC path and its legacy surrender factory remains hard-gated from deployment.",
-            "Fixed-cap and coupled LSMC choose WAIT/START through the same combined-v2 "
-            "Election hook, with "
-            "the first Policy Anniversary strictly after automatic-start age "
-            f"{costs.product.automatic_income_start_age:g} is reached, "
-            f"subject to the {float(costs.product.min_years_before_income):g}-year product "
-            "minimum waiting period.",
+            "The dynamic Behaviour model has no direct announced-cap coefficient. "
+            "Caps affect behaviour through projected Account Value, guarantee "
+            "moneyness and realised reference-versus-credited performance history.",
+            "Joint-Life contracts use the projector's pathwise primary/spouse "
+            "life-state treatment so the dynamic response is not replaced by a "
+            "static spouse-survival-weighted fallback.",
+            "Income Election follows the loaded dynamic annual Take-up hazard, "
+            "subject to contractual eligibility, the product minimum waiting "
+            f"period of {float(costs.product.min_years_before_income):g} year(s) "
+            f"and the automatic-start age {costs.product.automatic_income_start_age:g}.",
             "The New Business CSM measure is a signed market-consistent proxy aligned "
             "with insurer net value before Risk Margin. It is not reported IFRS 17 "
             "CSM and excludes Risk Adjustment, capital, tax and reinsurance.",
@@ -10695,9 +9780,10 @@ def main() -> None:
             "The admissible action and fixed-comparison grid is exactly 0.25%, then "
             "integer caps from 1% through 20%. Zero crediting and no upper cap are "
             "non-contractual sanity checks only.",
-            "The best fixed admissible cap is selected on a validation sample "
-            "and reported on a disjoint final sample; deployed-minus-fixed "
-            "differences use common final-evaluation paths.",
+            "The best fixed admissible cap is selected on its own sample. The "
+            "adaptive-versus-fixed deployment gate uses a second, disjoint sample, "
+            "and both policies are reported on a third final sample. Flexible-minus-"
+            "fixed differences are paired on common final-evaluation market paths.",
         ],
     }
 
@@ -10758,7 +9844,7 @@ def main() -> None:
     })
     preliminary_json_outputs = (
         (output / "optimization_summary.json", summary),
-        (output / "lsmc_policy.json", policy_payload),
+        (output / "dynamic_cap_policy.json", policy_payload),
         (output / "run_manifest.json", manifest),
     )
     with _logged_stage("Checkpoint numerical JSON results before plotting"):

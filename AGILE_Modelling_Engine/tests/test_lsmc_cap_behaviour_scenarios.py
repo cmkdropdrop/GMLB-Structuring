@@ -33,7 +33,27 @@ def test_default_scenarios_use_separate_train_and_evaluation_samples():
     assert args.cap_rates == [0.04, 0.06, 0.12, 0.20]
     assert args.n_train == 4000
     assert args.n_paths == 2000
-    assert args.train_seed != args.seed
+    assert len({
+        args.train_seed,
+        args.train_seed_2,
+        args.train_seed_3,
+        args.validation_seed,
+        args.seed,
+    }) == 5
+    assert len({
+        args.train_take_up_seed,
+        args.train_take_up_seed_2,
+        args.train_take_up_seed_3,
+        args.validation_take_up_seed,
+        args.take_up_seed,
+    }) == 5
+    assert len({
+        args.train_mortality_seed,
+        args.train_mortality_seed_2,
+        args.train_mortality_seed_3,
+        args.validation_mortality_seed,
+        args.mortality_seed,
+    }) == 5
     assert args.exercise_buffer_rmse_multiplier == pytest.approx(0.25)
     assert args.hedge_cap_leg_mode == "sold"
 
@@ -43,6 +63,12 @@ def test_hedge_cap_leg_mode_is_forwarded_to_lsmc_runner():
     command = _scenario_command(args, 0.06, "base", Path("scenario-output"))
     mode_index = command.index("--hedge-cap-leg-mode")
     assert command[mode_index + 1] == "not_sold"
+    assert command[command.index("--train-seed-2") + 1] == str(
+        args.train_seed_2
+    )
+    assert command[command.index("--train-seed-3") + 1] == str(
+        args.train_seed_3
+    )
 
 
 def test_manifest_hedge_cap_leg_mode_must_be_present_and_consistent():
@@ -123,6 +149,9 @@ def test_required_outputs_use_compact_factor_benchmark_directories():
     assert scenario / "bench" / "v00" / "portfolio_summary.csv" in required
     assert scenario / "bench" / "v01" / "portfolio_summary.csv" in required
     assert scenario / "bench" / "v10" / "portfolio_summary.csv" in required
+    assert (
+        scenario / "lsmc_multi_seed_validation_evaluation.csv" in required
+    )
     assert not any("continue_benchmark" in str(path) for path in required)
 
 

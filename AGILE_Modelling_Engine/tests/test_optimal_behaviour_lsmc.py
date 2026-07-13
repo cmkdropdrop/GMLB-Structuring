@@ -20,17 +20,24 @@ from agile_engine.esg import Measure, simulate
 from agile_engine.optimal_behaviour_lsmc import (
     ELECTION_FEATURE_NAMES,
     FEATURE_NAMES,
+    INCOME_ACTION_FEATURE_NAMES,
+    PARTIAL_ACTION_FEATURE_NAMES,
+    OptimalBehaviourPolicy,
     OptimalBehaviourLSMCSettings,
+    OptimalSurrenderPolicy,
+    build_income_action_regression_features,
     build_income_election_regression_features,
     build_surrender_regression_features,
     build_surrender_regression_features_from_arrays,
+    fit_income_action_advantage_policy,
     fit_optimal_behaviour_policy,
     fit_optimal_surrender_policy,
     fit_surrender_continuation_policy,
     no_voluntary_action_behaviour,
 )
 from agile_engine.product import Protection
-from agile_engine.projection import project
+from agile_engine.projection import (IncomeActionDecisionContext,
+                                     IncomeActionType, project)
 
 
 class _NeverSurrender:
@@ -168,6 +175,48 @@ def _synthetic_surrender_context(
         inforce_weight=rng.uniform(0.65, 1.0, n_paths),
         just_elected=np.zeros(n_paths, dtype=bool),
         full_withdrawal_eligible=np.ones(n_paths, dtype=bool),
+    )
+
+
+def _synthetic_income_action_context(
+    n_paths=384,
+    *,
+    step=25,
+):
+    account_value = np.linspace(80_000.0, 120_000.0, n_paths)
+    locked_income = np.full(n_paths, 6_000.0)
+    guarantee_pv = np.full(n_paths, 90_000.0)
+    surrender_value = account_value * 0.99
+    guarantee_log_moneyness = np.log(
+        guarantee_pv / np.maximum(surrender_value, 1.0e-12)
+    )
+    return IncomeActionDecisionContext(
+        step=step,
+        phase=np.full(n_paths, 1, dtype=np.int8),
+        inforce_weight=np.ones(n_paths),
+        partial_withdrawal_eligible=np.ones(n_paths, dtype=bool),
+        full_withdrawal_eligible=np.ones(n_paths, dtype=bool),
+        max_partial_gross_amount=account_value - 2_000.0,
+        account_value=account_value,
+        locked_annual_income=locked_income,
+        guarantee_pv=guarantee_pv,
+        guarantee_log_moneyness=guarantee_log_moneyness,
+        mva_factor=np.full(n_paths, 0.02),
+        surrender_value=surrender_value,
+        short_rate=np.full(n_paths, 0.04),
+        zero_rate_5y=np.full(n_paths, 0.045),
+        heston_variance=np.full(n_paths, 0.04),
+        duration_years=step / 12.0,
+        mva_remaining_years=max(10.0 - step / 12.0, 0.0),
+        attained_age=np.full(n_paths, 65.0 + step / 12.0),
+        time_to_forced_election=np.zeros(n_paths),
+        primary_alive=np.ones(n_paths, dtype=bool),
+        spouse_alive=np.zeros(n_paths, dtype=bool),
+        announced_cap=np.full(n_paths, 0.06),
+        previous_reference_return=np.full(n_paths, 0.04),
+        previous_credited_return=np.full(n_paths, 0.04),
+        performance_gap=np.zeros(n_paths),
+        just_elected=np.zeros(n_paths, dtype=bool),
     )
 
 
@@ -383,9 +432,9 @@ def test_legacy_lsmc_failed_cross_fits_fall_back_to_continue(monkeypatch):
     )
 
 
-def test_combined_lsmc_fits_election_and_surrender_and_rolls_out_from_issue():
-    _, training = _setup(n_paths=192, seed=1101, horizon=4.0)
-    _, evaluation = _setup(n_paths=192, seed=2202, horizon=4.0)
+def test_combined_lsmc_fits_election_and_monthly_actions_and_rolls_out_from_issue():
+    _, training = _setup(n_paths=384, seed=1101, horizon=4.0)
+    _, evaluation = _setup(n_paths=384, seed=2202, horizon=4.0)
     product = IndexLinkedLifetimeIncomeProduct(
         automatic_income_start_age=67.0
     )
@@ -411,10 +460,11 @@ def test_combined_lsmc_fits_election_and_surrender_and_rolls_out_from_issue():
 
     assert fit.training_scenario_fingerprint == training.content_fingerprint
     assert fit.fit_basis_fingerprint != fit.training_scenario_fingerprint
-    assert {diagnostic.action_type for diagnostic in fit.diagnostics} == {
-        "income_election",
-        "full_withdrawal",
-    }
+    assert {
+        "income_election", "partial_withdrawal", "full_withdrawal",
+    }.issubset({
+        diagnostic.action_type for diagnostic in fit.diagnostics
+    })
     assert all(
         diagnostic.phase in {"growth", "income"}
         for diagnostic in fit.diagnostics
@@ -426,6 +476,9 @@ def test_combined_lsmc_fits_election_and_surrender_and_rolls_out_from_issue():
     )
     assert fit.policy.provenance_fingerprint
     assert fit.policy.surrender_policy.provenance_fingerprint
+    assert fit.policy_iteration_count <= 2
+    assert fit.income_action_exposure_coverage >= 0.99
+    assert fit.valid, fit.invalid_reasons
 
     rollout = project(
         product,
@@ -435,7 +488,7 @@ def test_combined_lsmc_fits_election_and_surrender_and_rolls_out_from_issue():
         mortality,
         config=replace(config, mortality_seed=4422),
         income_election_policy=fit.policy,
-        surrender_policy=fit.policy,
+        income_action_policy=fit.policy,
     )
     assert evaluation.content_fingerprint != training.content_fingerprint
     assert np.all(rollout.income_election_events[:, :12] == 0.0)
@@ -537,6 +590,37 @@ def test_income_election_features_use_only_the_decision_context():
     assert not hasattr(capture.context, "future_discount")
 
 
+def test_v2_feature_catalogue_is_compact_and_excludes_redundant_levels():
+    settings = OptimalBehaviourLSMCSettings()
+    assert settings.minimum_regression_observations == 100
+    assert settings.observations_per_coefficient == 10
+    assert settings.relative_svd_cutoff == pytest.approx(1.0e-8)
+    assert settings.maximum_condition_number == pytest.approx(1.0e8)
+    assert len(FEATURE_NAMES) == 16
+    assert len(ELECTION_FEATURE_NAMES) == 22
+    assert len(INCOME_ACTION_FEATURE_NAMES) == 22
+    assert len(PARTIAL_ACTION_FEATURE_NAMES) == 27
+    assert "previous_credited_return" not in FEATURE_NAMES
+    assert "previous_credited_return" not in ELECTION_FEATURE_NAMES
+    assert "prospective_income_rate" not in ELECTION_FEATURE_NAMES
+    assert "max_partial_gross_ratio" not in INCOME_ACTION_FEATURE_NAMES
+    assert not any("cube" in name for name in FEATURE_NAMES)
+
+
+def test_combined_v2_rejects_a_non_contractual_ridge_grid():
+    _, scenarios = _setup(n_paths=2, seed=4401, horizon=3.0)
+    with pytest.raises(ValueError, match="fixed Ridge grid"):
+        fit_optimal_behaviour_policy(
+            IndexLinkedLifetimeIncomeProduct(
+                automatic_income_start_age=67.0
+            ),
+            PolicySpec(age=65, income_start_year=1),
+            scenarios,
+            MortalityTable.gompertz_makeham(),
+            settings=OptimalBehaviourLSMCSettings(ridge=3.0e-5),
+        )
+
+
 def test_context_exposes_only_observable_read_only_state_and_rich_features():
     _, scenarios = _setup(n_paths=16, seed=303, horizon=4.0)
     product = IndexLinkedLifetimeIncomeProduct(
@@ -600,8 +684,191 @@ def test_array_native_feature_builder_exactly_matches_context_builder():
     assert from_arrays.shape == (context.n_paths, len(FEATURE_NAMES))
 
 
+def test_deterministic_v2_advantages_recover_known_election_and_partial_action():
+    n_paths = 384
+    premium = 100_000.0
+    settings = OptimalBehaviourLSMCSettings(
+        n_folds=3,
+        fold_seed=41,
+        exercise_buffer_rmse_multiplier=0.0,
+    )
+    path_ids = np.arange(n_paths, dtype=np.int64)
+
+    election_raw = np.zeros((n_paths, len(ELECTION_FEATURE_NAMES)))
+    election_raw[:, 0] = np.linspace(0.2, 1.2, n_paths)
+    wait_value = np.full(n_paths, 1_000.0)
+    start_value = wait_value + 250.0
+    pair, election_oof, _folds, _fold_pairs = (
+        optimal_behaviour_module._fit_election_regression_pair(
+            election_raw,
+            wait_value,
+            start_value,
+            premium=premium,
+            settings=settings,
+            fold_ids=path_ids,
+        )
+    )
+    assert pair.stable(settings)
+    assert np.all(election_oof > settings.exercise_tolerance_aud)
+
+    context = _synthetic_income_action_context(n_paths=n_paths)
+    base = build_income_action_regression_features(context, premium)
+    fractions = np.tile(np.asarray([0.25, 0.50, 1.00]), (n_paths, 1))
+    # Analytic concave advantage with its unique maximum at 25% of M.
+    partial_advantage = 200.0 - 1_000.0 * (fractions - 0.25) ** 2
+    fit = fit_income_action_advantage_policy(
+        {context.step: base},
+        full_advantage_targets_aud_by_step={
+            context.step: np.full(n_paths, -100.0)
+        },
+        partial_fractions_by_step={context.step: fractions},
+        partial_advantage_targets_aud_by_step={
+            context.step: partial_advantage
+        },
+        premium=premium,
+        settings=settings,
+        fold_ids_by_step={context.step: path_ids},
+    )
+    policy = OptimalBehaviourPolicy(
+        election_regressions={},
+        surrender_policy=OptimalSurrenderPolicy(
+            regressions={}, settings=settings
+        ),
+        premium=premium,
+        issue_age=65.0,
+        settings=settings,
+        income_action_regressions=fit.regressions_by_step,
+    )
+    decision = policy.choose_income_action(context=context)
+    assert np.all(
+        decision.action_type
+        == IncomeActionType.PARTIAL_WITHDRAWAL.value
+    )
+    np.testing.assert_allclose(decision.partial_fraction_of_max, 0.25)
+
+
+def test_collinear_v2_design_produces_finite_stable_advantages():
+    # 151 paths are enough for the two actually retained coefficients
+    # (intercept plus one SVD component), but not for all nominal columns.
+    n_paths = 151
+    signal = np.linspace(-1.0, 1.0, n_paths)
+    raw = np.repeat(signal[:, None], len(INCOME_ACTION_FEATURE_NAMES), axis=1)
+    target = 75.0 * signal
+    settings = OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=47)
+    regression, oof, _folds, fold_regressions = (
+        optimal_behaviour_module._cross_fitted_advantage_regression(
+            raw,
+            target,
+            100_000.0,
+            settings,
+            np.arange(n_paths, dtype=np.int64),
+            core_feature_indices=(
+                optimal_behaviour_module.INCOME_ACTION_CORE_FEATURE_INDICES
+            ),
+        )
+    )
+    assert optimal_behaviour_module._regression_is_stable(
+        regression, settings
+    )
+    assert all(
+        optimal_behaviour_module._regression_is_stable(item, settings)
+        for item in fold_regressions
+    )
+    assert np.isfinite(oof).all()
+    assert np.isfinite(regression.predict_features(raw)).all()
+
+
+def test_partial_action_replicas_keep_the_complete_path_fold(monkeypatch):
+    context = _synthetic_income_action_context(n_paths=384)
+    premium = 100_000.0
+    base = build_income_action_regression_features(context, premium)
+    fractions = np.tile(np.asarray([0.25, 0.50, 1.00]), (context.n_paths, 1))
+    path_ids = np.arange(context.n_paths, dtype=np.int64)
+    captured_partial_ids = []
+    original = optimal_behaviour_module._cross_fitted_advantage_regression
+
+    def capture_group_ids(raw, target, premium_value, settings, fold_ids, **kwargs):
+        if raw.shape[1] == len(PARTIAL_ACTION_FEATURE_NAMES):
+            captured_partial_ids.append(np.asarray(fold_ids).copy())
+        return original(
+            raw,
+            target,
+            premium_value,
+            settings,
+            fold_ids,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        optimal_behaviour_module,
+        "_cross_fitted_advantage_regression",
+        capture_group_ids,
+    )
+    fit_income_action_advantage_policy(
+        {context.step: base},
+        full_advantage_targets_aud_by_step={},
+        partial_fractions_by_step={context.step: fractions},
+        partial_advantage_targets_aud_by_step={
+            context.step: np.zeros_like(fractions)
+        },
+        premium=premium,
+        settings=OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=43),
+        fold_ids_by_step={context.step: path_ids},
+    )
+
+    assert len(captured_partial_ids) == 1
+    replica_ids = captured_partial_ids[0].reshape(context.n_paths, -1)
+    np.testing.assert_array_equal(
+        replica_ids,
+        np.repeat(path_ids[:, None], replica_ids.shape[1], axis=1),
+    )
+
+
+def test_partial_replicas_cannot_satisfy_the_unique_path_minimum():
+    context = _synthetic_income_action_context(n_paths=99)
+    premium = 100_000.0
+    base = build_income_action_regression_features(context, premium)
+    fractions = np.tile(
+        np.asarray([0.20, 0.40, 0.60, 0.80, 1.00]),
+        (context.n_paths, 1),
+    )
+    with pytest.raises(ValueError, match="unique complete paths"):
+        fit_income_action_advantage_policy(
+            {context.step: base},
+            full_advantage_targets_aud_by_step={},
+            partial_fractions_by_step={context.step: fractions},
+            partial_advantage_targets_aud_by_step={
+                context.step: np.zeros_like(fractions)
+            },
+            premium=premium,
+            settings=OptimalBehaviourLSMCSettings(n_folds=2),
+            fold_ids_by_step={
+                context.step: np.arange(context.n_paths, dtype=np.int64)
+            },
+        )
+
+
+def test_invalid_v2_policy_hard_fails_instead_of_continuing():
+    settings = OptimalBehaviourLSMCSettings()
+    policy = OptimalBehaviourPolicy(
+        election_regressions={},
+        surrender_policy=OptimalSurrenderPolicy(
+            regressions={}, settings=settings
+        ),
+        premium=100_000.0,
+        issue_age=65.0,
+        settings=settings,
+        valid=False,
+        invalid_reasons=("policy_iteration_not_converged",),
+    )
+    with pytest.raises(RuntimeError, match="policy_iteration_not_converged"):
+        policy.choose_income_action(
+            context=_synthetic_income_action_context(n_paths=2)
+        )
+
+
 def test_public_continuation_fitter_returns_context_policy_and_pathwise_oof_fit():
-    context = _synthetic_surrender_context()
+    context = _synthetic_surrender_context(n_paths=512)
     premium = 100_000.0
     features = build_surrender_regression_features(context, premium)
     continuation = np.zeros(context.n_paths)
@@ -663,21 +930,25 @@ def test_public_continuation_fitter_falls_back_to_continue_when_too_small():
 
 
 def test_public_continuation_fitter_handles_an_imbalanced_boundary_fold():
-    context = _synthetic_surrender_context(n_paths=60)
+    context = _synthetic_surrender_context(n_paths=341)
     features = build_surrender_regression_features(context, 100_000.0)
-    # Modulo two gives 31 rows in fold 0 and 29 in fold 1.  Although the
-    # overall 60-row threshold is met, fold 0 leaves only 29 training rows for
-    # 29 raw features plus the intercept.
+    coefficient_count = len(FEATURE_NAMES) + 1
+    minimum_train = max(100, 10 * coefficient_count)
+    # The total panel reaches the v2 boundary, but the deliberately imbalanced
+    # two-fold assignment leaves only minimum_train - 1 rows in one train fold.
     complete_path_ids = np.concatenate((
-        np.arange(59, dtype=np.int64),
-        np.array([60], dtype=np.int64),
+        np.zeros(341 - (minimum_train - 1), dtype=np.int64),
+        np.ones(minimum_train - 1, dtype=np.int64),
     ))
 
     fit = fit_surrender_continuation_policy(
         {context.step: features},
         {context.step: np.zeros(context.n_paths)},
         premium=100_000.0,
-        settings=OptimalBehaviourLSMCSettings(n_folds=2),
+        settings=OptimalBehaviourLSMCSettings(
+            n_folds=2,
+            minimum_regression_observations=minimum_train,
+        ),
         fold_ids_by_step={context.step: complete_path_ids},
     )
 
@@ -685,16 +956,16 @@ def test_public_continuation_fitter_handles_an_imbalanced_boundary_fold():
     assert context.step not in fit.policy.regressions
     assert context.step not in fit.oof_continuation_by_step
     diagnostic = fit.diagnostics[0]
-    assert diagnostic.observations == 60
+    assert diagnostic.observations == 341
     assert diagnostic.folds_used == 0
     assert diagnostic.fallback_reason is not None
     assert diagnostic.fallback_reason.startswith("cross_fit_failed:")
-    assert "Insufficient observations" in diagnostic.fallback_reason
+    assert "unique complete paths" in diagnostic.fallback_reason
     assert not np.any(fit.policy.surrender_mask(context=context))
 
 
 def test_public_continuation_fitter_falls_back_to_continue_when_unstable():
-    context = _synthetic_surrender_context()
+    context = _synthetic_surrender_context(n_paths=512)
     features = build_surrender_regression_features(context, 100_000.0)
     fit = fit_surrender_continuation_policy(
         {context.step: features},

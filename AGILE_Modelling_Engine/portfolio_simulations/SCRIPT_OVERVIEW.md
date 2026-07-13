@@ -294,6 +294,33 @@ Defaultoutput ist `output/crediting_cap_lsmc` und enthält:
 - `run.log` mit DEBUG-Details;
 - sieben Diagnosegrafiken unter `plots/`, wahlweise als PNG, SVG oder beides.
 
+### `optimize_crediting_rate_dynamic_behaviour.py`
+
+Dies ist der dedizierte Runner für dieselbe jährliche adaptive Cap-Studie
+unter dem statistischen dynamischen Policyholder-Modell. Er fittet keine
+Policyholder-LSMC und bietet deshalb keinen Behaviour-Modus-Schalter. Income
+Election, Ordinary-/Performance-Lapse und Partial-/Excess-Withdrawals werden
+direkt aus den versionierten Annahmen unter `input_dynamic_behaviour` im
+monatlichen Projektor angewandt. Joint-Life-Modellpunkte verwenden dabei die
+pfadweise Primary-/Spouse-Life-State-Behandlung.
+
+Nur die Versicherer-Cap-Policy wird weiterhin durch cross-fitted
+Control-Randomisation/Fitted-Q geschätzt. Die adaptive Policy wird auf einem
+separaten Sample gegen das beste feste Cap validiert und danach auf einem
+disjunkten finalen Sample direkt projiziert. Der Defaultoutput ist
+`output/crediting_cap_dynamic_behaviour`; die Policy wird als
+`dynamic_cap_policy.json` geschrieben. Die Behaviour-Annahmen bleiben
+unkalibrierte Proxy-Annahmen.
+Der Hedge-Standard ist ausdrücklich der vollständige Call Spread mit
+verkaufter oberer Cap-Leg (`sold`); die Versicherung behält daher keine
+Referenzfondsperformance oberhalb des Kundencaps. Money-Market-Backing-Income
+bleibt davon unabhängig Bestandteil der CSM-Proxy.
+Die Optimierungsgröße folgt explizit
+`CSM = PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)`.
+Money-Market-Income und Hedge Gain werden dabei separat ausgewiesen; die
+Kosten enthalten Akquisitions- und laufende Kosten sowie den vollständigen
+fairen Optionsspread inklusive Markup, Management- und Ausführungskosten.
+
 ### `run_lsmc_crediting_cap.py`
 
 Diese Datei ist ein veralteter Kompatibilitäts-Wrapper. Bei direkter

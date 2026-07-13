@@ -116,3 +116,12 @@ Die Produktlogik für das generische Produkt ist in Produktdesign_Index_Linked_L
 
 
 Bei der Modellierung der Verhaltensweisen der Policyholder sollen 2 Arten im Vordergrund stehen: 1) optimales Verhalten nach LSMC und 2) dynamisches Verhalten. In beiden Fällen ist damit gemeint wann sich der Policyholder entscheidet die Growth Phase zu beenden und die Income Phase zu starten, und wann die Policyholder während der Income Phase mehr oder weniger entnehmen als vorgesehen, bzw. Lapsen. Bei 2) ist es wichtig, dass die Funktion dafür unter anderem von der Moneyness abhängt und in ähnlicher Form auch in der Praxis verwendet wird
+
+Das Standardmass für die Bewertung der Profitabilität soll die Contracutal Service Margin sein, auch CSM.
+CSM = PV(Fee Income) + PV(sonstiges Income) - PV(Claims) - PV(Costs)
+
+PV(sonstiges Income) soll berücksichtigen, dass die Versicherung die Rendite aus dem Money Market Fund bekommt in dem die Kundengelder angelegt werden. Es können aber auch Hedge Gewinne sein, z.B. wenn die Versicherung keinen Call Spread nutzt sondern nur den unteren Call und deswegen die Rendite des Index oberhalb des Caps behalten darf
+
+PV(Costs) sind sonstige Kosten, die die Versicherung hat wie etwa Acquisitionskosten und ganz wichtig: die Kosten für die Optionsspread. Wenn also die Versicherung einen höheren Cap wählt dann sollten die Hedgekosten höher sein, weil sie den long Call nicht mehr so gut subventioniert
+
+Kaufen und Verkaufen von Calls und Call Spread: Standardmässig kauft die Versicherung einen Call am Kapitalmarkt und verkauft ebenfalls einen Call am Kapitalmarkt. Damit ist nicht gemeint, dass die Versicherung die Optionen an ihre Kunden verkauft. Praktisch bedeutet dies: höhrerer Cap = höhere Kosten die die Versicherung zahlt

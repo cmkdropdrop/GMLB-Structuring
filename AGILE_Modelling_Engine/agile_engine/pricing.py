@@ -140,6 +140,7 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
                    scenarios: Optional[ScenarioSet] = None,
                    surrender_policy: Optional[object] = None,
                    income_election_policy: Optional[object] = None,
+                   income_action_policy: Optional[object] = None,
                    ) -> ValuationResult:
     """Full risk-neutral valuation of one model point."""
     def external_policy_identity(candidate: Optional[object]) -> object:
@@ -181,6 +182,9 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
     income_election_policy_identity = external_policy_identity(
         income_election_policy
     )
+    income_action_policy_identity = external_policy_identity(
+        income_action_policy
+    )
     if scenarios is None:
         scenarios = build_scenarios(esg_config, settings, Measure.RISK_NEUTRAL,
                                     horizon_years=resolve_horizon(settings, policy))
@@ -218,7 +222,8 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
     res = project(product, policy, scenarios, behaviour, mortality,
                   expenses=expenses, config=settings.projection,
                   surrender_policy=surrender_policy,
-                  income_election_policy=income_election_policy)
+                  income_election_policy=income_election_policy,
+                  income_action_policy=income_action_policy)
     pv = res.pv_by_component()
     pv.update(res.pv_phase_by_component())
 
@@ -238,6 +243,10 @@ def value_contract(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec
                                         (
                                             "income_election_policy",
                                             income_election_policy_identity,
+                                        ),
+                                        (
+                                            "income_action_policy",
+                                            income_action_policy_identity,
                                         ))
     return ValuationResult(pv=pv, premium=premium, bel_nonunit=bel_nonunit,
                            bel_total=policy.net_initial_investment + bel_nonunit,

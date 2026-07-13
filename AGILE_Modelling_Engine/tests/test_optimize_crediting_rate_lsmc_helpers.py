@@ -29,8 +29,10 @@ from agile_engine.product import Protection
 from portfolio_simulations.optimize_crediting_rate_lsmc import (
     ACTION_CAPS,
     BackwardResult,
+    COMBINED_FOLLOWER_VERSION,
     CONTROL_STATE_FEATURE_NAMES,
     ControlStateInputs,
+    CoupledPolicyholderFitSet,
     PathwiseReferenceFundSpec,
     PolicyholderFitSet,
     RegressionPolicyYear,
@@ -45,7 +47,7 @@ from portfolio_simulations.optimize_crediting_rate_lsmc import (
     _csm_benchmark_row,
     _pathwise_cap_adapter,
     _policy_payload,
-    _policyholder_fit_set_payload,
+    _policy_signature,
     _rollout_cap_policy,
     _slice_scenarios,
     _vector_hedge_option_package_value,
@@ -130,69 +132,125 @@ def test_adaptive_deployment_gate_is_validation_only_and_conservative(
     ) is expected
 
 
-def test_whole_training_policy_fallback_serializes_every_continue_step():
-    policy = OptimalSurrenderPolicy(
-        regressions={},
-        settings=OptimalBehaviourLSMCSettings(),
+def _minimal_combined_policy():
+    return SimpleNamespace(
+        valid=True,
+        invalid_reasons=(),
+        monthly_income_actions_required=True,
+        surrender_policy=SimpleNamespace(regressions={}),
+        start_income_mask=lambda *, context: context,
+        choose_income_action=lambda *, context: context,
     )
-    fit = SimpleNamespace(
-        policy=policy,
-        training_fallback_used=True,
-        diagnostics=(
-            SimpleNamespace(
-                decision_step=24,
-                regression_accepted_for_exercise=True,
-            ),
-            SimpleNamespace(
-                decision_step=36,
-                regression_accepted_for_exercise=True,
-            ),
+
+
+def _minimal_combined_fit(*, valid=True, invalid_reasons=()):
+    cross_fitted = _minimal_combined_policy()
+    return SimpleNamespace(
+        fit_version=COMBINED_FOLLOWER_VERSION,
+        valid=valid,
+        invalid_reasons=tuple(invalid_reasons),
+        policy=_minimal_combined_policy(),
+        cross_fitted_training_policy=cross_fitted,
+        diagnostics=(),
+        training_fallback_used=False,
+    )
+
+
+def test_policyholder_fit_set_factory_rejects_legacy_and_invalid_fits():
+    policy_spec = PolicySpec(age=65.0, income_start_year=5.0)
+    signature = _policy_signature(policy_spec)
+    legacy_fit = SimpleNamespace(
+        fit_version="legacy_surrender_only_v1",
+        valid=True,
+        invalid_reasons=(),
+        policy=OptimalSurrenderPolicy(
+            regressions={},
+            settings=OptimalBehaviourLSMCSettings(),
         ),
+        diagnostics=(),
+        training_fallback_used=False,
     )
+    invalid_v2_fit = _minimal_combined_fit(
+        valid=False,
+        invalid_reasons=("material_income_action_fit_failure",),
+    )
+
+    for fit, expected_message in (
+        (legacy_fit, "deployment requires"),
+        (invalid_v2_fit, "invalid combined follower"),
+    ):
+        fit_set = PolicyholderFitSet(
+            fits={signature: fit},
+            scenario_fingerprint="training",
+            cap_schedule_fingerprint="cap-schedule",
+        )
+        with pytest.raises(RuntimeError, match=expected_message):
+            fit_set.factory(policy_spec)
+
+
+def test_policyholder_fit_set_factory_returns_the_same_combined_v2_policy():
+    policy_spec = PolicySpec(age=65.0, income_start_year=5.0)
+    signature = _policy_signature(policy_spec)
+    fit = _minimal_combined_fit()
     fit_set = PolicyholderFitSet(
-        fits={("signature",): fit},
+        fits={signature: fit},
         scenario_fingerprint="training",
         cap_schedule_fingerprint="cap-schedule",
     )
 
-    assert fit_set.fallback_count == 1
-    assert fit_set.fallback_step_count == 2
-    signature = _policyholder_fit_set_payload(fit_set)["signatures"][0]
-    assert signature["continue_fallback_deployed"] is True
-    assert signature["whole_signature_continue_fallback_deployed"] is True
-    assert signature["continue_fallback_decision_steps"] == [24, 36]
-    assert signature["deployed_regression_count"] == 0
+    deployed = fit_set.factory(policy_spec)
+
+    assert deployed is fit.policy
+    assert fit_set.factory(policy_spec) is deployed
+    assert callable(deployed.start_income_mask)
+    assert callable(deployed.choose_income_action)
+    assert deployed.monthly_income_actions_required is True
+    assert deployed.surrender_policy.regressions == {}
 
 
-def test_step_cross_fit_fallback_is_counted_and_serialized():
-    policy = OptimalSurrenderPolicy(
+def test_coupled_fit_set_exposes_legacy_policy_only_as_benchmark():
+    policy_spec = PolicySpec(age=65.0, income_start_year=5.0)
+    signature = _policy_signature(policy_spec)
+    legacy_policy = OptimalSurrenderPolicy(
         regressions={},
         settings=OptimalBehaviourLSMCSettings(),
     )
-    fit_set = PolicyholderFitSet(
-        fits={
-            ("signature",): SimpleNamespace(
-                policy=policy,
-                training_fallback_used=False,
-                diagnostics=(SimpleNamespace(
-                    decision_step=48,
-                    regression_accepted_for_exercise=False,
-                    fallback_reason=(
-                        "cross_fit_failed:Insufficient observations"
-                    ),
-                ),),
-            )
-        },
+    fit_set = CoupledPolicyholderFitSet(
+        policies={signature: legacy_policy},
         scenario_fingerprint="training",
-        cap_schedule_fingerprint="cap-schedule",
+        cap_schedule_fingerprint="control-randomisation",
     )
 
-    assert fit_set.fallback_count == 1
-    assert fit_set.fallback_step_count == 1
-    signature = _policyholder_fit_set_payload(fit_set)["signatures"][0]
-    assert signature["continue_fallback_deployed"] is True
-    assert signature["whole_signature_continue_fallback_deployed"] is True
-    assert signature["continue_fallback_decision_steps"] == [48]
+    assert fit_set.deployment_eligible is False
+    with pytest.raises(RuntimeError, match="cannot be deployed"):
+        fit_set.factory(policy_spec)
+    assert fit_set.benchmark_factory(policy_spec) is legacy_policy
+
+
+def test_coupled_and_fixed_fit_sets_deploy_the_same_combined_v2_surface():
+    policy_spec = PolicySpec(age=65.0, income_start_year=5.0)
+    signature = _policy_signature(policy_spec)
+    fit = _minimal_combined_fit()
+    fixed = PolicyholderFitSet(
+        fits={signature: fit},
+        scenario_fingerprint="training",
+        cap_schedule_fingerprint="fixed-cap",
+    )
+    coupled = CoupledPolicyholderFitSet(
+        policies={},
+        fits={signature: fit},
+        scenario_fingerprint="training",
+        cap_schedule_fingerprint="randomised-caps",
+    )
+
+    assert coupled.deployment_eligible is True
+    assert coupled.follower_contract_version == COMBINED_FOLLOWER_VERSION
+    assert coupled.factory(policy_spec) is fixed.factory(policy_spec)
+    assert coupled.training_factory(policy_spec) is (
+        fit.cross_fitted_training_policy
+    )
+    assert callable(coupled.factory(policy_spec).start_income_mask)
+    assert callable(coupled.factory(policy_spec).choose_income_action)
 
 
 @pytest.mark.parametrize(

@@ -866,6 +866,9 @@ def _value_model_point(
     settings: ValuationSettings,
     scenarios: ScenarioSet,
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
+    income_action_policy_factory: Optional[
+        Callable[[PolicySpec], object]
+    ] = None,
     combined_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
 ) -> _ScalarValuation:
     """Value a model point, including the pre-Election spouse-life split."""
@@ -874,9 +877,18 @@ def _value_model_point(
         if combined_policy_factory is None
         else combined_policy_factory(model_point.policy)
     )
+    income_action_policy = (
+        combined_policy
+        if combined_policy is not None
+        and callable(getattr(combined_policy, "choose_income_action", None))
+        else None
+        if income_action_policy_factory is None
+        else income_action_policy_factory(model_point.policy)
+    )
     surrender_policy = (
         combined_policy
         if combined_policy is not None
+        and income_action_policy is None
         and callable(getattr(combined_policy, "surrender_mask", None))
         else None
         if surrender_policy_factory is None
@@ -886,6 +898,7 @@ def _value_model_point(
         behaviour.take_up.mode != "deterministic"
         or combined_policy_factory is not None
         or surrender_policy_factory is not None
+        or income_action_policy_factory is not None
         or behaviour.use_dynamic
         or behaviour.use_dynamic_withdrawals
         or settings.projection.force_pathwise_joint_life
@@ -916,6 +929,7 @@ def _value_model_point(
         scenarios=scenarios,
         surrender_policy=surrender_policy,
         income_election_policy=combined_policy,
+        income_action_policy=income_action_policy,
     ))
     if not model_point.policy.spouse or pathwise_behaviour:
         return joint_or_single
@@ -940,6 +954,11 @@ def _value_model_point(
             None
             if surrender_policy_factory is None
             else surrender_policy_factory(fallback_point.policy)
+        ),
+        income_action_policy=(
+            None
+            if income_action_policy_factory is None
+            else income_action_policy_factory(fallback_point.policy)
         ),
     ))
     return _combine_joint_and_single_fallback(
@@ -1226,6 +1245,9 @@ def value_policyholder_portfolio(
     profitability_materiality_bp: float = 1.0,
     progress_callback: Optional[Callable[[PortfolioProgress], None]] = None,
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
+    income_action_policy_factory: Optional[
+        Callable[[PolicySpec], object]
+    ] = None,
     combined_policy_factory: Optional[Callable[[PolicySpec], object]] = None,
     scenario_transform: Optional[Callable[[ScenarioSet], ScenarioSet]] = None,
 ) -> PortfolioValuationResult:
@@ -1243,9 +1265,10 @@ def value_policyholder_portfolio(
     model, seed, monthly grid or path dimensions.
 
     ``combined_policy_factory`` supplies one frozen out-of-sample policy per
-    PolicySpec.  The object may implement both
-    ``start_income_mask(*, context=...)`` and ``surrender_mask(*, context=...)``;
-    the same instance is passed through pricing to both contractual gates.
+    PolicySpec.  A v2 object implements ``start_income_mask`` and
+    ``choose_income_action`` and is passed to the annual Election and monthly
+    Income-action gates.  Older objects implementing ``surrender_mask`` remain
+    supported as explicit Election/Full-Withdrawal research policies.
     """
     total_model_points = len(model_points.model_points)
     if total_model_points == 0:
@@ -1283,12 +1306,22 @@ def value_policyholder_portfolio(
     )
     if any(not isinstance(value, bool) for value in fair_fee_switches):
         raise ValueError("Fair-fee switches must be boolean.")
-    if surrender_policy_factory is not None and combined_policy_factory is not None:
+    separate_policy_factories = sum(factory is not None for factory in (
+        surrender_policy_factory,
+        income_action_policy_factory,
+    ))
+    if combined_policy_factory is not None and separate_policy_factories:
         raise ValueError(
-            "Use either surrender_policy_factory or combined_policy_factory, "
-            "not both."
+            "Use combined_policy_factory or separate Income-action/Surrender "
+            "factories, not both."
+        )
+    if separate_policy_factories > 1:
+        raise ValueError(
+            "Use either surrender_policy_factory or "
+            "income_action_policy_factory, not both."
         )
     if (surrender_policy_factory is not None
+            or income_action_policy_factory is not None
             or combined_policy_factory is not None) and any(fair_fee_switches):
         raise ValueError(
             "Fair-fee solves with LSMC require refitting the exercise policy "
@@ -1309,6 +1342,7 @@ def value_policyholder_portfolio(
             behaviour.take_up.mode != "deterministic"
             or combined_policy_factory is not None
             or surrender_policy_factory is not None
+            or income_action_policy_factory is not None
             or behaviour.use_dynamic
             or behaviour.use_dynamic_withdrawals
             or valuation_settings.projection.force_pathwise_joint_life
@@ -1451,6 +1485,7 @@ def value_policyholder_portfolio(
             settings=common_settings,
             scenarios=scenarios,
             surrender_policy_factory=surrender_policy_factory,
+            income_action_policy_factory=income_action_policy_factory,
             combined_policy_factory=combined_policy_factory,
         )
         metrics = _valuation_metrics(
@@ -1477,8 +1512,10 @@ def value_policyholder_portfolio(
             deterministic_benchmark_year if deterministic_election else None
         )
         metrics["behaviour_treatment"] = (
-            "combined_policy_dynamic_income_election_and_full_withdrawal"
+            "combined_policy_optimal_income_election_and_income_actions"
             if combined_policy_factory is not None
+            else "lsmc_optimal_income_partial_or_full_withdrawal"
+            if income_action_policy_factory is not None
             else "lsmc_optimal_income_full_withdrawal"
             if surrender_policy_factory is not None
             else _model_point_behaviour_treatment(
@@ -1908,6 +1945,7 @@ def value_policyholder_portfolio(
         "heston_cos": bool(common_settings.projection.heston_cos),
         "lsmc_used": (
             surrender_policy_factory is not None
+            or income_action_policy_factory is not None
             or combined_policy_factory is not None
         ),
         "income_take_up_mode": (
@@ -1916,7 +1954,7 @@ def value_policyholder_portfolio(
             else behaviour.take_up.mode
         ),
         "income_take_up_source": (
-            "frozen_combined_income_election_and_surrender_policy"
+            "frozen_combined_income_election_and_income_action_policy"
             if combined_policy_factory is not None
             else
             "effective_model_point_income_start_year_with_automatic_age_backstop"
@@ -1944,8 +1982,10 @@ def value_policyholder_portfolio(
             "independent_lives" if has_joint_life else "not_applicable"
         ),
         "joint_life_behaviour_treatment": (
-            "pathwise_joint_life_combined_election_and_surrender_policy"
+            "pathwise_joint_life_combined_election_and_income_action_policy"
             if uses_pathwise_joint_life and combined_policy_factory is not None
+            else "pathwise_joint_life_fitted_post_election_income_action_policy"
+            if uses_pathwise_joint_life and income_action_policy_factory is not None
             else "pathwise_joint_life_fitted_post_election_surrender_policy"
             if uses_pathwise_joint_life and surrender_policy_factory is not None
             else "pathwise_joint_life_dynamic_state_dependent"
@@ -1955,7 +1995,10 @@ def value_policyholder_portfolio(
             if uses_pathwise_joint_life
             else
             "joint_and_single_fallback_branches_use_separately_fitted_lsmc_policies"
-            if joint_continue_income_count and surrender_policy_factory is not None
+            if joint_continue_income_count and (
+                surrender_policy_factory is not None
+                or income_action_policy_factory is not None
+            )
             else
             "joint_branch_static_base_single_fallback_dynamic_for_continue_income"
             if joint_continue_income_count

@@ -7,12 +7,18 @@ Reference Fund, daily fee subledger, monthly income, mortality, MVA, expenses,
 hedge costs and crediting margin.
 
 The primary API solves ``WAIT | START_INCOME_NOW`` in Growth and
-``CONTINUE | FULL_WITHDRAWAL`` in Income.  START is evaluated as the exact
+``CONTINUE | PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL`` in Income.  START is evaluated as the exact
 projector state transition followed by the already-solved Income policy; it is
 not treated as an immediate payment.  The historical surrender-only fit is
 retained under the explicit :func:`fit_optimal_surrender_policy` name as a
 fixed-Election validation API.  Growth surrender and all Growth withdrawals
 remain contractually prohibited.
+
+Version two fits *paired action advantages* rather than two noisy value levels.
+All regressions use training-fold standardisation and a truncated-SVD,
+augmented Ridge least-squares solve.  In particular, this module never forms
+normal equations: doing so squares the design condition number and was the
+source of mechanically late Elections in the original research implementation.
 """
 
 from __future__ import annotations
@@ -30,42 +36,45 @@ from .esg import ScenarioSet, STEPS_PER_YEAR
 from .mortality import MortalityTable
 from .product import (ExpenseAssumptions, IndexLinkedLifetimeIncomeProduct,
                       Phase, PolicySpec)
-from .projection import (IncomeElectionDecisionContext, ProjectionConfig,
-                         ProjectionResult, SurrenderDecisionContext, project)
+from .projection import (IncomeActionDecision, IncomeActionDecisionContext,
+                         IncomeActionState, IncomeActionType,
+                         IncomeElectionDecisionContext,
+                         IncomeTransitionPanelCollector,
+                         ProjectionConfig, ProjectionResult,
+                         SurrenderDecisionContext, advance_income_month,
+                         apply_income_action,
+                         build_income_action_decision_context, project)
 
 
 Array = NDArray[np.float64]
+
+# Economically compact v2 basis.  Ratios are measured against net premium and
+# all features are observable at the decision timestamp.  Deliberately omitted
+# are the former cubic terms and correlated value-level cross-products.
 FEATURE_NAMES = (
-    "account_value",
-    "account_value_sq",
-    "account_value_cu",
-    "surrender_value",
-    "surrender_value_sq",
-    "annual_income",
-    "annual_income_sq",
-    "guarantee_pv",
-    "guarantee_pv_sq",
+    "log1p_account_value_ratio",
+    "annual_income_ratio",
     "guarantee_log_moneyness",
     "short_rate",
-    "short_rate_sq",
-    "zero_rate_5y",
     "five_year_rate_slope",
-    "global_equity_variance",
-    "global_equity_variance_sq",
-    "duration_years",
+    "sqrt_heston_variance",
+    "duration_years_scaled",
     "announced_cap",
     "previous_reference_return",
-    "previous_credited_return",
     "performance_gap",
-    "account_value_x_income",
-    "account_value_x_guarantee_pv",
-    "surrender_value_x_guarantee_pv",
-    "account_value_x_short_rate",
-    "annual_income_x_short_rate",
+    "account_value_sq",
+    "annual_income_sq",
+    "guarantee_moneyness_sq",
+    "account_value_x_guarantee_moneyness",
+    "annual_income_x_guarantee_moneyness",
     "guarantee_moneyness_x_short_rate",
-    "announced_cap_x_account_value",
-    "performance_gap_x_guarantee_moneyness",
 )
+
+# The documented linear fallback contains only AV, Income, Moneyness, time
+# and rates.  Product controls (including MVA) deliberately remain full-basis
+# features and cannot leak into this fallback.
+CORE_FEATURE_INDICES = np.asarray((0, 1, 2, 3, 4, 6), dtype=np.int64)
+RIDGE_GRID_DEFAULT = (0.0, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2)
 
 
 @dataclass(frozen=True)
@@ -73,12 +82,17 @@ class OptimalBehaviourLSMCSettings:
     """Numerical settings for the backward LSMC fit."""
 
     ridge: float = 1.0e-6
+    ridge_grid: tuple[float, ...] = RIDGE_GRID_DEFAULT
     n_folds: int = 5
     fold_seed: int = 9137
     exercise_tolerance_aud: float = 1.0e-8
     exercise_buffer_rmse_multiplier: float = 0.25
     minimum_inforce_weight: float = 1.0e-10
-    maximum_condition_number: float = 1.0e10
+    relative_svd_cutoff: float = 1.0e-8
+    maximum_condition_number: float = 1.0e8
+    minimum_regression_observations: int = 100
+    observations_per_coefficient: int = 10
+    immaterial_exposure_fraction: float = 1.0e-6
     fallback_to_no_action_if_training_underperforms: bool = True
 
     def __post_init__(self) -> None:
@@ -87,12 +101,31 @@ class OptimalBehaviourLSMCSettings:
             self.exercise_tolerance_aud,
             self.exercise_buffer_rmse_multiplier,
             self.minimum_inforce_weight,
+            self.relative_svd_cutoff,
             self.maximum_condition_number,
+            self.immaterial_exposure_fraction,
         ], dtype=float)
         if not np.all(np.isfinite(numeric)) or np.any(numeric < 0.0):
             raise ValueError("LSMC numeric controls must be finite and non-negative.")
         if self.maximum_condition_number <= 1.0:
             raise ValueError("maximum_condition_number must exceed one.")
+        if not 0.0 < self.relative_svd_cutoff < 1.0:
+            raise ValueError("relative_svd_cutoff must lie strictly between zero and one.")
+        ridge_grid = tuple(float(value) for value in self.ridge_grid)
+        if not ridge_grid or any(
+            not np.isfinite(value) or value < 0.0 for value in ridge_grid
+        ):
+            raise ValueError("ridge_grid must contain finite non-negative values.")
+        ridge_grid = tuple(sorted(set((*ridge_grid, float(self.ridge)))))
+        object.__setattr__(self, "ridge_grid", ridge_grid)
+        for name in (
+            "minimum_regression_observations",
+            "observations_per_coefficient",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) \
+                    or int(value) < 2:
+                raise ValueError(f"{name} must be an integer of at least two.")
         if isinstance(self.n_folds, bool) or not isinstance(
                 self.n_folds, (int, np.integer)) or self.n_folds < 2:
             raise ValueError("n_folds must be an integer of at least two.")
@@ -122,6 +155,11 @@ class LSMCRegressionDiagnostic:
     training_exercise_rate: float
     regression_accepted_for_exercise: bool
     fallback_reason: Optional[str] = None
+    selected_ridge: Optional[float] = None
+    effective_rank: int = 0
+    basis_level: str = "full"
+    oof_policy_uplift_aud: Optional[float] = None
+    relevant_exposure_fraction: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return dict(self.__dict__)
@@ -142,6 +180,11 @@ class SurrenderContinuationRegressionDiagnostic:
     mean_continuation_target_aud: float
     regression_accepted_for_exercise: bool
     fallback_reason: Optional[str]
+    selected_ridge: Optional[float] = None
+    effective_rank: int = 0
+    basis_level: str = "full"
+    oof_policy_uplift_aud: Optional[float] = None
+    relevant_exposure_fraction: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return dict(self.__dict__)
@@ -194,7 +237,7 @@ def build_surrender_regression_features_from_arrays(
     performance_gap: object,
     premium: object,
 ) -> Array:
-    """Build the canonical 29 policyholder features from compact arrays.
+    """Build the canonical compact v2 policyholder features from arrays.
 
     Each input may be a scalar or a one-dimensional observation array.  The
     inputs are broadcast to one common path/row axis and the result has shape
@@ -206,6 +249,10 @@ def build_surrender_regression_features_from_arrays(
     :func:`build_surrender_regression_features`.  No future return, discount,
     hedge result or backing-asset input is accepted by this API.
     """
+    # Retain the historical keyword in this low-level signature so external
+    # research callers do not break, but v2 intentionally excludes the
+    # redundant credited-return level from its design matrix.
+    del previous_credited_return
     values = {
         "account_value": account_value,
         "surrender_value": surrender_value,
@@ -218,7 +265,6 @@ def build_surrender_regression_features_from_arrays(
         "duration_years": duration_years,
         "announced_cap": announced_cap,
         "previous_reference_return": previous_reference_return,
-        "previous_credited_return": previous_credited_return,
         "performance_gap": performance_gap,
         "premium": premium,
     }
@@ -260,52 +306,37 @@ def build_surrender_regression_features_from_arrays(
 
     premium_array = data["premium"]
     x = np.maximum(data["account_value"], 0.0) / premium_array
-    s = np.maximum(data["surrender_value"], 0.0) / premium_array
+    log_x = np.log1p(x)
     y = np.maximum(data["locked_annual_income"], 0.0) / premium_array
-    g = np.maximum(data["guarantee_pv"], 0.0) / premium_array
     m = data["guarantee_log_moneyness"]
     r = data["short_rate"]
     z5 = data["zero_rate_5y"]
-    v = np.maximum(data["heston_variance"], 0.0)
+    sqrt_v = np.sqrt(np.maximum(data["heston_variance"], 0.0))
     duration = data["duration_years"] / 100.0
     # ``+inf`` is the explicit uncapped benchmark.  Regression design matrices
     # must remain finite, so encode that special state as a documented 100%
     # annual cap sentinel, safely above the admissible 0.25%-20% control grid.
     cap = np.where(np.isposinf(cap_input), 1.0, cap_input)
     reference_return = data["previous_reference_return"]
-    credited_return = data["previous_credited_return"]
     gap = np.maximum(data["performance_gap"], 0.0)
 
     out = np.column_stack((
-        x,
-        x * x,
-        x * x * x,
-        s,
-        s * s,
+        log_x,
         y,
-        y * y,
-        g,
-        g * g,
         m,
         r,
-        r * r,
-        z5,
         z5 - r,
-        v,
-        v * v,
+        sqrt_v,
         duration,
         cap,
         reference_return,
-        credited_return,
         gap,
-        x * y,
-        x * g,
-        s * g,
-        x * r,
-        y * r,
+        log_x * log_x,
+        y * y,
+        m * m,
+        log_x * m,
+        y * m,
         m * r,
-        cap * x,
-        gap * m,
     ))
     if out.shape[1] != len(FEATURE_NAMES):
         raise RuntimeError("LSMC feature names and feature matrix are inconsistent.")
@@ -317,6 +348,7 @@ def build_surrender_regression_features_from_arrays(
 @dataclass(frozen=True)
 class _ContinuationRegression:
     premium: float
+    raw_feature_count: int
     active_feature_indices: NDArray[np.int64]
     orthogonal_components: Array
     centre: Array
@@ -325,13 +357,17 @@ class _ContinuationRegression:
     condition_number: float
     matrix_rank: int
     oof_rmse_aud: float
+    selected_ridge: float = 0.0
+    effective_rank: int = 0
+    basis_level: str = "full"
+    clip_non_negative: bool = True
 
     def predict_features(self, raw_features: Array) -> Array:
-        """Evaluate the frozen continuation model on canonical 29-feature rows."""
+        """Evaluate a frozen level or paired-advantage regression."""
         raw = np.asarray(raw_features, dtype=float)
-        if raw.ndim != 2 or raw.shape[1] != len(FEATURE_NAMES):
+        if raw.ndim != 2 or raw.shape[1] != self.raw_feature_count:
             raise ValueError(
-                f"Surrender features must have shape (n, {len(FEATURE_NAMES)})."
+                f"Regression features must have shape (n, {self.raw_feature_count})."
             )
         if not np.all(np.isfinite(raw)):
             raise ValueError("Surrender features must be finite.")
@@ -341,7 +377,8 @@ class _ContinuationRegression:
                 raw[:, self.active_feature_indices] - self.centre
             ) / self.scale) @ self.orthogonal_components.T,
         ))
-        return np.maximum(design @ self.coefficients * self.premium, 0.0)
+        prediction = design @ self.coefficients * self.premium
+        return np.maximum(prediction, 0.0) if self.clip_non_negative else prediction
 
     def predict(self, context: SurrenderDecisionContext) -> Array:
         raw = build_surrender_regression_features(context, self.premium)
@@ -355,6 +392,8 @@ class OptimalSurrenderPolicy:
     regressions: Mapping[int, _ContinuationRegression]
     settings: OptimalBehaviourLSMCSettings
     provenance_fingerprint: Optional[str] = None
+    regressions_are_advantages: bool = False
+    strict_missing_material_regression: bool = False
     evaluation_statistics: dict[int, dict[str, int]] = field(default_factory=dict)
     anniversary_only: bool = field(default=True, init=False, repr=False)
 
@@ -373,7 +412,7 @@ class OptimalSurrenderPolicy:
             raise TypeError("Optimal surrender requires SurrenderDecisionContext.")
         step = context.step
         n_paths = context.n_paths
-        if not context.is_anniversary or step not in self.regressions:
+        if not context.is_anniversary:
             return np.zeros(n_paths, dtype=bool)
         eligible = (
             context.full_withdrawal_eligible
@@ -382,7 +421,17 @@ class OptimalSurrenderPolicy:
         )
         if not np.any(eligible):
             return np.zeros(n_paths, dtype=bool)
-        continuation = self.regressions[step].predict(context)
+        if step not in self.regressions:
+            exposure = float(np.mean(np.where(
+                eligible, context.inforce_weight, 0.0
+            )))
+            if self.strict_missing_material_regression \
+                    and exposure > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material Full-Withdrawal regression is missing at "
+                    f"step {step} (exposure={exposure:.12g})."
+                )
+            return np.zeros(n_paths, dtype=bool)
         regression = self.regressions[step]
         stable = (
             regression.matrix_rank == regression.coefficients.size
@@ -396,8 +445,11 @@ class OptimalSurrenderPolicy:
             + self.settings.exercise_buffer_rmse_multiplier
             * regression.oof_rmse_aud
         )
-        exercise = eligible & (
-            context.surrender_value > continuation + buffer
+        prediction = regression.predict(context)
+        exercise = (
+            eligible & (prediction > buffer)
+            if self.regressions_are_advantages
+            else eligible & (context.surrender_value > prediction + buffer)
         )
         stats = self.evaluation_statistics.setdefault(
             int(step), {"eligible_path_count": 0, "exercise_path_count": 0})
@@ -413,6 +465,8 @@ class CrossFittedOptimalSurrenderPolicy:
     regressions_by_step: Mapping[int, tuple[_ContinuationRegression, ...]]
     fold_ids_by_step: Mapping[int, NDArray[np.int64]]
     settings: OptimalBehaviourLSMCSettings
+    regressions_are_advantages: bool = False
+    strict_missing_material_regression: bool = False
     anniversary_only: bool = field(default=True, init=False, repr=False)
 
     def surrender_mask(
@@ -423,7 +477,23 @@ class CrossFittedOptimalSurrenderPolicy:
         if not isinstance(context, SurrenderDecisionContext):
             raise TypeError("Cross-fitted surrender requires decision context.")
         step = int(context.step)
-        if not context.is_anniversary or step not in self.regressions_by_step:
+        if not context.is_anniversary:
+            return np.zeros(context.n_paths, dtype=bool)
+        if step not in self.regressions_by_step:
+            eligible = (
+                context.full_withdrawal_eligible
+                & (context.phase == Phase.INCOME.value)
+                & (context.inforce_weight > self.settings.minimum_inforce_weight)
+            )
+            exposure = float(np.mean(np.where(
+                eligible, context.inforce_weight, 0.0
+            )))
+            if self.strict_missing_material_regression \
+                    and exposure > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material cross-fitted Full regression is missing at "
+                    f"step {step} (exposure={exposure:.12g})."
+                )
             return np.zeros(context.n_paths, dtype=bool)
         fold_ids = np.asarray(self.fold_ids_by_step[step], dtype=np.int64)
         if fold_ids.shape != (context.n_paths,):
@@ -436,7 +506,7 @@ class CrossFittedOptimalSurrenderPolicy:
             & (context.phase == Phase.INCOME.value)
             & (context.inforce_weight > self.settings.minimum_inforce_weight)
         )
-        continuation = np.zeros(context.n_paths)
+        prediction = np.zeros(context.n_paths)
         stable = np.ones(context.n_paths, dtype=bool)
         buffer = np.full(
             context.n_paths, self.settings.exercise_tolerance_aud, dtype=float
@@ -446,8 +516,8 @@ class CrossFittedOptimalSurrenderPolicy:
             selected = fold_ids == fold
             if not np.any(selected):
                 continue
-            prediction = regression.predict(context)
-            continuation[selected] = prediction[selected]
+            fold_prediction = regression.predict(context)
+            prediction[selected] = fold_prediction[selected]
             fold_stable = (
                 regression.matrix_rank == regression.coefficients.size
                 and regression.condition_number
@@ -458,8 +528,10 @@ class CrossFittedOptimalSurrenderPolicy:
                 self.settings.exercise_buffer_rmse_multiplier
                 * regression.oof_rmse_aud
             )
-        return eligible & stable & (
-            context.surrender_value > continuation + buffer
+        return (
+            eligible & stable & (prediction > buffer)
+            if self.regressions_are_advantages
+            else eligible & stable & (context.surrender_value > prediction + buffer)
         )
 
 
@@ -568,46 +640,109 @@ def _fit_regression(
     ridge: float,
     *,
     oof_rmse_aud: float = 0.0,
+    relative_svd_cutoff: float = 1.0e-8,
+    feature_indices: Optional[NDArray[np.int64]] = None,
+    basis_level: str = "full",
+    clip_non_negative: bool = True,
 ) -> _ContinuationRegression:
-    full_centre = np.mean(raw_features, axis=0)
-    full_scale = np.std(raw_features, axis=0)
-    active = np.flatnonzero(full_scale > 1.0e-10).astype(np.int64)
-    centre = full_centre[active]
-    scale = full_scale[active]
-    standardised = (raw_features[:, active] - centre) / scale
+    raw = np.asarray(raw_features, dtype=float)
+    target_aud_array = np.asarray(target_aud, dtype=float)
+    if raw.ndim != 2 or target_aud_array.shape != (raw.shape[0],):
+        raise ValueError("Regression feature and target shapes are inconsistent.")
+    if raw.shape[0] < 2 or not np.all(np.isfinite(raw)) \
+            or not np.all(np.isfinite(target_aud_array)):
+        raise ValueError("Regression inputs must contain finite observations.")
+    if not np.isfinite(ridge) or ridge < 0.0:
+        raise ValueError("Ridge must be finite and non-negative.")
+    if not 0.0 < relative_svd_cutoff < 1.0:
+        raise ValueError("relative_svd_cutoff must lie in (0, 1).")
+
+    selected = (
+        np.arange(raw.shape[1], dtype=np.int64)
+        if feature_indices is None
+        else np.asarray(feature_indices, dtype=np.int64)
+    )
+    if selected.ndim != 1 or np.any(selected < 0) \
+            or np.any(selected >= raw.shape[1]) \
+            or np.unique(selected).size != selected.size:
+        raise ValueError("Regression feature indices are invalid.")
+    selected_centre = np.mean(raw[:, selected], axis=0)
+    selected_scale = np.std(raw[:, selected], axis=0)
+    varying = selected_scale > 1.0e-10
+    active = selected[varying]
+    centre = selected_centre[varying]
+    scale = selected_scale[varying]
+    standardised = (raw[:, active] - centre) / scale
     if active.size:
         _left, singular, right = np.linalg.svd(
-            standardised, full_matrices=False)
-        threshold = max(standardised.shape) * np.finfo(float).eps * singular[0]
-        components = right[singular > threshold]
+            standardised, full_matrices=False
+        )
+        # The v2 truncation is defined relative to the largest singular value
+        # of the standardised feature matrix itself.  The intercept is added
+        # only afterwards and must not change that contractual threshold.
+        if singular.size and singular[0] > 0.0:
+            keep = singular >= relative_svd_cutoff * float(singular[0])
+            components = right[keep]
+        else:
+            components = np.zeros((0, active.size))
     else:
         components = np.zeros((0, 0))
     design = np.column_stack((
-        np.ones(raw_features.shape[0]),
+        np.ones(raw.shape[0]),
         standardised @ components.T,
     ))
-    target = np.asarray(target_aud, dtype=float) / premium
-    penalty = np.eye(design.shape[1])
-    penalty[0, 0] = 0.0
-    normal = design.T @ design + ridge * penalty
-    rhs = design.T @ target
-    try:
-        coefficients = np.linalg.solve(normal, rhs)
-    except np.linalg.LinAlgError:
-        coefficients = np.linalg.lstsq(normal, rhs, rcond=None)[0]
+    target = target_aud_array / premium
+
+    # Ridge is solved as an augmented least-squares problem.  This keeps the
+    # conditioning of X visible instead of squaring it through X'X.
+    if ridge > 0.0 and design.shape[1] > 1:
+        penalty = np.zeros((design.shape[1] - 1, design.shape[1]))
+        penalty[:, 1:] = np.sqrt(ridge) * np.eye(design.shape[1] - 1)
+        augmented_design = np.vstack((design, penalty))
+        augmented_target = np.concatenate((target, np.zeros(penalty.shape[0])))
+    else:
+        augmented_design = design
+        augmented_target = target
+    coefficients = np.linalg.lstsq(
+        augmented_design, augmented_target, rcond=relative_svd_cutoff
+    )[0]
     if not np.all(np.isfinite(coefficients)):
         raise ValueError("LSMC regression produced non-finite coefficients.")
+    design_singular = np.linalg.svd(design, compute_uv=False)
+    condition = (
+        float(design_singular[0] / design_singular[-1])
+        if design_singular.size and design_singular[-1] > 0.0
+        else float("inf")
+    )
     return _ContinuationRegression(
         premium=float(premium),
+        raw_feature_count=int(raw.shape[1]),
         active_feature_indices=active,
         orthogonal_components=np.asarray(components, dtype=float),
         centre=np.asarray(centre, dtype=float),
         scale=np.asarray(scale, dtype=float),
         coefficients=np.asarray(coefficients, dtype=float),
-        condition_number=float(np.linalg.cond(normal)),
+        condition_number=condition,
         matrix_rank=int(np.linalg.matrix_rank(design)),
         oof_rmse_aud=float(oof_rmse_aud),
+        selected_ridge=float(ridge),
+        effective_rank=int(design.shape[1]),
+        basis_level=str(basis_level),
+        clip_non_negative=bool(clip_non_negative),
     )
+
+
+def _minimum_cross_fit_observations(
+    settings: OptimalBehaviourLSMCSettings,
+    coefficient_count: int,
+) -> int:
+    minimum_train = max(
+        settings.minimum_regression_observations,
+        settings.observations_per_coefficient * int(coefficient_count),
+    )
+    return int(np.floor(
+        minimum_train * settings.n_folds / (settings.n_folds - 1)
+    )) + 1
 
 
 def fit_surrender_continuation_regression(
@@ -653,6 +788,7 @@ def fit_surrender_continuation_regression(
         premium_value,
         settings.ridge,
         oof_rmse_aud=float(oof_rmse_aud),
+        relative_svd_cutoff=settings.relative_svd_cutoff,
     )
 
 
@@ -662,6 +798,11 @@ def _cross_fitted_regression(
     premium: float,
     settings: OptimalBehaviourLSMCSettings,
     fold_ids: NDArray[np.int64],
+    *,
+    advantage_target: bool = False,
+    feature_indices: Optional[NDArray[np.int64]] = None,
+    basis_level: str = "full",
+    enforce_unique_path_minimum: bool = False,
 ) -> tuple[
     _ContinuationRegression,
     Array,
@@ -669,47 +810,206 @@ def _cross_fitted_regression(
     tuple[_ContinuationRegression, ...],
 ]:
     n_obs = raw_features.shape[0]
-    feature_count = raw_features.shape[1] + 1
-    if n_obs < 2 * feature_count:
-        raise ValueError(
-            "LSMC requires at least twice as many eligible paths as regression "
-            f"features; got {n_obs} paths and {feature_count} features."
+    selected = (
+        np.arange(raw_features.shape[1], dtype=np.int64)
+        if feature_indices is None
+        else np.asarray(feature_indices, dtype=np.int64)
+    )
+    if selected.ndim != 1 or np.any(selected < 0) \
+            or np.any(selected >= raw_features.shape[1]) \
+            or np.unique(selected).size != selected.size:
+        raise ValueError("Regression feature indices are invalid.")
+
+    def required_training_observations(train_raw: Array) -> int:
+        """Count the coefficients actually retained by the v2 SVD basis."""
+        selected_raw = np.asarray(train_raw, dtype=float)[:, selected]
+        scale = np.std(selected_raw, axis=0)
+        varying = scale > 1.0e-10
+        if np.any(varying):
+            standardised = (
+                selected_raw[:, varying]
+                - np.mean(selected_raw[:, varying], axis=0)
+            ) / scale[varying]
+            singular = np.linalg.svd(standardised, compute_uv=False)
+            retained = int(np.count_nonzero(
+                singular >= settings.relative_svd_cutoff * float(singular[0])
+            )) if singular.size and singular[0] > 0.0 else 0
+        else:
+            retained = 0
+        coefficient_count = retained + 1  # intercept
+        return max(
+            settings.minimum_regression_observations,
+            settings.observations_per_coefficient * coefficient_count,
         )
-    folds_used = min(settings.n_folds, max(2, n_obs // feature_count))
-    effective_folds = np.mod(fold_ids[:n_obs], folds_used)
-    oof = np.zeros(n_obs)
-    fold_regressions: list[_ContinuationRegression] = []
-    for fold in range(folds_used):
-        test = effective_folds == fold
-        train = ~test
-        if not np.any(test) or np.count_nonzero(train) < feature_count:
-            raise ValueError("Insufficient observations in an LSMC cross-fit fold.")
-        regression = _fit_regression(
-            raw_features[train], target_aud[train], premium, settings.ridge)
-        fold_regressions.append(regression)
-        # Use the training-fold standardisation for the held-out prediction.
-        held_out = np.column_stack((
-            np.ones(np.count_nonzero(test)),
-            ((
-                raw_features[test][:, regression.active_feature_indices]
-                - regression.centre
-            ) / regression.scale) @ regression.orthogonal_components.T,
+
+    if n_obs <= settings.minimum_regression_observations:
+        raise ValueError(
+            "LSMC requires more observations than the per-regression minimum; "
+            f"got {n_obs}."
+        )
+    supplied_ids = np.asarray(fold_ids, dtype=np.int64)
+    if supplied_ids.shape != (n_obs,) or np.any(supplied_ids < 0):
+        raise ValueError("Cross-fit IDs must match all regression rows.")
+    viable_folds: list[int] = []
+    for folds in range(2, settings.n_folds + 1):
+        candidate_folds = np.mod(supplied_ids, folds)
+        viable = True
+        for fold in range(folds):
+            test = candidate_folds == fold
+            train = ~test
+            minimum_train = required_training_observations(raw_features[train])
+            if not np.any(test) or np.count_nonzero(train) < minimum_train:
+                viable = False
+                break
+            if enforce_unique_path_minimum and np.unique(
+                supplied_ids[train]
+            ).size < minimum_train:
+                viable = False
+                break
+        if viable:
+            viable_folds.append(folds)
+    if not viable_folds:
+        raise ValueError(
+            "No cross-fit partition leaves the required number of unique "
+            "complete paths for its active coefficient count."
+        )
+    folds_used = max(viable_folds)
+    effective_folds = np.mod(supplied_ids, folds_used)
+    target = np.asarray(target_aud, dtype=float)
+
+    candidate_results: list[tuple[
+        float, float, Array, Array, tuple[_ContinuationRegression, ...]
+    ]] = []
+    for ridge in settings.ridge_grid:
+        candidate_oof = np.zeros(n_obs)
+        candidate_folds: list[_ContinuationRegression] = []
+        for fold in range(folds_used):
+            test = effective_folds == fold
+            train = ~test
+            minimum_train = required_training_observations(raw_features[train])
+            if not np.any(test) or np.count_nonzero(train) < minimum_train \
+                    or (
+                        enforce_unique_path_minimum
+                        and np.unique(supplied_ids[train]).size < minimum_train
+                    ):
+                raise ValueError("Insufficient observations in an LSMC cross-fit fold.")
+            regression = _fit_regression(
+                raw_features[train],
+                target[train],
+                premium,
+                ridge,
+                relative_svd_cutoff=settings.relative_svd_cutoff,
+                feature_indices=feature_indices,
+                basis_level=basis_level,
+                clip_non_negative=not advantage_target,
+            )
+            candidate_folds.append(regression)
+            candidate_oof[test] = regression.predict_features(raw_features[test])
+        if advantage_target:
+            # Regret in AUD: realised positive advantage lost by Continue plus
+            # realised negative advantage incurred by exercising.  Ridge
+            # selection uses the same buffered action boundary as deployment,
+            # including the candidate's own OOF RMSE.
+            candidate_rmse = float(np.sqrt(np.mean(
+                (candidate_oof - target) ** 2
+            )))
+            candidate_buffer = (
+                settings.exercise_tolerance_aud
+                + settings.exercise_buffer_rmse_multiplier * candidate_rmse
+            )
+            action = candidate_oof > candidate_buffer
+            losses = np.where(action, np.maximum(-target, 0.0),
+                              np.maximum(target, 0.0))
+        else:
+            losses = (candidate_oof - target) ** 2
+        candidate_results.append((
+            float(np.mean(losses)),
+            float(ridge),
+            np.asarray(losses, dtype=float),
+            candidate_oof,
+            tuple(candidate_folds),
         ))
-        oof[test] = np.maximum(
-            held_out @ regression.coefficients * premium, 0.0)
-    rmse = float(np.sqrt(np.mean((oof - target_aud) ** 2)))
+
+    best_mean = min(item[0] for item in candidate_results)
+    best_losses = min(candidate_results, key=lambda item: item[0])[2]
+    one_standard_error = (
+        float(np.std(best_losses, ddof=1) / np.sqrt(n_obs))
+        if n_obs > 1 else 0.0
+    )
+    # One-standard-error rule with the stronger Ridge as deterministic
+    # tie-break: this selects a simpler boundary when decision loss is
+    # statistically indistinguishable.
+    eligible_candidates = [
+        item for item in candidate_results
+        if item[0] <= best_mean + one_standard_error + 1.0e-14
+    ]
+    _score, selected_ridge, _losses, oof, selected_fold_regressions = max(
+        eligible_candidates, key=lambda item: item[1]
+    )
+    rmse = float(np.sqrt(np.mean((oof - target) ** 2)))
     full = _fit_regression(
         raw_features,
-        target_aud,
+        target,
         premium,
-        settings.ridge,
+        selected_ridge,
         oof_rmse_aud=rmse,
+        relative_svd_cutoff=settings.relative_svd_cutoff,
+        feature_indices=feature_indices,
+        basis_level=basis_level,
+        clip_non_negative=not advantage_target,
     )
     fold_regressions = [
         replace(regression, oof_rmse_aud=rmse)
-        for regression in fold_regressions
+        for regression in selected_fold_regressions
     ]
     return full, oof, folds_used, tuple(fold_regressions)
+
+
+def _cross_fitted_advantage_regression(
+    raw_features: Array,
+    advantage_target_aud: Array,
+    premium: float,
+    settings: OptimalBehaviourLSMCSettings,
+    fold_ids: NDArray[np.int64],
+    *,
+    core_feature_indices: NDArray[np.int64],
+    enforce_unique_path_minimum: bool = False,
+) -> tuple[
+    _ContinuationRegression,
+    Array,
+    int,
+    tuple[_ContinuationRegression, ...],
+]:
+    """Fit the documented full -> core -> constant advantage hierarchy."""
+    attempts = (
+        ("full", None),
+        ("core", np.asarray(core_feature_indices, dtype=np.int64)),
+        ("constant", np.zeros(0, dtype=np.int64)),
+    )
+    failures: list[str] = []
+    for basis_level, indices in attempts:
+        try:
+            fit = _cross_fitted_regression(
+                raw_features,
+                advantage_target_aud,
+                premium,
+                settings,
+                fold_ids,
+                advantage_target=True,
+                feature_indices=indices,
+                basis_level=basis_level,
+                enforce_unique_path_minimum=enforce_unique_path_minimum,
+            )
+            regression, _oof, _folds, fold_regressions = fit
+            if _regression_is_stable(regression, settings) and all(
+                _regression_is_stable(item, settings)
+                for item in fold_regressions
+            ):
+                return fit
+            failures.append(f"{basis_level}:unstable")
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            failures.append(f"{basis_level}:{exc}")
+    raise ValueError(";".join(failures))
 
 
 def fit_surrender_continuation_policy(
@@ -728,7 +1028,8 @@ def fit_surrender_continuation_policy(
     common PCA/ridge fit, complete-path cross-fitting, stability gates and the
     conservative Continue fallback.
 
-    ``features_by_step[step]`` must have shape ``(n_paths, 29)`` and the target
+    ``features_by_step[step]`` must have shape
+    ``(n_paths, len(FEATURE_NAMES))`` and the target
     at that step must have shape ``(n_paths,)``.  When ``fold_ids_by_step`` is
     supplied, repeated replicas of one complete path must carry the same
     non-negative integer identifier.  The identifier is reduced modulo the
@@ -831,7 +1132,9 @@ def fit_surrender_continuation_policy(
     oof_by_step: dict[int, Array] = {}
     diagnostics: list[SurrenderContinuationRegressionDiagnostic] = []
     raw_feature_count = len(FEATURE_NAMES) + 1
-    minimum_observations = 2 * raw_feature_count
+    minimum_observations = _minimum_cross_fit_observations(
+        settings, raw_feature_count
+    )
     for step in steps:
         raw = features[step]
         target = targets[step]
@@ -916,6 +1219,11 @@ def fit_surrender_continuation_policy(
             mean_continuation_target_aud=mean_target,
             regression_accepted_for_exercise=accepted,
             fallback_reason=fallback_reason,
+            selected_ridge=regression.selected_ridge,
+            effective_rank=regression.effective_rank,
+            basis_level=regression.basis_level,
+            oof_policy_uplift_aud=None,
+            relevant_exposure_fraction=1.0,
         ))
         if accepted:
             regressions[step] = regression
@@ -1033,7 +1341,9 @@ def fit_optimal_surrender_policy(
             & (scale_0 > 1.0e-300)
         )
         eligible_index = np.flatnonzero(eligible)
-        if eligible_index.size < 2 * (len(FEATURE_NAMES) + 1):
+        if eligible_index.size < _minimum_cross_fit_observations(
+            settings, 1
+        ):
             # At the hard terminal-age tail there is no material in-force
             # cohort left to fit.  Continuing to the terminal closeout is the
             # conservative admissible action.
@@ -1044,6 +1354,9 @@ def fit_optimal_surrender_policy(
             continue
 
         continuation_target = future_value_0[eligible] / scale_0[eligible]
+        immediate_all = context.surrender_value
+        immediate = immediate_all[eligible]
+        advantage_target = immediate - continuation_target
         raw = build_surrender_regression_features(context, premium)[eligible]
         fold_ids = base_fold_ids[eligible_index]
         try:
@@ -1052,12 +1365,13 @@ def fit_optimal_surrender_policy(
                 oof_continuation,
                 folds_used,
                 fold_regressions,
-            ) = _cross_fitted_regression(
+            ) = _cross_fitted_advantage_regression(
                 raw,
-                continuation_target,
+                advantage_target,
                 premium,
                 settings,
                 fold_ids,
+                core_feature_indices=CORE_FEATURE_INDICES,
             )
         except (ValueError, np.linalg.LinAlgError) as exc:
             # A globally sufficient tail sample can still leave an
@@ -1090,8 +1404,6 @@ def fit_optimal_surrender_policy(
                 future_value_0 += np.sum(
                     discounted_cashflow[:, previous + 1:step + 1], axis=1)
             continue
-        immediate_all = context.surrender_value
-        immediate = immediate_all[eligible]
         buffer = (
             settings.exercise_tolerance_aud
             + settings.exercise_buffer_rmse_multiplier
@@ -1099,7 +1411,7 @@ def fit_optimal_surrender_policy(
         )
         exercise_eligible = (
             context.full_withdrawal_eligible[eligible]
-            & (immediate > oof_continuation + buffer)
+            & (oof_continuation > buffer)
         )
         regression_stable = (
             regression.matrix_rank == regression.coefficients.size
@@ -1122,9 +1434,9 @@ def fit_optimal_surrender_policy(
             scale_0 * immediate_all,
             future_value_0,
         )
-        residual = continuation_target - oof_continuation
+        residual = advantage_target - oof_continuation
         total_ss = float(np.sum(
-            (continuation_target - np.mean(continuation_target)) ** 2))
+            (advantage_target - np.mean(advantage_target)) ** 2))
         residual_ss = float(np.sum(residual ** 2))
         r_squared = 1.0 - residual_ss / total_ss if total_ss > 0.0 else 1.0
         regressions[step] = regression
@@ -1147,6 +1459,13 @@ def fit_optimal_surrender_policy(
             training_exercise_rate=float(np.mean(exercise_eligible)),
             regression_accepted_for_exercise=regression_stable,
             fallback_reason=fallback_reason,
+            selected_ridge=regression.selected_ridge,
+            effective_rank=regression.effective_rank,
+            basis_level=regression.basis_level,
+            oof_policy_uplift_aud=float(np.mean(
+                np.where(exercise_eligible, advantage_target, 0.0)
+            )),
+            relevant_exposure_fraction=float(np.mean(inforce[eligible])),
         ))
         if position > 0:
             previous = decision_steps[position - 1]
@@ -1185,11 +1504,13 @@ def fit_optimal_surrender_policy(
         regressions=selected_regressions,
         settings=settings,
         provenance_fingerprint=legacy_policy_fingerprint,
+        regressions_are_advantages=True,
     )
     cross_fitted_training_policy = CrossFittedOptimalSurrenderPolicy(
         regressions_by_step=selected_cross_fitted_regressions,
         fold_ids_by_step=selected_cross_fitted_fold_ids,
         settings=settings,
+        regressions_are_advantages=True,
     )
     return OptimalBehaviourLSMCFit(
         policy=optimal_policy,
@@ -1205,36 +1526,258 @@ def fit_optimal_surrender_policy(
 
 
 ELECTION_FEATURE_NAMES = (
-    "account_value",
-    "account_value_sq",
-    "account_value_cu",
-    "prospective_annual_income",
-    "prospective_annual_income_sq",
-    "prospective_guarantee_pv",
-    "prospective_guarantee_pv_sq",
+    "log1p_account_value_ratio",
+    "prospective_annual_income_ratio",
     "guarantee_log_moneyness",
     "short_rate",
-    "short_rate_sq",
-    "zero_rate_5y",
     "five_year_rate_slope",
-    "global_equity_variance",
-    "global_equity_variance_sq",
-    "duration_years",
-    "attained_age",
+    "sqrt_heston_variance",
+    "duration_years_scaled",
+    "attained_age_scaled",
+    "time_to_forced_election_scaled",
+    "mva_remaining_years_scaled",
+    "mva_factor",
+    "primary_alive",
+    "spouse_alive",
     "previous_cap",
     "previous_reference_return",
-    "previous_credited_return",
     "performance_gap",
-    "account_value_x_income",
-    "account_value_x_guarantee_pv",
-    "income_x_guarantee_pv",
-    "account_value_x_short_rate",
-    "income_x_short_rate",
+    "account_value_sq",
+    "prospective_annual_income_sq",
+    "guarantee_moneyness_sq",
+    "account_value_x_guarantee_moneyness",
+    "income_x_guarantee_moneyness",
     "guarantee_moneyness_x_short_rate",
-    "previous_cap_x_account_value",
-    "performance_gap_x_guarantee_moneyness",
-    "prospective_income_rate",
 )
+
+ELECTION_CORE_FEATURE_INDICES = np.asarray(
+    (0, 1, 2, 3, 4, 6, 7, 8), dtype=np.int64
+)
+
+INCOME_ACTION_FEATURE_NAMES = (
+    *FEATURE_NAMES,
+    "attained_age_scaled",
+    "time_to_forced_election_scaled",
+    "mva_remaining_years_scaled",
+    "mva_factor",
+    "primary_alive",
+    "spouse_alive",
+)
+PARTIAL_ACTION_FEATURE_NAMES = (
+    *INCOME_ACTION_FEATURE_NAMES,
+    "partial_fraction",
+    "partial_fraction_sq",
+    "partial_fraction_x_moneyness",
+    "partial_fraction_x_mva_factor",
+    "partial_fraction_x_income",
+)
+INCOME_ACTION_CORE_FEATURE_INDICES = np.asarray(
+    (*CORE_FEATURE_INDICES,
+     len(FEATURE_NAMES),
+     len(FEATURE_NAMES) + 1),
+    dtype=np.int64,
+)
+PARTIAL_ACTION_CORE_FEATURE_INDICES = np.asarray(
+    (*INCOME_ACTION_CORE_FEATURE_INDICES,
+     len(INCOME_ACTION_FEATURE_NAMES)),
+    dtype=np.int64,
+)
+
+
+def build_income_action_regression_features(
+    context: IncomeActionDecisionContext,
+    premium: float,
+) -> Array:
+    """Build observable monthly Income-state features for the action policy."""
+    if not isinstance(context, IncomeActionDecisionContext):
+        raise TypeError("Income-action features require IncomeActionDecisionContext.")
+    base = build_surrender_regression_features_from_arrays(
+        account_value=context.account_value,
+        surrender_value=context.surrender_value,
+        locked_annual_income=context.locked_annual_income,
+        guarantee_pv=context.guarantee_pv,
+        guarantee_log_moneyness=context.guarantee_log_moneyness,
+        short_rate=context.short_rate,
+        zero_rate_5y=context.zero_rate_5y,
+        heston_variance=context.heston_variance,
+        duration_years=context.duration_years,
+        announced_cap=context.announced_cap,
+        previous_reference_return=context.previous_reference_return,
+        previous_credited_return=context.previous_credited_return,
+        performance_gap=context.performance_gap,
+        premium=premium,
+    )
+    attained_age = np.asarray(context.attained_age, dtype=float) / 100.0
+    time_to_forced = np.asarray(
+        context.time_to_forced_election, dtype=float
+    ) / 100.0
+    mva_remaining = np.full(
+        context.n_paths, float(context.mva_remaining_years) / 100.0
+    )
+    mva_factor = np.asarray(context.mva_factor, dtype=float)
+    primary_alive = np.asarray(context.primary_alive, dtype=float)
+    spouse_alive = np.asarray(context.spouse_alive, dtype=float)
+    if not np.all(np.isfinite(mva_factor)) or np.any(mva_factor < 0.0):
+        raise ValueError("Income-action MVA factors are invalid.")
+    out = np.column_stack((
+        base,
+        attained_age,
+        time_to_forced,
+        mva_remaining,
+        mva_factor,
+        primary_alive,
+        spouse_alive,
+    ))
+    if out.shape != (context.n_paths, len(INCOME_ACTION_FEATURE_NAMES)):
+        raise RuntimeError("Income-action feature matrix is inconsistent.")
+    return np.asarray(out, dtype=float)
+
+
+def build_partial_action_regression_features(
+    base_features: Array,
+    partial_fraction_of_max: object,
+) -> Array:
+    """Append an action amount to monthly state features without future data."""
+    base = np.asarray(base_features, dtype=float)
+    if base.ndim != 2 or base.shape[1] != len(INCOME_ACTION_FEATURE_NAMES):
+        raise ValueError(
+            "Base Income-action features have an inconsistent shape."
+        )
+    fraction = np.asarray(partial_fraction_of_max, dtype=float)
+    if fraction.ndim == 0:
+        fraction = np.full(base.shape[0], float(fraction))
+    if fraction.shape != (base.shape[0],) or not np.all(np.isfinite(fraction)) \
+            or np.any((fraction <= 0.0) | (fraction > 1.0)):
+        raise ValueError("Partial fractions must be finite and lie in (0, 1].")
+    moneyness = base[:, FEATURE_NAMES.index("guarantee_log_moneyness")]
+    income = base[:, FEATURE_NAMES.index("annual_income_ratio")]
+    mva = base[:, INCOME_ACTION_FEATURE_NAMES.index("mva_factor")]
+    out = np.column_stack((
+        base,
+        fraction,
+        fraction * fraction,
+        fraction * moneyness,
+        fraction * mva,
+        fraction * income,
+    ))
+    if out.shape[1] != len(PARTIAL_ACTION_FEATURE_NAMES):
+        raise RuntimeError("Partial-action feature matrix is inconsistent.")
+    return np.asarray(out, dtype=float)
+
+
+@dataclass(frozen=True)
+class IncomeActionRegressionSet:
+    """Frozen monthly action-advantage models for one projector step."""
+
+    full_withdrawal_advantage: Optional[_ContinuationRegression] = None
+    partial_withdrawal_advantage: Optional[_ContinuationRegression] = None
+
+
+def _partial_candidate_fractions(context: IncomeActionDecisionContext) -> Array:
+    maximum = np.asarray(context.max_partial_gross_amount, dtype=float)
+    candidates = np.column_stack((
+        np.divide(100.0, maximum, out=np.zeros_like(maximum), where=maximum > 0.0),
+        np.full(context.n_paths, 0.25),
+        np.full(context.n_paths, 0.50),
+        np.full(context.n_paths, 0.75),
+        np.ones(context.n_paths),
+    ))
+    candidates = np.clip(candidates, 0.0, 1.0)
+    gross = candidates * maximum[:, None]
+    valid = gross >= 100.0 - 1.0e-10
+    # Deduplicate by the contractual gross amount, not by a nominal fraction.
+    # The grid is ordered from AUD 100 through increasing proportional amounts.
+    for column in range(1, candidates.shape[1]):
+        duplicate = np.any(
+            valid[:, :column]
+            & np.isclose(
+                gross[:, :column], gross[:, [column]], atol=1.0e-8, rtol=0.0
+            ),
+            axis=1,
+        )
+        candidates[duplicate, column] = 0.0
+    return candidates
+
+
+def _predict_best_partial_action(
+    regression: _ContinuationRegression,
+    context: IncomeActionDecisionContext,
+    base_features: Array,
+    settings: OptimalBehaviourLSMCSettings,
+) -> tuple[Array, Array]:
+    """Return best buffered partial score and fraction, including refinement."""
+    if not _regression_is_stable(regression, settings):
+        raise RuntimeError("Partial-withdrawal advantage regression is unstable.")
+    maximum = np.asarray(context.max_partial_gross_amount, dtype=float)
+    eligible = np.asarray(context.partial_withdrawal_eligible, dtype=bool)
+    candidates = _partial_candidate_fractions(context)
+    scores = np.full(candidates.shape, -np.inf)
+    buffer = (
+        settings.exercise_tolerance_aud
+        + settings.exercise_buffer_rmse_multiplier * regression.oof_rmse_aud
+    )
+    for column in range(candidates.shape[1]):
+        fraction = candidates[:, column]
+        valid = eligible & (maximum * fraction >= 100.0 - 1.0e-10) \
+            & (fraction > 0.0)
+        safe_fraction = np.where(valid, fraction, 1.0)
+        raw = build_partial_action_regression_features(base_features, safe_fraction)
+        prediction = regression.predict_features(raw) - buffer
+        scores[:, column] = np.where(valid, prediction, -np.inf)
+
+    # np.argmax provides the desired smaller-grid-index tie break; the AUD-100
+    # candidate is first, followed by increasing proportional amounts.
+    best_column = np.argmax(scores, axis=1)
+    rows = np.arange(context.n_paths)
+    best_fraction = candidates[rows, best_column]
+    best_score = scores[rows, best_column]
+
+    # True midpoints to the adjacent admissible gross-amount candidates.
+    gross_candidates = candidates * maximum[:, None]
+    coarse_valid = gross_candidates >= 100.0 - 1.0e-10
+    best_gross = best_fraction * maximum
+    lower_gross = np.max(np.where(
+        coarse_valid & (gross_candidates < best_gross[:, None] - 1.0e-8),
+        gross_candidates,
+        -np.inf,
+    ), axis=1)
+    upper_gross = np.min(np.where(
+        coarse_valid & (gross_candidates > best_gross[:, None] + 1.0e-8),
+        gross_candidates,
+        np.inf,
+    ), axis=1)
+    has_lower = np.isfinite(lower_gross)
+    has_upper = np.isfinite(upper_gross)
+    lower = np.divide(
+        0.5 * (best_gross + np.where(has_lower, lower_gross, best_gross)),
+        maximum,
+        out=np.zeros_like(maximum),
+        where=maximum > 0.0,
+    )
+    upper = np.divide(
+        0.5 * (best_gross + np.where(has_upper, upper_gross, best_gross)),
+        maximum,
+        out=np.zeros_like(maximum),
+        where=maximum > 0.0,
+    )
+    for fraction, has_neighbour in (
+        (lower, has_lower),
+        (upper, has_upper),
+    ):
+        valid = has_neighbour & eligible & (fraction > 0.0) & (fraction <= 1.0) \
+            & (maximum * fraction >= 100.0 - 1.0e-10)
+        safe_fraction = np.where(valid, fraction, 1.0)
+        raw = build_partial_action_regression_features(base_features, safe_fraction)
+        score = regression.predict_features(raw) - buffer
+        improve = valid & (
+            (score > best_score + settings.exercise_tolerance_aud)
+            | (
+                np.abs(score - best_score) <= settings.exercise_tolerance_aud
+            ) & (fraction < best_fraction)
+        )
+        best_score = np.where(improve, score, best_score)
+        best_fraction = np.where(improve, fraction, best_fraction)
+    return best_score, best_fraction
 
 
 @dataclass(frozen=True)
@@ -1263,6 +1806,11 @@ class OptimalBehaviourRegressionDiagnostic:
     action_regression_rank: Optional[int] = None
     action_regression_condition_number: Optional[float] = None
     action_regression_oof_rmse_aud: Optional[float] = None
+    selected_ridge: Optional[float] = None
+    effective_rank: int = 0
+    basis_level: str = "full"
+    oof_policy_uplift_aud: Optional[float] = None
+    relevant_exposure_fraction: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return dict(self.__dict__)
@@ -1272,6 +1820,7 @@ def build_income_election_regression_features(
     context: IncomeElectionDecisionContext,
     premium: float,
     issue_age: float,
+    automatic_income_start_age: float = 100.0,
 ) -> Array:
     """Build adapted Growth-state features without accepting future inputs."""
     if not isinstance(context, IncomeElectionDecisionContext):
@@ -1280,23 +1829,58 @@ def build_income_election_regression_features(
         )
     premium_value = float(premium)
     issue_age_value = float(issue_age)
+    automatic_age_value = float(automatic_income_start_age)
     if not np.isfinite(premium_value) or premium_value <= 0.0:
         raise ValueError("Income-Election feature premium must be positive and finite.")
     if not np.isfinite(issue_age_value) or issue_age_value < 0.0:
         raise ValueError("Income-Election issue age must be finite and non-negative.")
+    if not np.isfinite(automatic_age_value) \
+            or automatic_age_value < issue_age_value:
+        raise ValueError("Automatic Income start age must not precede issue age.")
 
     x = np.maximum(context.account_value, 0.0) / premium_value
+    log_x = np.log1p(x)
     y = np.maximum(
         context.prospective_locked_annual_income, 0.0
     ) / premium_value
-    g = np.maximum(context.guarantee_pv, 0.0) / premium_value
     m = np.asarray(context.guarantee_log_moneyness, dtype=float)
     r = np.asarray(context.short_rate, dtype=float)
     z5 = np.asarray(context.zero_rate_5y, dtype=float)
-    v = np.maximum(context.heston_variance, 0.0)
+    sqrt_v = np.sqrt(np.maximum(context.heston_variance, 0.0))
     duration = np.full(context.n_paths, context.duration_years / 100.0)
     attained_age = np.full(
         context.n_paths, (issue_age_value + context.duration_years) / 100.0
+    )
+    time_to_forced = np.full(
+        context.n_paths,
+        max(automatic_age_value - issue_age_value - context.duration_years, 0.0)
+        / 100.0,
+    )
+    # Context values are the canonical projector state.  The locally derived
+    # age/time arrays above remain a consistency fallback for older contexts.
+    attained_age = np.asarray(
+        getattr(context, "attained_age", attained_age * 100.0), dtype=float
+    ) / 100.0
+    time_to_forced = np.asarray(
+        getattr(
+            context,
+            "time_to_forced_election",
+            time_to_forced * 100.0,
+        ),
+        dtype=float,
+    ) / 100.0
+    mva_remaining = np.full(
+        context.n_paths,
+        float(getattr(context, "mva_remaining_years", 0.0)) / 100.0,
+    )
+    mva_factor = np.asarray(
+        getattr(context, "mva_factor", np.ones(context.n_paths)), dtype=float
+    )
+    primary_alive = np.asarray(
+        getattr(context, "primary_alive", np.ones(context.n_paths)), dtype=float
+    )
+    spouse_alive = np.asarray(
+        getattr(context, "spouse_alive", np.zeros(context.n_paths)), dtype=float
     )
     previous_cap_input = np.asarray(context.previous_cap, dtype=float)
     if np.any(np.isnan(previous_cap_input)) or np.any(previous_cap_input < 0.0):
@@ -1309,42 +1893,31 @@ def build_income_election_regression_features(
     previous_reference = np.asarray(
         context.previous_reference_return, dtype=float
     )
-    previous_credit = np.asarray(
-        context.previous_credited_return, dtype=float
-    )
     gap = np.maximum(context.performance_gap, 0.0)
-    rate = np.asarray(context.prospective_income_rate, dtype=float)
 
     out = np.column_stack((
-        x,
-        x * x,
-        x * x * x,
+        log_x,
         y,
-        y * y,
-        g,
-        g * g,
         m,
         r,
-        r * r,
-        z5,
         z5 - r,
-        v,
-        v * v,
+        sqrt_v,
         duration,
         attained_age,
+        time_to_forced,
+        mva_remaining,
+        mva_factor,
+        primary_alive,
+        spouse_alive,
         previous_cap,
         previous_reference,
-        previous_credit,
         gap,
-        x * y,
-        x * g,
-        y * g,
-        x * r,
-        y * r,
+        log_x * log_x,
+        y * y,
+        m * m,
+        log_x * m,
+        y * m,
         m * r,
-        previous_cap * x,
-        gap * m,
-        rate,
     ))
     if out.shape != (context.n_paths, len(ELECTION_FEATURE_NAMES)):
         raise RuntimeError("Income-Election feature matrix is inconsistent.")
@@ -1366,35 +1939,28 @@ def _regression_is_stable(
 
 @dataclass(frozen=True)
 class _ElectionRegressionPair:
-    wait: _ContinuationRegression
-    start: _ContinuationRegression
+    """Compatibility name for the v2 paired START-minus-WAIT model."""
+
+    advantage: _ContinuationRegression
 
     @property
     def combined_oof_rmse_aud(self) -> float:
-        return float(np.hypot(
-            self.wait.oof_rmse_aud,
-            self.start.oof_rmse_aud,
-        ))
+        return float(self.advantage.oof_rmse_aud)
 
     def stable(self, settings: OptimalBehaviourLSMCSettings) -> bool:
-        return (
-            _regression_is_stable(self.wait, settings)
-            and _regression_is_stable(self.start, settings)
-        )
+        return _regression_is_stable(self.advantage, settings)
 
     def predict(
         self,
         context: IncomeElectionDecisionContext,
         premium: float,
         issue_age: float,
-    ) -> tuple[Array, Array]:
+        automatic_income_start_age: float = 100.0,
+    ) -> Array:
         raw = build_income_election_regression_features(
-            context, premium, issue_age
+            context, premium, issue_age, automatic_income_start_age
         )
-        return (
-            self.wait.predict_features(raw),
-            self.start.predict_features(raw),
-        )
+        return self.advantage.predict_features(raw)
 
 
 @dataclass
@@ -1406,11 +1972,18 @@ class OptimalBehaviourPolicy:
     premium: float
     issue_age: float
     settings: OptimalBehaviourLSMCSettings
+    automatic_income_start_age: float = 100.0
+    income_action_regressions: Mapping[
+        int, IncomeActionRegressionSet
+    ] = field(default_factory=dict)
+    valid: bool = True
+    invalid_reasons: tuple[str, ...] = ()
+    monthly_income_actions_required: bool = True
     provenance_fingerprint: Optional[str] = None
     evaluation_statistics: dict[
-        tuple[str, int], dict[str, int]
+        tuple[str, int], dict[str, float | int]
     ] = field(default_factory=dict)
-    anniversary_only: bool = field(default=True, init=False, repr=False)
+    anniversary_only: bool = field(default=False, init=False, repr=False)
 
     def start_income_mask(
         self,
@@ -1422,6 +1995,11 @@ class OptimalBehaviourPolicy:
             raise TypeError(
                 "Optimal Income Election requires IncomeElectionDecisionContext."
             )
+        if not self.valid:
+            raise RuntimeError(
+                "Invalid optimal-behaviour policy cannot be evaluated: "
+                + ",".join(self.invalid_reasons)
+            )
         step = int(context.step)
         voluntary_eligible = (
             context.voluntary_election_eligible
@@ -1429,12 +2007,16 @@ class OptimalBehaviourPolicy:
             & (context.inforce_weight > self.settings.minimum_inforce_weight)
         )
         forced = np.asarray(context.forced_election, dtype=bool)
+        voluntary_eligible &= ~forced
         action = np.zeros(context.n_paths, dtype=bool)
         regression = self.election_regressions.get(step)
         if regression is not None and regression.stable(self.settings) \
                 and np.any(voluntary_eligible):
-            wait_value, start_value = regression.predict(
-                context, self.premium, self.issue_age
+            advantage = regression.predict(
+                context,
+                self.premium,
+                self.issue_age,
+                self.automatic_income_start_age,
             )
             buffer = (
                 self.settings.exercise_tolerance_aud
@@ -1442,7 +2024,20 @@ class OptimalBehaviourPolicy:
                 * regression.combined_oof_rmse_aud
             )
             action = voluntary_eligible & (
-                start_value > wait_value + buffer
+                advantage > buffer
+            )
+        elif regression is None and np.any(voluntary_eligible):
+            exposure = float(np.mean(np.where(
+                voluntary_eligible, context.inforce_weight, 0.0
+            )))
+            if exposure > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material Income-Election advantage regression is missing "
+                    f"at step {step} (exposure={exposure:.12g})."
+                )
+        elif regression is not None and not regression.stable(self.settings):
+            raise RuntimeError(
+                f"Income-Election advantage regression at step {step} is unstable."
             )
         stats = self.evaluation_statistics.setdefault(
             ("income_election", step),
@@ -1459,6 +2054,176 @@ class OptimalBehaviourPolicy:
         stats["forced_path_count"] += int(np.count_nonzero(forced))
         return action
 
+    def choose_income_action(
+        self,
+        *,
+        context: IncomeActionDecisionContext,
+    ) -> IncomeActionDecision:
+        """Choose one monthly Income action from paired advantage models.
+
+        A missing material step or action-specific model is an error; it is
+        never silently re-labelled as Continue.  The old annual Surrender API
+        is retained only as an explicit compatibility benchmark outside this
+        unified v2 hook.
+        """
+        if not isinstance(context, IncomeActionDecisionContext):
+            raise TypeError("Optimal Income action requires IncomeActionDecisionContext.")
+        if not self.valid:
+            raise RuntimeError(
+                "Invalid optimal-behaviour policy cannot be evaluated: "
+                + ",".join(self.invalid_reasons)
+            )
+        step = int(context.step)
+        n_paths = context.n_paths
+        in_income = (
+            (context.phase == Phase.INCOME.value)
+            & (context.inforce_weight > self.settings.minimum_inforce_weight)
+        )
+        models = self.income_action_regressions.get(step)
+        if models is None and self.monthly_income_actions_required:
+            exposure = float(np.mean(np.where(
+                in_income, context.inforce_weight, 0.0
+            )))
+            if exposure > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material monthly Income action regression is missing at "
+                    f"step {step} (exposure={exposure:.12g})."
+                )
+            return IncomeActionDecision(
+                action_type=np.full(
+                    n_paths, IncomeActionType.CONTINUE.value, dtype="<U32"
+                ),
+                partial_fraction_of_max=np.zeros(n_paths),
+            )
+
+        if models is not None and self.monthly_income_actions_required:
+            missing_full_exposure = float(np.mean(np.where(
+                in_income
+                & np.asarray(context.full_withdrawal_eligible, dtype=bool),
+                context.inforce_weight,
+                0.0,
+            )))
+            missing_partial_exposure = float(np.mean(np.where(
+                in_income
+                & np.asarray(context.partial_withdrawal_eligible, dtype=bool),
+                context.inforce_weight,
+                0.0,
+            )))
+            if models.full_withdrawal_advantage is None \
+                    and missing_full_exposure \
+                    > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material Full-Withdrawal advantage regression is missing "
+                    f"at step {step} (exposure={missing_full_exposure:.12g})."
+                )
+            if models.partial_withdrawal_advantage is None \
+                    and missing_partial_exposure \
+                    > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material Partial-Withdrawal advantage regression is missing "
+                    f"at step {step} (exposure={missing_partial_exposure:.12g})."
+                )
+
+        base_features = build_income_action_regression_features(
+            context, self.premium
+        )
+        partial_score = np.full(n_paths, -np.inf)
+        partial_fraction = np.zeros(n_paths)
+        if models is not None and models.partial_withdrawal_advantage is not None:
+            partial_score, partial_fraction = _predict_best_partial_action(
+                models.partial_withdrawal_advantage,
+                context,
+                base_features,
+                self.settings,
+            )
+            partial_score = np.where(in_income, partial_score, -np.inf)
+
+        full_regression = (
+            None if models is None else models.full_withdrawal_advantage
+        )
+        full_score = np.full(n_paths, -np.inf)
+        if full_regression is not None:
+            if not _regression_is_stable(full_regression, self.settings):
+                raise RuntimeError(
+                    f"Full-Withdrawal regression at step {step} is unstable."
+                )
+            raw = (
+                base_features
+                if full_regression.raw_feature_count == len(INCOME_ACTION_FEATURE_NAMES)
+                else base_features[:, :len(FEATURE_NAMES)]
+            )
+            prediction = full_regression.predict_features(raw)
+            advantage = prediction
+            buffer = (
+                self.settings.exercise_tolerance_aud
+                + self.settings.exercise_buffer_rmse_multiplier
+                * full_regression.oof_rmse_aud
+            )
+            full_score = np.where(
+                in_income & context.full_withdrawal_eligible,
+                advantage - buffer,
+                -np.inf,
+            )
+
+        action_type = np.full(
+            n_paths, IncomeActionType.CONTINUE.value, dtype="<U32"
+        )
+        fraction = np.zeros(n_paths)
+        take_partial = partial_score > 0.0
+        action_type[take_partial] = IncomeActionType.PARTIAL_WITHDRAWAL.value
+        fraction[take_partial] = partial_fraction[take_partial]
+        # FULL has the lowest tie priority, hence strict improvement over both
+        # Continue and the best Partial candidate is required.
+        take_full = (
+            (full_score > 0.0)
+            & (full_score > partial_score + self.settings.exercise_tolerance_aud)
+        )
+        action_type[take_full] = IncomeActionType.FULL_WITHDRAWAL.value
+        fraction[take_full] = 0.0
+
+        stats = self.evaluation_statistics.setdefault(
+            ("income_action", step),
+            {
+                "eligible_path_count": 0,
+                "action_path_count": 0,
+                "forced_path_count": 0,
+                "continue_path_count": 0,
+                "partial_path_count": 0,
+                "full_path_count": 0,
+                "partial_gross_amount_sum_aud": 0.0,
+                "partial_gross_below_100_path_count": 0,
+                "partial_gross_100_499_path_count": 0,
+                "partial_gross_500_1999_path_count": 0,
+                "partial_gross_2000_9999_path_count": 0,
+                "partial_gross_ge_10000_path_count": 0,
+            },
+        )
+        selected_partial = take_partial & ~take_full
+        selected_continue = in_income & ~(selected_partial | take_full)
+        gross = fraction * np.asarray(
+            context.max_partial_gross_amount, dtype=float
+        )
+        stats["eligible_path_count"] += int(np.count_nonzero(in_income))
+        stats["continue_path_count"] += int(np.count_nonzero(selected_continue))
+        stats["partial_path_count"] += int(np.count_nonzero(selected_partial))
+        stats["full_path_count"] += int(np.count_nonzero(take_full))
+        stats["action_path_count"] += int(np.count_nonzero(take_partial | take_full))
+        stats["partial_gross_amount_sum_aud"] += float(np.sum(
+            np.where(selected_partial, gross, 0.0)
+        ))
+        for key, band in (
+            ("partial_gross_below_100_path_count", gross < 100.0),
+            ("partial_gross_100_499_path_count", (gross >= 100.0) & (gross < 500.0)),
+            ("partial_gross_500_1999_path_count", (gross >= 500.0) & (gross < 2_000.0)),
+            ("partial_gross_2000_9999_path_count", (gross >= 2_000.0) & (gross < 10_000.0)),
+            ("partial_gross_ge_10000_path_count", gross >= 10_000.0),
+        ):
+            stats[key] += int(np.count_nonzero(selected_partial & band))
+        return IncomeActionDecision(
+            action_type=action_type,
+            partial_fraction_of_max=fraction,
+        )
+
     def surrender_mask(
         self,
         *,
@@ -1466,6 +2231,11 @@ class OptimalBehaviourPolicy:
     ) -> NDArray[np.bool_]:
         if not isinstance(context, SurrenderDecisionContext):
             raise TypeError("Optimal surrender requires SurrenderDecisionContext.")
+        if not self.valid:
+            raise RuntimeError(
+                "Invalid optimal-behaviour policy cannot be evaluated: "
+                + ",".join(self.invalid_reasons)
+            )
         action = self.surrender_policy.surrender_mask(context=context)
         eligible = (
             context.full_withdrawal_eligible
@@ -1497,7 +2267,14 @@ class CrossFittedOptimalBehaviourPolicy:
     premium: float
     issue_age: float
     settings: OptimalBehaviourLSMCSettings
-    anniversary_only: bool = field(default=True, init=False, repr=False)
+    automatic_income_start_age: float = 100.0
+    income_action_regressions_by_step: Mapping[
+        int, _CrossFittedIncomeActionRegressionSet
+    ] = field(default_factory=dict)
+    valid: bool = True
+    invalid_reasons: tuple[str, ...] = ()
+    monthly_income_actions_required: bool = True
+    anniversary_only: bool = field(default=False, init=False, repr=False)
 
     def start_income_mask(
         self,
@@ -1508,9 +2285,28 @@ class CrossFittedOptimalBehaviourPolicy:
             raise TypeError(
                 "Cross-fitted Election requires IncomeElectionDecisionContext."
             )
+        if not self.valid:
+            raise RuntimeError(
+                "Invalid cross-fitted optimal policy cannot be evaluated: "
+                + ",".join(self.invalid_reasons)
+            )
         step = int(context.step)
         pairs = self.election_regressions_by_step.get(step)
         if pairs is None:
+            eligible = (
+                context.voluntary_election_eligible
+                & ~np.asarray(context.forced_election, dtype=bool)
+                & (context.phase == Phase.GROWTH.value)
+                & (context.inforce_weight > self.settings.minimum_inforce_weight)
+            )
+            exposure = float(np.mean(np.where(
+                eligible, context.inforce_weight, 0.0
+            )))
+            if exposure > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material cross-fitted Election regression is missing at "
+                    f"step {step} (exposure={exposure:.12g})."
+                )
             return np.zeros(context.n_paths, dtype=bool)
         fold_ids = np.asarray(
             self.election_fold_ids_by_step[step], dtype=np.int64
@@ -1520,10 +2316,12 @@ class CrossFittedOptimalBehaviourPolicy:
                 "Cross-fitted Election policy requires its original path sample."
             )
         raw = build_income_election_regression_features(
-            context, self.premium, self.issue_age
+            context,
+            self.premium,
+            self.issue_age,
+            self.automatic_income_start_age,
         )
-        wait_value = np.zeros(context.n_paths)
-        start_value = np.zeros(context.n_paths)
+        advantage = np.zeros(context.n_paths)
         stable = np.zeros(context.n_paths, dtype=bool)
         buffer = np.full(
             context.n_paths, self.settings.exercise_tolerance_aud
@@ -1532,10 +2330,8 @@ class CrossFittedOptimalBehaviourPolicy:
             selected = fold_ids == fold
             if not np.any(selected):
                 continue
-            wait_prediction = pair.wait.predict_features(raw)
-            start_prediction = pair.start.predict_features(raw)
-            wait_value[selected] = wait_prediction[selected]
-            start_value[selected] = start_prediction[selected]
+            fold_prediction = pair.advantage.predict_features(raw)
+            advantage[selected] = fold_prediction[selected]
             stable[selected] = pair.stable(self.settings)
             buffer[selected] += (
                 self.settings.exercise_buffer_rmse_multiplier
@@ -1543,17 +2339,96 @@ class CrossFittedOptimalBehaviourPolicy:
             )
         eligible = (
             context.voluntary_election_eligible
+            & ~np.asarray(context.forced_election, dtype=bool)
             & (context.phase == Phase.GROWTH.value)
             & (context.inforce_weight > self.settings.minimum_inforce_weight)
         )
-        return eligible & stable & (start_value > wait_value + buffer)
+        return eligible & stable & (advantage > buffer)
 
     def surrender_mask(
         self,
         *,
         context: SurrenderDecisionContext,
     ) -> NDArray[np.bool_]:
+        if not self.valid:
+            raise RuntimeError(
+                "Invalid cross-fitted optimal policy cannot be evaluated: "
+                + ",".join(self.invalid_reasons)
+            )
         return self.surrender_policy.surrender_mask(context=context)
+
+    def choose_income_action(
+        self,
+        *,
+        context: IncomeActionDecisionContext,
+    ) -> IncomeActionDecision:
+        """Training-sample hook for unified monthly Partial/Full actions."""
+        if not isinstance(context, IncomeActionDecisionContext):
+            raise TypeError("Cross-fitted Income action requires decision context.")
+        if not self.valid:
+            raise RuntimeError(
+                "Invalid cross-fitted optimal policy cannot be evaluated: "
+                + ",".join(self.invalid_reasons)
+            )
+        step = int(context.step)
+        models = self.income_action_regressions_by_step.get(step)
+        if models is not None:
+            in_income = (
+                (context.phase == Phase.INCOME.value)
+                & (
+                    context.inforce_weight
+                    > self.settings.minimum_inforce_weight
+                )
+            )
+            full_exposure = float(np.mean(np.where(
+                in_income & context.full_withdrawal_eligible,
+                context.inforce_weight,
+                0.0,
+            )))
+            partial_exposure = float(np.mean(np.where(
+                in_income & context.partial_withdrawal_eligible,
+                context.inforce_weight,
+                0.0,
+            )))
+            if not models.full_withdrawal_advantage \
+                    and full_exposure \
+                    > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material cross-fitted Full advantage is missing at "
+                    f"step {step} (exposure={full_exposure:.12g})."
+                )
+            if not models.partial_withdrawal_advantage \
+                    and partial_exposure \
+                    > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material cross-fitted Partial advantage is missing at "
+                    f"step {step} (exposure={partial_exposure:.12g})."
+                )
+            helper = _CrossFittedIncomeActionPolicy(
+                regressions_by_step={step: models},
+                premium=self.premium,
+                settings=self.settings,
+            )
+            return helper._cross_fitted_decision(context, models)
+        if self.monthly_income_actions_required:
+            in_income = (
+                (context.phase == Phase.INCOME.value)
+                & (context.inforce_weight > self.settings.minimum_inforce_weight)
+            )
+            exposure = float(np.mean(np.where(
+                in_income, context.inforce_weight, 0.0
+            )))
+            if exposure > self.settings.immaterial_exposure_fraction:
+                raise RuntimeError(
+                    "Material cross-fitted monthly action regression is missing "
+                    f"at step {step} (exposure={exposure:.12g})."
+                )
+        return IncomeActionDecision(
+            action_type=np.full(
+                context.n_paths, IncomeActionType.CONTINUE.value, dtype="<U32"
+            ),
+            partial_fraction_of_max=np.zeros(context.n_paths),
+        )
 
 
 @dataclass
@@ -1587,6 +2462,153 @@ class _AssignedElectionContextRecorder:
     ) -> NDArray[np.bool_]:
         self.surrender_contexts[int(context.step)] = context
         return np.zeros(context.n_paths, dtype=bool)
+
+
+@dataclass(frozen=True)
+class _CrossFittedIncomeActionRegressionSet:
+    full_withdrawal_advantage: tuple[Optional[_ContinuationRegression], ...] = ()
+    full_fold_ids: Optional[NDArray[np.int64]] = None
+    partial_withdrawal_advantage: tuple[Optional[_ContinuationRegression], ...] = ()
+    partial_fold_ids: Optional[NDArray[np.int64]] = None
+
+
+@dataclass
+class _CrossFittedIncomeActionPolicy:
+    """Training-only policy with optional one-step action override."""
+
+    regressions_by_step: Mapping[int, _CrossFittedIncomeActionRegressionSet]
+    premium: float
+    settings: OptimalBehaviourLSMCSettings
+    override_step: Optional[int] = None
+    override_action: IncomeActionType = IncomeActionType.CONTINUE
+    override_partial_fraction: Optional[Array] = None
+    contexts: dict[int, IncomeActionDecisionContext] = field(default_factory=dict)
+    decisions: dict[int, IncomeActionDecision] = field(default_factory=dict)
+
+    def _cross_fitted_decision(
+        self,
+        context: IncomeActionDecisionContext,
+        models: _CrossFittedIncomeActionRegressionSet,
+    ) -> IncomeActionDecision:
+        base = build_income_action_regression_features(context, self.premium)
+        in_income = (
+            (context.phase == Phase.INCOME.value)
+            & (context.inforce_weight > self.settings.minimum_inforce_weight)
+        )
+        full_score = np.full(context.n_paths, -np.inf)
+        if models.full_withdrawal_advantage:
+            if models.full_fold_ids is None:
+                raise RuntimeError("Missing Full complete-path fold assignment.")
+            fold_ids = np.asarray(models.full_fold_ids, dtype=np.int64)
+            if fold_ids.shape != (context.n_paths,):
+                raise ValueError("Full fold IDs do not match the training paths.")
+            for fold, regression in enumerate(models.full_withdrawal_advantage):
+                selected = fold_ids == fold
+                if regression is None or not np.any(selected):
+                    continue
+                prediction = regression.predict_features(base)
+                buffer = (
+                    self.settings.exercise_tolerance_aud
+                    + self.settings.exercise_buffer_rmse_multiplier
+                    * regression.oof_rmse_aud
+                )
+                full_score[selected] = prediction[selected] - buffer
+        partial_score = np.full(context.n_paths, -np.inf)
+        partial_fraction = np.zeros(context.n_paths)
+        if models.partial_withdrawal_advantage:
+            if models.partial_fold_ids is None:
+                raise RuntimeError("Missing Partial complete-path fold assignment.")
+            fold_ids = np.asarray(models.partial_fold_ids, dtype=np.int64)
+            if fold_ids.shape != (context.n_paths,):
+                raise ValueError("Partial fold IDs do not match the training paths.")
+            for fold, regression in enumerate(models.partial_withdrawal_advantage):
+                selected = fold_ids == fold
+                if regression is None or not np.any(selected):
+                    continue
+                fold_score, fold_fraction = _predict_best_partial_action(
+                    regression, context, base, self.settings
+                )
+                partial_score[selected] = fold_score[selected]
+                partial_fraction[selected] = fold_fraction[selected]
+
+        take_partial = in_income & (partial_score > 0.0)
+        take_full = (
+            in_income
+            & context.full_withdrawal_eligible
+            & (full_score > 0.0)
+            & (full_score > partial_score + self.settings.exercise_tolerance_aud)
+        )
+        action_type = np.full(
+            context.n_paths, IncomeActionType.CONTINUE.value, dtype="<U32"
+        )
+        fraction = np.zeros(context.n_paths)
+        action_type[take_partial] = IncomeActionType.PARTIAL_WITHDRAWAL.value
+        fraction[take_partial] = partial_fraction[take_partial]
+        action_type[take_full] = IncomeActionType.FULL_WITHDRAWAL.value
+        fraction[take_full] = 0.0
+        return IncomeActionDecision(
+            action_type=action_type,
+            partial_fraction_of_max=fraction,
+        )
+
+    def choose_income_action(
+        self,
+        *,
+        context: IncomeActionDecisionContext,
+    ) -> IncomeActionDecision:
+        if not isinstance(context, IncomeActionDecisionContext):
+            raise TypeError("Training Income action requires decision context.")
+        step = int(context.step)
+        self.contexts[step] = context
+        if self.override_step is not None and step == int(self.override_step):
+            action_type = np.full(
+                context.n_paths, IncomeActionType.CONTINUE.value, dtype="<U32"
+            )
+            fraction = np.zeros(context.n_paths)
+            if self.override_action is IncomeActionType.FULL_WITHDRAWAL:
+                selected = np.asarray(
+                    context.full_withdrawal_eligible, dtype=bool
+                )
+                action_type[selected] = IncomeActionType.FULL_WITHDRAWAL.value
+            elif self.override_action is IncomeActionType.PARTIAL_WITHDRAWAL:
+                supplied = np.asarray(
+                    self.override_partial_fraction, dtype=float
+                )
+                if supplied.ndim == 0:
+                    supplied = np.full(context.n_paths, float(supplied))
+                if supplied.shape != (context.n_paths,):
+                    raise ValueError("Partial override must match the path sample.")
+                selected = (
+                    context.partial_withdrawal_eligible
+                    & (supplied > 0.0)
+                    & (supplied <= 1.0)
+                    & (
+                        context.max_partial_gross_amount * supplied
+                        >= 100.0 - 1.0e-10
+                    )
+                )
+                action_type[selected] = IncomeActionType.PARTIAL_WITHDRAWAL.value
+                fraction[selected] = supplied[selected]
+            decision = IncomeActionDecision(
+                action_type=action_type,
+                partial_fraction_of_max=fraction,
+            )
+        else:
+            models = self.regressions_by_step.get(step)
+            decision = (
+                IncomeActionDecision(
+                    action_type=np.full(
+                        context.n_paths,
+                        IncomeActionType.CONTINUE.value,
+                        dtype="<U32",
+                    ),
+                    partial_fraction_of_max=np.zeros(context.n_paths),
+                )
+                if models is None
+                else self._cross_fitted_decision(context, models)
+            )
+        self.decisions[step] = decision
+        return decision
 
 
 @dataclass
@@ -1633,6 +2655,14 @@ class OptimalBehaviourPolicyFit:
     training_candidate_policyholder_value_aud: float
     election_fallback_used: bool
     surrender_fallback_used: bool
+    valid: bool = True
+    invalid_reasons: tuple[str, ...] = ()
+    fit_version: str = "combined_optimal_behaviour_lsmc_v2"
+    income_action_exposure_coverage: float = 1.0
+    policy_iteration_count: int = 0
+    policy_iteration_converged: bool = True
+    final_action_agreement: float = 1.0
+    final_policy_value_change_aud: float = 0.0
 
     @property
     def training_optionality_uplift_aud(self) -> float:
@@ -1691,6 +2721,226 @@ def _oof_r_squared(target: Array, prediction: Array) -> float:
     return float(1.0 - residual_ss / total_ss) if total_ss > 0.0 else 1.0
 
 
+@dataclass(frozen=True)
+class IncomeActionAdvantagePolicyFit:
+    """Reusable fit boundary for a monthly Bellman transition engine."""
+
+    regressions_by_step: Mapping[int, IncomeActionRegressionSet]
+    diagnostics: tuple[OptimalBehaviourRegressionDiagnostic, ...]
+    fit_fingerprint: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "regressions_by_step",
+            MappingProxyType(dict(sorted(self.regressions_by_step.items()))),
+        )
+        object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
+
+
+def fit_income_action_advantage_policy(
+    base_features_by_step: Mapping[int, Array],
+    *,
+    full_advantage_targets_aud_by_step: Mapping[int, Array],
+    partial_fractions_by_step: Mapping[int, Array],
+    partial_advantage_targets_aud_by_step: Mapping[int, Array],
+    premium: float,
+    settings: OptimalBehaviourLSMCSettings = OptimalBehaviourLSMCSettings(),
+    fold_ids_by_step: Optional[Mapping[int, NDArray[np.int64]]] = None,
+    partial_valid_by_step: Optional[Mapping[int, NDArray[np.bool_]]] = None,
+) -> IncomeActionAdvantagePolicyFit:
+    """Fit monthly FULL and action-conditioned PARTIAL advantages.
+
+    This array-native API is the integration boundary for the monthly Bellman
+    kernel.  Partial alternatives may have shape ``(n_paths, n_candidates)``;
+    repeated alternatives inherit their complete-path fold ID, preventing
+    action replicas from leaking across train and test folds.
+    """
+    if not isinstance(settings, OptimalBehaviourLSMCSettings):
+        raise TypeError("settings must be OptimalBehaviourLSMCSettings.")
+    premium_value = float(premium)
+    if not np.isfinite(premium_value) or premium_value <= 0.0:
+        raise ValueError("Income-action premium must be positive and finite.")
+    steps = tuple(sorted(int(step) for step in base_features_by_step))
+    if any(step < 0 for step in steps) or len(steps) != len(base_features_by_step):
+        raise ValueError("Income-action decision steps must be unique and non-negative.")
+    allowed_steps = set(steps)
+    for name, mapping in (
+        ("full", full_advantage_targets_aud_by_step),
+        ("partial fractions", partial_fractions_by_step),
+        ("partial targets", partial_advantage_targets_aud_by_step),
+    ):
+        if not set(map(int, mapping)).issubset(allowed_steps):
+            raise ValueError(f"{name} contains a step without base features.")
+    if set(map(int, partial_fractions_by_step)) != set(
+        map(int, partial_advantage_targets_aud_by_step)
+    ):
+        raise ValueError("Partial fraction and target mappings must share steps.")
+
+    rng = np.random.default_rng(settings.fold_seed)
+    fitted: dict[int, IncomeActionRegressionSet] = {}
+    diagnostics: list[OptimalBehaviourRegressionDiagnostic] = []
+    fingerprint_inputs: dict[int, tuple[object, ...]] = {}
+    for step in steps:
+        base = np.asarray(base_features_by_step[step], dtype=float)
+        if base.ndim != 2 or base.shape[1] != len(INCOME_ACTION_FEATURE_NAMES) \
+                or not np.all(np.isfinite(base)):
+            raise ValueError(
+                f"Income-action features at step {step} have an invalid shape/value."
+            )
+        n_paths = base.shape[0]
+        if fold_ids_by_step is None:
+            path_ids = np.arange(n_paths, dtype=np.int64)
+            rng.shuffle(path_ids)
+        else:
+            if step not in fold_ids_by_step:
+                raise ValueError(f"Missing complete-path fold IDs at step {step}.")
+            path_ids = np.asarray(fold_ids_by_step[step], dtype=np.int64)
+            if path_ids.shape != (n_paths,) or np.any(path_ids < 0):
+                raise ValueError(f"Invalid complete-path fold IDs at step {step}.")
+
+        full_regression: Optional[_ContinuationRegression] = None
+        partial_regression: Optional[_ContinuationRegression] = None
+        full_target = full_advantage_targets_aud_by_step.get(step)
+        if full_target is not None:
+            target = np.asarray(full_target, dtype=float)
+            if target.shape != (n_paths,) or not np.all(np.isfinite(target)):
+                raise ValueError(f"Invalid Full advantage target at step {step}.")
+            full_regression, full_oof, folds_used, _fold_models = (
+                _cross_fitted_advantage_regression(
+                    base,
+                    target,
+                    premium_value,
+                    settings,
+                    path_ids,
+                    core_feature_indices=INCOME_ACTION_CORE_FEATURE_INDICES,
+                    enforce_unique_path_minimum=True,
+                )
+            )
+            buffer = (
+                settings.exercise_tolerance_aud
+                + settings.exercise_buffer_rmse_multiplier
+                * full_regression.oof_rmse_aud
+            )
+            diagnostics.append(OptimalBehaviourRegressionDiagnostic(
+                action_type="full_withdrawal",
+                phase="income",
+                policy_year=step // STEPS_PER_YEAR,
+                decision_step=step,
+                observations=n_paths,
+                folds_used=folds_used,
+                feature_count=int(full_regression.coefficients.size),
+                matrix_rank=full_regression.matrix_rank,
+                condition_number=full_regression.condition_number,
+                oof_rmse_aud=full_regression.oof_rmse_aud,
+                oof_r_squared=_oof_r_squared(target, full_oof),
+                mean_wait_or_continue_value_aud=0.0,
+                mean_action_value_aud=float(np.mean(target)),
+                training_action_rate=float(np.mean(full_oof > buffer)),
+                regression_accepted_for_action=True,
+                fallback_reason=None,
+                selected_ridge=full_regression.selected_ridge,
+                effective_rank=full_regression.effective_rank,
+                basis_level=full_regression.basis_level,
+                oof_policy_uplift_aud=float(np.mean(np.where(
+                    full_oof > buffer, target, 0.0
+                ))),
+                relevant_exposure_fraction=1.0,
+            ))
+
+        if step in partial_fractions_by_step:
+            fractions = np.asarray(partial_fractions_by_step[step], dtype=float)
+            targets = np.asarray(
+                partial_advantage_targets_aud_by_step[step], dtype=float
+            )
+            if fractions.ndim != 2 or fractions.shape[0] != n_paths \
+                    or targets.shape != fractions.shape:
+                raise ValueError(f"Invalid Partial action panel at step {step}.")
+            valid = (
+                np.ones(fractions.shape, dtype=bool)
+                if partial_valid_by_step is None or step not in partial_valid_by_step
+                else np.asarray(partial_valid_by_step[step], dtype=bool)
+            )
+            if valid.shape != fractions.shape:
+                raise ValueError(f"Invalid Partial validity mask at step {step}.")
+            selected_fraction = fractions[valid]
+            selected_target = targets[valid]
+            if selected_fraction.size == 0 \
+                    or not np.all(np.isfinite(selected_fraction)) \
+                    or np.any((selected_fraction <= 0.0) | (selected_fraction > 1.0)) \
+                    or not np.all(np.isfinite(selected_target)):
+                raise ValueError(f"No finite admissible Partial targets at step {step}.")
+            candidate_count = fractions.shape[1]
+            repeated_base = np.repeat(base, candidate_count, axis=0)[valid.ravel()]
+            repeated_ids = np.repeat(path_ids, candidate_count)[valid.ravel()]
+            partial_raw = build_partial_action_regression_features(
+                repeated_base, selected_fraction
+            )
+            partial_regression, partial_oof, folds_used, _fold_models = (
+                _cross_fitted_advantage_regression(
+                    partial_raw,
+                    selected_target,
+                    premium_value,
+                    settings,
+                    repeated_ids,
+                    core_feature_indices=PARTIAL_ACTION_CORE_FEATURE_INDICES,
+                    enforce_unique_path_minimum=True,
+                )
+            )
+            buffer = (
+                settings.exercise_tolerance_aud
+                + settings.exercise_buffer_rmse_multiplier
+                * partial_regression.oof_rmse_aud
+            )
+            diagnostics.append(OptimalBehaviourRegressionDiagnostic(
+                action_type="partial_withdrawal",
+                phase="income",
+                policy_year=step // STEPS_PER_YEAR,
+                decision_step=step,
+                observations=int(selected_fraction.size),
+                folds_used=folds_used,
+                feature_count=int(partial_regression.coefficients.size),
+                matrix_rank=partial_regression.matrix_rank,
+                condition_number=partial_regression.condition_number,
+                oof_rmse_aud=partial_regression.oof_rmse_aud,
+                oof_r_squared=_oof_r_squared(selected_target, partial_oof),
+                mean_wait_or_continue_value_aud=0.0,
+                mean_action_value_aud=float(np.mean(selected_target)),
+                training_action_rate=float(np.mean(partial_oof > buffer)),
+                regression_accepted_for_action=True,
+                fallback_reason=None,
+                selected_ridge=partial_regression.selected_ridge,
+                effective_rank=partial_regression.effective_rank,
+                basis_level=partial_regression.basis_level,
+                oof_policy_uplift_aud=float(np.mean(np.where(
+                    partial_oof > buffer, selected_target, 0.0
+                ))),
+                relevant_exposure_fraction=1.0,
+            ))
+
+        if full_regression is None and partial_regression is None:
+            raise ValueError(f"Step {step} has no Income action target.")
+        fitted[step] = IncomeActionRegressionSet(
+            full_withdrawal_advantage=full_regression,
+            partial_withdrawal_advantage=partial_regression,
+        )
+        fingerprint_inputs[step] = (base, full_target, partial_fractions_by_step.get(step),
+                                    partial_advantage_targets_aud_by_step.get(step), path_ids)
+
+    return IncomeActionAdvantagePolicyFit(
+        regressions_by_step=fitted,
+        diagnostics=tuple(sorted(
+            diagnostics, key=lambda item: (item.decision_step, item.action_type)
+        )),
+        fit_fingerprint=assumption_fingerprint(
+            "monthly_income_action_advantage_lsmc_v2",
+            fingerprint_inputs,
+            premium_value,
+            settings,
+        ),
+    )
+
+
 def _fit_surrender_phase_from_projection(
     *,
     projection: ProjectionResult,
@@ -1731,7 +2981,9 @@ def _fit_surrender_phase_from_projection(
     ] = {}
     fold_ids_by_step: dict[int, NDArray[np.int64]] = {}
     diagnostics: list[OptimalBehaviourRegressionDiagnostic] = []
-    minimum_observations = 2 * (len(FEATURE_NAMES) + 1)
+    minimum_observations = _minimum_cross_fit_observations(settings, 1)
+    material_failures: list[str] = []
+    training_panels: dict[int, tuple[Array, Array, NDArray[np.int64]]] = {}
 
     last_step = decision_steps[-1]
     future_value_0 = np.sum(
@@ -1755,34 +3007,34 @@ def _fit_surrender_phase_from_projection(
         continuation_target = np.zeros(0)
         immediate = np.zeros(0)
         oof_continuation = np.zeros(0)
+        advantage_target = np.zeros(0)
         regression: Optional[_ContinuationRegression] = None
         fold_regressions: tuple[_ContinuationRegression, ...] = ()
 
-        if observations < minimum_observations:
-            fallback_reason = (
-                f"too_few_observations:{observations}<"
-                f"{minimum_observations}"
-            )
-        else:
+        if observations:
             continuation_target = (
                 future_value_0[eligible] / scale_0[eligible]
             )
             immediate = context.surrender_value[eligible]
+            advantage_target = immediate - continuation_target
             raw = build_surrender_regression_features(
                 context, premium
             )[eligible]
+            local_ids = base_fold_ids[eligible_index]
+            training_panels[step] = (raw, advantage_target, local_ids)
             try:
                 (
                     regression,
                     oof_continuation,
                     folds_used,
                     fold_regressions,
-                ) = _cross_fitted_regression(
+                ) = _cross_fitted_advantage_regression(
                     raw,
-                    continuation_target,
+                    advantage_target,
                     premium,
                     settings,
-                    base_fold_ids[eligible_index],
+                    local_ids,
+                    core_feature_indices=CORE_FEATURE_INDICES,
                 )
                 full_stable = _regression_is_stable(regression, settings)
                 folds_stable = all(
@@ -1796,6 +3048,49 @@ def _fit_surrender_phase_from_projection(
                     fallback_reason = "cross_fit_fold_unstable"
             except (ValueError, np.linalg.LinAlgError) as exc:
                 fallback_reason = f"cross_fit_failed:{exc}"
+                neighbours = [
+                    panel for other_step, panel in training_panels.items()
+                    if other_step != step and abs(other_step - step) <= STEPS_PER_YEAR
+                ]
+                if neighbours:
+                    pooled_raw = np.concatenate((raw, *(item[0] for item in neighbours)))
+                    pooled_target = np.concatenate((
+                        advantage_target, *(item[1] for item in neighbours)
+                    ))
+                    pooled_ids = np.concatenate((
+                        local_ids, *(item[2] for item in neighbours)
+                    ))
+                    try:
+                        (
+                            regression,
+                            pooled_oof,
+                            folds_used,
+                            fold_regressions,
+                        ) = _cross_fitted_advantage_regression(
+                            pooled_raw,
+                            pooled_target,
+                            premium,
+                            settings,
+                            pooled_ids,
+                            core_feature_indices=CORE_FEATURE_INDICES,
+                        )
+                        regression = replace(
+                            regression,
+                            basis_level=f"pooled_12m/{regression.basis_level}",
+                        )
+                        fold_regressions = tuple(
+                            replace(item, basis_level=regression.basis_level)
+                            for item in fold_regressions
+                        )
+                        oof_continuation = pooled_oof[:observations]
+                        accepted = True
+                        fallback_reason = None
+                    except (ValueError, np.linalg.LinAlgError) as pooled_exc:
+                        fallback_reason += f";pooled_12m_failed:{pooled_exc}"
+        else:
+            fallback_reason = (
+                f"too_few_observations:{observations}<{minimum_observations}"
+            )
 
         exercise = np.zeros(scenarios.n_paths, dtype=bool)
         training_action_rate = 0.0
@@ -1805,7 +3100,7 @@ def _fit_surrender_phase_from_projection(
                 + settings.exercise_buffer_rmse_multiplier
                 * regression.oof_rmse_aud
             )
-            exercise_eligible = immediate > oof_continuation + buffer
+            exercise_eligible = oof_continuation > buffer
             exercise[eligible_index] = exercise_eligible
             training_action_rate = float(np.mean(exercise_eligible))
             regressions[step] = regression
@@ -1813,6 +3108,15 @@ def _fit_surrender_phase_from_projection(
             fold_ids_by_step[step] = np.mod(
                 base_fold_ids, folds_used
             ).astype(np.int64)
+        relevant_exposure = float(np.mean(np.where(
+            eligible, context.inforce_weight, 0.0
+        )))
+        if not accepted and relevant_exposure > settings.immaterial_exposure_fraction:
+            material_failures.append(
+                f"step={step},exposure={relevant_exposure:.12g},reason={fallback_reason}"
+            )
+        elif not accepted:
+            fallback_reason = "immaterial_no_fit"
 
         future_value_0 = np.where(
             exercise,
@@ -1839,7 +3143,7 @@ def _fit_surrender_phase_from_projection(
             oof_r_squared=(
                 None
                 if regression is None
-                else _oof_r_squared(continuation_target, oof_continuation)
+                else _oof_r_squared(advantage_target, oof_continuation)
             ),
             mean_wait_or_continue_value_aud=(
                 float(np.mean(continuation_target))
@@ -1860,12 +3164,39 @@ def _fit_surrender_phase_from_projection(
             wait_regression_oof_rmse_aud=(
                 None if regression is None else regression.oof_rmse_aud
             ),
+            selected_ridge=(
+                None if regression is None else regression.selected_ridge
+            ),
+            effective_rank=(
+                0 if regression is None else regression.effective_rank
+            ),
+            basis_level=(
+                "none" if regression is None else regression.basis_level
+            ),
+            oof_policy_uplift_aud=(
+                None if regression is None else float(np.mean(np.where(
+                    oof_continuation > (
+                        settings.exercise_tolerance_aud
+                        + settings.exercise_buffer_rmse_multiplier
+                        * regression.oof_rmse_aud
+                    ),
+                    advantage_target,
+                    0.0,
+                )))
+            ),
+            relevant_exposure_fraction=relevant_exposure,
         ))
         if position > 0:
             previous = decision_steps[position - 1]
             future_value_0 += np.sum(
                 discounted_cashflow[:, previous + 1:step + 1], axis=1
             )
+
+    if material_failures:
+        raise ValueError(
+            "Material Income advantage regressions unavailable: "
+            + " | ".join(material_failures)
+        )
 
     first_step = decision_steps[0]
     candidate_path_value = (
@@ -1887,6 +3218,8 @@ def _fit_surrender_phase_from_projection(
         policy=OptimalSurrenderPolicy(
             regressions=MappingProxyType(dict(sorted(regressions.items()))),
             settings=settings,
+            regressions_are_advantages=True,
+            strict_missing_material_regression=not fallback_used,
         ),
         cross_fitted_policy=CrossFittedOptimalSurrenderPolicy(
             regressions_by_step=MappingProxyType(dict(sorted(
@@ -1896,6 +3229,8 @@ def _fit_surrender_phase_from_projection(
                 fold_ids_by_step.items()
             ))),
             settings=settings,
+            regressions_are_advantages=True,
+            strict_missing_material_regression=not fallback_used,
         ),
         diagnostics=tuple(sorted(
             diagnostics, key=lambda item: item.decision_step
@@ -1918,51 +3253,33 @@ def _fit_election_regression_pair(
 ) -> tuple[
     _ElectionRegressionPair,
     Array,
-    Array,
     int,
     tuple[_ElectionRegressionPair, ...],
 ]:
+    advantage_target = np.asarray(start_target_aud) - np.asarray(wait_target_aud)
     (
-        wait_regression,
-        wait_oof,
-        wait_folds_used,
-        wait_fold_regressions,
-    ) = _cross_fitted_regression(
+        advantage_regression,
+        advantage_oof,
+        folds_used,
+        fold_advantage_regressions,
+    ) = _cross_fitted_advantage_regression(
         raw_features,
-        wait_target_aud,
+        advantage_target,
         premium,
         settings,
         fold_ids,
+        core_feature_indices=ELECTION_CORE_FEATURE_INDICES,
+        enforce_unique_path_minimum=True,
     )
-    (
-        start_regression,
-        start_oof,
-        start_folds_used,
-        start_fold_regressions,
-    ) = _cross_fitted_regression(
-        raw_features,
-        start_target_aud,
-        premium,
-        settings,
-        fold_ids,
-    )
-    if wait_folds_used != start_folds_used:
-        raise RuntimeError("WAIT and START cross-fits use different folds.")
-    full_pair = _ElectionRegressionPair(
-        wait=wait_regression,
-        start=start_regression,
-    )
+    full_pair = _ElectionRegressionPair(advantage=advantage_regression)
     fold_pairs = tuple(
-        _ElectionRegressionPair(wait=wait, start=start)
-        for wait, start in zip(
-            wait_fold_regressions, start_fold_regressions
-        )
+        _ElectionRegressionPair(advantage=advantage)
+        for advantage in fold_advantage_regressions
     )
     return (
         full_pair,
-        wait_oof,
-        start_oof,
-        wait_folds_used,
+        advantage_oof,
+        folds_used,
         fold_pairs,
     )
 
@@ -1977,7 +3294,8 @@ def _project_fixed_election_branch(
     mortality: MortalityTable,
     expenses: Optional[ExpenseAssumptions],
     config: ProjectionConfig,
-    surrender_policy: Optional[object],
+    surrender_policy: Optional[object] = None,
+    income_action_policy: Optional[object] = None,
 ) -> tuple[ProjectionResult, _FixedElectionContextRecorder]:
     election_recorder = _FixedElectionContextRecorder(start_step=start_step)
     projection = project(
@@ -1990,8 +3308,1160 @@ def _project_fixed_election_branch(
         config=config,
         surrender_policy=surrender_policy,
         income_election_policy=election_recorder,
+        income_action_policy=income_action_policy,
     )
     return projection, election_recorder
+
+
+def _project_assigned_election_income_branch(
+    *,
+    assigned_start_steps: NDArray[np.int64],
+    action_policy: _CrossFittedIncomeActionPolicy,
+    product: IndexLinkedLifetimeIncomeProduct,
+    policy: PolicySpec,
+    scenarios: ScenarioSet,
+    behaviour: BehaviourModel,
+    mortality: MortalityTable,
+    expenses: Optional[ExpenseAssumptions],
+    config: ProjectionConfig,
+    income_transition_observer: Optional[object] = None,
+) -> ProjectionResult:
+    election_policy = _AssignedElectionContextRecorder(
+        assigned_start_steps=np.asarray(assigned_start_steps, dtype=np.int64)
+    )
+    return project(
+        product,
+        policy,
+        scenarios,
+        behaviour,
+        mortality,
+        expenses=expenses,
+        config=config,
+        income_election_policy=election_policy,
+        income_action_policy=action_policy,
+        income_transition_observer=income_transition_observer,
+    )
+
+
+@dataclass(frozen=True)
+class _MonthlyIncomeActionFit:
+    regressions_by_step: Mapping[int, IncomeActionRegressionSet]
+    cross_fitted_regressions_by_step: Mapping[
+        int, _CrossFittedIncomeActionRegressionSet
+    ]
+    diagnostics: tuple[OptimalBehaviourRegressionDiagnostic, ...]
+    training_policyholder_value_aud: float
+    training_continue_value_aud: float
+    training_candidate_value_aud: float
+    covered_exposure_fraction: float
+    policy_iteration_count: int
+    policy_iteration_converged: bool
+    final_action_agreement: float
+    final_value_change_aud: float
+    valid: bool
+    invalid_reasons: tuple[str, ...]
+
+
+def _cross_fitted_state_value_regression(
+    raw_features: Array,
+    value_target_aud: Array,
+    premium: float,
+    settings: OptimalBehaviourLSMCSettings,
+    fold_ids: NDArray[np.int64],
+    *,
+    enforce_unique_path_minimum: bool = False,
+) -> tuple[
+    _ContinuationRegression,
+    Array,
+    int,
+    tuple[_ContinuationRegression, ...],
+]:
+    """Fit full -> linear core -> constant for an internal state value."""
+    attempts = (
+        ("full", None),
+        ("core", INCOME_ACTION_CORE_FEATURE_INDICES),
+        ("constant", np.zeros(0, dtype=np.int64)),
+    )
+    failures: list[str] = []
+    for basis_level, indices in attempts:
+        try:
+            fit = _cross_fitted_regression(
+                raw_features,
+                value_target_aud,
+                premium,
+                settings,
+                fold_ids,
+                advantage_target=False,
+                feature_indices=indices,
+                basis_level=basis_level,
+                enforce_unique_path_minimum=enforce_unique_path_minimum,
+            )
+            regression, _oof, _folds, fold_regressions = fit
+            if _regression_is_stable(regression, settings) and all(
+                _regression_is_stable(item, settings)
+                for item in fold_regressions
+            ):
+                return fit
+            failures.append(f"{basis_level}:unstable")
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            failures.append(f"{basis_level}:{exc}")
+    raise ValueError(";".join(failures))
+
+
+def _monthly_action_diagnostic(
+    *,
+    action_type: str,
+    step: int,
+    target: Array,
+    oof: Array,
+    regression: _ContinuationRegression,
+    folds_used: int,
+    settings: OptimalBehaviourLSMCSettings,
+    exposure: float,
+    iteration: int,
+) -> OptimalBehaviourRegressionDiagnostic:
+    buffer = (
+        settings.exercise_tolerance_aud
+        + settings.exercise_buffer_rmse_multiplier * regression.oof_rmse_aud
+    )
+    action = oof > buffer
+    return OptimalBehaviourRegressionDiagnostic(
+        action_type=action_type,
+        phase="income",
+        policy_year=step // STEPS_PER_YEAR,
+        decision_step=step,
+        observations=int(target.size),
+        folds_used=folds_used,
+        feature_count=int(regression.coefficients.size),
+        matrix_rank=regression.matrix_rank,
+        condition_number=regression.condition_number,
+        oof_rmse_aud=regression.oof_rmse_aud,
+        oof_r_squared=_oof_r_squared(target, oof),
+        mean_wait_or_continue_value_aud=0.0,
+        mean_action_value_aud=float(np.mean(target)),
+        training_action_rate=float(np.mean(action)),
+        regression_accepted_for_action=True,
+        fallback_reason=None,
+        action_regression_rank=regression.matrix_rank,
+        action_regression_condition_number=regression.condition_number,
+        action_regression_oof_rmse_aud=regression.oof_rmse_aud,
+        selected_ridge=regression.selected_ridge,
+        effective_rank=regression.effective_rank,
+        basis_level=f"iteration_{iteration}/{regression.basis_level}",
+        oof_policy_uplift_aud=float(np.mean(np.where(action, target, 0.0))),
+        relevant_exposure_fraction=float(exposure),
+    )
+
+
+def _failed_monthly_action_diagnostic(
+    *,
+    action_type: str,
+    step: int,
+    observations: int,
+    reason: str,
+    exposure: float,
+    iteration: int,
+) -> OptimalBehaviourRegressionDiagnostic:
+    return OptimalBehaviourRegressionDiagnostic(
+        action_type=action_type,
+        phase="income",
+        policy_year=step // STEPS_PER_YEAR,
+        decision_step=step,
+        observations=int(observations),
+        folds_used=0,
+        feature_count=0,
+        matrix_rank=0,
+        condition_number=None,
+        oof_rmse_aud=None,
+        oof_r_squared=None,
+        mean_wait_or_continue_value_aud=0.0,
+        mean_action_value_aud=0.0,
+        training_action_rate=0.0,
+        regression_accepted_for_action=False,
+        fallback_reason=reason,
+        basis_level=f"iteration_{iteration}/none",
+        relevant_exposure_fraction=float(exposure),
+    )
+
+
+def _income_policy_rollout(
+    *,
+    regressions_by_step: Mapping[int, _CrossFittedIncomeActionRegressionSet],
+    assigned_start_steps: NDArray[np.int64],
+    product: IndexLinkedLifetimeIncomeProduct,
+    policy: PolicySpec,
+    scenarios: ScenarioSet,
+    behaviour: BehaviourModel,
+    mortality: MortalityTable,
+    expenses: Optional[ExpenseAssumptions],
+    config: ProjectionConfig,
+    premium: float,
+    settings: OptimalBehaviourLSMCSettings,
+) -> tuple[
+    float,
+    _CrossFittedIncomeActionPolicy,
+    ProjectionResult,
+    IncomeTransitionPanelCollector,
+]:
+    action_policy = _CrossFittedIncomeActionPolicy(
+        regressions_by_step=regressions_by_step,
+        premium=premium,
+        settings=settings,
+    )
+    transition_collector = IncomeTransitionPanelCollector()
+    projection = _project_assigned_election_income_branch(
+        assigned_start_steps=assigned_start_steps,
+        action_policy=action_policy,
+        product=product,
+        policy=policy,
+        scenarios=scenarios,
+        behaviour=behaviour,
+        mortality=mortality,
+        expenses=expenses,
+        config=config,
+        income_transition_observer=transition_collector,
+    )
+    path_value = np.sum(
+        _discounted_policyholder_cashflows(projection, scenarios), axis=1
+    )
+    return (
+        float(np.mean(path_value)),
+        action_policy,
+        projection,
+        transition_collector,
+    )
+
+
+def _income_action_agreement(
+    left: _CrossFittedIncomeActionPolicy,
+    right: _CrossFittedIncomeActionPolicy,
+    settings: OptimalBehaviourLSMCSettings,
+) -> float:
+    matches = 0
+    relevant = 0
+    for step in sorted(set(left.decisions) | set(right.decisions)):
+        left_decision = left.decisions.get(step)
+        right_decision = right.decisions.get(step)
+        left_context = left.contexts.get(step)
+        right_context = right.contexts.get(step)
+        if left_decision is None or right_decision is None \
+                or left_context is None or right_context is None:
+            continue
+        if left_context.n_paths != right_context.n_paths \
+                or left_decision.n_paths != right_decision.n_paths \
+                or left_decision.n_paths != left_context.n_paths:
+            raise ValueError(
+                "Policy-iteration agreement requires common scenario paths."
+            )
+        # Agreement is measured only where both on-policy rollouts reach the
+        # same monthly boundary with positive Income exposure.
+        eligible = (
+            (left_context.phase == Phase.INCOME.value)
+            & (right_context.phase == Phase.INCOME.value)
+            & (
+                left_context.inforce_weight
+                > settings.minimum_inforce_weight
+            )
+            & (
+                right_context.inforce_weight
+                > settings.minimum_inforce_weight
+            )
+        )
+        same = (
+            left_decision.action_type == right_decision.action_type
+        ) & np.isclose(
+            left_decision.partial_fraction_of_max,
+            right_decision.partial_fraction_of_max,
+            atol=1.0e-10,
+            rtol=0.0,
+        )
+        matches += int(np.count_nonzero(eligible & same))
+        relevant += int(np.count_nonzero(eligible))
+    return 1.0 if relevant == 0 else float(matches / relevant)
+
+
+@dataclass(frozen=True)
+class _OuterFoldIncomeBellmanChain:
+    """One recursively fold-pure monthly Income Bellman chain."""
+
+    regressions_by_step: Mapping[int, IncomeActionRegressionSet]
+    diagnostics: tuple[OptimalBehaviourRegressionDiagnostic, ...]
+    deployment_exposure: float
+    covered_deployment_exposure: float
+    material_failures: tuple[str, ...]
+
+
+def _fit_monthly_income_action_phase(
+    *,
+    assigned_start_steps: NDArray[np.int64],
+    product: IndexLinkedLifetimeIncomeProduct,
+    policy: PolicySpec,
+    scenarios: ScenarioSet,
+    behaviour: BehaviourModel,
+    mortality: MortalityTable,
+    expenses: Optional[ExpenseAssumptions],
+    config: ProjectionConfig,
+    premium: float,
+    settings: OptimalBehaviourLSMCSettings,
+    base_fold_ids: NDArray[np.int64],
+) -> _MonthlyIncomeActionFit:
+    """Solve Income actions with complete outer-fold Bellman isolation.
+
+    A deployment chain is fitted on all paths.  Independently, outer chain
+    ``f`` excludes fold ``f`` from every action and state-value regression at
+    every later month.  Consequently a held-out path cannot re-enter its own
+    continuation target indirectly through a downstream fitted policy/value.
+    """
+    n_paths = scenarios.n_paths
+    fold_source = np.asarray(base_fold_ids, dtype=np.int64)
+    assigned = np.asarray(assigned_start_steps, dtype=np.int64)
+    if fold_source.shape != (n_paths,) or np.unique(fold_source).size != n_paths:
+        raise ValueError("Monthly Bellman folds require one stable ID per path.")
+    if assigned.shape != (n_paths,):
+        raise ValueError("Assigned Income starts must match the training paths.")
+    outer_folds = int(settings.n_folds)
+    outer_fold_ids = np.mod(fold_source, outer_folds).astype(np.int64)
+    if any(not np.any(outer_fold_ids == fold) for fold in range(outer_folds)):
+        raise ValueError("Every outer Bellman fold must contain a complete path.")
+
+    (
+        continue_value,
+        prior_rollout_policy,
+        _continue_projection,
+        continue_collector,
+    ) = _income_policy_rollout(
+        regressions_by_step={},
+        assigned_start_steps=assigned,
+        product=product,
+        policy=policy,
+        scenarios=scenarios,
+        behaviour=behaviour,
+        mortality=mortality,
+        expenses=expenses,
+        config=config,
+        premium=premium,
+        settings=settings,
+    )
+
+    def solve_chain(
+        collector: IncomeTransitionPanelCollector,
+        *,
+        excluded_fold: Optional[int],
+        iteration: int,
+        record_diagnostics: bool,
+    ) -> _OuterFoldIncomeBellmanChain:
+        """Fit one full downstream chain without the requested outer fold."""
+        states_by_step = collector.states_by_step
+        slices_by_step = collector.slices_by_step
+        if set(states_by_step) != set(slices_by_step):
+            raise RuntimeError("Income transition collector panels are inconsistent.")
+
+        action_models: dict[int, IncomeActionRegressionSet] = {}
+        value_models: dict[int, _ContinuationRegression] = {}
+        diagnostics: list[OptimalBehaviourRegressionDiagnostic] = []
+        failures: list[str] = []
+        missing_continuations: set[tuple[int, int]] = set()
+        total_deployment_exposure = 0.0
+        covered_deployment_exposure = 0.0
+        full_panels: dict[int, tuple[Array, Array, NDArray[np.int64]]] = {}
+        partial_panels: dict[int, tuple[Array, Array, NDArray[np.int64]]] = {}
+        value_panels: dict[int, tuple[Array, Array, NDArray[np.int64]]] = {}
+        chain_name = (
+            "deployment" if excluded_fold is None else f"outer_fold_{excluded_fold}"
+        )
+
+        def fit_panel_with_pooling(
+            *,
+            step: int,
+            raw: Array,
+            target: Array,
+            path_ids: NDArray[np.int64],
+            history: dict[int, tuple[Array, Array, NDArray[np.int64]]],
+            advantage: bool,
+            core_indices: NDArray[np.int64] = INCOME_ACTION_CORE_FEATURE_INDICES,
+        ) -> tuple[_ContinuationRegression, Array, int]:
+            raw_array = np.asarray(raw, dtype=float)
+            target_array = np.asarray(target, dtype=float)
+            ids = np.asarray(path_ids, dtype=np.int64)
+            history[step] = (raw_array, target_array, ids)
+
+            def fit_one(
+                fit_raw: Array,
+                fit_target: Array,
+                fit_ids: NDArray[np.int64],
+            ) -> tuple[_ContinuationRegression, Array, int]:
+                if advantage:
+                    regression, oof, folds_used, _fold_models = (
+                        _cross_fitted_advantage_regression(
+                            fit_raw,
+                            fit_target,
+                            premium,
+                            settings,
+                            fit_ids,
+                            core_feature_indices=core_indices,
+                            enforce_unique_path_minimum=True,
+                        )
+                    )
+                else:
+                    regression, oof, folds_used, _fold_models = (
+                        _cross_fitted_state_value_regression(
+                            fit_raw,
+                            fit_target,
+                            premium,
+                            settings,
+                            fit_ids,
+                            enforce_unique_path_minimum=True,
+                        )
+                    )
+                return regression, oof, folds_used
+
+            local_error: Optional[Exception] = None
+            try:
+                return fit_one(raw_array, target_array, ids)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                local_error = exc
+
+            neighbours = [
+                panel
+                for other_step, panel in history.items()
+                if other_step != step
+                and 0 < other_step - step <= STEPS_PER_YEAR
+            ]
+            if neighbours:
+                pooled_raw = np.concatenate(
+                    (raw_array, *(item[0] for item in neighbours))
+                )
+                pooled_target = np.concatenate(
+                    (target_array, *(item[1] for item in neighbours))
+                )
+                pooled_ids = np.concatenate(
+                    (ids, *(item[2] for item in neighbours))
+                )
+                try:
+                    regression, pooled_oof, folds_used = fit_one(
+                        pooled_raw, pooled_target, pooled_ids
+                    )
+                    regression = replace(
+                        regression,
+                        basis_level=f"pooled_12m/{regression.basis_level}",
+                    )
+                    return regression, pooled_oof[:target_array.size], folds_used
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    local_error = exc
+            raise ValueError(
+                str(local_error)
+                if local_error is not None
+                else "fit_failed_after_12m_pooling"
+            )
+
+        for step in sorted(states_by_step, reverse=True):
+            state = states_by_step[step]
+            scenario_slice = slices_by_step[step]
+            context = build_income_action_decision_context(
+                state, product, scenario_slice, terminal=False
+            )
+            path_index = np.asarray(state.path_index, dtype=np.int64)
+            if path_index.shape != (context.n_paths,) \
+                    or np.any(path_index < 0) or np.any(path_index >= n_paths):
+                raise RuntimeError("Collected Income path indices are inconsistent.")
+            path_ids = fold_source[path_index]
+            state_outer_folds = outer_fold_ids[path_index]
+            train_path = (
+                np.ones(context.n_paths, dtype=bool)
+                if excluded_fold is None
+                else state_outer_folds != excluded_fold
+            )
+            deployment_path = (
+                np.ones(context.n_paths, dtype=bool)
+                if excluded_fold is None
+                else state_outer_folds == excluded_fold
+            )
+            base_features = build_income_action_regression_features(
+                context, premium
+            )
+            current_weight = np.asarray(state.inforce_weight, dtype=float)
+            in_income = (
+                (context.phase == Phase.INCOME.value)
+                & (current_weight > settings.minimum_inforce_weight)
+            )
+            full_eligible = in_income & context.full_withdrawal_eligible
+            partial_eligible = in_income & context.partial_withdrawal_eligible
+            train_full = full_eligible & train_path
+            train_partial = partial_eligible & train_path
+            deploy_full = full_eligible & deployment_path
+            deploy_partial = partial_eligible & deployment_path
+            full_deployment_exposure = float(np.sum(np.where(
+                deploy_full, current_weight, 0.0
+            )) / n_paths)
+            partial_deployment_exposure = float(np.sum(np.where(
+                deploy_partial, current_weight, 0.0
+            )) / n_paths)
+            total_deployment_exposure += (
+                full_deployment_exposure + partial_deployment_exposure
+            )
+
+            def make_decision(
+                action: IncomeActionType,
+                selected: NDArray[np.bool_],
+                fraction: Optional[Array] = None,
+            ) -> IncomeActionDecision:
+                selected_array = np.asarray(selected, dtype=bool)
+                if selected_array.shape != (context.n_paths,):
+                    raise ValueError("Bellman action mask has an invalid shape.")
+                action_type = np.full(
+                    context.n_paths,
+                    IncomeActionType.CONTINUE.value,
+                    dtype="<U18",
+                )
+                fractions = np.zeros(context.n_paths)
+                if action is IncomeActionType.FULL_WITHDRAWAL:
+                    action_type[selected_array] = action.value
+                elif action is IncomeActionType.PARTIAL_WITHDRAWAL:
+                    if fraction is None:
+                        raise ValueError("Partial Bellman action requires a fraction.")
+                    supplied = np.asarray(fraction, dtype=float)
+                    if supplied.shape != (context.n_paths,):
+                        raise ValueError(
+                            "Partial Bellman fractions have an invalid shape."
+                        )
+                    action_type[selected_array] = action.value
+                    fractions[selected_array] = supplied[selected_array]
+                elif action is not IncomeActionType.CONTINUE:
+                    raise ValueError("Unknown Bellman Income action.")
+                return IncomeActionDecision(
+                    action_type=action_type,
+                    partial_fraction_of_max=fractions,
+                )
+
+            def action_q_value(decision: IncomeActionDecision) -> Array:
+                action_transition = apply_income_action(
+                    state,
+                    decision,
+                    product,
+                    scenario_slice,
+                    terminal=False,
+                )
+                month_transition = advance_income_month(
+                    action_transition.post_action_state,
+                    product,
+                    policy,
+                    scenario_slice,
+                )
+                next_state = month_transition.next_state
+                next_active = (
+                    (next_state.phase == Phase.INCOME.value)
+                    & (
+                        next_state.inforce_weight
+                        > settings.minimum_inforce_weight
+                    )
+                )
+                next_value = np.zeros(context.n_paths)
+                if np.any(next_active):
+                    value_model = value_models.get(int(next_state.step))
+                    if value_model is None:
+                        key = (int(step), int(next_state.step))
+                        exposure = float(np.sum(np.where(
+                            next_active, next_state.inforce_weight, 0.0
+                        )) / n_paths)
+                        if exposure > settings.immaterial_exposure_fraction \
+                                and key not in missing_continuations:
+                            missing_continuations.add(key)
+                            failures.append(
+                                f"{chain_name}:continuation@{step}->"
+                                f"{next_state.step}:missing_state_value_model"
+                            )
+                    else:
+                        next_raw = build_income_action_regression_features(
+                            month_transition.next_context, premium
+                        )
+                        per_exposure = np.maximum(
+                            value_model.predict_features(next_raw), 0.0
+                        )
+                        next_value = np.where(
+                            next_active,
+                            next_state.inforce_weight * per_exposure,
+                            0.0,
+                        )
+                return np.asarray(
+                    action_transition.policyholder_cashflow
+                    + month_transition.discount_ratio
+                    * (
+                        month_transition.mandatory_policyholder_cashflow
+                        + next_value
+                    ),
+                    dtype=float,
+                )
+
+            continue_q = action_q_value(make_decision(
+                IncomeActionType.CONTINUE,
+                np.zeros(context.n_paths, dtype=bool),
+            ))
+            full_q = continue_q.copy()
+            full_regression: Optional[_ContinuationRegression] = None
+            full_score = np.full(context.n_paths, -np.inf)
+            if np.any(full_eligible):
+                full_q = action_q_value(make_decision(
+                    IncomeActionType.FULL_WITHDRAWAL, full_eligible
+                ))
+            if np.any(train_full):
+                full_target = np.divide(
+                    full_q[train_full] - continue_q[train_full],
+                    current_weight[train_full],
+                    out=np.zeros(np.count_nonzero(train_full)),
+                    where=current_weight[train_full] > 0.0,
+                )
+                try:
+                    full_regression, full_oof, full_folds_used = (
+                        fit_panel_with_pooling(
+                            step=step,
+                            raw=base_features[train_full],
+                            target=full_target,
+                            path_ids=path_ids[train_full],
+                            history=full_panels,
+                            advantage=True,
+                            core_indices=INCOME_ACTION_CORE_FEATURE_INDICES,
+                        )
+                    )
+                    full_buffer = (
+                        settings.exercise_tolerance_aud
+                        + settings.exercise_buffer_rmse_multiplier
+                        * full_regression.oof_rmse_aud
+                    )
+                    full_score[full_eligible] = (
+                        full_regression.predict_features(base_features)[full_eligible]
+                        - full_buffer
+                    )
+                    covered_deployment_exposure += full_deployment_exposure
+                    if record_diagnostics:
+                        diagnostics.append(_monthly_action_diagnostic(
+                            action_type="full_withdrawal",
+                            step=step,
+                            target=full_target,
+                            oof=full_oof,
+                            regression=full_regression,
+                            folds_used=full_folds_used,
+                            settings=settings,
+                            exposure=full_deployment_exposure,
+                            iteration=iteration,
+                        ))
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    reason = f"cross_fit_failed:{exc}"
+                    training_exposure = float(np.sum(np.where(
+                        train_full, current_weight, 0.0
+                    )) / n_paths)
+                    immaterial = max(
+                        training_exposure, full_deployment_exposure
+                    ) <= settings.immaterial_exposure_fraction
+                    if not immaterial:
+                        failures.append(f"{chain_name}:full@{step}:{reason}")
+                    if record_diagnostics:
+                        diagnostics.append(_failed_monthly_action_diagnostic(
+                            action_type="full_withdrawal",
+                            step=step,
+                            observations=int(np.count_nonzero(train_full)),
+                            reason="immaterial_no_fit" if immaterial else reason,
+                            exposure=full_deployment_exposure,
+                            iteration=iteration,
+                        ))
+            elif full_deployment_exposure > settings.immaterial_exposure_fraction:
+                failures.append(
+                    f"{chain_name}:full@{step}:no_outer_training_exposure"
+                )
+
+            partial_regression: Optional[_ContinuationRegression] = None
+            partial_score = np.full(context.n_paths, -np.inf)
+            partial_fraction = np.zeros(context.n_paths)
+            if np.any(partial_eligible):
+                coarse_fraction = _partial_candidate_fractions(context)
+                candidate_fractions: list[Array] = [
+                    coarse_fraction[:, column].copy()
+                    for column in range(coarse_fraction.shape[1])
+                ]
+                candidate_targets: list[Array] = []
+                candidate_valid: list[NDArray[np.bool_]] = []
+
+                def evaluate_partial_candidate(
+                    fraction: Array,
+                    valid: NDArray[np.bool_],
+                ) -> Array:
+                    if not np.any(valid):
+                        return np.zeros(context.n_paths)
+                    candidate_q = action_q_value(make_decision(
+                        IncomeActionType.PARTIAL_WITHDRAWAL,
+                        valid,
+                        fraction,
+                    ))
+                    return np.divide(
+                        candidate_q - continue_q,
+                        current_weight,
+                        out=np.zeros(context.n_paths),
+                        where=current_weight > 0.0,
+                    )
+
+                for fraction in candidate_fractions:
+                    valid = (
+                        partial_eligible
+                        & (fraction > 0.0)
+                        & (
+                            context.max_partial_gross_amount * fraction
+                            >= 100.0 - 1.0e-10
+                        )
+                    )
+                    candidate_valid.append(valid)
+                    candidate_targets.append(
+                        evaluate_partial_candidate(fraction, valid)
+                    )
+
+                coarse_targets = np.column_stack(candidate_targets)
+                coarse_valid = np.column_stack(candidate_valid)
+                realised = np.where(coarse_valid, coarse_targets, -np.inf)
+                best_column = np.argmax(realised, axis=1)
+                rows = np.arange(context.n_paths)
+                best_fraction = coarse_fraction[rows, best_column]
+                coarse_gross = (
+                    coarse_fraction
+                    * context.max_partial_gross_amount[:, None]
+                )
+                best_gross = best_fraction * context.max_partial_gross_amount
+                lower_gross = np.max(np.where(
+                    coarse_valid
+                    & (coarse_gross < best_gross[:, None] - 1.0e-8),
+                    coarse_gross,
+                    -np.inf,
+                ), axis=1)
+                upper_gross = np.min(np.where(
+                    coarse_valid
+                    & (coarse_gross > best_gross[:, None] + 1.0e-8),
+                    coarse_gross,
+                    np.inf,
+                ), axis=1)
+                has_lower = np.isfinite(lower_gross)
+                has_upper = np.isfinite(upper_gross)
+                refinements = (
+                    np.divide(
+                        0.5 * (
+                            best_gross
+                            + np.where(has_lower, lower_gross, best_gross)
+                        ),
+                        context.max_partial_gross_amount,
+                        out=np.zeros(context.n_paths),
+                        where=context.max_partial_gross_amount > 0.0,
+                    ),
+                    np.divide(
+                        0.5 * (
+                            best_gross
+                            + np.where(has_upper, upper_gross, best_gross)
+                        ),
+                        context.max_partial_gross_amount,
+                        out=np.zeros(context.n_paths),
+                        where=context.max_partial_gross_amount > 0.0,
+                    ),
+                )
+                for fraction, neighbour_exists in zip(
+                    refinements, (has_lower, has_upper)
+                ):
+                    valid = (
+                        neighbour_exists
+                        & partial_eligible
+                        & (fraction > 0.0)
+                        & (fraction <= 1.0)
+                        & (
+                            context.max_partial_gross_amount * fraction
+                            >= 100.0 - 1.0e-10
+                        )
+                    )
+                    gross = context.max_partial_gross_amount * fraction
+                    for prior_fraction, prior_valid in zip(
+                        candidate_fractions, candidate_valid
+                    ):
+                        valid &= ~(
+                            prior_valid
+                            & np.isclose(
+                                gross,
+                                context.max_partial_gross_amount * prior_fraction,
+                                atol=1.0e-8,
+                                rtol=0.0,
+                            )
+                        )
+                    candidate_fractions.append(fraction)
+                    candidate_valid.append(valid)
+                    candidate_targets.append(
+                        evaluate_partial_candidate(fraction, valid)
+                    )
+
+                fraction_matrix = np.column_stack(candidate_fractions)
+                target_matrix = np.column_stack(candidate_targets)
+                valid_matrix = np.column_stack(candidate_valid)
+                training_valid = valid_matrix & train_path[:, None]
+                selected_fraction = fraction_matrix[training_valid]
+                selected_target = target_matrix[training_valid]
+                candidate_count = fraction_matrix.shape[1]
+                repeated_base = np.repeat(
+                    base_features, candidate_count, axis=0
+                )[training_valid.ravel()]
+                repeated_ids = np.repeat(
+                    path_ids, candidate_count
+                )[training_valid.ravel()]
+                if selected_fraction.size:
+                    try:
+                        partial_raw = build_partial_action_regression_features(
+                            repeated_base, selected_fraction
+                        )
+                        (
+                            partial_regression,
+                            partial_oof,
+                            partial_folds_used,
+                        ) = fit_panel_with_pooling(
+                            step=step,
+                            raw=partial_raw,
+                            target=selected_target,
+                            path_ids=repeated_ids,
+                            history=partial_panels,
+                            advantage=True,
+                            core_indices=PARTIAL_ACTION_CORE_FEATURE_INDICES,
+                        )
+                        partial_score, partial_fraction = (
+                            _predict_best_partial_action(
+                                partial_regression,
+                                context,
+                                base_features,
+                                settings,
+                            )
+                        )
+                        covered_deployment_exposure += (
+                            partial_deployment_exposure
+                        )
+                        if record_diagnostics:
+                            diagnostics.append(_monthly_action_diagnostic(
+                                action_type="partial_withdrawal",
+                                step=step,
+                                target=selected_target,
+                                oof=partial_oof,
+                                regression=partial_regression,
+                                folds_used=partial_folds_used,
+                                settings=settings,
+                                exposure=partial_deployment_exposure,
+                                iteration=iteration,
+                            ))
+                    except (ValueError, np.linalg.LinAlgError) as exc:
+                        reason = f"cross_fit_failed:{exc}"
+                        training_exposure = float(np.sum(np.where(
+                            train_partial, current_weight, 0.0
+                        )) / n_paths)
+                        immaterial = max(
+                            training_exposure, partial_deployment_exposure
+                        ) <= settings.immaterial_exposure_fraction
+                        if not immaterial:
+                            failures.append(
+                                f"{chain_name}:partial@{step}:{reason}"
+                            )
+                        if record_diagnostics:
+                            diagnostics.append(_failed_monthly_action_diagnostic(
+                                action_type="partial_withdrawal",
+                                step=step,
+                                observations=int(selected_fraction.size),
+                                reason=(
+                                    "immaterial_no_fit" if immaterial else reason
+                                ),
+                                exposure=partial_deployment_exposure,
+                                iteration=iteration,
+                            ))
+                elif (
+                    partial_deployment_exposure
+                    > settings.immaterial_exposure_fraction
+                ):
+                    failures.append(
+                        f"{chain_name}:partial@{step}:"
+                        "no_outer_training_candidates"
+                    )
+
+            action_models[step] = IncomeActionRegressionSet(
+                full_withdrawal_advantage=full_regression,
+                partial_withdrawal_advantage=partial_regression,
+            )
+
+            take_partial = in_income & (partial_score > 0.0)
+            selected_q = continue_q.copy()
+            if np.any(take_partial):
+                partial_policy_q = action_q_value(make_decision(
+                    IncomeActionType.PARTIAL_WITHDRAWAL,
+                    take_partial,
+                    partial_fraction,
+                ))
+                selected_q = np.where(
+                    take_partial, partial_policy_q, selected_q
+                )
+            take_full = (
+                full_eligible
+                & (full_score > 0.0)
+                & (
+                    full_score
+                    > partial_score + settings.exercise_tolerance_aud
+                )
+            )
+            selected_q = np.where(take_full, full_q, selected_q)
+
+            train_value = in_income & train_path
+            if np.any(train_value):
+                value_target = np.divide(
+                    selected_q[train_value],
+                    current_weight[train_value],
+                    out=np.zeros(np.count_nonzero(train_value)),
+                    where=current_weight[train_value] > 0.0,
+                )
+                try:
+                    value_regression, _value_oof, _value_folds = (
+                        fit_panel_with_pooling(
+                            step=step,
+                            raw=base_features[train_value],
+                            target=value_target,
+                            path_ids=path_ids[train_value],
+                            history=value_panels,
+                            advantage=False,
+                        )
+                    )
+                    value_models[step] = value_regression
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    value_exposure = float(np.sum(np.where(
+                        train_value | (in_income & deployment_path),
+                        current_weight,
+                        0.0,
+                    )) / n_paths)
+                    if value_exposure > settings.immaterial_exposure_fraction:
+                        failures.append(
+                            f"{chain_name}:state_value@{step}:"
+                            f"cross_fit_failed:{exc}"
+                        )
+
+        return _OuterFoldIncomeBellmanChain(
+            regressions_by_step=MappingProxyType(dict(sorted(action_models.items()))),
+            diagnostics=tuple(diagnostics),
+            deployment_exposure=float(total_deployment_exposure),
+            covered_deployment_exposure=float(covered_deployment_exposure),
+            material_failures=tuple(dict.fromkeys(failures)),
+        )
+
+    def assembled_cross_fitted_models(
+        chains: tuple[_OuterFoldIncomeBellmanChain, ...],
+    ) -> Mapping[int, _CrossFittedIncomeActionRegressionSet]:
+        if len(chains) != outer_folds:
+            raise RuntimeError("Outer-fold Income chains are incomplete.")
+        steps = sorted(set().union(*(
+            set(chain.regressions_by_step) for chain in chains
+        )))
+        assembled: dict[int, _CrossFittedIncomeActionRegressionSet] = {}
+        for step in steps:
+            per_fold = [
+                chain.regressions_by_step.get(step, IncomeActionRegressionSet())
+                for chain in chains
+            ]
+            full = tuple(
+                item.full_withdrawal_advantage for item in per_fold
+            )
+            partial = tuple(
+                item.partial_withdrawal_advantage for item in per_fold
+            )
+            assembled[step] = _CrossFittedIncomeActionRegressionSet(
+                full_withdrawal_advantage=(
+                    full if any(item is not None for item in full) else ()
+                ),
+                full_fold_ids=(
+                    outer_fold_ids.copy()
+                    if any(item is not None for item in full) else None
+                ),
+                partial_withdrawal_advantage=(
+                    partial if any(item is not None for item in partial) else ()
+                ),
+                partial_fold_ids=(
+                    outer_fold_ids.copy()
+                    if any(item is not None for item in partial) else None
+                ),
+            )
+        return MappingProxyType(dict(sorted(assembled.items())))
+
+    def uniform_chain_models(
+        chain: _OuterFoldIncomeBellmanChain,
+    ) -> Mapping[int, _CrossFittedIncomeActionRegressionSet]:
+        uniform: dict[int, _CrossFittedIncomeActionRegressionSet] = {}
+        for step, item in chain.regressions_by_step.items():
+            full = item.full_withdrawal_advantage
+            partial = item.partial_withdrawal_advantage
+            uniform[step] = _CrossFittedIncomeActionRegressionSet(
+                full_withdrawal_advantage=(
+                    tuple(full for _ in range(outer_folds))
+                    if full is not None else ()
+                ),
+                full_fold_ids=(
+                    outer_fold_ids.copy() if full is not None else None
+                ),
+                partial_withdrawal_advantage=(
+                    tuple(partial for _ in range(outer_folds))
+                    if partial is not None else ()
+                ),
+                partial_fold_ids=(
+                    outer_fold_ids.copy() if partial is not None else None
+                ),
+            )
+        return MappingProxyType(dict(sorted(uniform.items())))
+
+    global_collector = continue_collector
+    fold_collectors = tuple(continue_collector for _ in range(outer_folds))
+    prior_value = continue_value
+    final_frozen: Mapping[int, IncomeActionRegressionSet] = MappingProxyType({})
+    final_cross: Mapping[
+        int, _CrossFittedIncomeActionRegressionSet
+    ] = MappingProxyType({})
+    all_diagnostics: list[OptimalBehaviourRegressionDiagnostic] = []
+    final_coverage = 1.0
+    final_agreement = 1.0
+    final_value_change = 0.0
+    final_material_failures: tuple[str, ...] = ()
+    converged = False
+    iteration_count = 0
+
+    for iteration in range(1, 3):
+        iteration_count = iteration
+        global_chain = solve_chain(
+            global_collector,
+            excluded_fold=None,
+            iteration=iteration,
+            record_diagnostics=True,
+        )
+        fold_chains = tuple(
+            solve_chain(
+                fold_collectors[fold],
+                excluded_fold=fold,
+                iteration=iteration,
+                record_diagnostics=False,
+            )
+            for fold in range(outer_folds)
+        )
+        cross = assembled_cross_fitted_models(fold_chains)
+        cross_total = float(sum(
+            chain.deployment_exposure for chain in fold_chains
+        ))
+        cross_covered = float(sum(
+            chain.covered_deployment_exposure for chain in fold_chains
+        ))
+        cross_coverage = (
+            1.0 if cross_total <= 0.0 else cross_covered / cross_total
+        )
+        global_coverage = (
+            1.0
+            if global_chain.deployment_exposure <= 0.0
+            else global_chain.covered_deployment_exposure
+            / global_chain.deployment_exposure
+        )
+        coverage = float(min(cross_coverage, global_coverage))
+        material_failures = tuple(dict.fromkeys((
+            *global_chain.material_failures,
+            *(failure for chain in fold_chains
+              for failure in chain.material_failures),
+        )))
+
+        (
+            new_value,
+            new_rollout_policy,
+            _new_projection,
+            new_cross_collector,
+        ) = _income_policy_rollout(
+            regressions_by_step=cross,
+            assigned_start_steps=assigned,
+            product=product,
+            policy=policy,
+            scenarios=scenarios,
+            behaviour=behaviour,
+            mortality=mortality,
+            expenses=expenses,
+            config=config,
+            premium=premium,
+            settings=settings,
+        )
+        agreement = _income_action_agreement(
+            prior_rollout_policy, new_rollout_policy, settings
+        )
+        value_change = abs(new_value - prior_value)
+        converged = bool(
+            agreement >= 0.99 and value_change <= 0.001 * premium
+        )
+        all_diagnostics.extend(global_chain.diagnostics)
+        final_frozen = global_chain.regressions_by_step
+        final_cross = cross
+        final_coverage = coverage
+        final_agreement = agreement
+        final_value_change = value_change
+        final_material_failures = material_failures
+        prior_value = new_value
+        prior_rollout_policy = new_rollout_policy
+        if converged:
+            break
+        if iteration == 1:
+            # The deployment re-fit may use the assembled OOF state sample.
+            # Each outer re-fit instead receives a collector generated by its
+            # own fold-excluding policy on every path.  Thus paths in fold f
+            # cannot influence even the state distribution used by chain f.
+            global_collector = new_cross_collector
+            next_fold_collectors: list[IncomeTransitionPanelCollector] = []
+            for chain in fold_chains:
+                (
+                    _chain_value,
+                    _chain_policy,
+                    _chain_projection,
+                    chain_collector,
+                ) = _income_policy_rollout(
+                    regressions_by_step=uniform_chain_models(chain),
+                    assigned_start_steps=assigned,
+                    product=product,
+                    policy=policy,
+                    scenarios=scenarios,
+                    behaviour=behaviour,
+                    mortality=mortality,
+                    expenses=expenses,
+                    config=config,
+                    premium=premium,
+                    settings=settings,
+                )
+                next_fold_collectors.append(chain_collector)
+            fold_collectors = tuple(next_fold_collectors)
+
+    candidate_value = prior_value
+    invalid_reasons: list[str] = []
+    if final_coverage < 0.99:
+        invalid_reasons.append(
+            f"income_action_exposure_coverage:{final_coverage:.12g}<0.99"
+        )
+    if final_material_failures:
+        invalid_reasons.append(
+            "material_income_action_fit_failure:"
+            + "|".join(final_material_failures)
+        )
+    if not converged:
+        invalid_reasons.append("policy_iteration_not_converged")
+    if (
+        settings.fallback_to_no_action_if_training_underperforms
+        and candidate_value < continue_value
+    ):
+        invalid_reasons.append("income_training_lower_bound_underperformed")
+    return _MonthlyIncomeActionFit(
+        regressions_by_step=final_frozen,
+        cross_fitted_regressions_by_step=final_cross,
+        diagnostics=tuple(sorted(
+            all_diagnostics,
+            key=lambda item: (
+                item.basis_level, item.decision_step, item.action_type
+            ),
+        )),
+        training_policyholder_value_aud=candidate_value,
+        training_continue_value_aud=continue_value,
+        training_candidate_value_aud=candidate_value,
+        covered_exposure_fraction=final_coverage,
+        policy_iteration_count=iteration_count,
+        policy_iteration_converged=converged,
+        final_action_agreement=final_agreement,
+        final_value_change_aud=final_value_change,
+        valid=not invalid_reasons,
+        invalid_reasons=tuple(dict.fromkeys(invalid_reasons)),
+    )
 
 
 def fit_optimal_behaviour_policy(
@@ -2005,7 +4475,7 @@ def fit_optimal_behaviour_policy(
     settings: OptimalBehaviourLSMCSettings = OptimalBehaviourLSMCSettings(),
     fit_basis_inputs: Optional[Mapping[str, object]] = None,
 ) -> OptimalBehaviourPolicyFit:
-    """Fit one phase-aware Election and Full-Withdrawal Bellman policy.
+    """Fit annual Election and unified monthly Partial/Full Income actions.
 
     The absorbing phase order permits the Income subproblem to be solved first.
     Its state sample is stratified over every admissible Election anniversary.
@@ -2017,6 +4487,11 @@ def fit_optimal_behaviour_policy(
     """
     if not isinstance(settings, OptimalBehaviourLSMCSettings):
         raise TypeError("settings must be OptimalBehaviourLSMCSettings.")
+    if tuple(settings.ridge_grid) != RIDGE_GRID_DEFAULT:
+        raise ValueError(
+            "Combined optimal-behaviour LSMC v2 requires the fixed Ridge grid "
+            f"{RIDGE_GRID_DEFAULT}; got {tuple(settings.ridge_grid)}."
+        )
     policy.validate_against(product)
     if policy.age_pension_plus:
         raise NotImplementedError("Generic optimal behaviour does not support APS.")
@@ -2062,24 +4537,15 @@ def fit_optimal_behaviour_policy(
              for index in range(fold_paths.size)],
             dtype=np.int64,
         )
-    state_recorder = _AssignedElectionContextRecorder(
-        assigned_start_steps=assigned_start_steps
-    )
-    stratified_projection = project(
-        product,
-        policy,
-        training_scenarios,
-        behaviour,
-        mortality,
+    income_action_fit = _fit_monthly_income_action_phase(
+        assigned_start_steps=assigned_start_steps,
+        product=product,
+        policy=policy,
+        scenarios=training_scenarios,
+        behaviour=behaviour,
+        mortality=mortality,
         expenses=expenses,
         config=config,
-        surrender_policy=state_recorder,
-        income_election_policy=state_recorder,
-    )
-    surrender_fit = _fit_surrender_phase_from_projection(
-        projection=stratified_projection,
-        contexts=state_recorder.surrender_contexts,
-        scenarios=training_scenarios,
         premium=premium,
         settings=settings,
         base_fold_ids=base_fold_ids,
@@ -2107,9 +4573,17 @@ def fit_optimal_behaviour_policy(
 
     start_value_0_by_step: dict[int, Array] = {}
     growth_discounted_cashflow: Optional[Array] = None
+    growth_pre_election_benefit_0: Optional[Array] = None
     growth_contexts: Optional[dict[int, IncomeElectionDecisionContext]] = None
     wait_path_value_0: Optional[Array] = None
     for start_step in election_steps:
+        cross_fitted_income_policy = _CrossFittedIncomeActionPolicy(
+            regressions_by_step=(
+                income_action_fit.cross_fitted_regressions_by_step
+            ),
+            premium=premium,
+            settings=settings,
+        )
         branch_projection, election_recorder = _project_fixed_election_branch(
             start_step=start_step,
             product=product,
@@ -2119,22 +4593,46 @@ def fit_optimal_behaviour_policy(
             mortality=mortality,
             expenses=expenses,
             config=config,
-            surrender_policy=surrender_fit.cross_fitted_policy,
+            income_action_policy=cross_fitted_income_policy,
         )
         branch_discounted = _discounted_policyholder_cashflows(
             branch_projection, training_scenarios
         )
-        # Election has no immediate Policyholder payment; all current-step
-        # pre-Election flows are common and deliberately excluded.
-        start_value_0_by_step[start_step] = np.sum(
-            branch_discounted[:, start_step + 1:], axis=1
+        if branch_projection.phase_cashflows is None:
+            raise RuntimeError(
+                "Income-Election Bellman fit requires phase cashflow ledgers."
+            )
+        # Fixed Income starts one month later, but v2 permits a Partial action
+        # immediately after Election.  Include that exact post-Election
+        # current-step benefit while excluding mortality/other pre-Election
+        # cashflows which are common to START and WAIT.
+        post_election_current_0 = (
+            branch_projection.phase_cashflows[
+                "policyholder_benefits_post_election"
+            ][:, start_step]
+            * training_scenarios.discount[:, start_step]
+        )
+        start_value_0_by_step[start_step] = (
+            post_election_current_0
+            + np.sum(branch_discounted[:, start_step + 1:], axis=1)
         )
         if start_step == forced_step:
             growth_discounted_cashflow = branch_discounted
+            growth_pre_election_benefit_0 = (
+                branch_projection.phase_cashflows[
+                    "policyholder_benefits_pre_election"
+                ]
+                * training_scenarios.discount[
+                    :, :branch_projection.phase_cashflows[
+                        "policyholder_benefits_pre_election"
+                    ].shape[1]
+                ]
+            )
             growth_contexts = dict(election_recorder.election_contexts)
             wait_path_value_0 = np.sum(branch_discounted, axis=1)
 
     if growth_discounted_cashflow is None or growth_contexts is None \
+            or growth_pre_election_benefit_0 is None \
             or wait_path_value_0 is None:
         raise RuntimeError("Forced-Election branch was not projected.")
 
@@ -2144,13 +4642,23 @@ def fit_optimal_behaviour_policy(
     ] = {}
     election_fold_ids: dict[int, NDArray[np.int64]] = {}
     election_diagnostics: list[OptimalBehaviourRegressionDiagnostic] = []
-    minimum_election_observations = 2 * (len(ELECTION_FEATURE_NAMES) + 1)
+    minimum_election_observations = _minimum_cross_fit_observations(
+        settings, 1
+    )
+    material_election_failures: list[str] = []
+    election_panels: dict[
+        int,
+        tuple[Array, Array, Array, NDArray[np.int64]],
+    ] = {}
 
     future_value_0 = start_value_0_by_step[forced_step].copy()
     next_step = forced_step
     for step in reversed(election_steps[:-1]):
-        future_value_0 += np.sum(
-            growth_discounted_cashflow[:, step + 1:next_step + 1], axis=1
+        future_value_0 += (
+            np.sum(
+                growth_discounted_cashflow[:, step + 1:next_step], axis=1
+            )
+            + growth_pre_election_benefit_0[:, next_step]
         )
         wait_realised_0 = future_value_0.copy()
         start_realised_0 = start_value_0_by_step[step]
@@ -2173,10 +4681,22 @@ def fit_optimal_behaviour_policy(
         folds_used = 0
         wait_target = np.zeros(0)
         start_target = np.zeros(0)
-        wait_oof = np.zeros(0)
-        start_oof = np.zeros(0)
+        advantage_oof = np.zeros(0)
         pair: Optional[_ElectionRegressionPair] = None
         fold_pairs: tuple[_ElectionRegressionPair, ...] = ()
+        if observations:
+            wait_target = wait_realised_0[eligible] / scale_0[eligible]
+            start_target = start_realised_0[eligible] / scale_0[eligible]
+            raw = build_income_election_regression_features(
+                context,
+                premium,
+                policy.age,
+                product.automatic_income_start_age,
+            )[eligible]
+            panel_ids = base_fold_ids[eligible_index]
+            election_panels[step] = (
+                raw, wait_target, start_target, panel_ids
+            )
 
         if observations < minimum_election_observations:
             fallback_reason = (
@@ -2184,16 +4704,10 @@ def fit_optimal_behaviour_policy(
                 f"{minimum_election_observations}"
             )
         else:
-            wait_target = wait_realised_0[eligible] / scale_0[eligible]
-            start_target = start_realised_0[eligible] / scale_0[eligible]
-            raw = build_income_election_regression_features(
-                context, premium, policy.age
-            )[eligible]
             try:
                 (
                     pair,
-                    wait_oof,
-                    start_oof,
+                    advantage_oof,
                     folds_used,
                     fold_pairs,
                 ) = _fit_election_regression_pair(
@@ -2202,7 +4716,7 @@ def fit_optimal_behaviour_policy(
                     start_target,
                     premium=premium,
                     settings=settings,
-                    fold_ids=base_fold_ids[eligible_index],
+                    fold_ids=panel_ids,
                 )
                 full_stable = pair.stable(settings)
                 folds_stable = all(
@@ -2216,6 +4730,85 @@ def fit_optimal_behaviour_policy(
             except (ValueError, np.linalg.LinAlgError) as exc:
                 fallback_reason = f"cross_fit_failed:{exc}"
 
+        # Fourth fallback level: pool complete-path panels from the nearest
+        # already-solved Election years.  The current panel is first so its
+        # OOF slice remains directly usable for this decision point.
+        if not accepted and observations:
+            neighbours = sorted(
+                (
+                    (other_step, panel)
+                    for other_step, panel in election_panels.items()
+                    if other_step != step
+                ),
+                key=lambda item: abs(item[0] - step),
+            )[:2]
+            if neighbours:
+                pooled_raw = np.concatenate((
+                    raw, *(panel[0] for _year, panel in neighbours)
+                ))
+                pooled_wait = np.concatenate((
+                    wait_target, *(panel[1] for _year, panel in neighbours)
+                ))
+                pooled_start = np.concatenate((
+                    start_target, *(panel[2] for _year, panel in neighbours)
+                ))
+                pooled_ids = np.concatenate((
+                    panel_ids, *(panel[3] for _year, panel in neighbours)
+                ))
+                if np.unique(pooled_ids).size \
+                        >= minimum_election_observations:
+                    try:
+                        (
+                            pooled_pair,
+                            pooled_oof,
+                            folds_used,
+                            pooled_fold_pairs,
+                        ) = _fit_election_regression_pair(
+                            pooled_raw,
+                            pooled_wait,
+                            pooled_start,
+                            premium=premium,
+                            settings=settings,
+                            fold_ids=pooled_ids,
+                        )
+                        basis = (
+                            "pooled_election_years/"
+                            f"{pooled_pair.advantage.basis_level}"
+                        )
+                        pair = _ElectionRegressionPair(
+                            advantage=replace(
+                                pooled_pair.advantage,
+                                basis_level=basis,
+                            )
+                        )
+                        fold_pairs = tuple(
+                            _ElectionRegressionPair(
+                                advantage=replace(
+                                    fold_pair.advantage,
+                                    basis_level=basis,
+                                )
+                            )
+                            for fold_pair in pooled_fold_pairs
+                        )
+                        advantage_oof = pooled_oof[:observations]
+                        accepted = bool(
+                            pair.stable(settings)
+                            and all(
+                                fold_pair.stable(settings)
+                                for fold_pair in fold_pairs
+                            )
+                        )
+                        fallback_reason = (
+                            None
+                            if accepted
+                            else "pooled_election_regression_unstable"
+                        )
+                    except (ValueError, np.linalg.LinAlgError) as exc:
+                        fallback_reason = (
+                            "pooled_election_cross_fit_failed:"
+                            f"{exc}"
+                        )
+
         start_action = np.zeros(n_paths, dtype=bool)
         training_action_rate = 0.0
         if accepted and pair is not None:
@@ -2224,7 +4817,7 @@ def fit_optimal_behaviour_policy(
                 + settings.exercise_buffer_rmse_multiplier
                 * pair.combined_oof_rmse_aud
             )
-            action_eligible = start_oof > wait_oof + buffer
+            action_eligible = advantage_oof > buffer
             start_action[eligible_index] = action_eligible
             training_action_rate = float(np.mean(action_eligible))
             election_regressions[step] = pair
@@ -2232,6 +4825,16 @@ def fit_optimal_behaviour_policy(
             election_fold_ids[step] = np.mod(
                 base_fold_ids, folds_used
             ).astype(np.int64)
+
+        relevant_exposure = float(np.mean(np.where(
+            eligible, context.inforce_weight, 0.0
+        )))
+        if not accepted and relevant_exposure > settings.immaterial_exposure_fraction:
+            material_election_failures.append(
+                f"step={step},exposure={relevant_exposure:.12g},reason={fallback_reason}"
+            )
+        elif not accepted:
+            fallback_reason = "immaterial_no_fit"
 
         future_value_0 = np.where(
             start_action, start_realised_0, wait_realised_0
@@ -2246,23 +4849,17 @@ def fit_optimal_behaviour_policy(
             feature_count=(
                 0
                 if pair is None
-                else max(
-                    int(pair.wait.coefficients.size),
-                    int(pair.start.coefficients.size),
-                )
+                else int(pair.advantage.coefficients.size)
             ),
             matrix_rank=(
                 0
                 if pair is None
-                else min(pair.wait.matrix_rank, pair.start.matrix_rank)
+                else pair.advantage.matrix_rank
             ),
             condition_number=(
                 None
                 if pair is None
-                else max(
-                    pair.wait.condition_number,
-                    pair.start.condition_number,
-                )
+                else pair.advantage.condition_number
             ),
             oof_rmse_aud=(
                 None if pair is None else pair.combined_oof_rmse_aud
@@ -2270,9 +4867,8 @@ def fit_optimal_behaviour_policy(
             oof_r_squared=(
                 None
                 if pair is None
-                else min(
-                    _oof_r_squared(wait_target, wait_oof),
-                    _oof_r_squared(start_target, start_oof),
+                else _oof_r_squared(
+                    start_target - wait_target, advantage_oof
                 )
             ),
             mean_wait_or_continue_value_aud=(
@@ -2285,23 +4881,44 @@ def fit_optimal_behaviour_policy(
             regression_accepted_for_action=accepted,
             fallback_reason=fallback_reason,
             wait_regression_rank=(
-                None if pair is None else pair.wait.matrix_rank
+                None if pair is None else pair.advantage.matrix_rank
             ),
             wait_regression_condition_number=(
-                None if pair is None else pair.wait.condition_number
+                None if pair is None else pair.advantage.condition_number
             ),
             wait_regression_oof_rmse_aud=(
-                None if pair is None else pair.wait.oof_rmse_aud
+                None if pair is None else pair.advantage.oof_rmse_aud
             ),
             action_regression_rank=(
-                None if pair is None else pair.start.matrix_rank
+                None if pair is None else pair.advantage.matrix_rank
             ),
             action_regression_condition_number=(
-                None if pair is None else pair.start.condition_number
+                None if pair is None else pair.advantage.condition_number
             ),
             action_regression_oof_rmse_aud=(
-                None if pair is None else pair.start.oof_rmse_aud
+                None if pair is None else pair.advantage.oof_rmse_aud
             ),
+            selected_ridge=(
+                None if pair is None else pair.advantage.selected_ridge
+            ),
+            effective_rank=(
+                0 if pair is None else pair.advantage.effective_rank
+            ),
+            basis_level=(
+                "none" if pair is None else pair.advantage.basis_level
+            ),
+            oof_policy_uplift_aud=(
+                None if pair is None else float(np.mean(np.where(
+                    advantage_oof > (
+                        settings.exercise_tolerance_aud
+                        + settings.exercise_buffer_rmse_multiplier
+                        * pair.advantage.oof_rmse_aud
+                    ),
+                    start_target - wait_target,
+                    0.0,
+                )))
+            ),
+            relevant_exposure_fraction=relevant_exposure,
         ))
         next_step = step
 
@@ -2316,35 +4933,40 @@ def fit_optimal_behaviour_policy(
         settings.fallback_to_no_action_if_training_underperforms
         and candidate_value < wait_value
     )
-    if election_fallback:
-        election_regressions.clear()
-        election_fold_regressions.clear()
-        election_fold_ids.clear()
-    selected_value = wait_value if election_fallback else candidate_value
+    selected_value = candidate_value
 
-    surrender_policy = surrender_fit.policy
-    cross_surrender_policy = surrender_fit.cross_fitted_policy
-    surrender_fallback = surrender_fit.fallback_used
+    # The v2 combined policy deploys only the unified monthly Income-action
+    # surface.  The explicit legacy Surrender object remains empty and is kept
+    # solely for API compatibility with fixed-Election Stackelberg callers.
+    surrender_policy = OptimalSurrenderPolicy(
+        regressions={}, settings=settings
+    )
+    cross_surrender_policy = CrossFittedOptimalSurrenderPolicy(
+        regressions_by_step={}, fold_ids_by_step={}, settings=settings
+    )
+    surrender_fallback = not income_action_fit.valid
     # A final cross-fitted lower-bound gate protects against an adverse
     # interaction between the separately solved absorbing phase and Growth
     # policy.  Evaluation paths are never inspected for this choice.
-    if (
+    combined_underperformed = bool(
         settings.fallback_to_no_action_if_training_underperforms
         and selected_value < no_action_value
-    ):
-        election_regressions.clear()
-        election_fold_regressions.clear()
-        election_fold_ids.clear()
-        surrender_policy = OptimalSurrenderPolicy(
-            regressions={}, settings=settings
-        )
-        cross_surrender_policy = CrossFittedOptimalSurrenderPolicy(
-            regressions_by_step={}, fold_ids_by_step={}, settings=settings
-        )
+    )
+    if combined_underperformed:
         election_fallback = True
         surrender_fallback = True
-        selected_value = no_action_value
 
+    invalid_reason_list = list(income_action_fit.invalid_reasons)
+    if material_election_failures:
+        invalid_reason_list.append(
+            "material_election_fit_failure:"
+            + "|".join(material_election_failures)
+        )
+    if election_fallback:
+        invalid_reason_list.append("election_training_lower_bound_underperformed")
+    if combined_underperformed:
+        invalid_reason_list.append("combined_training_lower_bound_underperformed")
+    invalid_reasons = tuple(dict.fromkeys(invalid_reason_list))
     optimal_policy = OptimalBehaviourPolicy(
         election_regressions=MappingProxyType(dict(sorted(
             election_regressions.items()
@@ -2353,6 +4975,10 @@ def fit_optimal_behaviour_policy(
         premium=premium,
         issue_age=float(policy.age),
         settings=settings,
+        automatic_income_start_age=float(product.automatic_income_start_age),
+        income_action_regressions=income_action_fit.regressions_by_step,
+        valid=not invalid_reasons,
+        invalid_reasons=invalid_reasons,
     )
     cross_fitted_policy = CrossFittedOptimalBehaviourPolicy(
         election_regressions_by_step=MappingProxyType(dict(sorted(
@@ -2365,6 +4991,12 @@ def fit_optimal_behaviour_policy(
         premium=premium,
         issue_age=float(policy.age),
         settings=settings,
+        automatic_income_start_age=float(product.automatic_income_start_age),
+        income_action_regressions_by_step=(
+            income_action_fit.cross_fitted_regressions_by_step
+        ),
+        valid=not invalid_reasons,
+        invalid_reasons=invalid_reasons,
     )
     # ``income_start_year`` is deliberately absent from the optimal policy's
     # state transition and is retained on PolicySpec only for deterministic
@@ -2375,7 +5007,7 @@ def fit_optimal_behaviour_policy(
         income_start_year=float(product.min_years_before_income),
     )
     fit_basis_fingerprint = assumption_fingerprint(
-        "combined_income_election_and_surrender_lsmc_v1",
+        "combined_optimal_behaviour_lsmc_v2",
         training_scenarios.content_fingerprint,
         product,
         optimal_policy_basis,
@@ -2389,7 +5021,7 @@ def fit_optimal_behaviour_policy(
         optimal_policy.surrender_policy,
         provenance_fingerprint=assumption_fingerprint(
             fit_basis_fingerprint,
-            "income_phase_full_withdrawal_policy",
+            "legacy_empty_surrender_compatibility_policy",
         ),
     )
     optimal_policy = replace(
@@ -2397,12 +5029,14 @@ def fit_optimal_behaviour_policy(
         surrender_policy=fitted_surrender_policy,
         provenance_fingerprint=assumption_fingerprint(
             fit_basis_fingerprint,
-            "combined_income_election_and_surrender_policy",
+            "combined_income_election_and_monthly_income_action_policy",
         ),
     )
     diagnostics = tuple(sorted(
-        (*surrender_fit.diagnostics, *election_diagnostics),
-        key=lambda item: (item.decision_step, item.action_type),
+        (*income_action_fit.diagnostics, *election_diagnostics),
+        key=lambda item: (
+            item.decision_step, item.action_type, item.basis_level
+        ),
     ))
     return OptimalBehaviourPolicyFit(
         policy=optimal_policy,
@@ -2417,6 +5051,19 @@ def fit_optimal_behaviour_policy(
         training_candidate_policyholder_value_aud=candidate_value,
         election_fallback_used=election_fallback,
         surrender_fallback_used=surrender_fallback,
+        valid=not invalid_reasons,
+        invalid_reasons=invalid_reasons,
+        income_action_exposure_coverage=(
+            income_action_fit.covered_exposure_fraction
+        ),
+        policy_iteration_count=income_action_fit.policy_iteration_count,
+        policy_iteration_converged=(
+            income_action_fit.policy_iteration_converged
+        ),
+        final_action_agreement=income_action_fit.final_action_agreement,
+        final_policy_value_change_aud=(
+            income_action_fit.final_value_change_aud
+        ),
     )
 
 
@@ -2425,6 +5072,10 @@ __all__ = [
     "CrossFittedOptimalSurrenderPolicy",
     "ELECTION_FEATURE_NAMES",
     "FEATURE_NAMES",
+    "INCOME_ACTION_FEATURE_NAMES",
+    "PARTIAL_ACTION_FEATURE_NAMES",
+    "IncomeActionAdvantagePolicyFit",
+    "IncomeActionRegressionSet",
     "LSMCRegressionDiagnostic",
     "OptimalBehaviourPolicy",
     "OptimalBehaviourPolicyFit",
@@ -2435,10 +5086,13 @@ __all__ = [
     "SurrenderContinuationPolicyFit",
     "SurrenderContinuationRegressionDiagnostic",
     "build_income_election_regression_features",
+    "build_income_action_regression_features",
+    "build_partial_action_regression_features",
     "build_surrender_regression_features",
     "build_surrender_regression_features_from_arrays",
     "fit_optimal_behaviour_policy",
     "fit_optimal_surrender_policy",
+    "fit_income_action_advantage_policy",
     "fit_surrender_continuation_regression",
     "fit_surrender_continuation_policy",
     "no_voluntary_action_behaviour",

@@ -2,28 +2,36 @@
 
 For every requested scenario Maximum Return, this orchestrator calls both
 ``run_portfolio_valuation.py`` (statistical/dynamic policyholder behaviour) and
-``run_portfolio_valuation_lsmc.py`` (fitted annual joint Income-Election and
-post-Election Full-Withdrawal lower-bound policy evaluated out of sample).
-Phase-specific benchmarks are retained both for a 2x2 Election/post-Election
-Behaviour decomposition and to split cap effects against variable Election
-followed by no voluntary post-Election exit.
+``run_portfolio_valuation_lsmc.py`` (annual fitted Income Election followed by
+monthly Continue/Partial/Full-Withdrawal lower-bound decisions evaluated out
+of sample).
+Only the complete V11 policies are retained for the risk comparison: Dynamic
+Election plus Dynamic post-Election Behaviour, and optimal LSMC Election plus
+optimal monthly LSMC Income actions.  Counterfactual V00/V01/V10 Dynamic runs
+and Behaviour-effect decompositions are deliberately omitted.
 
-The default risk scope is limited to Lapse, interest rates and Longevity.
-Lapse risk is assessed through the Dynamic/LSMC comparison and the 2x2
-Election/post-Election Behaviour decomposition.  The additional default
-one-factor shock-and-revalue runs are therefore interest up, interest down and
-Longevity.  Other research stresses remain available only when explicitly
-selected.  The portfolio runners deliberately retain expected present values
-and model-point scalars, not pathwise loss distributions.  Consequently this
-script does not label model-point dispersion as VaR/CTE and does not claim to
-calculate economic capital, Risk Margin or an APRA/LAGIC stress aggregation.
+The deliberately reduced default is one contractual 6% Cap on the base market
+scenario with the complete Dynamic and LSMC V11 policies, but without
+counterfactual Behaviour arms, shock-and-revalue stresses or plots.  This makes
+Lapse/Behaviour the default risk scope.  Interest up,
+interest down and Longevity remain the preselected one-factor stress set when
+stress analysis is explicitly enabled.  Other research stresses remain
+available only when explicitly selected.  The portfolio runners deliberately
+retain expected present values and model-point scalars, not pathwise loss
+distributions.  Consequently this script does not label model-point dispersion
+as VaR/CTE and does not claim to calculate economic capital, Risk Margin or an
+APRA/LAGIC stress aggregation.
+
+Every invocation writes all aggregate results and its Dynamic/LSMC child-run
+artifacts below a new UTC timestamp subdirectory of the configured output root.
+Existing run directories are never overwritten.
 
 Independent cap/stress scenario pairs are scheduled together in one parallel
-queue.  The default uses up to 16 workers with one BLAS/OpenMP thread per child
-so that outer scenario parallelism is not defeated by nested thread
-oversubscription.  The optional automatic mode remains deliberately
-conservative and gates CPU concurrency by a path/horizon-based LSMC memory
-estimate; Dynamic and LSMC remain serial within each pair to bound peak memory.
+queue.  The reduced default uses one worker with one BLAS/OpenMP thread per
+child.  Larger explicitly requested grids can opt into a higher fixed worker
+count or the deliberately conservative automatic mode, which gates CPU
+concurrency by a path/horizon-based LSMC memory estimate.  Dynamic and LSMC
+remain serial within each pair to bound peak memory.
 """
 
 from __future__ import annotations
@@ -71,12 +79,13 @@ DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY = REPOSITORY_ROOT / "input_dynamic_behaviour
 DYNAMIC_PORTFOLIO_RUNNER = SCRIPT_DIRECTORY / "run_portfolio_valuation.py"
 LSMC_PORTFOLIO_RUNNER = SCRIPT_DIRECTORY / "run_portfolio_valuation_lsmc.py"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "output" / "portfolio_risk_analysis"
-DEFAULT_CREDITING_CAP_RATES = (0.04, 0.06, 0.12, 0.20)
+RUN_DIRECTORY_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
+DEFAULT_CREDITING_CAP_RATES = (0.06,)
 DEFAULT_BASELINE_RATE = 0.06
 CONTRACTUAL_MINIMUM_CREDITING_CAP_RATE = 0.0025
 MINIMUM_LSMC_TRAINING_PATHS = 60
 AUTO_WORKER_MEMORY_FRACTION = 0.65
-DEFAULT_MAX_WORKERS = 16
+DEFAULT_MAX_WORKERS = 1
 AUTO_WORKER_MAXIMUM = 16
 AUTO_WORKER_FIXED_BYTES = 1_342_177_280  # 1.25 GiB process/projection overhead
 # Includes the added Election, phase-exposure and cause-specific Behaviour
@@ -311,12 +320,14 @@ STRESS_DEFINITIONS: dict[str, dict[str, object]] = {
         ),
     },
 }
-# Lapse risk is present in every base Cap run through the Behaviour comparison
-# and its exact 2x2 factor decomposition.  It is deliberately not represented
+# Lapse risk is present in every base Cap run through the V11 Dynamic/LSMC
+# Behaviour comparison.  It is deliberately not represented
 # as a statistical lapse-rate shock because the LSMC method replaces those
-# rates with its joint action policy.  The default shock grid therefore adds
-# only the two interest-rate directions and Longevity.
-DEFAULT_RISK_SCOPE = ("lapse", "interest_rate", "longevity")
+# rates with its joint action policy.  The reduced default runs no explicit
+# shock grid, so its effective risk scope is Lapse/Behaviour only.  If stress
+# analysis is enabled, the preselected set adds the two interest-rate
+# directions and Longevity.
+DEFAULT_RISK_SCOPE = ("lapse",)
 DEFAULT_STRESS_SCENARIOS = ("interest_up", "interest_down", "longevity")
 DEFAULT_BEHAVIOUR_MODELS = ("dynamic_functions", "lsmc")
 
@@ -390,6 +401,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--train-seed", type=int, default=12026)
     parser.add_argument("--train-take-up-seed", type=int, default=10097)
     parser.add_argument("--train-mortality-seed", type=int, default=10197)
+    parser.add_argument("--train-seed-2", type=int, default=32026)
+    parser.add_argument("--train-take-up-seed-2", type=int, default=30097)
+    parser.add_argument("--train-mortality-seed-2", type=int, default=30197)
+    parser.add_argument("--train-seed-3", type=int, default=42026)
+    parser.add_argument("--train-take-up-seed-3", type=int, default=40097)
+    parser.add_argument("--train-mortality-seed-3", type=int, default=40197)
+    parser.add_argument("--n-validation", type=int, default=2_000)
+    parser.add_argument("--validation-seed", type=int, default=22026)
+    parser.add_argument("--validation-take-up-seed", type=int, default=20097)
+    parser.add_argument("--validation-mortality-seed", type=int, default=20197)
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--hedge-cap-leg-mode",
@@ -401,7 +422,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--lsmc-folds", type=int, default=5)
-    parser.add_argument("--lsmc-ridge", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--lsmc-ridge",
+        type=float,
+        choices=(0.0, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2),
+        default=1.0e-6,
+    )
     parser.add_argument(
         "--exercise-buffer-rmse-multiplier",
         type=float,
@@ -429,19 +455,32 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         metavar="STRESS",
         help=(
             "one-factor shock-and-revalue scenarios; each selected stress is "
-            "run for every cap and both policyholder-behaviour methods. The "
-            "default adds only interest up/down and Longevity; Lapse risk is "
-            "always covered by the Behaviour comparison and 2x2 decomposition"
+            "run for every cap and both policyholder-behaviour methods when "
+            "--stress-analysis is enabled. The preselected set is interest "
+            "up/down and Longevity; Lapse risk is always covered by the "
+            "full-policy Dynamic-V11 versus LSMC-V11 comparison"
         ),
     )
-    parser.add_argument(
+    stress_toggle = parser.add_mutually_exclusive_group()
+    stress_toggle.add_argument(
+        "--stress-analysis",
+        dest="no_stress_analysis",
+        action="store_false",
+        help=(
+            "enable the selected shock-and-revalue grid in addition to the "
+            "base Cap and Lapse-Behaviour analysis"
+        ),
+    )
+    stress_toggle.add_argument(
         "--no-stress-analysis",
+        dest="no_stress_analysis",
         action="store_true",
         help=(
             "skip the selected shock-and-revalue grid; the Cap and Lapse-"
             "Behaviour exposure analysis is still produced"
         ),
     )
+    parser.set_defaults(no_stress_analysis=True)
     parser.add_argument(
         "--reuse-existing",
         action="store_true",
@@ -457,9 +496,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         metavar="AUTO_OR_N",
         help=(
             "parallel independent cap/stress scenario pairs in one combined "
-            "queue. The configured default keeps up to 16 single-threaded "
-            "valuation children busy; 'auto' instead uses a conservative "
-            "CPU/RAM estimate"
+            "queue. The reduced default is one single-threaded valuation "
+            "child; 'auto' instead uses a conservative CPU/RAM estimate"
         ),
     )
     parser.add_argument(
@@ -471,12 +509,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "CPU oversubscription when scenario workers run in parallel"
         ),
     )
-    parser.add_argument(
+    plot_toggle = parser.add_mutually_exclusive_group()
+    plot_toggle.add_argument(
+        "--plots",
+        dest="no_plots",
+        action="store_false",
+        help="create the aggregate risk-analysis figures",
+    )
+    plot_toggle.add_argument(
         "--no-plots",
+        dest="no_plots",
         action="store_true",
         help="write CSV/report/manifest outputs without analysis figures",
     )
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIRECTORY)
+    parser.set_defaults(no_plots=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIRECTORY,
+        help=(
+            "base output directory; every invocation creates a new UTC "
+            "timestamp subdirectory"
+        ),
+    )
     parser.add_argument("--python-executable", default=sys.executable)
     parser.add_argument(
         "--log-level",
@@ -505,24 +560,60 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--lsmc-folds must be at least two")
     if args.blas_threads <= 0:
         parser.error("--blas-threads must be positive")
-    if any(
-        seed < 0
-        for seed in (
-            args.seed,
-            args.train_seed,
-            args.take_up_seed,
-            args.mortality_seed,
-            args.train_take_up_seed,
-            args.train_mortality_seed,
-        )
-    ):
+    seed_names = (
+        "seed",
+        "take_up_seed",
+        "mortality_seed",
+        "train_seed",
+        "train_take_up_seed",
+        "train_mortality_seed",
+        "train_seed_2",
+        "train_take_up_seed_2",
+        "train_mortality_seed_2",
+        "train_seed_3",
+        "train_take_up_seed_3",
+        "train_mortality_seed_3",
+        "validation_seed",
+        "validation_take_up_seed",
+        "validation_mortality_seed",
+    )
+    if any(getattr(args, name) < 0 for name in seed_names):
         parser.error("seeds must be non-negative")
-    if args.seed == args.train_seed:
-        parser.error("--seed and --train-seed must be different")
-    if args.take_up_seed == args.train_take_up_seed:
-        parser.error("--take-up-seed and --train-take-up-seed must differ")
-    if args.mortality_seed == args.train_mortality_seed:
-        parser.error("--mortality-seed and --train-mortality-seed must differ")
+    if args.n_validation <= 0:
+        parser.error("--n-validation must be positive")
+    market_seeds = (
+        args.train_seed,
+        args.train_seed_2,
+        args.train_seed_3,
+        args.validation_seed,
+        args.seed,
+    )
+    take_up_seeds = (
+        args.train_take_up_seed,
+        args.train_take_up_seed_2,
+        args.train_take_up_seed_3,
+        args.validation_take_up_seed,
+        args.take_up_seed,
+    )
+    mortality_seeds = (
+        args.train_mortality_seed,
+        args.train_mortality_seed_2,
+        args.train_mortality_seed_3,
+        args.validation_mortality_seed,
+        args.mortality_seed,
+    )
+    if len(set(market_seeds)) != 5:
+        parser.error(
+            "all three training, validation and evaluation market seeds must differ"
+        )
+    if len(set(take_up_seeds)) != 5:
+        parser.error(
+            "all three training, validation and evaluation take-up seeds must differ"
+        )
+    if len(set(mortality_seeds)) != 5:
+        parser.error(
+            "all three training, validation and evaluation mortality seeds must differ"
+        )
     for name in ("lsmc_ridge", "exercise_buffer_rmse_multiplier"):
         value = float(getattr(args, name))
         if not math.isfinite(value) or value < 0.0:
@@ -551,6 +642,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def _rate_key(rate: float) -> float:
     return round(float(rate), 12)
+
+
+def _create_timestamped_run_directory(
+    output_root: Path,
+    created_at: Optional[datetime] = None,
+) -> tuple[Path, Path, str, str]:
+    """Create one immutable UTC-timestamped directory for this invocation."""
+    created = datetime.now(timezone.utc) if created_at is None else created_at
+    if created.tzinfo is None:
+        raise ValueError("Run creation timestamp must be timezone-aware.")
+    created_utc = created.astimezone(timezone.utc)
+    run_id = created_utc.strftime(RUN_DIRECTORY_TIMESTAMP_FORMAT)
+    root = output_root.expanduser().resolve()
+    output = root / run_id
+    if output.parent != root:
+        raise RuntimeError("Unsafe timestamped risk-analysis output path.")
+    output.mkdir(parents=True, exist_ok=False)
+    return root, output, run_id, created_utc.isoformat()
 
 
 def _rate_directory_name(rate: float) -> str:
@@ -626,27 +735,11 @@ def _dynamic_benchmark_commands(
     *,
     stress_scenario: str,
 ) -> tuple[tuple[str, ...], ...]:
-    directories = _dynamic_benchmark_directories(dynamic_output)
-    specifications = (
-        ("deterministic_election_continue", "deterministic", "continue"),
-        (
-            "deterministic_election_post_behaviour",
-            "deterministic",
-            "dynamic",
-        ),
-        ("variable_election_continue", "dynamic", "continue"),
-    )
-    return tuple(
-        tuple(_dynamic_command(
-            args,
-            rate,
-            directories[benchmark_id],
-            stress_scenario=stress_scenario,
-            income_election_mode=election_mode,
-            post_income_behaviour=post_behaviour,
-        ))
-        for benchmark_id, election_mode, post_behaviour in specifications
-    )
+    # The risk runner intentionally retains only the complete Dynamic V11 arm.
+    # V00/V01/V10 remain research counterfactuals in lower-level runners, not
+    # part of this default portfolio comparison.
+    del args, rate, dynamic_output, stress_scenario
+    return ()
 
 
 def _lsmc_command(
@@ -669,6 +762,16 @@ def _lsmc_command(
         "--train-seed", str(args.train_seed),
         "--train-take-up-seed", str(args.train_take_up_seed),
         "--train-mortality-seed", str(args.train_mortality_seed),
+        "--train-seed-2", str(args.train_seed_2),
+        "--train-take-up-seed-2", str(args.train_take_up_seed_2),
+        "--train-mortality-seed-2", str(args.train_mortality_seed_2),
+        "--train-seed-3", str(args.train_seed_3),
+        "--train-take-up-seed-3", str(args.train_take_up_seed_3),
+        "--train-mortality-seed-3", str(args.train_mortality_seed_3),
+        "--n-validation", str(args.n_validation),
+        "--validation-seed", str(args.validation_seed),
+        "--validation-take-up-seed", str(args.validation_take_up_seed),
+        "--validation-mortality-seed", str(args.validation_mortality_seed),
         "--heston-substeps", str(args.heston_substeps),
         "--hedge-cap-leg-mode", args.hedge_cap_leg_mode,
         "--lsmc-folds", str(args.lsmc_folds),
@@ -681,6 +784,9 @@ def _lsmc_command(
         # in the same ScenarioJob.  Suppress only the duplicate Dynamic run
         # embedded in the standalone LSMC runner.
         "--no-dynamic-benchmark",
+        # The risk analysis reports only V11.  The LSMC runner retains its
+        # internal V10 Continue control solely for fit-quality validation.
+        "--no-factorial-benchmarks",
         "--log-level", args.log_level,
         "--output", str(output),
     ]
@@ -717,9 +823,13 @@ def _expected_job_artifact_paths(
     """Return the longest relevant files expected below one job layout."""
     dynamic_benchmark_directories = tuple(
         _dynamic_benchmark_directories(job.dynamic_output).values()
+        if job.dynamic_benchmark_commands
+        else ()
     )
-    lsmc_benchmark_directories = tuple(
-        _lsmc_benchmark_directories(job.lsmc_output).values()
+    lsmc_benchmark_directories = (
+        _lsmc_benchmark_directories(job.lsmc_output)[
+            "variable_election_continue"
+        ],
     )
     reconciliation_directories = (
         job.dynamic_output,
@@ -731,6 +841,9 @@ def _expected_job_artifact_paths(
         directory / RECONCILIATION_FILE_NAME
         for directory in reconciliation_directories
     ]
+    paths.append(
+        job.lsmc_output / "lsmc_multi_seed_validation_evaluation.csv"
+    )
     if include_plots:
         paths.extend(
             directory / LONGEST_SCENARIO_PLOT_RELATIVE_PATH
@@ -1167,7 +1280,7 @@ def _run_logged_command(
 
 
 def _execute_scenario_job(job: ScenarioJob, blas_threads: int) -> None:
-    """Run all Dynamic variants then LSMC within one memory-budgeted worker."""
+    """Run the full Dynamic V11 and LSMC V11 pair in one worker."""
     _run_logged_command(
         job.dynamic_command,
         job.dynamic_output,
@@ -1175,6 +1288,8 @@ def _execute_scenario_job(job: ScenarioJob, blas_threads: int) -> None:
     )
     benchmark_directories = tuple(
         _dynamic_benchmark_directories(job.dynamic_output).values()
+        if job.dynamic_benchmark_commands
+        else ()
     )
     if len(benchmark_directories) != len(job.dynamic_benchmark_commands):
         raise ValueError("Dynamic benchmark command/output counts differ.")
@@ -1217,11 +1332,24 @@ def _run_pending_jobs(
         f"{reused_count} reused, {effective_workers} worker(s)."
     )
     if effective_workers == 1:
+        failures: list[str] = []
         for index, job in enumerate(pending, start=1):
             log_to_console(
                 f"[{phase_label} {index}/{len(pending)}] Run {job.label}"
             )
-            _execute_scenario_job(job, worker_plan.blas_threads_per_child)
+            try:
+                _execute_scenario_job(job, worker_plan.blas_threads_per_child)
+            except Exception as exc:
+                failures.append(f"{job.label}: {exc}")
+                log_to_console(
+                    f"[{phase_label} {index}/{len(pending)}] FAILED {job.label}",
+                    level="ERROR",
+                )
+        if failures:
+            raise RuntimeError(
+                "One or more scenario cells failed; no aggregate report was "
+                "created:\n" + "\n".join(failures)
+            )
         return
 
     executor = ThreadPoolExecutor(
@@ -1230,7 +1358,7 @@ def _run_pending_jobs(
     )
     futures: dict[Future[None], ScenarioJob] = {}
     completed_count = 0
-    failed = False
+    failures: list[str] = []
     try:
         for job in pending:
             future = executor.submit(
@@ -1241,19 +1369,26 @@ def _run_pending_jobs(
             futures[future] = job
         for future in as_completed(futures):
             job = futures[future]
-            future.result()
-            completed_count += 1
-            log_to_console(
-                f"[{phase_label} {completed_count}/{len(pending)}] "
-                f"Completed {job.label}"
-            )
-    except BaseException:
-        failed = True
-        for future in futures:
-            future.cancel()
-        raise
+            try:
+                future.result()
+            except Exception as exc:
+                failures.append(f"{job.label}: {exc}")
+                log_to_console(
+                    f"[{phase_label}] FAILED {job.label}", level="ERROR"
+                )
+            else:
+                completed_count += 1
+                log_to_console(
+                    f"[{phase_label} {completed_count}/{len(pending)}] "
+                    f"Completed {job.label}"
+                )
     finally:
-        executor.shutdown(wait=True, cancel_futures=failed)
+        executor.shutdown(wait=True, cancel_futures=False)
+    if failures:
+        raise RuntimeError(
+            "One or more scenario cells failed; no aggregate report was "
+            "created:\n" + "\n".join(failures)
+        )
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -1744,6 +1879,25 @@ def _lsmc_diagnostic_metrics(
 ) -> dict[str, object]:
     if not action_rows or not diagnostic_rows:
         raise ValueError("LSMC action and regression diagnostics must be non-empty.")
+    action_seed_indices: set[int] = set()
+    for row in action_rows:
+        seed_index = int(_as_float(
+            row.get("training_seed_index"),
+            "action training_seed_index",
+        ))
+        if seed_index not in (1, 2, 3):
+            raise ValueError("LSMC action summary has an unknown training seed.")
+        action_seed_indices.add(seed_index)
+        if _as_bool(row.get("primary_training_seed")) is not (seed_index == 1):
+            raise ValueError(
+                "LSMC action summary has an inconsistent primary flag."
+            )
+    if action_seed_indices != {1, 2, 3}:
+        raise ValueError("LSMC action summary does not cover all three seeds.")
+    action_rows = [
+        row for row in action_rows
+        if _as_bool(row.get("primary_training_seed"))
+    ]
     if any(
         not str(row.get("action_type", "")).strip()
         and _as_float(row.get("eligible_path_count", 0.0), "eligible_path_count")
@@ -1751,8 +1905,8 @@ def _lsmc_diagnostic_metrics(
         for row in action_rows
     ):
         raise ValueError(
-            "LSMC action summary must distinguish income_election and "
-            "full_withdrawal action types."
+            "LSMC action summary must distinguish Election and monthly "
+            "Continue/Partial/Full action types."
         )
     action_rows = [
         row for row in action_rows
@@ -1781,7 +1935,7 @@ def _lsmc_diagnostic_metrics(
                     "exercise_path_count",
                     "start_income_path_count"
                     if action_type == "income_election"
-                    else "full_withdrawal_path_count",
+                    else f"{action_type}_path_count",
                 ),
                 label=f"{action_type} selected path count",
             ))
@@ -1804,14 +1958,14 @@ def _lsmc_diagnostic_metrics(
     election_count, election_eligible, forced_election_count = action_totals(
         "income_election"
     )
+    continue_count, continue_eligible, _ = action_totals("continue")
+    partial_count, partial_eligible, _ = action_totals("partial_withdrawal")
     surrender_count, surrender_eligible, _ = action_totals("full_withdrawal")
     if election_eligible <= 0:
         raise ValueError("LSMC action summary has no eligible Election decisions.")
-    # A rejected action step may have no fitted regression at all (for
-    # example too few eligible paths).  Such rows are genuine conservative
-    # WAIT/CONTINUE fallbacks, not malformed diagnostics.  Keep them in the
-    # acceptance denominator while summarising numerical fit quality only
-    # over rows on which those quantities exist.
+    # A documented immaterial-no-fit step may have no numerical regression.
+    # Material missing/unstable steps invalidate the fit and are rejected by
+    # the validation manifest before this aggregation is reached.
     r_squared = [
         _as_float(row.get("oof_r_squared"), "oof_r_squared")
         for row in diagnostic_rows
@@ -1839,11 +1993,16 @@ def _lsmc_diagnostic_metrics(
             row for row in diagnostic_rows
             if str(row.get("action_type")).strip().lower() == action_type
         ]
-        for action_type in ("income_election", "full_withdrawal")
+        for action_type in (
+            "income_election",
+            "partial_withdrawal",
+            "full_withdrawal",
+        )
     }
     if any(not rows for rows in diagnostic_groups.values()):
         raise ValueError(
-            "LSMC diagnostics must cover both Election and Full Withdrawal."
+            "LSMC diagnostics must cover Election, Partial Withdrawal and "
+            "Full Withdrawal."
         )
     settings = manifest.get("lsmc_settings")
     if not isinstance(settings, Mapping):
@@ -1868,9 +2027,16 @@ def _lsmc_diagnostic_metrics(
             surrender_count / surrender_eligible
             if surrender_eligible else 0.0
         ),
+        "unweighted_partial_withdrawal_action_rate": (
+            partial_count / partial_eligible if partial_eligible else 0.0
+        ),
         "income_election_action_path_count": election_count,
         "income_election_eligible_path_count": election_eligible,
         "forced_income_election_action_path_count": forced_election_count,
+        "continue_action_path_count": continue_count,
+        "continue_eligible_path_count": continue_eligible,
+        "partial_withdrawal_action_path_count": partial_count,
+        "partial_withdrawal_eligible_path_count": partial_eligible,
         "full_withdrawal_action_path_count": surrender_count,
         "full_withdrawal_eligible_path_count": surrender_eligible,
         "unique_policy_fit_count": unique_fits,
@@ -1901,9 +2067,11 @@ def _lsmc_diagnostic_metrics(
         ),
     }
     for action_type, rows in diagnostic_groups.items():
-        prefix = (
-            "election" if action_type == "income_election" else "surrender"
-        )
+        prefix = {
+            "income_election": "election",
+            "partial_withdrawal": "partial_withdrawal",
+            "full_withdrawal": "surrender",
+        }[action_type]
         group_r_squared = [
             _as_float(row.get("oof_r_squared"), "oof_r_squared")
             for row in rows
@@ -2049,15 +2217,12 @@ def _paired_model_point_rows(
     rate: float,
     dynamic_rows: list[dict[str, str]],
     lsmc_rows: list[dict[str, str]],
-    continue_rows: list[dict[str, str]],
 ) -> list[dict[str, object]]:
     dynamic = {str(row["model_point_id"]): row for row in dynamic_rows}
-    continuing = {str(row["model_point_id"]): row for row in continue_rows}
     output: list[dict[str, object]] = []
     for right in lsmc_rows:
         model_point_id = str(right["model_point_id"])
         left = dynamic[model_point_id]
-        continue_row = continuing[model_point_id]
         row: dict[str, object] = {
             "crediting_cap_rate": rate,
             "crediting_cap_rate_percent": 100.0 * rate,
@@ -2105,15 +2270,10 @@ def _paired_model_point_rows(
             field = f"per_contract_{metric}"
             left_value = _as_float(left.get(field), f"Dynamic {field}")
             right_value = _as_float(right.get(field), f"LSMC {field}")
-            continue_value = _as_float(
-                continue_row.get(field), f"Continue {field}")
             row[f"dynamic_per_contract_{metric}"] = left_value
             row[f"lsmc_per_contract_{metric}"] = right_value
-            row[f"continue_per_contract_{metric}"] = continue_value
             row[f"lsmc_minus_dynamic_per_contract_{metric}"] = (
                 right_value - left_value)
-            row[f"lsmc_minus_continue_per_contract_{metric}"] = (
-                right_value - continue_value)
             for contribution_prefix in (
                 "normalised_contribution_",
                 "portfolio_contribution_",
@@ -2226,6 +2386,347 @@ def _manifest_fit_basis_fingerprint(
     ).hexdigest()
 
 
+_LSMC_VALIDATION_COMPONENTS = {
+    "election_only",
+    "income_action_only",
+    "combined_policy",
+}
+
+
+def _expected_lsmc_training_seed_triplets(
+    args: argparse.Namespace,
+) -> tuple[dict[str, object], ...]:
+    return (
+        {
+            "seed_index": 1,
+            "market_seed": args.train_seed,
+            "take_up_seed": args.train_take_up_seed,
+            "mortality_seed": args.train_mortality_seed,
+            "primary": True,
+        },
+        {
+            "seed_index": 2,
+            "market_seed": args.train_seed_2,
+            "take_up_seed": args.train_take_up_seed_2,
+            "mortality_seed": args.train_mortality_seed_2,
+            "primary": False,
+        },
+        {
+            "seed_index": 3,
+            "market_seed": args.train_seed_3,
+            "take_up_seed": args.train_take_up_seed_3,
+            "mortality_seed": args.train_mortality_seed_3,
+            "primary": False,
+        },
+    )
+
+
+def _validate_three_seed_gate_set(
+    gates: object,
+    *,
+    label: str,
+) -> None:
+    if not isinstance(gates, list) or len(gates) != 3:
+        raise ValueError(f"{label} must contain exactly three validation gates.")
+    if any(
+        not isinstance(gate, Mapping) or not _as_bool(gate.get("valid"))
+        for gate in gates
+    ):
+        raise ValueError(f"{label} contains an invalid validation gate.")
+    components = {
+        str(gate.get("component", "")).strip()
+        for gate in gates
+        if isinstance(gate, Mapping)
+    }
+    if components != _LSMC_VALIDATION_COMPONENTS:
+        raise ValueError(
+            f"{label} must contain Election-, Income-action- and Combined gates."
+        )
+
+
+def _validate_three_seed_lsmc_evidence(
+    directory: Path,
+    manifest: Mapping[str, object],
+    validation_manifest: Mapping[str, object],
+    *,
+    expected_args: argparse.Namespace,
+) -> tuple[str, str, str]:
+    """Validate the immutable three-fit acceptance and evaluation evidence."""
+
+    lsmc_settings = manifest.get("lsmc_settings")
+    validation_settings = manifest.get("validation_settings")
+    evaluation_settings = manifest.get("evaluation_settings")
+    if not all(
+        isinstance(item, Mapping)
+        for item in (lsmc_settings, validation_settings, evaluation_settings)
+    ):
+        raise ValueError("LSMC three-seed settings are incomplete.")
+    assert isinstance(lsmc_settings, Mapping)
+    assert isinstance(validation_settings, Mapping)
+    assert isinstance(evaluation_settings, Mapping)
+
+    expected_triplets = _expected_lsmc_training_seed_triplets(expected_args)
+    triplets = lsmc_settings.get("training_seed_triplets")
+    if not isinstance(triplets, list) or len(triplets) != 3:
+        raise ValueError("LSMC manifest must contain exactly three seed triplets.")
+    for index, (actual, expected) in enumerate(
+        zip(triplets, expected_triplets), start=1
+    ):
+        if not isinstance(actual, Mapping):
+            raise ValueError(f"LSMC training seed triplet {index} is malformed.")
+        for field in ("seed_index", "market_seed", "take_up_seed", "mortality_seed"):
+            if int(_as_float(actual.get(field), field)) != int(expected[field]):
+                raise ValueError(
+                    f"LSMC training seed triplet {index} changed {field}."
+                )
+        if _as_bool(actual.get("primary")) is not bool(expected["primary"]):
+            raise ValueError(
+                f"LSMC training seed triplet {index} has the wrong primary flag."
+            )
+
+    training_fingerprints_raw = lsmc_settings.get(
+        "training_scenario_fingerprints"
+    )
+    if not isinstance(training_fingerprints_raw, list) or len(
+        training_fingerprints_raw
+    ) != 3:
+        raise ValueError(
+            "LSMC manifest must contain exactly three training fingerprints."
+        )
+    training_fingerprints = tuple(
+        str(value).strip() for value in training_fingerprints_raw
+    )
+    validation_fingerprint = str(
+        validation_settings.get("scenario_fingerprint", "")
+    ).strip()
+    evaluation_fingerprint = str(
+        evaluation_settings.get("scenario_fingerprint", "")
+    ).strip()
+    all_fingerprints = {
+        *training_fingerprints,
+        validation_fingerprint,
+        evaluation_fingerprint,
+    }
+    if "" in all_fingerprints or len(set(training_fingerprints)) != 3 \
+            or len(all_fingerprints) != 5:
+        raise ValueError(
+            "All three training, validation and evaluation fingerprints must differ."
+        )
+    if str(lsmc_settings.get("training_scenario_fingerprint", "")).strip() \
+            != training_fingerprints[0]:
+        raise ValueError(
+            "The backward-compatible training fingerprint is not primary seed 1."
+        )
+    if int(_as_float(
+        lsmc_settings.get("training_seed_count"), "training_seed_count"
+    )) != 3 or int(_as_float(
+        lsmc_settings.get("primary_training_seed_index"),
+        "primary_training_seed_index",
+    )) != 1:
+        raise ValueError("LSMC primary training seed 1 is not predeclared.")
+    if lsmc_settings.get("evaluation_used_for_training_seed_selection") is not False:
+        raise ValueError("LSMC training-seed selection used final evaluation data.")
+    selection_rule = str(
+        lsmc_settings.get("primary_seed_selection_rule", "")
+    ).lower()
+    if "predeclared" not in selection_rule or "not_evaluation" not in selection_rule:
+        raise ValueError("LSMC primary seed-selection rule is not predeclared.")
+
+    gates_by_seed = validation_settings.get("gates_by_training_seed")
+    if not isinstance(gates_by_seed, Mapping) or set(gates_by_seed) != {
+        "training_seed_1",
+        "training_seed_2",
+        "training_seed_3",
+    }:
+        raise ValueError("LSMC manifest has no complete gates-by-seed mapping.")
+    for index in range(1, 4):
+        _validate_three_seed_gate_set(
+            gates_by_seed[f"training_seed_{index}"],
+            label=f"LSMC manifest training seed {index}",
+        )
+    if not _as_bool(
+        validation_settings.get("every_seed_passes_election_income_combined")
+    ):
+        raise ValueError("Not every LSMC training seed passed all three gates.")
+
+    if not isinstance(validation_manifest, Mapping) or not _as_bool(
+        validation_manifest.get("valid")
+    ):
+        raise ValueError("Independent LSMC validation manifest is invalid.")
+    if int(_as_float(
+        validation_manifest.get("training_seed_count"),
+        "validation training_seed_count",
+    )) != 3:
+        raise ValueError("Validation manifest does not evidence three seed fits.")
+    if validation_manifest.get("seed_selection_using_evaluation") is not False:
+        raise ValueError("Validation manifest permits evaluation-based selection.")
+    if int(_as_float(
+        validation_manifest.get("primary_training_seed_index"),
+        "validation primary_training_seed_index",
+    )) != 1:
+        raise ValueError("Validation manifest does not predeclare seed 1.")
+    top_level_gates = validation_manifest.get("gates")
+    if not isinstance(top_level_gates, list) or len(top_level_gates) != 9:
+        raise ValueError("Validation manifest must contain exactly nine gates.")
+    top_level_groups: dict[int, list[Mapping[str, object]]] = {
+        1: [], 2: [], 3: []
+    }
+    for gate in top_level_gates:
+        if not isinstance(gate, Mapping) or not _as_bool(gate.get("valid")):
+            raise ValueError("Validation manifest contains an invalid top-level gate.")
+        seed_index = int(_as_float(
+            gate.get("training_seed_index"), "gate training_seed_index"
+        ))
+        if seed_index not in top_level_groups:
+            raise ValueError("Validation gate refers to an unknown training seed.")
+        top_level_groups[seed_index].append(gate)
+    for index, gates in top_level_groups.items():
+        _validate_three_seed_gate_set(
+            gates,
+            label=f"Validation manifest top-level seed {index}",
+        )
+        expected = expected_triplets[index - 1]
+        for gate in gates:
+            if str(gate.get("training_scenario_fingerprint", "")).strip() != (
+                training_fingerprints[index - 1]
+            ):
+                raise ValueError("Top-level validation gate changed its sample.")
+            for field, expected_field in (
+                ("training_market_seed", "market_seed"),
+                ("training_take_up_seed", "take_up_seed"),
+                ("training_mortality_seed", "mortality_seed"),
+            ):
+                if int(_as_float(gate.get(field), field)) != int(
+                    expected[expected_field]
+                ):
+                    raise ValueError(
+                        f"Top-level validation gate {index} changed {field}."
+                    )
+
+    training_runs = validation_manifest.get("training_runs")
+    if not isinstance(training_runs, list) or len(training_runs) != 3:
+        raise ValueError("Validation manifest must contain exactly three runs.")
+    for index, (run, expected, fingerprint) in enumerate(
+        zip(training_runs, expected_triplets, training_fingerprints), start=1
+    ):
+        if not isinstance(run, Mapping) or not _as_bool(run.get("valid")):
+            raise ValueError(f"Validation training run {index} is invalid.")
+        for field in ("seed_index", "market_seed", "take_up_seed", "mortality_seed"):
+            if int(_as_float(run.get(field), field)) != int(expected[field]):
+                raise ValueError(
+                    f"Validation training run {index} changed {field}."
+                )
+        if _as_bool(run.get("primary")) is not bool(expected["primary"]):
+            raise ValueError(
+                f"Validation training run {index} has the wrong primary flag."
+            )
+        if str(run.get("training_scenario_fingerprint", "")).strip() != fingerprint:
+            raise ValueError(
+                f"Validation training run {index} changed its fingerprint."
+            )
+        _validate_three_seed_gate_set(
+            run.get("gates"),
+            label=f"Validation training run {index}",
+        )
+
+    final_evaluations = evaluation_settings.get("multi_seed_final_evaluation")
+    evaluation_fingerprints = evaluation_settings.get(
+        "multi_seed_evaluation_scenario_fingerprints"
+    )
+    if not isinstance(final_evaluations, list) or len(final_evaluations) != 3:
+        raise ValueError("LSMC manifest must report three final evaluations.")
+    if not isinstance(evaluation_fingerprints, list) or len(
+        evaluation_fingerprints
+    ) != 3 or any(
+        str(value).strip() != evaluation_fingerprint
+        for value in evaluation_fingerprints
+    ):
+        raise ValueError("The three LSMC fits do not share one final evaluation.")
+    if evaluation_settings.get("training_seed_selected_using_evaluation") is not False:
+        raise ValueError("Final evaluation was used to select a training seed.")
+    for index, (row, expected, fingerprint) in enumerate(
+        zip(final_evaluations, expected_triplets, training_fingerprints), start=1
+    ):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"Final evaluation row {index} is malformed.")
+        if int(_as_float(
+            row.get("training_seed_index"), "evaluation training_seed_index"
+        )) != index:
+            raise ValueError("Final evaluation training-seed order changed.")
+        if _as_bool(row.get("primary_training_seed")) is not bool(
+            expected["primary"]
+        ):
+            raise ValueError("Final evaluation primary-seed flag is inconsistent.")
+        if str(row.get("training_scenario_fingerprint", "")).strip() != fingerprint:
+            raise ValueError("Final evaluation changed a training fingerprint.")
+        for field, expected_field in (
+            ("training_market_seed", "market_seed"),
+            ("training_take_up_seed", "take_up_seed"),
+            ("training_mortality_seed", "mortality_seed"),
+        ):
+            if int(_as_float(row.get(field), field)) != int(
+                expected[expected_field]
+            ):
+                raise ValueError(f"Final evaluation row {index} changed {field}.")
+        if str(row.get("evaluation_scenario_fingerprint", "")).strip() \
+                != evaluation_fingerprint:
+            raise ValueError("Final evaluations do not use one common sample.")
+        if row.get("evaluation_used_for_seed_selection") is not False:
+            raise ValueError("Final evaluation row permits seed selection.")
+        if _as_bool(row.get("selected_for_primary_outputs")) is not (index == 1):
+            raise ValueError("Only predeclared training seed 1 may drive outputs.")
+
+    report_rows = _read_csv(
+        directory / "lsmc_multi_seed_validation_evaluation.csv"
+    )
+    if len(report_rows) != 3:
+        raise ValueError("Multi-seed CSV must contain exactly three rows.")
+    for index, (row, expected, fingerprint) in enumerate(
+        zip(report_rows, expected_triplets, training_fingerprints), start=1
+    ):
+        if int(_as_float(
+            row.get("training_seed_index"), "CSV training_seed_index"
+        )) != index:
+            raise ValueError("Multi-seed CSV training-seed order changed.")
+        if _as_bool(row.get("primary_training_seed")) is not bool(
+            expected["primary"]
+        ):
+            raise ValueError("Multi-seed CSV primary-seed flag is inconsistent.")
+        for field, expected_field in (
+            ("training_market_seed", "market_seed"),
+            ("training_take_up_seed", "take_up_seed"),
+            ("training_mortality_seed", "mortality_seed"),
+        ):
+            if int(_as_float(row.get(field), field)) != int(expected[expected_field]):
+                raise ValueError(f"Multi-seed CSV row {index} changed {field}.")
+        if str(row.get("training_scenario_fingerprint", "")).strip() != fingerprint:
+            raise ValueError("Multi-seed CSV changed a training fingerprint.")
+        if str(row.get("validation_scenario_fingerprint", "")).strip() \
+                != validation_fingerprint or str(
+                    row.get("evaluation_scenario_fingerprint", "")
+                ).strip() != evaluation_fingerprint:
+            raise ValueError("Multi-seed CSV changed validation/evaluation samples.")
+        if not _as_bool(row.get("all_fits_valid")) or not _as_bool(
+            row.get("validation_valid")
+        ):
+            raise ValueError("Multi-seed CSV contains an invalid fit or gate set.")
+        if _as_bool(row.get("selected_for_primary_outputs")) is not (index == 1):
+            raise ValueError("Multi-seed CSV did not preselect seed 1.")
+        if _as_bool(row.get("evaluation_used_for_seed_selection")):
+            raise ValueError("Multi-seed CSV evidences evaluation-based selection.")
+        csv_selection_rule = str(row.get("selection_rule", "")).lower()
+        if "predeclared" not in csv_selection_rule or "not_evaluation" not in (
+            csv_selection_rule
+        ):
+            raise ValueError("Multi-seed CSV has no predeclared selection rule.")
+        for component in _LSMC_VALIDATION_COMPONENTS:
+            if not _as_bool(row.get(f"validation_{component}_valid")):
+                raise ValueError(
+                    f"Multi-seed CSV row {index} failed {component}."
+                )
+    return training_fingerprints
+
+
 def _validate_behaviour_manifest(
     manifest: Mapping[str, object],
     *,
@@ -2302,9 +2803,14 @@ def _validate_behaviour_manifest(
                 f"{label} does not document dynamic post-Election exit."
             )
     else:
-        if not {"continue", "full_withdrawal"}.issubset(actions):
+        if not {
+            "continue",
+            "partial_withdrawal",
+            "full_withdrawal",
+        }.issubset(actions):
             raise ValueError(
-                f"{label} does not expose CONTINUE | FULL_WITHDRAWAL in Income."
+                f"{label} does not expose monthly CONTINUE | "
+                "PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL in Income."
             )
 
     joint = str(
@@ -2330,10 +2836,13 @@ def _scenario_outputs_complete(
     require_plots: bool,
     expected_stress: str = "base",
 ) -> bool:
-    dynamic_benchmark_directories = _dynamic_benchmark_directories(
-        dynamic_output
-    )
-    lsmc_benchmark_directories = _lsmc_benchmark_directories(lsmc_output)
+    dynamic_benchmark_directories: dict[str, Path] = {}
+    all_lsmc_benchmark_directories = _lsmc_benchmark_directories(lsmc_output)
+    lsmc_benchmark_directories = {
+        "variable_election_continue": all_lsmc_benchmark_directories[
+            "variable_election_continue"
+        ]
+    }
     required = (
         dynamic_output / "portfolio_summary.csv",
         dynamic_output / "model_point_results.csv",
@@ -2345,6 +2854,9 @@ def _scenario_outputs_complete(
         lsmc_output / "run_manifest.json",
         lsmc_output / "lsmc_action_summary.csv",
         lsmc_output / "lsmc_regression_diagnostics.csv",
+        lsmc_output / "lsmc_validation_summary.csv",
+        lsmc_output / "lsmc_validation_manifest.json",
+        lsmc_output / "lsmc_multi_seed_validation_evaluation.csv",
         *(
             path / file_name
             for path in dynamic_benchmark_directories.values()
@@ -2414,27 +2926,22 @@ def _load_scenario_result(
         dynamic_output / "portfolio_summary.csv")
     dynamic_rows = _read_csv(dynamic_output / "model_point_results.csv")
     dynamic_manifest = _read_json(dynamic_output / "run_manifest.json")
-    dynamic_benchmark_directories = _dynamic_benchmark_directories(
-        dynamic_output
-    )
-    dynamic_benchmark_summaries = {
-        benchmark_id: _read_single_csv_row(
-            directory / "portfolio_summary.csv"
-        )
-        for benchmark_id, directory in dynamic_benchmark_directories.items()
-    }
-    dynamic_benchmark_rows = {
-        benchmark_id: _read_csv(directory / "model_point_results.csv")
-        for benchmark_id, directory in dynamic_benchmark_directories.items()
-    }
-    dynamic_benchmark_manifests = {
-        benchmark_id: _read_json(directory / "run_manifest.json")
-        for benchmark_id, directory in dynamic_benchmark_directories.items()
-    }
+    dynamic_benchmark_directories: dict[str, Path] = {}
+    dynamic_benchmark_summaries: dict[str, dict[str, str]] = {}
+    dynamic_benchmark_rows: dict[str, list[dict[str, str]]] = {}
+    dynamic_benchmark_manifests: dict[str, dict[str, object]] = {}
     lsmc_summary = _read_single_csv_row(lsmc_output / "portfolio_summary.csv")
     lsmc_rows = _read_csv(lsmc_output / "model_point_results.csv")
     lsmc_manifest = _read_json(lsmc_output / "run_manifest.json")
-    lsmc_benchmark_directories = _lsmc_benchmark_directories(lsmc_output)
+    lsmc_validation_manifest = _read_json(
+        lsmc_output / "lsmc_validation_manifest.json"
+    )
+    all_lsmc_benchmark_directories = _lsmc_benchmark_directories(lsmc_output)
+    lsmc_benchmark_directories = {
+        "variable_election_continue": all_lsmc_benchmark_directories[
+            "variable_election_continue"
+        ]
+    }
     election_continue_directory = lsmc_benchmark_directories[
         "variable_election_continue"
     ]
@@ -2450,30 +2957,6 @@ def _load_scenario_result(
     lsmc_benchmark_rows: dict[str, list[dict[str, str]]] = {
         "variable_election_continue": continue_rows,
     }
-    for benchmark_id in (
-        "deterministic_election_continue",
-        "deterministic_election_post_behaviour",
-    ):
-        directory = lsmc_benchmark_directories[benchmark_id]
-        summary_path = directory / "portfolio_summary.csv"
-        rows_path = directory / "model_point_results.csv"
-        reconciliation_path = (
-            directory / "portfolio_aggregation_reconciliation.csv"
-        )
-        required_benchmark_paths = (
-            summary_path,
-            rows_path,
-            reconciliation_path,
-        )
-        if not all(path.is_file() for path in required_benchmark_paths):
-            raise ValueError(
-                f"LSMC factorial benchmark {benchmark_id} is incomplete."
-            )
-        lsmc_benchmark_summaries[benchmark_id] = _read_single_csv_row(
-            summary_path
-        )
-        lsmc_benchmark_rows[benchmark_id] = _read_csv(rows_path)
-
     runner_manifests = (
         ("Dynamic full policy", dynamic_manifest),
         *(
@@ -2582,7 +3065,8 @@ def _load_scenario_result(
         lsmc_evaluation_settings.get("force_pathwise_joint_life")
     ):
         raise ValueError(
-            "LSMC V00/V01/V10/V11 do not share the pathwise Joint-Life basis."
+            "LSMC V11 and its internal validation control do not share the "
+            "pathwise Joint-Life basis."
         )
     benchmark_metadata = lsmc_method.get("behaviour_benchmarks")
     if not isinstance(benchmark_metadata, Mapping):
@@ -2806,7 +3290,7 @@ def _load_scenario_result(
     _validate_live_aggregation(dynamic_summary, dynamic_rows, "Dynamic")
     _validate_live_aggregation(lsmc_summary, lsmc_rows, "LSMC")
     _validate_live_aggregation(continue_summary, continue_rows, "Continue")
-    for benchmark_id in BENCHMARK_IDS:
+    for benchmark_id in dynamic_benchmark_summaries:
         _validate_live_aggregation(
             dynamic_benchmark_summaries[benchmark_id],
             dynamic_benchmark_rows[benchmark_id],
@@ -2915,6 +3399,7 @@ def _load_scenario_result(
     dynamic_portfolio = dynamic_manifest.get("portfolio")
     lsmc_method = lsmc_manifest.get("method")
     evaluation_settings = lsmc_manifest.get("evaluation_settings")
+    validation_settings = lsmc_manifest.get("validation_settings")
     lsmc_settings = lsmc_manifest.get("lsmc_settings")
     if not isinstance(dynamic_portfolio, Mapping):
         raise ValueError("Dynamic manifest has no portfolio object.")
@@ -2922,8 +3407,24 @@ def _load_scenario_result(
         raise ValueError("LSMC manifest has no method object.")
     if not isinstance(evaluation_settings, Mapping):
         raise ValueError("LSMC manifest has no evaluation_settings object.")
+    if not isinstance(validation_settings, Mapping):
+        raise ValueError("LSMC manifest has no validation_settings object.")
+    if not _as_bool(validation_settings.get("valid")):
+        raise ValueError("LSMC policy did not pass independent validation.")
+    if str(lsmc_validation_manifest.get("scenario_fingerprint")) != str(
+        validation_settings.get("scenario_fingerprint")
+    ):
+        raise ValueError(
+            "LSMC validation manifest and run manifest use different samples."
+        )
     if not isinstance(lsmc_settings, Mapping):
         raise ValueError("LSMC manifest has no lsmc_settings object.")
+    training_fingerprints = _validate_three_seed_lsmc_evidence(
+        lsmc_output,
+        lsmc_manifest,
+        lsmc_validation_manifest,
+        expected_args=args,
+    )
     if _as_bool(lsmc_method.get("dynamic_behaviour_used_for_benchmark")):
         raise ValueError(
             "LSMC scenario unexpectedly contains a duplicate Dynamic benchmark."
@@ -2951,10 +3452,19 @@ def _load_scenario_result(
             raise ValueError(
                 f"Dynamic benchmark {benchmark_id} changed evaluation paths."
             )
-    training_fingerprint = str(
-        lsmc_settings.get("training_scenario_fingerprint"))
-    if training_fingerprint == evaluation_fingerprint:
-        raise ValueError("LSMC training and evaluation scenarios must differ.")
+    training_fingerprint = training_fingerprints[0]
+    validation_fingerprint = str(
+        validation_settings.get("scenario_fingerprint")
+    )
+    if len({
+        *training_fingerprints,
+        validation_fingerprint,
+        evaluation_fingerprint,
+    }) != 5:
+        raise ValueError(
+            "All three LSMC training, validation and evaluation scenarios "
+            "must differ."
+        )
     _require_close(
         _as_float(lsmc_settings.get("n_train"), "n_train"),
         float(args.n_train),
@@ -2974,6 +3484,12 @@ def _load_scenario_result(
          "LSMC training take-up seed"),
         (lsmc_settings, "train_mortality_seed", args.train_mortality_seed,
          "LSMC training mortality seed"),
+        (validation_settings, "seed", args.validation_seed,
+         "LSMC validation market seed"),
+        (validation_settings, "take_up_seed", args.validation_take_up_seed,
+         "LSMC validation take-up seed"),
+        (validation_settings, "mortality_seed", args.validation_mortality_seed,
+         "LSMC validation mortality seed"),
     ):
         _require_close(
             _as_float(container.get(field), field),
@@ -2989,6 +3505,11 @@ def _load_scenario_result(
         "LSMC summary training paths",
     )
     _require_close(
+        _as_float(validation_settings.get("n_paths"), "validation n_paths"),
+        float(args.n_validation),
+        "LSMC validation paths",
+    )
+    _require_close(
         _as_float(
             lsmc_summary.get("lsmc_training_seed"),
             "lsmc_training_seed",
@@ -3000,6 +3521,32 @@ def _load_scenario_result(
         lsmc_summary.get("lsmc_training_scenario_fingerprint")
     ) != training_fingerprint:
         raise ValueError("LSMC summary and manifest training fingerprints differ.")
+    try:
+        summary_training_fingerprints = tuple(json.loads(str(
+            lsmc_summary.get("lsmc_training_scenario_fingerprints_json", "")
+        )))
+        summary_seed_triplets = json.loads(str(
+            lsmc_summary.get("lsmc_training_seed_triplets_json", "")
+        ))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "LSMC summary has no valid three-seed JSON evidence."
+        ) from exc
+    if summary_training_fingerprints != training_fingerprints:
+        raise ValueError("LSMC summary changed the three training fingerprints.")
+    if summary_seed_triplets != list(
+        _expected_lsmc_training_seed_triplets(args)
+    ):
+        raise ValueError("LSMC summary changed the three training seed triplets.")
+    if int(_as_float(
+        lsmc_summary.get("lsmc_training_seed_count"),
+        "lsmc_training_seed_count",
+    )) != 3 or not _as_bool(
+        lsmc_summary.get("lsmc_validation_all_three_seeds_valid")
+    ) or not _as_bool(
+        lsmc_summary.get("lsmc_final_evaluation_all_three_seeds_reported")
+    ):
+        raise ValueError("LSMC summary has incomplete three-seed evidence.")
     _require_close(
         _as_float(lsmc_settings.get("n_folds"), "n_folds"),
         float(args.lsmc_folds),
@@ -3094,14 +3641,29 @@ def _load_scenario_result(
     action_rows = _read_csv(lsmc_output / "lsmc_action_summary.csv")
     diagnostic_rows = _read_csv(
         lsmc_output / "lsmc_regression_diagnostics.csv")
-    if any(
-        str(diagnostic.get("training_scenario_fingerprint"))
-        != training_fingerprint
-        for diagnostic in diagnostic_rows
-    ):
-        raise ValueError(
-            "LSMC regression diagnostics use a different training fingerprint."
-        )
+    diagnostic_seed_indices: set[int] = set()
+    for diagnostic in diagnostic_rows:
+        seed_index = int(_as_float(
+            diagnostic.get("training_seed_index"),
+            "diagnostic training_seed_index",
+        ))
+        if seed_index not in (1, 2, 3):
+            raise ValueError("LSMC regression diagnostic has an unknown seed.")
+        diagnostic_seed_indices.add(seed_index)
+        if str(diagnostic.get("training_scenario_fingerprint")) != (
+            training_fingerprints[seed_index - 1]
+        ):
+            raise ValueError(
+                "LSMC regression diagnostics changed a training fingerprint."
+            )
+        if _as_bool(diagnostic.get("primary_training_seed")) is not (
+            seed_index == 1
+        ):
+            raise ValueError(
+                "LSMC regression diagnostic has an inconsistent primary flag."
+            )
+    if diagnostic_seed_indices != {1, 2, 3}:
+        raise ValueError("LSMC diagnostics do not cover all three training seeds.")
     lsmc_diagnostics = _lsmc_diagnostic_metrics(
         action_rows,
         diagnostic_rows,
@@ -3120,28 +3682,34 @@ def _load_scenario_result(
         "premium_aud": dynamic_metrics["premium_aud"],
         "evaluation_scenario_fingerprint": evaluation_fingerprint,
         "training_scenario_fingerprint": training_fingerprint,
+        "training_scenario_fingerprints_json": json.dumps(
+            list(training_fingerprints)
+        ),
+        "training_scenario_fingerprint_1": training_fingerprints[0],
+        "training_scenario_fingerprint_2": training_fingerprints[1],
+        "training_scenario_fingerprint_3": training_fingerprints[2],
+        "training_seed_triplets_json": json.dumps(
+            list(_expected_lsmc_training_seed_triplets(args)),
+            sort_keys=True,
+        ),
+        "primary_training_seed_index": 1,
+        "every_training_seed_passes_validation": True,
+        "evaluation_used_for_training_seed_selection": False,
+        "validation_scenario_fingerprint": validation_fingerprint,
         "lsmc_fit_basis_fingerprint": lsmc_fit_basis_fingerprint,
         "source_metadata_fingerprint": source_metadata_fingerprint,
         "engine_version": dynamic_engine_version,
         "dynamic_scenario_directory": str(dynamic_output),
         "lsmc_scenario_directory": str(lsmc_output),
+        "lsmc_multi_seed_validation_evaluation_csv": str(
+            lsmc_output / "lsmc_multi_seed_validation_evaluation.csv"
+        ),
     }
     for method, metrics in (
         ("dynamic", dynamic_metrics),
         ("lsmc", lsmc_metrics),
-        ("continue", continue_metrics),
     ):
         row.update({f"{method}_{key}": value for key, value in metrics.items()})
-    for benchmark_id, metrics in dynamic_benchmark_metrics.items():
-        row.update({
-            f"dynamic_benchmark_{benchmark_id}_{key}": value
-            for key, value in metrics.items()
-        })
-    for benchmark_id, metrics in lsmc_benchmark_metrics.items():
-        row.update({
-            f"lsmc_benchmark_{benchmark_id}_{key}": value
-            for key, value in metrics.items()
-        })
     row.update({
         f"dynamic_{key}": value for key, value in dynamic_mp_risk.items()
     })
@@ -3172,10 +3740,6 @@ def _load_scenario_result(
         if dynamic_value is not None and lsmc_value is not None:
             row[f"lsmc_minus_dynamic_{metric}"] = (
                 float(lsmc_value) - float(dynamic_value))
-        continue_value = continue_metrics.get(metric)
-        if continue_value is not None and lsmc_value is not None:
-            row[f"lsmc_minus_continue_{metric}"] = (
-                float(lsmc_value) - float(continue_value))
 
     premium = float(row["premium_aud"])
     behaviour_risk = (
@@ -3199,18 +3763,9 @@ def _load_scenario_result(
             - float(dynamic_metrics["pv_policyholder_benefits_aud"]),
             premium,
         ),
-        "lsmc_policyholder_value_difference_vs_continue_aud": (
-            float(lsmc_metrics["pv_policyholder_benefits_aud"])
-            - float(continue_metrics["pv_policyholder_benefits_aud"])
-        ),
-        "lsmc_policyholder_value_difference_vs_continue_to_premium": _safe_ratio(
-            float(lsmc_metrics["pv_policyholder_benefits_aud"])
-            - float(continue_metrics["pv_policyholder_benefits_aud"]),
-            premium,
-        ),
     })
     return row, _paired_model_point_rows(
-        rate, dynamic_rows, lsmc_rows, continue_rows)
+        rate, dynamic_rows, lsmc_rows)
 
 
 def _validated_reuse_result(
@@ -3256,7 +3811,6 @@ def _validated_reuse_result(
 CORE_BASELINE_FIELDS = (
     "dynamic_pv_guarantee_claims_aud",
     "lsmc_pv_guarantee_claims_aud",
-    "continue_pv_guarantee_claims_aud",
     "dynamic_guarantee_value_aud",
     "lsmc_guarantee_value_aud",
     "dynamic_pv_future_fees_aud",
@@ -3284,8 +3838,8 @@ CORE_BASELINE_FIELDS = (
     "dynamic_negative_value_contract_share",
     "lsmc_negative_value_contract_share",
     "behaviour_model_gap_to_insurer_aud",
-    "lsmc_policyholder_value_difference_vs_continue_aud",
     "lsmc_unweighted_income_election_action_rate",
+    "lsmc_unweighted_partial_withdrawal_action_rate",
     "lsmc_unweighted_full_withdrawal_action_rate",
     "dynamic_income_start_year_mean",
     "lsmc_income_start_year_mean",
@@ -3412,12 +3966,12 @@ BEHAVIOUR_SENSITIVITY_METRICS = (
         "diagnostic",
     ),
     (
-        "lsmc_policyholder_value_difference_vs_continue_aud",
-        "AUD",
+        "lsmc_unweighted_income_election_action_rate",
+        "ratio",
         "diagnostic",
     ),
     (
-        "lsmc_unweighted_income_election_action_rate",
+        "lsmc_unweighted_partial_withdrawal_action_rate",
         "ratio",
         "diagnostic",
     ),
@@ -3470,7 +4024,7 @@ def _build_sensitivity_rows(
         if _rate_key(rate) == _rate_key(baseline_rate)
     )
     series: list[tuple[str, str, str, str]] = []
-    for method in ("dynamic", "lsmc", "continue"):
+    for method in ("dynamic", "lsmc"):
         series.extend(
             (method, metric, unit, direction)
             for metric, unit, direction in METHOD_SENSITIVITY_METRICS
@@ -3674,6 +4228,15 @@ def _validate_scenario_grid(
     checks = (
         ("evaluation_scenario_fingerprint", "evaluation scenario set"),
         ("training_scenario_fingerprint", "LSMC training scenario set"),
+        (
+            "training_scenario_fingerprints_json",
+            "all three LSMC training scenario sets",
+        ),
+        ("training_scenario_fingerprint_1", "LSMC training scenario set 1"),
+        ("training_scenario_fingerprint_2", "LSMC training scenario set 2"),
+        ("training_scenario_fingerprint_3", "LSMC training scenario set 3"),
+        ("training_seed_triplets_json", "three LSMC training seed triplets"),
+        ("validation_scenario_fingerprint", "LSMC validation scenario set"),
         ("source_metadata_fingerprint", "source inputs"),
         ("engine_version", "engine version"),
     )
@@ -3688,12 +4251,41 @@ def _validate_scenario_grid(
             f"{label} reused an LSMC fit basis across different caps; every "
             "cap/stress combination must be refitted."
         )
-    if {
-        str(row["evaluation_scenario_fingerprint"]) for row in rows
-    } == {
-        str(row["training_scenario_fingerprint"]) for row in rows
-    }:
-        raise ValueError(f"{label} LSMC training and evaluation must differ.")
+    for row in rows:
+        training_fingerprints = (
+            str(row["training_scenario_fingerprint_1"]),
+            str(row["training_scenario_fingerprint_2"]),
+            str(row["training_scenario_fingerprint_3"]),
+        )
+        try:
+            encoded_training_fingerprints = tuple(json.loads(str(
+                row["training_scenario_fingerprints_json"]
+            )))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"{label} has malformed three-seed fingerprint evidence."
+            ) from exc
+        if encoded_training_fingerprints != training_fingerprints:
+            raise ValueError(
+                f"{label} scalar and encoded training fingerprints differ."
+            )
+        if str(row["training_scenario_fingerprint"]) != training_fingerprints[0]:
+            raise ValueError(
+                f"{label} primary fingerprint is not predeclared seed 1."
+            )
+        if len({
+            str(row["evaluation_scenario_fingerprint"]),
+            *training_fingerprints,
+            str(row["validation_scenario_fingerprint"]),
+        }) != 5:
+            raise ValueError(
+                f"{label} all three LSMC training, validation and evaluation "
+                "samples must differ."
+            )
+        if int(row["primary_training_seed_index"]) != 1 or not _as_bool(
+            row["every_training_seed_passes_validation"]
+        ) or _as_bool(row["evaluation_used_for_training_seed_selection"]):
+            raise ValueError(f"{label} violates the three-seed acceptance rule.")
 
 
 STRESS_DELTA_METRICS = (
@@ -3764,7 +4356,7 @@ def _build_stress_loss_rows(
             "lsmc_stress_scenario_directory": stressed[
                 "lsmc_scenario_directory"],
         }
-        for method in ("dynamic", "lsmc", "continue"):
+        for method in ("dynamic", "lsmc"):
             npv_field = (
                 f"{method}_insurer_net_present_value_before_risk_margin_aud"
             )
@@ -3808,7 +4400,7 @@ def _build_stress_loss_rows(
             index for index, rate in enumerate(rates)
             if _rate_key(rate) == _rate_key(baseline_rate)
         )
-        for method in ("dynamic", "lsmc", "continue"):
+        for method in ("dynamic", "lsmc"):
             field = f"{method}_signed_stress_loss_aud"
             values = [float(row[field]) for row in group]
             baseline_value = values[baseline_index]
@@ -3867,7 +4459,7 @@ def _create_plots(
     colours = {"dynamic": "#5b6573", "lsmc": "#005f73"}
     labels = {
         "dynamic": "Dynamic assumptions",
-        "lsmc": "Fitted annual LSMC lower bound",
+        "lsmc": "Fitted monthly-action LSMC lower bound",
     }
     figure_paths: dict[str, str] = {}
 
@@ -4231,60 +4823,6 @@ def _create_plots(
     finish(fig, quality_path)
     figure_paths["lsmc_model_risk_diagnostics"] = str(quality_path)
 
-    selected_decomposition = {
-        metric: [row for row in decomposition_rows if row["metric"] == metric]
-        for metric in (
-            "pv_policyholder_benefits_aud",
-            "insurer_net_present_value_before_risk_margin_aud",
-        )
-    }
-    fig, axes = plt.subplots(2, 1, figsize=(12.0, 9.0), sharex=True)
-    bar_width = min(1.1, max(0.25, 0.18 * (max(caps) - min(caps) or 1.0)))
-    for axis, (metric, metric_rows) in zip(axes, selected_decomposition.items()):
-        mechanical = [
-            float(row["continue_benchmark_change_vs_baseline"])
-            for row in metric_rows
-        ]
-        interaction = [
-            float(row["change_in_lsmc_minus_continue_gap_vs_baseline"])
-            for row in metric_rows
-        ]
-        total = [
-            float(row["lsmc_total_change_vs_baseline"])
-            for row in metric_rows
-        ]
-        axis.bar(
-            caps, mechanical, width=bar_width, color="#94d2bd",
-            label="Continue-benchmark component",
-        )
-        axis.bar(
-            caps, interaction, width=bar_width, bottom=mechanical,
-            color="#ee9b00", label="Change in LSMC-minus-Continue gap",
-        )
-        axis.plot(
-            caps, total, marker="D", linestyle="none", color="#9b2226",
-            label="Total LSMC change",
-        )
-        axis.axhline(0.0, color="#1f2937", linewidth=0.8)
-        axis.axvline(baseline_percent, color="#9ca3af", linestyle="--")
-        axis.yaxis.set_major_formatter(FuncFormatter(_aud_axis))
-        axis.grid(axis="y", alpha=0.25)
-        axis.set_ylabel("AUD")
-        axis.set_title(
-            "PV Policyholder Benefits"
-            if metric == "pv_policyholder_benefits_aud"
-            else "Insurer NPV before Risk Margin",
-            loc="left",
-        )
-    axes[0].legend(ncol=3, fontsize=9)
-    axes[1].set_xlabel("Scenario Maximum Return / Crediting Cap (%)")
-    fig.suptitle(
-        f"Crediting-cap effect relative to {baseline_percent:.2f}% baseline"
-    )
-    decomposition_path = output / "05_crediting_cap_effect_decomposition.png"
-    finish(fig, decomposition_path)
-    figure_paths["crediting_cap_effect_decomposition"] = str(decomposition_path)
-
     if stress_rows:
         selected_stresses = [
             stress_id for stress_id in STRESS_DEFINITIONS
@@ -4423,8 +4961,9 @@ def _write_report(
         "",
         (
             "Die Analyse vergleicht eine pfadabhängige statistische Dynamic-"
-            "Policy mit einer jährlich entscheidenden, out-of-sample "
-            "bewerteten LSMC-Policy. Beide Ansätze modellieren die Income-"
+            "Policy mit einer out-of-sample bewerteten LSMC-Policy. Die "
+            "Income Election bleibt jährlich; freiwillige Income-Aktionen "
+            "werden monatlich entschieden. Beide Ansätze modellieren die Income-"
             "Election endogen; nach der Election werden Income-Lapse und "
             "Full Withdrawal separat von der Growth-Phase behandelt. Die als "
             "Crediting Rate bezeichnete Eingabe ist technisch der Scenario "
@@ -4583,18 +5122,21 @@ def _write_report(
         "### LSMC-Action- und Regressionsdiagnostik",
         "",
         (
-            "| Cap | Election action (ungewichtet) | Full Withdrawal action "
-            "(ungewichtet) | Election regressions accepted | Withdrawal "
-            "regressions accepted |"
+            "| Cap | Election action (ungewichtet) | Partial action "
+            "(ungewichtet) | Full Withdrawal action (ungewichtet) | "
+            "Election regressions accepted | Partial regressions accepted | "
+            "Full regressions accepted |"
         ),
-        "|---:|---:|---:|---:|---:|",
+        "|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in rows:
         lines.append(
             f"| {float(row['crediting_cap_rate_percent']):.2f}% | "
             f"{100.0 * float(row['lsmc_unweighted_income_election_action_rate']):.3f}% | "
+            f"{100.0 * float(row['lsmc_unweighted_partial_withdrawal_action_rate']):.3f}% | "
             f"{100.0 * float(row['lsmc_unweighted_full_withdrawal_action_rate']):.3f}% | "
             f"{100.0 * float(row['lsmc_election_regression_accepted_share']):.3f}% | "
+            f"{100.0 * float(row['lsmc_partial_withdrawal_regression_accepted_share']):.3f}% | "
             f"{100.0 * float(row['lsmc_surrender_regression_accepted_share']):.3f}% |"
         )
 
@@ -4609,11 +5151,12 @@ def _write_report(
         lines.extend([
             "",
             (
-                "> **LSMC-Validierungswarnung:** Die eingefrorene Policy "
-                "unterschreitet out of sample den Continue-Benchmark bei: "
+                "> **LSMC-Evaluationshinweis:** Die zuvor unabhängig validierte "
+                "und eingefrorene Policy unterschreitet auf dem unangetasteten "
+                "finalen Sample den Continue-Benchmark bei: "
                 + ", ".join(f"{cap:.2f}%" for cap in failed_oos_caps)
-                + ". Diese Szenarien sind Fit-Diagnostik und dürfen nicht als "
-                "optimales Verhalten interpretiert werden."
+                + ". Das ist eine berichtete Evaluationsschwankung; das finale "
+                "Sample ändert weder Policy noch Validierungsstatus."
             ),
         ])
     below_minimum_caps = [
@@ -4814,15 +5357,16 @@ def _write_report(
             lines.extend([
                 "",
                 (
-                    "> **LSMC-Stressvalidierungswarnung:** Die eingefrorene "
-                    "Stress-Policy unterschreitet den Continue-Benchmark bei "
+                    "> **LSMC-Stressevaluationshinweis:** Die unabhängig "
+                    "validierte Stress-Policy unterschreitet auf dem finalen "
+                    "Sample den Continue-Benchmark bei "
                     + ", ".join(
                         f"{row['stress_scenario_id']} / "
                         f"{float(row['crediting_cap_rate_percent']):.2f}%"
                         for row in failed_stress_oos
                     )
-                    + ". Diese Stresswerte dürfen nicht als optimale "
-                    "Policyholder-Ausübung interpretiert werden."
+                    + ". Das finale Sample ändert weder Policy noch "
+                    "Validierungsstatus."
                 ),
             ])
 
@@ -4885,29 +5429,27 @@ def _write_report(
             "Das Delta ist ein Vergleich zweier vollständiger Behaviour-Ansätze: "
             "pfadabhängige statistische Income-Election plus monatliche "
             "Post-Election-Lapse-/Withdrawal-Annahmen einerseits und eine "
-            "gemeinsam gefittete jährliche LSMC-Policy andererseits. In der "
+            "gemeinsam gefittete LSMC-Policy andererseits. In der "
             "Growth-Phase entscheidet LSMC zwischen WAIT und START_INCOME, in "
-            "der Income-Phase zwischen CONTINUE und FULL_WITHDRAWAL. Es ist "
+            "der Income-Phase monatlich zwischen CONTINUE, PARTIAL_WITHDRAWAL "
+            "und FULL_WITHDRAWAL. Es ist "
             "deshalb nicht als isolierter Effekt einer einzelnen Rate zu lesen."
         ),
         "",
         (
-            "Entscheidungen liegen auf Vertragsjahrestagen; noch nicht "
-            "electede und lebende Verträge starten spätestens am ersten "
+            "Income-Election-Entscheidungen liegen auf Vertragsjahrestagen; "
+            "freiwillige Income-Aktionen auf Monatsenden. Noch nicht electede "
+            "und lebende Verträge starten spätestens am ersten "
             "Vertragsjahrestag nach Erreichen des Alters 100. Joint-Life-"
             "Verträge verwenden pfadweise getrennte Primary-/Spouse-"
             "Lebenszustände."
         ),
         "",
         (
-            "Der Variable-Election/Continue-Benchmark zerlegt den Cap-Effekt "
-            "algebraisch in die "
-            "Änderung unter Continue und die Änderung des jeweiligen Wert-Gaps "
-            "gegen Continue. Letztere umfasst Refit, Zustands-/Payoff-Änderungen "
-            "und Trainingsrauschen; sie ist kein isolierter kausaler "
-            "Reoptimierungseffekt. Die 2×2-Zerlegung ergänzt dies um getrennte "
-            "Election-, Post-Election- und Interaktionseffekte. Rohe Election- "
-            "und Full-Withdrawal-Action-Raten sind über Modellpunkt-/Pfad-/"
+            "Berichtet werden ausschließlich die vollständigen V11-Policies; "
+            "V00/V01/V10 und die Zerlegung in Election-, Post-Election- und "
+            "Interaktionseffekte entfallen. Rohe Election- sowie Partial-/"
+            "Full-Withdrawal-Action-Raten sind über Modellpunkt-/Pfad-/"
             "Entscheidungsereignisse ungewichtet und keine portfolio-gewichteten "
             "Take-up- oder Surrender-Raten."
         ),
@@ -4937,8 +5479,8 @@ def _write_report(
             else "- Es liegt kein Equity-Level-Stressergebnis vor."
         ),
         (
-            "- Lapse-Risiko wird über Dynamic versus LSMC und die 2×2-Zerlegung "
-            "von Election und Post-Election Behaviour untersucht. Ein symmetrischer "
+            "- Lapse-Risiko wird über die vollständigen Dynamic-V11- und "
+            "LSMC-V11-Policies untersucht. Ein symmetrischer "
             "statistischer Lapse-/Take-up-/Withdrawal-Schock wird nicht auf LSMC "
             "angewandt, weil dessen phasenspezifisches Joint-Action-Set diese "
             "statistischen Funktionen ersetzt."
@@ -4950,10 +5492,9 @@ def _write_report(
             "Konfidenzanalysen nicht als statistisch signifikant zu werten."
         ),
         (
-            "- Die LSMC-Policy ist ein konservativer Lower Bound auf einem "
-            "jährlichen Exercise-Grid mit WAIT/START_INCOME in Growth und "
-            "CONTINUE/FULL_WITHDRAWAL in Income; Partial Withdrawal ist nicht "
-            "Teil des Action Sets. "
+            "- Die LSMC-Policy ist ein konservativer Lower Bound mit jährlichem "
+            "WAIT/START_INCOME in Growth und monatlichem CONTINUE/"
+            "PARTIAL_WITHDRAWAL/FULL_WITHDRAWAL in Income. "
             "Der Lower Bound gilt für den Policyholder-Wert und ist kein "
             "konservativer Upper Bound für Versichererkosten."
         ),
@@ -4977,8 +5518,10 @@ def _write_report(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    output = args.output.expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root, output, run_id, run_created_at_utc = (
+        _create_timestamped_run_directory(args.output)
+    )
+    log_to_console(f"Risk-analysis run directory: {output}")
     rates = sorted({
         _rate_key(rate)
         for rate in (*args.crediting_rates, args.baseline_rate)
@@ -5185,27 +5728,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             level="WARNING",
         )
 
-    # Base and stress scenarios are independent.  A single queue avoids the
-    # former four-job base barrier leaving most of a 16-worker pool idle before
-    # the larger stress grid starts.
+    # Base and opt-in stress scenarios are independent.  A single queue also
+    # keeps explicitly requested multi-cell grids efficient when callers raise
+    # the worker count above the reduced serial default.
     _run_pending_jobs(all_jobs, worker_plan, phase_label="valuation grid")
+    validated_results_by_sequence: dict[
+        int,
+        tuple[dict[str, object], list[dict[str, object]]],
+    ] = dict(validated_base_reuse_results)
+    validated_results_by_sequence.update({
+        sequence: (row, [])
+        for sequence, row in validated_stress_reuse_rows.items()
+    })
+    cell_validation_failures: list[str] = []
+    for job in all_jobs:
+        if job.sequence in validated_results_by_sequence:
+            continue
+        try:
+            validated_results_by_sequence[job.sequence] = _load_scenario_result(
+                args,
+                job.rate,
+                job.dynamic_output,
+                job.lsmc_output,
+                expected_stress=job.stress_id,
+            )
+        except (OSError, ValueError, TypeError, KeyError, csv.Error) as exc:
+            cell_validation_failures.append(
+                f"{job.label}: {type(exc).__name__}: "
+                + " ".join(str(exc).split())
+            )
+    if cell_validation_failures:
+        raise RuntimeError(
+            "One or more scenario cells failed validation; no aggregate "
+            "report was created:\n" + "\n".join(cell_validation_failures)
+        )
+
     rows: list[dict[str, object]] = []
     model_point_rows: list[dict[str, object]] = []
     for index, job in enumerate(base_jobs, start=1):
         log_to_console(
             f"[base validation {index}/{len(base_jobs)}] {job.label}"
         )
-        if job.sequence in validated_base_reuse_results:
-            scenario_row, scenario_model_points = (
-                validated_base_reuse_results[job.sequence]
-            )
-        else:
-            scenario_row, scenario_model_points = _load_scenario_result(
-                args,
-                job.rate,
-                job.dynamic_output,
-                job.lsmc_output,
-            )
+        scenario_row, scenario_model_points = validated_results_by_sequence[
+            job.sequence
+        ]
         rows.append(scenario_row)
         model_point_rows.extend(scenario_model_points)
 
@@ -5216,6 +5782,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     training_fingerprints = {
         str(row["training_scenario_fingerprint"]) for row in rows
+    }
+    training_fingerprint_triplets = {
+        str(row["training_scenario_fingerprints_json"]) for row in rows
+    }
+    if len(training_fingerprint_triplets) != 1:
+        raise ValueError(
+            "Base scenarios do not share the same three training samples."
+        )
+    common_training_fingerprints = tuple(json.loads(
+        next(iter(training_fingerprint_triplets))
+    ))
+    validation_fingerprints = {
+        str(row["validation_scenario_fingerprint"]) for row in rows
     }
     source_fingerprints = {
         str(row["source_metadata_fingerprint"]) for row in rows
@@ -5238,16 +5817,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"[stress validation {index}/{len(stress_group_jobs)}] "
                     f"{job.label}"
                 )
-                if job.sequence in validated_stress_reuse_rows:
-                    stress_row = validated_stress_reuse_rows[job.sequence]
-                else:
-                    stress_row, _stress_model_points = _load_scenario_result(
-                        args,
-                        job.rate,
-                        job.dynamic_output,
-                        job.lsmc_output,
-                        expected_stress=stress_id,
-                    )
+                stress_row, _stress_model_points = (
+                    validated_results_by_sequence[job.sequence]
+                )
                 stress_group.append(stress_row)
                 stressed_scenario_rows.append(stress_row)
 
@@ -5312,39 +5884,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _add_baseline_deltas(rows, args.baseline_rate)
     sensitivity_rows = _build_sensitivity_rows(rows, args.baseline_rate)
-    decomposition_rows = _build_decomposition_rows(rows, args.baseline_rate)
-    behaviour_decomposition_rows = _build_behaviour_decomposition_rows(rows)
+    decomposition_rows: list[dict[str, object]] = []
+    behaviour_decomposition_rows: list[dict[str, object]] = []
     stress_loss_rows = _build_stress_loss_rows(
         rows,
         stressed_scenario_rows,
         args.baseline_rate,
     )
-    for row in decomposition_rows:
-        mechanical = float(row["continue_benchmark_change_vs_baseline"])
-        lsmc_interaction = float(
-            row["change_in_lsmc_minus_continue_gap_vs_baseline"])
-        dynamic_interaction = float(
-            row["change_in_dynamic_minus_continue_gap_vs_baseline"])
-        if not _close(
-            float(row["lsmc_total_change_vs_baseline"]),
-            mechanical + lsmc_interaction,
-        ):
-            raise ValueError("LSMC cap-effect decomposition does not reconcile.")
-        if not _close(
-            float(row["dynamic_total_change_vs_baseline"]),
-            mechanical + dynamic_interaction,
-        ):
-            raise ValueError("Dynamic cap-effect decomposition does not reconcile.")
-    for row in behaviour_decomposition_rows:
-        if not _close(
-            float(row["decomposition_reconciliation_gap_aud"]),
-            0.0,
-        ):
-            raise ValueError(
-                "Election/post-Election Behaviour decomposition does not "
-                "reconcile."
-            )
-
     risk_csv = output / "portfolio_risk_by_crediting_cap.csv"
     sensitivity_csv = output / "crediting_cap_risk_sensitivities.csv"
     decomposition_csv = output / "crediting_cap_effect_decomposition.csv"
@@ -5357,7 +5903,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     manifest_path = output / "analysis_manifest.json"
     _write_csv(risk_csv, rows)
     _write_csv(sensitivity_csv, sensitivity_rows)
-    _write_csv(decomposition_csv, decomposition_rows)
+    if decomposition_rows:
+        _write_csv(decomposition_csv, decomposition_rows)
     if behaviour_decomposition_rows:
         _write_csv(behaviour_decomposition_csv, behaviour_decomposition_rows)
     _write_csv(model_point_csv, model_point_rows)
@@ -5395,6 +5942,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     manifest = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "run_created_at_utc": run_created_at_utc,
+        "output_root": str(output_root),
+        "run_directory": str(output),
         "purpose": "gmlb_gmwb_shock_cap_and_behaviour_portfolio_risk_analysis",
         "contractual_base_crediting_cap_rate": DEFAULT_BASELINE_RATE,
         "contractual_minimum_crediting_cap_rate": (
@@ -5410,12 +5961,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "post_election_lapse_and_withdrawal"
             ),
             "lsmc_behaviour": (
-                "annual_out_of_sample_joint_income_election_and_full_"
-                "withdrawal_lower_bound"
+                "annual_election_and_monthly_continue_partial_full_"
+                "cross_fitted_lower_bound"
             ),
             "income_election_action_set": ["WAIT", "START_INCOME"],
-            "post_income_action_set": ["CONTINUE", "FULL_WITHDRAWAL"],
-            "income_election_decision_grid": "policy_anniversaries",
+            "post_income_action_set": [
+                "CONTINUE",
+                "PARTIAL_WITHDRAWAL",
+                "FULL_WITHDRAWAL",
+            ],
+            "income_election_decision_grid": {
+                "income_election": "policy_anniversaries",
+                "income_actions": "monthly",
+            },
             "minimum_income_start": "contractual_minimum_start_rule",
             "forced_income_start": (
                 "first_policy_anniversary_after_primary_attains_age_100"
@@ -5438,22 +5996,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "monthly_cashflow_grid"
             ),
             "customer_liability_uses_performance_fund_as_backing": False,
-            "behaviour_benchmarks": {
-                "deterministic_election_continue": (
-                    "deterministic Election; no voluntary post-Election exit"
+            "behaviour_arms_retained": {
+                "dynamic_v11": (
+                    "dynamic Election; dynamic post-Election behaviour"
                 ),
-                "deterministic_election_post_behaviour": (
-                    "deterministic Election; active post-Election behaviour"
-                ),
-                "variable_election_continue": (
-                    "variable/optimal Election; no voluntary post-Election exit"
-                ),
-                "full_policy": (
-                    "variable/optimal Election; active post-Election behaviour"
+                "lsmc_v11": (
+                    "optimal Election; optimal monthly Income actions"
                 ),
             },
-            "variable_election_continue_benchmark_used_for_cap_decomposition": True,
-            "two_by_two_behaviour_effect_decomposition": True,
+            "counterfactual_v00_v01_v10_dynamic_runs": False,
+            "behaviour_effect_decomposition_calculated": False,
             "lsmc_policy_refitted_for_every_crediting_cap": True,
             "lsmc_policy_refitted_for_every_stress_and_crediting_cap": (
                 not args.no_stress_analysis),
@@ -5471,8 +6023,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "default_risk_scope": list(DEFAULT_RISK_SCOPE),
             "effective_risk_scope": effective_risk_scope,
             "lapse_risk_assessment": (
-                "dynamic_vs_lsmc_and_two_by_two_election_post_election_"
-                "behaviour_decomposition"
+                "full_policy_dynamic_v11_vs_full_policy_lsmc_v11"
             ),
             "stress_losses_are_not_regulatory_capital_aggregation": True,
             "portfolio_tail_distribution_calculated": False,
@@ -5486,6 +6037,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "train_seed": args.train_seed,
             "train_take_up_seed": args.train_take_up_seed,
             "train_mortality_seed": args.train_mortality_seed,
+            "train_seed_2": args.train_seed_2,
+            "train_take_up_seed_2": args.train_take_up_seed_2,
+            "train_mortality_seed_2": args.train_mortality_seed_2,
+            "train_seed_3": args.train_seed_3,
+            "train_take_up_seed_3": args.train_take_up_seed_3,
+            "train_mortality_seed_3": args.train_mortality_seed_3,
+            "training_seed_triplets": list(
+                _expected_lsmc_training_seed_triplets(args)
+            ),
+            "primary_training_seed_index": 1,
+            "training_seed_selection_rule": (
+                "predeclared_seed_1_not_evaluation_based"
+            ),
+            "n_validation": args.n_validation,
+            "validation_seed": args.validation_seed,
+            "validation_take_up_seed": args.validation_take_up_seed,
+            "validation_mortality_seed": args.validation_mortality_seed,
             "heston_substeps": args.heston_substeps,
             "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
             "lsmc_folds": args.lsmc_folds,
@@ -5519,10 +6087,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 iter(evaluation_fingerprints)),
             "common_training_scenario_fingerprint": next(
                 iter(training_fingerprints)),
+            "common_training_scenario_fingerprints": list(
+                common_training_fingerprints
+            ),
+            "common_validation_scenario_fingerprint": next(
+                iter(validation_fingerprints)),
             "common_source_metadata_fingerprint": next(
                 iter(source_fingerprints)),
             "common_engine_version": next(iter(engine_versions)),
-            "training_and_evaluation_are_distinct": True,
+            "training_validation_evaluation_are_distinct": True,
+            "all_three_training_validation_evaluation_are_distinct": True,
+            "every_training_seed_passes_election_income_combined": True,
+            "primary_training_seed_index": 1,
+            "evaluation_used_for_training_seed_selection": False,
+            "multi_seed_validation_evaluation_csv_required_per_cell": True,
             "aggregation_reconciliations_checked": True,
             "model_point_alignment_checked": True,
             "source_identifiers_checked": True,
@@ -5561,7 +6139,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "policyholder_behaviour": [
                 "behaviour_model_npv_gap_dynamic_minus_lsmc",
                 "lsmc_guarantee_claim_difference",
-                "lsmc_policyholder_value_difference_vs_continue",
                 "income_start_year_mean_median_p10_p90",
                 "income_election_and_forced_election_share",
                 "mean_growth_duration_and_phase_exposures",
@@ -5569,7 +6146,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "unweighted_lsmc_income_election_action_rate",
                 "unweighted_lsmc_full_withdrawal_action_rate",
                 "policy_year_income_election_and_growth_phase_buckets",
-                "two_by_two_election_post_election_decomposition",
             ],
             "model_point_concentration": [
                 "negative_value_contract_share",
@@ -5607,13 +6183,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if stress_loss_rows
                 else "The explicit shock-and-revalue grid was skipped for this run."
             ),
-            "Lapse risk is assessed through Dynamic versus LSMC and the 2x2 Election/post-Election Behaviour decomposition; no symmetric statistical lapse/take-up/withdrawal shock is applied because LSMC replaces those functions with a phase-specific joint action set.",
+            "Lapse risk is assessed through the complete Dynamic V11 versus LSMC V11 policies; no V00/V01/V10 Behaviour-effect decomposition or symmetric statistical lapse/take-up/withdrawal shock is reported.",
             "No catastrophe, FX, credit-spread or correlation stress.",
             "Results are before Risk Margin and gross of reinsurance.",
             "Mortality is illustrative and not an approved production basis.",
-            "LSMC is an annual-grid lower-bound policy with WAIT/START_INCOME before Election and CONTINUE/FULL_WITHDRAWAL after Election.",
+            "LSMC uses annual WAIT/START_INCOME decisions and monthly "
+            "CONTINUE/PARTIAL_WITHDRAWAL/FULL_WITHDRAWAL Income actions.",
             "Income is forced no later than the first policy anniversary after primary age 100 for an eligible surviving contract.",
-            "The LSMC Election and Full-Withdrawal action diagnostics are unweighted fit diagnostics, not portfolio-weighted take-up or surrender rates.",
+            "The LSMC Election, Partial- and Full-Withdrawal action diagnostics are unweighted fit diagnostics, not portfolio-weighted take-up or surrender rates.",
             "Non-6% caps are non-contractual design sensitivities.",
             "Caps below 0.25% are technical sensitivities outside the contractual minimum.",
             "Crediting-cap variants hold all other terms fixed and are not budget-neutral repricings.",
@@ -5622,7 +6199,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "outputs": {
             "portfolio_risk_by_crediting_cap_csv": str(risk_csv),
             "crediting_cap_risk_sensitivities_csv": str(sensitivity_csv),
-            "crediting_cap_effect_decomposition_csv": str(decomposition_csv),
+            "crediting_cap_effect_decomposition_csv": (
+                str(decomposition_csv) if decomposition_rows else None
+            ),
             "behaviour_effect_decomposition_csv": (
                 str(behaviour_decomposition_csv)
                 if behaviour_decomposition_rows else None

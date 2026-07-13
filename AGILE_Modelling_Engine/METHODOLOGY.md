@@ -344,39 +344,69 @@ and solves one phase-dependent Policyholder problem:
 
 ```text
 Growth: WAIT | START_INCOME_NOW
-Income: CONTINUE | FULL_WITHDRAWAL
+Income: CONTINUE | PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL
 ```
 
 `START_INCOME_NOW` fixes annual income from the current post-credit,
 post-fee and post-mortality Account Value and the rate card then in force; it
 is a state transition and has no immediate payment. The first income payment
-is one month later. A newly elected path cannot also choose Full Withdrawal at
-the same timestamp. Growth surrender and Growth withdrawals remain excluded
-by the product gates.
+is one month later. A Partial Withdrawal may be selected at the Election
+anniversary after the regular event sequence; Full Withdrawal is blocked until
+the following month. Growth surrender and Growth withdrawals remain excluded
+by the product gates. Regular Fixed Income is mandatory and is never treated
+as an optional action.
 
-The Income subproblem is fitted on a stratified panel of admissible Election
-states. At every admissible Growth anniversary, backward induction then
+The Income subproblem is solved monthly on a stratified panel of admissible
+Election states. Continue, Full Withdrawal and an adaptive Partial-amount grid
+(AUD 100 and 25/50/75/100% of the maximum gross amount, followed by one local
+midpoint refinement) use the same contractual transition logic. At every
+admissible Growth anniversary, backward induction then
 compares a complete START transition followed by the cross-fitted Income
 policy with WAIT followed by the already-solved later combined policy. Both
 regression surfaces receive only their read-only decision context. Future
 returns, discount factors, later caps, hedge results and backing-asset values
 are not part of either feature surface.
 
-Complete paths remain out of fold. Ridge regularisation, rank and condition
-gates and an out-of-fold RMSE action buffer apply to both action types. An
-unstable Election regression falls back to WAIT and an unstable Surrender
-regression to CONTINUE; the contractual automatic-age gate overrides WAIT.
-The final full-sample policy is frozen and valued on independent evaluation
-paths. Its fit-basis fingerprint includes training scenario content, Cap,
+Complete paths, including all action replicas, remain in one fold. Direct
+action advantages are fitted by augmented truncated-SVD/Ridge least squares;
+Ridge is selected from a fixed grid by out-of-fold decision loss. The action
+buffer is based on advantage RMSE. Material missing or unstable regressions do
+not silently become WAIT or CONTINUE: they make the fit invalid.
+
+At each decision point the estimator tries the compact full basis, then a
+linear core basis, then a paired constant-advantage model, and finally local
+pooling (adjacent Election years or a twelve-month Income window). A fit is
+deployable only if at least 99% of weighted relevant exposure is covered.
+Decision points below one millionth of initial exposure may be recorded as
+`immaterial_no_fit`; this is the only no-action numerical fallback.
+
+After the initial backward fit, at most two cross-fit on-policy rollouts update
+the visited-state distribution. Convergence requires at least 99% action
+agreement on common paths and a Policyholder lower-bound change no larger than
+0.1% of premium. Failure is reported as `policy_iteration_not_converged` and
+invalidates the policy.
+
+Training, validation and final evaluation are three independent samples. The
+frozen policy must pass paired 95% non-inferiority gates for Election-only,
+Income-action-only and Combined behaviour against a pre-declared deterministic
+benchmark library, with a tolerance of one basis point of premium. Validation
+does not tune the policy; a failed gate writes diagnostics and aborts before
+the final sample is used. Three separately trained policies, using three
+pre-declared training-seed triplets, must each pass all gates on the same
+validation paths and are each reported on the same final evaluation paths.
+The first seed is the pre-declared primary reporting policy; final evaluation
+is never used to select among seeds. The fit-basis fingerprint includes
+training scenario content, Cap,
 stress, product and canonical policy basis, mortality, expenses, projection
 configuration and LSMC settings. A Cap×stress analysis must therefore refit,
 and evidence a distinct fit basis, for every cell.
 
 The V00/V01/V10/V11 report is a factor decomposition of that frozen joint
-policy. V01 deploys its Income rule under deterministic Election without a
-separate refit; V10 deploys its Election rule with Surrender suppressed without
-a Continue-only refit. These deliberate restrictions are manifest limitations,
-not four independently re-optimised contracts.
+policy. V01 deploys its monthly Income-action rule under deterministic Election
+without a separate refit; V10 deploys its Election rule with all voluntary
+Income actions suppressed without a Continue-only refit. These deliberate
+restrictions are manifest limitations, not four independently re-optimised
+contracts.
 
 ## 10. Market models and measures
 

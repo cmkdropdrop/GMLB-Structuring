@@ -28,8 +28,9 @@ Monthly event order (documented convention)
 7. lifetime income payment to lives surviving to the payment date (monthly,
    in arrears; the first payment falls one month after income election, PDS
    section 13); shortfall beyond Account Value is a Guarantee Claim,
-8. dynamically modelled Income-phase Excess/Partial Withdrawals, and
-9. Income-phase lapse / Full Withdrawal after event-driven fee posting and MVA.
+8. exactly one voluntary Income action: either the configured statistical
+   Partial/Excess-Withdrawal-and-lapse path or an external unified
+   CONTINUE/PARTIAL/FULL policy action.
 
 Daily Value Adjustment and insurer hedge/backing model
 -------------------------------------------------------
@@ -53,7 +54,8 @@ uncapped long call.  Fair premium, purchase markup, hedge-reference management
 fee and any legacy execution proxy are insurer hedge costs.  They never alter
 the customer Reference Fund, Account Value, credited return or claims.  The
 uncapped alternative alone records the option payoff above the customer cap as
-an insurer hedge gain.  Neither COS nor LSMC is used by the portfolio workflow.
+an insurer hedge gain.  Neither COS nor LSMC is used to value this intra-year
+DVA package.
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ from __future__ import annotations
 from calendar import isleap
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
+from enum import Enum
 from inspect import signature
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional
@@ -80,6 +83,1238 @@ from .product import (IndexLinkedLifetimeIncomeProduct, ExpenseAssumptions, Fund
                       Protection, SpouseDeathElection, INCOME_PHASE_OPTION)
 
 Array = NDArray[np.float64]
+
+
+class IncomeActionType(str, Enum):
+    """Mutually exclusive voluntary actions available in Income phase."""
+
+    CONTINUE = "continue"
+    PARTIAL_WITHDRAWAL = "partial_withdrawal"
+    FULL_WITHDRAWAL = "full_withdrawal"
+
+
+@dataclass(frozen=True)
+class IncomeActionDecision:
+    """Immutable pathwise decision returned by an optimal Income policy.
+
+    ``action_type`` accepts exact :class:`IncomeActionType` members or their
+    string values.  A Partial Withdrawal specifies its gross amount as a
+    fraction of ``context.max_partial_gross_amount``.  CONTINUE and FULL must
+    carry a zero fraction so the three actions remain strictly exclusive.
+    """
+
+    action_type: object
+    partial_fraction_of_max: Array
+
+    def __post_init__(self) -> None:
+        supplied_actions = np.asarray(self.action_type, dtype=object)
+        if supplied_actions.ndim != 1:
+            raise ValueError("Income action_type must be one-dimensional.")
+
+        normalised = np.empty(supplied_actions.shape, dtype="<U18")
+        for index, supplied in enumerate(supplied_actions):
+            try:
+                action = (
+                    supplied
+                    if isinstance(supplied, IncomeActionType)
+                    else IncomeActionType(supplied)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Income action_type contains an unknown action."
+                ) from exc
+            normalised[index] = action.value
+
+        fractions = np.array(
+            self.partial_fraction_of_max, dtype=float, copy=True
+        )
+        if fractions.ndim != 1:
+            raise ValueError(
+                "partial_fraction_of_max must be one-dimensional."
+            )
+        if fractions.shape != normalised.shape:
+            raise ValueError(
+                "Income action arrays must share one scenario-path shape."
+            )
+        if not np.all(np.isfinite(fractions)) or not np.all(
+            (fractions >= 0.0) & (fractions <= 1.0)
+        ):
+            raise ValueError(
+                "partial_fraction_of_max must contain finite values in [0, 1]."
+            )
+
+        partial = normalised == IncomeActionType.PARTIAL_WITHDRAWAL.value
+        if np.any(partial & (fractions <= 0.0)):
+            raise ValueError(
+                "PARTIAL_WITHDRAWAL requires a strictly positive fraction."
+            )
+        if np.any(~partial & (fractions != 0.0)):
+            raise ValueError(
+                "CONTINUE and FULL_WITHDRAWAL require a zero partial fraction."
+            )
+
+        normalised.setflags(write=False)
+        fractions.setflags(write=False)
+        object.__setattr__(self, "action_type", normalised)
+        object.__setattr__(self, "partial_fraction_of_max", fractions)
+
+    @property
+    def n_paths(self) -> int:
+        """Number of scenario paths represented by the decision."""
+        return int(self.action_type.shape[0])
+
+
+@dataclass(frozen=True)
+class IncomeActionDecisionContext:
+    """Read-only state at the monthly voluntary Income-action boundary.
+
+    The boundary is after mortality, any Income Election and the regular
+    monthly Fixed-Income payment.  It contains customer-observable current
+    state only: no future market paths, discount factors, backing assets or
+    hedge results.  ``max_partial_gross_amount`` is the largest contractual
+    gross deduction which preserves the minimum residual Account Value;
+    cash received can be smaller because MVA is applied by the projector.
+    """
+
+    step: int
+    phase: NDArray[np.int8]
+    inforce_weight: Array
+    partial_withdrawal_eligible: NDArray[np.bool_]
+    full_withdrawal_eligible: NDArray[np.bool_]
+    max_partial_gross_amount: Array
+    account_value: Array
+    locked_annual_income: Array
+    guarantee_pv: Array
+    guarantee_log_moneyness: Array
+    mva_factor: Array
+    surrender_value: Array
+    short_rate: Array
+    zero_rate_5y: Array
+    heston_variance: Array
+    duration_years: float
+    mva_remaining_years: float
+    attained_age: Array
+    time_to_forced_election: Array
+    primary_alive: NDArray[np.bool_]
+    spouse_alive: NDArray[np.bool_]
+    announced_cap: Array
+    previous_reference_return: Array
+    previous_credited_return: Array
+    performance_gap: Array
+    just_elected: NDArray[np.bool_]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.step, bool) or int(self.step) != self.step or self.step < 0:
+            raise ValueError("Income-action step must be a non-negative integer.")
+        if not np.isfinite(self.duration_years) or self.duration_years < 0.0:
+            raise ValueError(
+                "Income-action duration_years must be finite and non-negative."
+            )
+        if (
+            not np.isfinite(self.mva_remaining_years)
+            or self.mva_remaining_years < 0.0
+        ):
+            raise ValueError(
+                "Income-action mva_remaining_years must be finite/non-negative."
+            )
+
+        array_dtypes: dict[str, object] = {
+            "phase": np.int8,
+            "inforce_weight": float,
+            "partial_withdrawal_eligible": bool,
+            "full_withdrawal_eligible": bool,
+            "max_partial_gross_amount": float,
+            "account_value": float,
+            "locked_annual_income": float,
+            "guarantee_pv": float,
+            "guarantee_log_moneyness": float,
+            "mva_factor": float,
+            "surrender_value": float,
+            "short_rate": float,
+            "zero_rate_5y": float,
+            "heston_variance": float,
+            "attained_age": float,
+            "time_to_forced_election": float,
+            "primary_alive": bool,
+            "spouse_alive": bool,
+            "announced_cap": float,
+            "previous_reference_return": float,
+            "previous_credited_return": float,
+            "performance_gap": float,
+            "just_elected": bool,
+        }
+        expected_shape: Optional[tuple[int, ...]] = None
+        for name, dtype in array_dtypes.items():
+            value = np.array(getattr(self, name), dtype=dtype, copy=True)
+            if value.ndim != 1:
+                raise ValueError(
+                    f"Income-action context {name} must be one-dimensional."
+                )
+            if expected_shape is None:
+                expected_shape = value.shape
+            elif value.shape != expected_shape:
+                raise ValueError(
+                    "Income-action context arrays must share one path shape."
+                )
+            if dtype not in (bool, np.int8):
+                valid = (
+                    np.all(~np.isnan(value) & (value >= 0.0))
+                    if name == "announced_cap"
+                    else np.all(np.isfinite(value))
+                )
+                if not valid:
+                    raise ValueError(
+                        f"Income-action context {name} is invalid."
+                    )
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+        if not np.all(np.isin(
+            self.phase,
+            np.asarray([
+                Phase.GROWTH.value,
+                Phase.INCOME.value,
+                Phase.TERMINATED.value,
+            ], dtype=np.int8),
+        )):
+            raise ValueError("Income-action context contains an unknown phase.")
+        for name in (
+            "inforce_weight",
+            "max_partial_gross_amount",
+            "account_value",
+            "locked_annual_income",
+            "guarantee_pv",
+            "mva_factor",
+            "surrender_value",
+            "attained_age",
+            "time_to_forced_election",
+        ):
+            if np.any(getattr(self, name) < 0.0):
+                raise ValueError(
+                    f"Income-action context {name} must be non-negative."
+                )
+        if np.any(self.mva_factor > 1.0 + 1.0e-12):
+            raise ValueError("Income-action mva_factor must not exceed one.")
+        if np.any(
+            self.partial_withdrawal_eligible
+            & (self.phase != Phase.INCOME.value)
+        ) or np.any(
+            self.full_withdrawal_eligible
+            & (self.phase != Phase.INCOME.value)
+        ):
+            raise ValueError("Income actions are eligible only in Income phase.")
+        if np.any(
+            self.full_withdrawal_eligible & self.just_elected
+        ):
+            raise ValueError(
+                "Full Withdrawal cannot be eligible in the Election month."
+            )
+
+    @property
+    def n_paths(self) -> int:
+        """Number of scenario paths represented by the context."""
+        return int(self.account_value.shape[0])
+
+
+def _frozen_path_array(
+    value: object,
+    *,
+    name: str,
+    dtype: object = float,
+    shape: Optional[tuple[int, ...]] = None,
+    allow_positive_infinity: bool = False,
+) -> NDArray:
+    """Return one defensive, read-only one-dimensional path array."""
+    array = np.array(value, dtype=dtype, copy=True)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional.")
+    if shape is not None and array.shape != shape:
+        raise ValueError(f"{name} must share the scenario-path shape {shape}.")
+    if dtype not in (bool, np.bool_, np.int8):
+        valid = np.isfinite(array)
+        if allow_positive_infinity:
+            valid |= np.isposinf(array)
+        if not np.all(valid):
+            qualifier = "finite values or positive infinity" if (
+                allow_positive_infinity
+            ) else "finite values"
+            raise ValueError(f"{name} must contain {qualifier}.")
+    array.setflags(write=False)
+    return array
+
+
+@dataclass(frozen=True)
+class IncomeActionState:
+    """Complete array-native state at a voluntary Income-action boundary.
+
+    This is an engine/training surface, not an information surface offered to
+    a Policyholder policy.  It deliberately carries the fee, mortality and
+    DVA subledgers needed to propagate a counterfactual action to the next
+    monthly boundary.  All fields are defensively copied and read-only.
+
+    The v2 optimal-action engine supports the generic product without Age
+    Pension Plus.  Growth paths may be present in a collected panel, but the
+    transition functions prohibit voluntary actions on those paths.
+    """
+
+    step: int
+    path_index: NDArray[np.int64]
+    gross_premium: Array
+    attained_age: Array
+    time_to_forced_election: Array
+    account_value: Array
+    iv_frame: Array
+    locked_annual_income: Array
+    phase: NDArray[np.int8]
+    inforce_weight: Array
+    fee_product_accrued: Array
+    fee_lip_accrued: Array
+    primary_alive: NDArray[np.bool_]
+    spouse_alive: NDArray[np.bool_]
+    joint_income_cover: NDArray[np.bool_]
+    joint_survival_primary: Array
+    joint_survival_spouse: Array
+    previous_reference_return: Array
+    previous_credited_return: Array
+    performance_gap: Array
+    announced_cap: Array
+    just_elected: NDArray[np.bool_]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.step, bool)
+            or int(self.step) != self.step
+            or self.step < 0
+        ):
+            raise ValueError("Income-action state step must be non-negative.")
+        dtypes: dict[str, object] = {
+            "path_index": np.int64,
+            "gross_premium": float,
+            "attained_age": float,
+            "time_to_forced_election": float,
+            "account_value": float,
+            "iv_frame": float,
+            "locked_annual_income": float,
+            "phase": np.int8,
+            "inforce_weight": float,
+            "fee_product_accrued": float,
+            "fee_lip_accrued": float,
+            "primary_alive": bool,
+            "spouse_alive": bool,
+            "joint_income_cover": bool,
+            "joint_survival_primary": float,
+            "joint_survival_spouse": float,
+            "previous_reference_return": float,
+            "previous_credited_return": float,
+            "performance_gap": float,
+            "announced_cap": float,
+            "just_elected": bool,
+        }
+        shape: Optional[tuple[int, ...]] = None
+        for name, dtype in dtypes.items():
+            value = _frozen_path_array(
+                getattr(self, name), name=f"Income-action state {name}",
+                dtype=dtype, shape=shape,
+                allow_positive_infinity=name == "announced_cap",
+            )
+            if shape is None:
+                shape = value.shape
+            object.__setattr__(self, name, value)
+
+        if not np.all(np.isin(
+            self.phase,
+            np.asarray([
+                Phase.GROWTH.value,
+                Phase.INCOME.value,
+                Phase.TERMINATED.value,
+            ], dtype=np.int8),
+        )):
+            raise ValueError("Income-action state contains an unknown phase.")
+        if np.any(self.path_index < 0) or np.unique(self.path_index).size != self.n_paths:
+            raise ValueError("Income-action state path_index must be unique/non-negative.")
+        for name in (
+            "gross_premium",
+            "attained_age",
+            "time_to_forced_election",
+            "account_value",
+            "iv_frame",
+            "locked_annual_income",
+            "inforce_weight",
+            "fee_product_accrued",
+            "fee_lip_accrued",
+            "performance_gap",
+            "announced_cap",
+        ):
+            if np.any(getattr(self, name) < 0.0):
+                raise ValueError(f"Income-action state {name} must be non-negative.")
+        if np.any(self.gross_premium <= 0.0):
+            raise ValueError("Income-action state gross_premium must be positive.")
+        for name in ("joint_survival_primary", "joint_survival_spouse"):
+            value = getattr(self, name)
+            if np.any((value < 0.0) | (value > 1.0)):
+                raise ValueError(f"Income-action state {name} must be in [0, 1].")
+
+    @property
+    def n_paths(self) -> int:
+        return int(self.account_value.shape[0])
+
+
+@dataclass(frozen=True)
+class IncomeMonthScenarioSlice:
+    """Exogenous current/next-boundary data for one Income month.
+
+    The object is intentionally explicit: market-model, mortality and discount
+    simulation remain owned by the canonical projector.  A Forward pass can
+    collect these immutable slices once, and every CONTINUE/PARTIAL/FULL
+    counterfactual then advances under the *same* market and mortality shock.
+
+    ``anniversary_credit_rate`` is used only when ``is_anniversary`` is true.
+    ``next_dva_factor`` maps the post-credit/post-fee IV frame to customer
+    Account Value at the next action boundary (one when DVA is disabled).
+    ``terminating_death_probability`` is either a sampled 0/1 event or the
+    expected monthly decrement used by the deterministic projector.
+    """
+
+    current_step: int
+    next_step: int
+    current_duration_years: float
+    next_duration_years: float
+    is_anniversary: bool
+    terminal_next: bool
+    fee_year_fraction: float
+    current_mva_factor: Array
+    current_annuity_factor: Array
+    current_short_rate: Array
+    current_zero_rate_5y: Array
+    current_heston_variance: Array
+    anniversary_credit_rate: Array
+    next_dva_factor: Array
+    terminating_death_probability: Array
+    next_primary_alive: NDArray[np.bool_]
+    next_spouse_alive: NDArray[np.bool_]
+    next_joint_income_cover: NDArray[np.bool_]
+    next_joint_survival_primary: Array
+    next_joint_survival_spouse: Array
+    next_mva_factor: Array
+    next_annuity_factor: Array
+    next_short_rate: Array
+    next_zero_rate_5y: Array
+    next_heston_variance: Array
+    next_announced_cap: Array
+    next_reference_return: Array
+    next_credited_return: Array
+    next_performance_gap: Array
+    discount_ratio: Array
+
+    def __post_init__(self) -> None:
+        for name in ("current_step", "next_step"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) != value or value < 0:
+                raise ValueError(f"Income-month {name} must be non-negative.")
+        if self.next_step != self.current_step + 1:
+            raise ValueError("Income-month slices must span exactly one grid step.")
+        if (
+            not np.isfinite(self.current_duration_years)
+            or not np.isfinite(self.next_duration_years)
+            or self.current_duration_years < 0.0
+            or self.next_duration_years <= self.current_duration_years
+        ):
+            raise ValueError("Income-month durations must be increasing and finite.")
+        if not isinstance(self.is_anniversary, (bool, np.bool_)):
+            raise ValueError("Income-month is_anniversary must be boolean.")
+        if not isinstance(self.terminal_next, (bool, np.bool_)):
+            raise ValueError("Income-month terminal_next must be boolean.")
+        if not np.isfinite(self.fee_year_fraction) or self.fee_year_fraction <= 0.0:
+            raise ValueError("Income-month fee_year_fraction must be positive.")
+
+        dtypes: dict[str, object] = {
+            "current_mva_factor": float,
+            "current_annuity_factor": float,
+            "current_short_rate": float,
+            "current_zero_rate_5y": float,
+            "current_heston_variance": float,
+            "anniversary_credit_rate": float,
+            "next_dva_factor": float,
+            "terminating_death_probability": float,
+            "next_primary_alive": bool,
+            "next_spouse_alive": bool,
+            "next_joint_income_cover": bool,
+            "next_joint_survival_primary": float,
+            "next_joint_survival_spouse": float,
+            "next_mva_factor": float,
+            "next_annuity_factor": float,
+            "next_short_rate": float,
+            "next_zero_rate_5y": float,
+            "next_heston_variance": float,
+            "next_announced_cap": float,
+            "next_reference_return": float,
+            "next_credited_return": float,
+            "next_performance_gap": float,
+            "discount_ratio": float,
+        }
+        shape: Optional[tuple[int, ...]] = None
+        for name, dtype in dtypes.items():
+            value = _frozen_path_array(
+                getattr(self, name), name=f"Income-month slice {name}",
+                dtype=dtype, shape=shape,
+                allow_positive_infinity=name == "next_announced_cap",
+            )
+            if shape is None:
+                shape = value.shape
+            object.__setattr__(self, name, value)
+
+        for name in ("current_mva_factor", "next_mva_factor"):
+            value = getattr(self, name)
+            if np.any((value < 0.0) | (value > 1.0 + 1.0e-12)):
+                raise ValueError(f"Income-month {name} must be in [0, 1].")
+        for name in (
+            "current_annuity_factor",
+            "current_heston_variance",
+            "anniversary_credit_rate",
+            "next_dva_factor",
+            "next_annuity_factor",
+            "next_heston_variance",
+            "next_announced_cap",
+            "next_performance_gap",
+            "discount_ratio",
+        ):
+            if np.any(getattr(self, name) < 0.0):
+                raise ValueError(f"Income-month {name} must be non-negative.")
+        if np.any(self.next_dva_factor <= 0.0):
+            raise ValueError("Income-month next_dva_factor must be positive.")
+        if np.any(self.discount_ratio <= 0.0):
+            raise ValueError("Income-month discount_ratio must be positive.")
+        probability = self.terminating_death_probability
+        if np.any((probability < 0.0) | (probability > 1.0)):
+            raise ValueError(
+                "Income-month terminating_death_probability must be in [0, 1]."
+            )
+        for name in ("next_joint_survival_primary", "next_joint_survival_spouse"):
+            value = getattr(self, name)
+            if np.any((value < 0.0) | (value > 1.0)):
+                raise ValueError(f"Income-month {name} must be in [0, 1].")
+
+    @property
+    def n_paths(self) -> int:
+        return int(self.current_mva_factor.shape[0])
+
+
+@dataclass(frozen=True)
+class IncomeActionTransition:
+    """Immediate action cashflows and exact post-action contract state.
+
+    Cashflows are already multiplied by ``state.inforce_weight``, matching the
+    canonical projector ledgers.  A Partial Withdrawal has no fee cashflow;
+    Full Withdrawal posts both fee subledgers before surrender settlement.
+    """
+
+    executed_decision: IncomeActionDecision
+    post_action_state: IncomeActionState
+    gross_partial_deduction: Array
+    partial_withdrawal_cashflow: Array
+    surrender_benefit_cashflow: Array
+    fees_product_cashflow: Array
+    fees_lip_cashflow: Array
+    mva_retained_cashflow: Array
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.executed_decision, IncomeActionDecision):
+            raise TypeError("executed_decision must be IncomeActionDecision.")
+        if not isinstance(self.post_action_state, IncomeActionState):
+            raise TypeError("post_action_state must be IncomeActionState.")
+        n_paths = self.post_action_state.n_paths
+        if self.executed_decision.n_paths != n_paths:
+            raise ValueError("Income action transition path shapes do not match.")
+        for name in (
+            "gross_partial_deduction",
+            "partial_withdrawal_cashflow",
+            "surrender_benefit_cashflow",
+            "fees_product_cashflow",
+            "fees_lip_cashflow",
+            "mva_retained_cashflow",
+        ):
+            value = _frozen_path_array(
+                getattr(self, name), name=f"Income action transition {name}",
+                shape=(n_paths,),
+            )
+            if np.any(value < 0.0):
+                raise ValueError(f"Income action transition {name} is negative.")
+            object.__setattr__(self, name, value)
+
+    @property
+    def policyholder_cashflow(self) -> Array:
+        value = np.asarray(
+            self.partial_withdrawal_cashflow + self.surrender_benefit_cashflow,
+            dtype=float,
+        )
+        value.setflags(write=False)
+        return value
+
+
+@dataclass(frozen=True)
+class IncomeMonthTransition:
+    """Mandatory cashflows and next state after one Income month."""
+
+    next_state: IncomeActionState
+    next_context: IncomeActionDecisionContext
+    income_cashflow: Array
+    death_benefit_cashflow: Array
+    terminal_closeout_cashflow: Array
+    guarantee_claim_cashflow: Array
+    fees_product_cashflow: Array
+    fees_lip_cashflow: Array
+    discount_ratio: Array
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.next_state, IncomeActionState):
+            raise TypeError("next_state must be IncomeActionState.")
+        if not isinstance(self.next_context, IncomeActionDecisionContext):
+            raise TypeError("next_context must be IncomeActionDecisionContext.")
+        n_paths = self.next_state.n_paths
+        if self.next_context.n_paths != n_paths:
+            raise ValueError("Income month transition path shapes do not match.")
+        for name in (
+            "income_cashflow",
+            "death_benefit_cashflow",
+            "terminal_closeout_cashflow",
+            "guarantee_claim_cashflow",
+            "fees_product_cashflow",
+            "fees_lip_cashflow",
+            "discount_ratio",
+        ):
+            value = _frozen_path_array(
+                getattr(self, name), name=f"Income month transition {name}",
+                shape=(n_paths,),
+            )
+            if np.any(value < 0.0):
+                raise ValueError(f"Income month transition {name} is negative.")
+            object.__setattr__(self, name, value)
+
+    @property
+    def mandatory_policyholder_cashflow(self) -> Array:
+        value = np.asarray(
+            self.income_cashflow
+            + self.death_benefit_cashflow
+            + self.terminal_closeout_cashflow,
+            dtype=float,
+        )
+        value.setflags(write=False)
+        return value
+
+
+class IncomeTransitionPanelCollector:
+    """Minimal recorder for one projector run's monthly Income panels.
+
+    The projector calls :meth:`observe_income_transition` once for each step
+    which has positive Income exposure.  Stored state/slice objects are already
+    immutable; mapping snapshots are exposed read-only.  Reusing one collector
+    for two projections without constructing a fresh instance is rejected so
+    model-point panels cannot be mixed accidentally.
+    """
+
+    def __init__(self) -> None:
+        self._states_by_step: dict[int, IncomeActionState] = {}
+        self._slices_by_step: dict[int, IncomeMonthScenarioSlice] = {}
+
+    def observe_income_transition(
+        self,
+        *,
+        state: IncomeActionState,
+        scenario_slice: IncomeMonthScenarioSlice,
+    ) -> None:
+        if not isinstance(state, IncomeActionState):
+            raise TypeError("Collected state must be IncomeActionState.")
+        if not isinstance(scenario_slice, IncomeMonthScenarioSlice):
+            raise TypeError(
+                "Collected scenario_slice must be IncomeMonthScenarioSlice."
+            )
+        if state.step != scenario_slice.current_step:
+            raise ValueError("Collected Income state/slice steps do not match.")
+        if state.n_paths != scenario_slice.n_paths:
+            raise ValueError("Collected Income state/slice shapes do not match.")
+        if state.step in self._states_by_step:
+            raise ValueError(
+                f"Income transition step {state.step} was collected twice."
+            )
+        self._states_by_step[state.step] = state
+        self._slices_by_step[state.step] = scenario_slice
+
+    @property
+    def states_by_step(self) -> Mapping[int, IncomeActionState]:
+        return MappingProxyType(dict(self._states_by_step))
+
+    @property
+    def slices_by_step(self) -> Mapping[int, IncomeMonthScenarioSlice]:
+        return MappingProxyType(dict(self._slices_by_step))
+
+
+def _settle_fee_subledger_arrays(
+    account_value: object,
+    fee_product_accrued: object,
+    fee_lip_accrued: object,
+) -> tuple[Array, Array, Array]:
+    """Pure fee settlement shared by projector and Bellman transitions."""
+    available = np.maximum(np.asarray(account_value, dtype=float), 0.0)
+    product_due = np.maximum(np.asarray(fee_product_accrued, dtype=float), 0.0)
+    lip_due = np.maximum(np.asarray(fee_lip_accrued, dtype=float), 0.0)
+    if available.shape != product_due.shape or available.shape != lip_due.shape:
+        raise ValueError("Fee-subledger arrays must share one path shape.")
+    outstanding = product_due + lip_due
+    collected = np.minimum(available, outstanding)
+    scale = np.divide(
+        collected,
+        outstanding,
+        out=np.zeros_like(available),
+        where=outstanding > 0.0,
+    )
+    return product_due * scale, lip_due * scale, available - collected
+
+
+def _income_mva_amount(gross: object, mva_factor: object) -> Array:
+    """MVA retained from a generic-product gross Income withdrawal."""
+    gross_array = np.maximum(np.asarray(gross, dtype=float), 0.0)
+    factor = np.asarray(mva_factor, dtype=float)
+    if gross_array.shape != factor.shape:
+        raise ValueError("Income MVA arrays must share one path shape.")
+    return np.clip(gross_array * factor, 0.0, gross_array)
+
+
+def _income_partial_action_values(
+    account_value: object,
+    iv_frame: object,
+    locked_annual_income: object,
+    gross_deduction: object,
+    mva_factor: object,
+) -> tuple[Array, Array, Array, Array, Array]:
+    """Pure generic-product Partial-Withdrawal formulas.
+
+    Returns post-action Account Value, IV frame, locked annual income, cash
+    received and MVA retained.  The caller is responsible for enforcing the
+    AUD 100 minimum and AUD 2,000 residual gates.
+    """
+    account = np.maximum(np.asarray(account_value, dtype=float), 0.0)
+    frame = np.maximum(np.asarray(iv_frame, dtype=float), 0.0)
+    income = np.maximum(np.asarray(locked_annual_income, dtype=float), 0.0)
+    gross = np.maximum(np.asarray(gross_deduction, dtype=float), 0.0)
+    if not (
+        account.shape == frame.shape == income.shape == gross.shape
+        == np.asarray(mva_factor).shape
+    ):
+        raise ValueError("Income Partial-Withdrawal arrays must share one shape.")
+    gross = np.minimum(gross, account)
+    mva = _income_mva_amount(gross, mva_factor)
+    cash = gross - mva
+    post_account = account - gross
+    ratio = np.divide(
+        post_account,
+        np.maximum(account, 1.0e-300),
+        out=np.ones_like(account),
+        where=account > 0.0,
+    )
+    post_frame = frame * ratio
+    post_income = income * np.clip(1.0 - np.divide(
+        gross,
+        np.maximum(account, 1.0e-300),
+        out=np.zeros_like(account),
+        where=account > 0.0,
+    ), 0.0, 1.0)
+    return post_account, post_frame, post_income, cash, mva
+
+
+def _income_action_context_from_values(
+    *,
+    state: IncomeActionState,
+    product: IndexLinkedLifetimeIncomeProduct,
+    step: int,
+    duration_years: float,
+    terminal: bool,
+    mva_factor: Array,
+    annuity_factor: Array,
+    short_rate: Array,
+    zero_rate_5y: Array,
+    heston_variance: Array,
+) -> IncomeActionDecisionContext:
+    """Build the public observable context from a complete private state."""
+    n_paths = state.n_paths
+    for name, value in (
+        ("mva_factor", mva_factor),
+        ("annuity_factor", annuity_factor),
+        ("short_rate", short_rate),
+        ("zero_rate_5y", zero_rate_5y),
+        ("heston_variance", heston_variance),
+    ):
+        if np.asarray(value).shape != (n_paths,):
+            raise ValueError(f"Income-action {name} must have one value per path.")
+
+    _, _, post_fee_account = _settle_fee_subledger_arrays(
+        state.account_value,
+        state.fee_product_accrued,
+        state.fee_lip_accrued,
+    )
+    surrender_mva = _income_mva_amount(post_fee_account, mva_factor)
+    surrender_value = post_fee_account - surrender_mva
+    guarantee_pv = np.maximum(
+        state.locked_annual_income * np.asarray(annuity_factor, dtype=float),
+        0.0,
+    )
+    guarantee_ratio = np.divide(
+        guarantee_pv,
+        np.maximum(surrender_value, 1.0e-300),
+        out=np.full(n_paths, np.exp(2.0)),
+        where=surrender_value > 1.0e-12,
+    )
+    log_moneyness = np.log(np.maximum(guarantee_ratio, 1.0e-300))
+    max_partial = np.maximum(
+        state.account_value - product.withdrawals.min_residual_value,
+        0.0,
+    )
+    income_state = (
+        (state.phase == Phase.INCOME.value)
+        & (state.inforce_weight > 0.0)
+    )
+    partial_eligible = (
+        income_state
+        & ~bool(terminal)
+        & (max_partial >= product.withdrawals.min_withdrawal)
+    )
+    materiality = 1.0e-12 * state.gross_premium
+    positive_guarantee = income_state & (guarantee_pv > materiality)
+    zero_exit_with_guarantee = (
+        (surrender_value <= materiality) & positive_guarantee
+    )
+    full_eligible = (
+        income_state
+        & ~bool(terminal)
+        & ~state.just_elected
+        & (surrender_value > materiality)
+        & ~zero_exit_with_guarantee
+    )
+    return IncomeActionDecisionContext(
+        step=int(step),
+        phase=state.phase,
+        inforce_weight=state.inforce_weight,
+        partial_withdrawal_eligible=partial_eligible,
+        full_withdrawal_eligible=full_eligible,
+        max_partial_gross_amount=max_partial,
+        account_value=state.account_value,
+        locked_annual_income=state.locked_annual_income,
+        guarantee_pv=guarantee_pv,
+        guarantee_log_moneyness=log_moneyness,
+        mva_factor=mva_factor,
+        surrender_value=surrender_value,
+        short_rate=short_rate,
+        zero_rate_5y=zero_rate_5y,
+        heston_variance=heston_variance,
+        duration_years=float(duration_years),
+        mva_remaining_years=max(
+            product.withdrawals.mva_period_years - float(duration_years), 0.0
+        ),
+        attained_age=state.attained_age,
+        time_to_forced_election=state.time_to_forced_election,
+        primary_alive=state.primary_alive,
+        spouse_alive=state.spouse_alive,
+        announced_cap=state.announced_cap,
+        previous_reference_return=state.previous_reference_return,
+        previous_credited_return=state.previous_credited_return,
+        performance_gap=state.performance_gap,
+        just_elected=state.just_elected,
+    )
+
+
+def build_income_action_decision_context(
+    state: IncomeActionState,
+    product: IndexLinkedLifetimeIncomeProduct,
+    scenario_slice: IncomeMonthScenarioSlice,
+    *,
+    terminal: bool = False,
+) -> IncomeActionDecisionContext:
+    """Return the safe policy context at ``state`` from a training slice."""
+    if not isinstance(state, IncomeActionState):
+        raise TypeError("state must be IncomeActionState.")
+    if not isinstance(scenario_slice, IncomeMonthScenarioSlice):
+        raise TypeError("scenario_slice must be IncomeMonthScenarioSlice.")
+    if state.step != scenario_slice.current_step:
+        raise ValueError("State and Income-month slice steps do not match.")
+    if state.n_paths != scenario_slice.n_paths:
+        raise ValueError("State and Income-month slice path shapes do not match.")
+    return _income_action_context_from_values(
+        state=state,
+        product=product,
+        step=state.step,
+        duration_years=scenario_slice.current_duration_years,
+        terminal=terminal,
+        mva_factor=scenario_slice.current_mva_factor,
+        annuity_factor=scenario_slice.current_annuity_factor,
+        short_rate=scenario_slice.current_short_rate,
+        zero_rate_5y=scenario_slice.current_zero_rate_5y,
+        heston_variance=scenario_slice.current_heston_variance,
+    )
+
+
+def apply_income_action(
+    state: IncomeActionState,
+    decision: IncomeActionDecision,
+    product: IndexLinkedLifetimeIncomeProduct,
+    scenario_slice: IncomeMonthScenarioSlice,
+    *,
+    terminal: bool = False,
+) -> IncomeActionTransition:
+    """Apply one CONTINUE/PARTIAL/FULL action without advancing the market.
+
+    PARTIAL uses the same gross-deduction, MVA and proportional locked-income
+    reduction as the monthly projector.  FULL first settles both accrued fee
+    ledgers, then applies MVA, pays the surrender value and terminates both the
+    contract and its income guarantee.  No action is admissible in Growth or
+    on the terminal projection point.
+    """
+    if not isinstance(decision, IncomeActionDecision):
+        raise TypeError("decision must be IncomeActionDecision.")
+    context = build_income_action_decision_context(
+        state, product, scenario_slice, terminal=terminal
+    )
+    if decision.n_paths != state.n_paths:
+        raise ValueError("Decision and Income-action state shapes do not match.")
+
+    action_type = np.asarray(decision.action_type)
+    requested_partial = (
+        action_type == IncomeActionType.PARTIAL_WITHDRAWAL.value
+    )
+    requested_full = action_type == IncomeActionType.FULL_WITHDRAWAL.value
+    gross_request = (
+        decision.partial_fraction_of_max
+        * context.max_partial_gross_amount
+    )
+    # Product convention: a requested gross amount below AUD 100 is CONTINUE.
+    partial = requested_partial & (
+        gross_request >= product.withdrawals.min_withdrawal
+    )
+    if np.any(partial & ~context.partial_withdrawal_eligible):
+        raise ValueError(
+            "PARTIAL_WITHDRAWAL was selected on an ineligible Income path."
+        )
+    if np.any(requested_full & ~context.full_withdrawal_eligible):
+        raise ValueError(
+            "FULL_WITHDRAWAL was selected on an ineligible Income path."
+        )
+    full = requested_full
+    gross = np.where(partial, gross_request, 0.0)
+
+    (
+        partial_account,
+        partial_frame,
+        partial_income,
+        partial_cash,
+        partial_mva,
+    ) = _income_partial_action_values(
+        state.account_value,
+        state.iv_frame,
+        state.locked_annual_income,
+        gross,
+        scenario_slice.current_mva_factor,
+    )
+
+    fee_product, fee_lip, full_post_fee_account = (
+        _settle_fee_subledger_arrays(
+            state.account_value,
+            state.fee_product_accrued,
+            state.fee_lip_accrued,
+        )
+    )
+    full_mva = _income_mva_amount(
+        full_post_fee_account, scenario_slice.current_mva_factor
+    )
+    full_cash = full_post_fee_account - full_mva
+
+    account = np.where(partial, partial_account, state.account_value)
+    frame = np.where(partial, partial_frame, state.iv_frame)
+    income = np.where(partial, partial_income, state.locked_annual_income)
+    account = np.where(full, 0.0, account)
+    frame = np.where(full, 0.0, frame)
+    income = np.where(full, 0.0, income)
+    phase = np.where(
+        full, Phase.TERMINATED.value, state.phase
+    ).astype(np.int8)
+    inforce = np.where(full, 0.0, state.inforce_weight)
+    fee_product_after = np.where(full, 0.0, state.fee_product_accrued)
+    fee_lip_after = np.where(full, 0.0, state.fee_lip_accrued)
+
+    post_state = replace(
+        state,
+        account_value=account,
+        iv_frame=frame,
+        locked_annual_income=income,
+        phase=phase,
+        inforce_weight=inforce,
+        fee_product_accrued=fee_product_after,
+        fee_lip_accrued=fee_lip_after,
+        joint_income_cover=np.where(
+            full, False, state.joint_income_cover
+        ),
+        just_elected=np.where(full, False, state.just_elected),
+    )
+    executed_action = np.full(
+        state.n_paths, IncomeActionType.CONTINUE.value, dtype="<U18"
+    )
+    executed_fraction = np.zeros(state.n_paths)
+    executed_action[partial] = IncomeActionType.PARTIAL_WITHDRAWAL.value
+    executed_fraction[partial] = decision.partial_fraction_of_max[partial]
+    executed_action[full] = IncomeActionType.FULL_WITHDRAWAL.value
+    executed = IncomeActionDecision(
+        action_type=executed_action,
+        partial_fraction_of_max=executed_fraction,
+    )
+    weight = state.inforce_weight
+    return IncomeActionTransition(
+        executed_decision=executed,
+        post_action_state=post_state,
+        gross_partial_deduction=gross,
+        partial_withdrawal_cashflow=weight * np.where(
+            partial, partial_cash, 0.0
+        ),
+        surrender_benefit_cashflow=weight * np.where(full, full_cash, 0.0),
+        fees_product_cashflow=weight * np.where(full, fee_product, 0.0),
+        fees_lip_cashflow=weight * np.where(full, fee_lip, 0.0),
+        mva_retained_cashflow=weight * (
+            np.where(partial, partial_mva, 0.0)
+            + np.where(full, full_mva, 0.0)
+        ),
+    )
+
+
+def advance_income_month(
+    post_action_state: IncomeActionState,
+    product: IndexLinkedLifetimeIncomeProduct,
+    policy: PolicySpec,
+    scenario_slice: IncomeMonthScenarioSlice,
+) -> IncomeMonthTransition:
+    """Advance a generic-product post-action state to the next action point.
+
+    The event order matches the Policyholder-relevant projector order:
+    market/Anniversary credit, fee accrual and Anniversary posting, terminating
+    mortality/death benefit, Anniversary DVA restart, and mandatory monthly
+    Fixed Income.  Mortality and market generation themselves are deliberately
+    outside this pure kernel and arrive through ``scenario_slice`` so every
+    counterfactual action uses common random numbers.
+    """
+    if not isinstance(post_action_state, IncomeActionState):
+        raise TypeError("post_action_state must be IncomeActionState.")
+    if not isinstance(scenario_slice, IncomeMonthScenarioSlice):
+        raise TypeError("scenario_slice must be IncomeMonthScenarioSlice.")
+    if policy.age_pension_plus:
+        raise NotImplementedError(
+            "Optimal monthly Income actions do not support Age Pension Plus."
+        )
+    if post_action_state.step != scenario_slice.current_step:
+        raise ValueError("Post-action state and Income-month step do not match.")
+    if post_action_state.n_paths != scenario_slice.n_paths:
+        raise ValueError("Post-action state and Income-month shapes do not match.")
+    active_growth = (
+        (post_action_state.phase == Phase.GROWTH.value)
+        & (post_action_state.inforce_weight > 0.0)
+    )
+    if np.any(active_growth):
+        raise ValueError("advance_income_month accepts Income/terminated states only.")
+
+    state = post_action_state
+    active = state.phase < Phase.TERMINATED.value
+    frame_start = np.maximum(state.iv_frame, 0.0)
+    frame = frame_start.copy()
+    fee_product = state.fee_product_accrued + np.where(
+        active,
+        frame_start * product.fees.product_fee
+        * scenario_slice.fee_year_fraction,
+        0.0,
+    )
+    fee_lip = state.fee_lip_accrued + np.where(
+        active,
+        frame_start * product.fees.lifetime_income_premium
+        * scenario_slice.fee_year_fraction,
+        0.0,
+    )
+
+    if scenario_slice.is_anniversary:
+        frame = np.where(
+            active,
+            frame * (1.0 + scenario_slice.anniversary_credit_rate),
+            0.0,
+        )
+        account = frame.copy()
+        posted_product, posted_lip, post_fee_account = (
+            _settle_fee_subledger_arrays(account, fee_product, fee_lip)
+        )
+        ratio = np.divide(
+            post_fee_account,
+            np.maximum(account, 1.0e-300),
+            out=np.ones(state.n_paths),
+            where=account > 0.0,
+        )
+        frame = frame * ratio
+        account = post_fee_account
+        fee_product = np.zeros(state.n_paths)
+        fee_lip = np.zeros(state.n_paths)
+        fee_product_cashflow = state.inforce_weight * posted_product
+        fee_lip_cashflow = state.inforce_weight * posted_lip
+    else:
+        account = frame * scenario_slice.next_dva_factor
+        fee_product_cashflow = np.zeros(state.n_paths)
+        fee_lip_cashflow = np.zeros(state.n_paths)
+
+    death_probability = np.where(
+        active, scenario_slice.terminating_death_probability, 0.0
+    )
+    death_fee_product, death_fee_lip, death_post_fee_account = (
+        _settle_fee_subledger_arrays(account, fee_product, fee_lip)
+    )
+    death_weight = state.inforce_weight * death_probability
+    death_benefit_cashflow = death_weight * death_post_fee_account
+    fee_product_cashflow = (
+        fee_product_cashflow + death_weight * death_fee_product
+    )
+    fee_lip_cashflow = fee_lip_cashflow + death_weight * death_fee_lip
+
+    certain_death = death_probability >= 1.0 - 1.0e-15
+    phase = np.where(
+        certain_death, Phase.TERMINATED.value, state.phase
+    ).astype(np.int8)
+    frame = np.where(certain_death, 0.0, frame)
+    account = np.where(certain_death, 0.0, account)
+    locked_income = np.where(
+        certain_death, 0.0, state.locked_annual_income
+    )
+    fee_product = np.where(certain_death, 0.0, fee_product)
+    fee_lip = np.where(certain_death, 0.0, fee_lip)
+    inforce = state.inforce_weight * (1.0 - death_probability)
+
+    # At an Anniversary the new DVA/hedge year starts after fee and mortality
+    # settlement.  At a non-Anniversary this factor was already used above.
+    if scenario_slice.is_anniversary:
+        account = frame * scenario_slice.next_dva_factor
+
+    pay = np.where(
+        phase == Phase.INCOME.value,
+        locked_income / STEPS_PER_YEAR,
+        0.0,
+    )
+    from_account = np.minimum(pay, account)
+    guarantee_claim = pay - from_account
+    ratio = np.divide(
+        account - from_account,
+        np.maximum(account, 1.0e-300),
+        out=np.ones(state.n_paths),
+        where=account > 0.0,
+    )
+    account = account - from_account
+    frame = frame * ratio
+    income_cashflow = inforce * pay
+    guarantee_claim_cashflow = inforce * guarantee_claim
+    exhausted = account <= 1.0e-12
+    fee_product = np.where(exhausted, 0.0, fee_product)
+    fee_lip = np.where(exhausted, 0.0, fee_lip)
+
+    terminal_closeout_cashflow = np.zeros(state.n_paths)
+    if scenario_slice.terminal_next:
+        # A truncated horizon is a valuation closeout, not a death or a
+        # voluntary FULL action.  Match the canonical projector: settle the
+        # survivor fee subledger, pay the remaining Account Value without MVA,
+        # and terminate contract and guarantee at the same grid timestamp.
+        terminal_mask = phase < Phase.TERMINATED.value
+        (
+            terminal_fee_product,
+            terminal_fee_lip,
+            terminal_post_fee_account,
+        ) = _settle_fee_subledger_arrays(account, fee_product, fee_lip)
+        fee_product_cashflow = fee_product_cashflow + inforce * np.where(
+            terminal_mask, terminal_fee_product, 0.0
+        )
+        fee_lip_cashflow = fee_lip_cashflow + inforce * np.where(
+            terminal_mask, terminal_fee_lip, 0.0
+        )
+        terminal_closeout_cashflow = inforce * np.where(
+            terminal_mask, terminal_post_fee_account, 0.0
+        )
+        account = np.where(terminal_mask, 0.0, account)
+        frame = np.where(terminal_mask, 0.0, frame)
+        locked_income = np.where(terminal_mask, 0.0, locked_income)
+        fee_product = np.where(terminal_mask, 0.0, fee_product)
+        fee_lip = np.where(terminal_mask, 0.0, fee_lip)
+        phase = np.where(
+            terminal_mask, Phase.TERMINATED.value, phase
+        ).astype(np.int8)
+        inforce = np.where(terminal_mask, 0.0, inforce)
+
+    if scenario_slice.is_anniversary:
+        previous_reference_return = scenario_slice.next_reference_return
+        previous_credited_return = scenario_slice.next_credited_return
+        performance_gap = scenario_slice.next_performance_gap
+        announced_cap = scenario_slice.next_announced_cap
+    else:
+        previous_reference_return = state.previous_reference_return
+        previous_credited_return = state.previous_credited_return
+        performance_gap = state.performance_gap
+        announced_cap = state.announced_cap
+
+    next_state = IncomeActionState(
+        step=scenario_slice.next_step,
+        path_index=state.path_index,
+        gross_premium=state.gross_premium,
+        attained_age=(
+            state.attained_age
+            + scenario_slice.next_duration_years
+            - scenario_slice.current_duration_years
+        ),
+        time_to_forced_election=np.maximum(
+            state.time_to_forced_election
+            - (
+                scenario_slice.next_duration_years
+                - scenario_slice.current_duration_years
+            ),
+            0.0,
+        ),
+        account_value=account,
+        iv_frame=frame,
+        locked_annual_income=locked_income,
+        phase=phase,
+        inforce_weight=inforce,
+        fee_product_accrued=fee_product,
+        fee_lip_accrued=fee_lip,
+        primary_alive=scenario_slice.next_primary_alive,
+        spouse_alive=scenario_slice.next_spouse_alive,
+        joint_income_cover=np.where(
+            phase == Phase.TERMINATED.value,
+            False,
+            scenario_slice.next_joint_income_cover,
+        ),
+        joint_survival_primary=scenario_slice.next_joint_survival_primary,
+        joint_survival_spouse=scenario_slice.next_joint_survival_spouse,
+        previous_reference_return=previous_reference_return,
+        previous_credited_return=previous_credited_return,
+        performance_gap=performance_gap,
+        announced_cap=announced_cap,
+        just_elected=np.zeros(state.n_paths, dtype=bool),
+    )
+    next_context = _income_action_context_from_values(
+        state=next_state,
+        product=product,
+        step=scenario_slice.next_step,
+        duration_years=scenario_slice.next_duration_years,
+        terminal=scenario_slice.terminal_next,
+        mva_factor=scenario_slice.next_mva_factor,
+        annuity_factor=scenario_slice.next_annuity_factor,
+        short_rate=scenario_slice.next_short_rate,
+        zero_rate_5y=scenario_slice.next_zero_rate_5y,
+        heston_variance=scenario_slice.next_heston_variance,
+    )
+    return IncomeMonthTransition(
+        next_state=next_state,
+        next_context=next_context,
+        income_cashflow=income_cashflow,
+        death_benefit_cashflow=death_benefit_cashflow,
+        terminal_closeout_cashflow=terminal_closeout_cashflow,
+        guarantee_claim_cashflow=guarantee_claim_cashflow,
+        fees_product_cashflow=fee_product_cashflow,
+        fees_lip_cashflow=fee_lip_cashflow,
+        discount_ratio=scenario_slice.discount_ratio,
+    )
 
 
 @dataclass(frozen=True)
@@ -212,6 +1447,12 @@ class IncomeElectionDecisionContext:
     short_rate: Array
     zero_rate_5y: Array
     heston_variance: Array
+    mva_factor: Array
+    mva_remaining_years: float
+    attained_age: Array
+    time_to_forced_election: Array
+    primary_alive: NDArray[np.bool_]
+    spouse_alive: NDArray[np.bool_]
     previous_cap: Array
     previous_reference_return: Array
     previous_credited_return: Array
@@ -237,6 +1478,13 @@ class IncomeElectionDecisionContext:
             raise ValueError(
                 "Income-Election decision time and duration must be finite."
             )
+        if (
+            not np.isfinite(self.mva_remaining_years)
+            or self.mva_remaining_years < 0.0
+        ):
+            raise ValueError(
+                "Income-Election mva_remaining_years must be finite/non-negative."
+            )
         if not isinstance(self.is_anniversary, (bool, np.bool_)):
             raise ValueError("is_anniversary must be boolean.")
 
@@ -251,6 +1499,11 @@ class IncomeElectionDecisionContext:
             "short_rate": float,
             "zero_rate_5y": float,
             "heston_variance": float,
+            "mva_factor": float,
+            "attained_age": float,
+            "time_to_forced_election": float,
+            "primary_alive": bool,
+            "spouse_alive": bool,
             "previous_cap": float,
             "previous_reference_return": float,
             "previous_credited_return": float,
@@ -284,6 +1537,17 @@ class IncomeElectionDecisionContext:
                     )
             value.setflags(write=False)
             object.__setattr__(self, name, value)
+        for name in (
+            "mva_factor",
+            "attained_age",
+            "time_to_forced_election",
+        ):
+            if np.any(getattr(self, name) < 0.0):
+                raise ValueError(
+                    f"Income-Election context {name} must be non-negative."
+                )
+        if np.any(self.mva_factor > 1.0 + 1.0e-12):
+            raise ValueError("Income-Election mva_factor must not exceed one.")
 
     @property
     def n_paths(self) -> int:
@@ -812,8 +2076,10 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             config: ProjectionConfig = ProjectionConfig(),
             surrender_policy: Optional[object] = None,
             income_election_policy: Optional[object] = None,
+            income_action_policy: Optional[object] = None,
             cap_decision_observer: Optional[object] = None,
             surrender_decision_observer: Optional[object] = None,
+            income_transition_observer: Optional[object] = None,
             ) -> ProjectionResult:
     """Run the monthly projection over all scenario paths.
 
@@ -828,12 +2094,22 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     monthly cashflow engine.  When supplied, it replaces the statistical lapse
     probability; all fees, MVA, mortality and accounting order stay unchanged.
 
-    ``income_election_policy`` is the corresponding safe hook at the annual
+    ``income_election_policy`` is the corresponding strict hook at the annual
     Growth-phase action boundary.  A hook implements
-    ``start_income_mask(*, context: IncomeElectionDecisionContext)``.  Missing
-    or unusable voluntary decisions conservatively mean WAIT; the contractual
-    minimum-duration and automatic-age gates remain owned by the product, and
-    a contractual forced start always overrides the hook.
+    ``start_income_mask(*, context: IncomeElectionDecisionContext)``.  Invalid
+    outputs and unexpected policy exceptions propagate instead of becoming a
+    silent WAIT decision.  Contractual gates remain owned by the product, and
+    a forced start always overrides the voluntary hook.
+
+    ``income_action_policy`` is the unified optimal-action hook after the
+    regular monthly Fixed-Income payment.  It implements
+    ``choose_income_action(*, context: IncomeActionDecisionContext)`` and
+    returns one strictly pathwise :class:`IncomeActionDecision`.  When
+    supplied it replaces statistical Income-phase Partial/Excess Withdrawals
+    and lapse, while Growth behaviour and the complete no-hook projection path
+    remain unchanged.  It is mutually exclusive with ``surrender_policy``;
+    the latter remains available for fixed-Election/Full-Withdrawal-only
+    compatibility studies.
 
     ``cap_decision_observer`` is a read-only research observer.  Its
     ``observe_cap_decision(*, context: CreditingCapDecisionContext)`` method is
@@ -848,9 +2124,53 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     current-step cashflows and the exact counterfactual FULL_WITHDRAWAL
     settlement/expense cashflows.  The richer action-value context is never
     passed to ``surrender_policy`` and cannot alter the action or product state.
+
+    ``income_transition_observer`` is an engine/training observer, never a
+    Policyholder information surface.  Its
+    ``observe_income_transition(*, state, scenario_slice)`` method receives a
+    pre-action :class:`IncomeActionState` and the immutable exogenous shock to
+    the next monthly action boundary.  Calls are delayed by one grid step so
+    the slice contains the mortality draw actually consumed by the projector;
+    no future field is added to :class:`IncomeActionDecisionContext`.
     """
 
     policy.validate_against(product)
+    if income_action_policy is not None and surrender_policy is not None:
+        raise ValueError(
+            "income_action_policy and surrender_policy are mutually exclusive."
+        )
+    if income_action_policy is not None and policy.age_pension_plus:
+        raise NotImplementedError(
+            "Optimal monthly Income actions do not support Age Pension Plus."
+        )
+    if income_transition_observer is not None and policy.age_pension_plus:
+        raise NotImplementedError(
+            "Income transition panels do not support Age Pension Plus."
+        )
+    if income_action_policy is None:
+        income_action_method = None
+    else:
+        income_action_method = getattr(
+            income_action_policy, "choose_income_action", None
+        )
+        if income_action_method is None or not callable(income_action_method):
+            raise TypeError(
+                "income_action_policy must provide a choose_income_action method."
+            )
+    if income_transition_observer is None:
+        income_transition_observer_method = None
+    else:
+        income_transition_observer_method = getattr(
+            income_transition_observer, "observe_income_transition", None
+        )
+        if (
+            income_transition_observer_method is None
+            or not callable(income_transition_observer_method)
+        ):
+            raise TypeError(
+                "income_transition_observer must provide an "
+                "observe_income_transition method."
+            )
     take_up = behaviour.take_up
     policy_controlled_election = income_election_policy is not None
     pathwise_joint_life = bool(
@@ -859,6 +2179,8 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             take_up.mode != "deterministic"
             or policy_controlled_election
             or surrender_policy is not None
+            or income_action_policy is not None
+            or income_transition_observer is not None
             or behaviour.use_dynamic
             or behaviour.use_dynamic_withdrawals
             or config.force_pathwise_joint_life
@@ -951,9 +2273,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         income_step = np.full(n_paths, np.iinfo(np.int32).max, dtype=np.int64)
     else:
         # A Policy-controlled Election has no model-point scheduled date.  The
-        # object is queried only at eligible Anniversaries below; missing or
-        # unstable voluntary actions therefore remain WAIT until a contractual
-        # product force applies.
+        # object is queried only at eligible Anniversaries below.  Missing,
+        # malformed or unstable voluntary decisions are hard errors; only a
+        # valid WAIT decision can defer to a later contractual force.
         income_step = np.full(n_paths, np.iinfo(np.int32).max, dtype=np.int64)
 
     min_income_step = product.min_years_before_income * STEPS_PER_YEAR
@@ -1216,8 +2538,17 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
 
     gross_premium = float(policy.initial_investment)
 
-    def annuity_factor_at(step: int, t: float) -> Array:
-        """Pathwise annuity factor under the market state at ``step``."""
+    def annuity_factor_for_state(
+        step: int,
+        t: float,
+        phase_state: NDArray[np.int8],
+        primary_alive_state: NDArray[np.bool_],
+        spouse_alive_state: NDArray[np.bool_],
+        joint_income_cover_state: NDArray[np.bool_],
+        joint_surv_primary_state: Array,
+        joint_surv_spouse_state: Array,
+    ) -> Array:
+        """Pathwise annuity factor for an explicit mortality/phase state."""
         age_now = policy.age + t
         z10 = scenarios.forward_zero_cc(step, 10.0)
         if policy.spouse and policy.spouse_age is not None:
@@ -1246,34 +2577,36 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 both_alive = primary_only
 
             if pathwise_joint_life:
-                primary_component = np.where(primary_alive, primary_only, 0.0)
+                primary_component = np.where(
+                    primary_alive_state, primary_only, 0.0
+                )
                 if (
                     policy.spouse_death_election
                     == SpouseDeathElection.CONTINUE_INCOME
                 ):
                     joint_component = np.where(
-                        primary_alive & spouse_alive,
+                        primary_alive_state & spouse_alive_state,
                         both_alive,
                         np.where(
-                            primary_alive,
+                            primary_alive_state,
                             primary_only,
-                            np.where(spouse_alive, spouse_only, 0.0),
+                            np.where(spouse_alive_state, spouse_only, 0.0),
                         ),
                     )
                 else:
                     joint_component = primary_component
                 growth_component = np.where(
-                    primary_alive & spouse_alive,
+                    primary_alive_state & spouse_alive_state,
                     both_alive,
                     primary_component,
                 )
                 income_component = np.where(
-                    joint_income_cover,
+                    joint_income_cover_state,
                     joint_component,
                     primary_component,
                 )
                 return np.where(
-                    phase == Phase.INCOME.value,
+                    phase_state == Phase.INCOME.value,
                     income_component,
                     growth_component,
                 )
@@ -1283,9 +2616,9 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 != SpouseDeathElection.CONTINUE_INCOME
             ):
                 return primary_only
-            p11 = joint_surv_primary * joint_surv_spouse
-            p10 = joint_surv_primary * (1.0 - joint_surv_spouse)
-            p01 = (1.0 - joint_surv_primary) * joint_surv_spouse
+            p11 = joint_surv_primary_state * joint_surv_spouse_state
+            p10 = joint_surv_primary_state * (1.0 - joint_surv_spouse_state)
+            p01 = (1.0 - joint_surv_primary_state) * joint_surv_spouse_state
             last_survivor = p11 + p10 + p01
             survivor_mix = np.divide(
                 p11 * both_alive + p10 * primary_only + p01 * spouse_only,
@@ -1294,11 +2627,24 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 where=last_survivor > 0.0,
             )
             return np.where(
-                phase == Phase.INCOME.value, survivor_mix, both_alive)
+                phase_state == Phase.INCOME.value, survivor_mix, both_alive)
         return np.asarray(mortality.annuity_factor(
             age_now, policy.sex, z10,
             years_from_base=mortality_issue_offset + t,
             projection_duration_start=t), dtype=float)
+
+    def annuity_factor_at(step: int, t: float) -> Array:
+        """Pathwise annuity factor under the current projector state."""
+        return annuity_factor_for_state(
+            step,
+            t,
+            phase,
+            primary_alive,
+            spouse_alive,
+            joint_income_cover,
+            joint_surv_primary,
+            joint_surv_spouse,
+        )
 
     def prospective_income_rate(t: float) -> Array:
         """Income rate available now, respecting current Spouse eligibility."""
@@ -1430,6 +2776,151 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                                scenarios.zero_rate(step, tau_rem), tau_rem)
         return np.clip(np.asarray(f, dtype=float), 0.0, 1.0)
 
+    def income_transition_state(
+        step: int,
+        path_index: NDArray[np.int64],
+    ) -> IncomeActionState:
+        """Snapshot the complete pre-action Income state for a path subset."""
+        idx = np.asarray(path_index, dtype=np.int64)
+        if idx.ndim != 1:
+            raise ValueError("Income transition path indices must be one-dimensional.")
+        if pathwise_joint_life:
+            cover = joint_income_cover
+        else:
+            expected_joint_cover = bool(
+                policy.spouse
+                and policy.spouse_age is not None
+                and policy.spouse_death_election
+                == SpouseDeathElection.CONTINUE_INCOME
+            )
+            cover = np.where(
+                phase == Phase.INCOME.value,
+                expected_joint_cover,
+                False,
+            )
+        announced = as_path_array(
+            reference_spec.cap(anniv_step // STEPS_PER_YEAR),
+            name="announced crediting cap",
+        )
+        return IncomeActionState(
+            step=int(step),
+            path_index=idx,
+            gross_premium=np.full(idx.size, gross_premium),
+            attained_age=np.full(idx.size, policy.age + times[step]),
+            time_to_forced_election=np.full(
+                idx.size,
+                max(age_100_force_step / STEPS_PER_YEAR - times[step], 0.0),
+            ),
+            account_value=iv[idx],
+            iv_frame=iv_frame[idx],
+            locked_annual_income=income_annual[idx],
+            phase=phase[idx],
+            inforce_weight=w[idx],
+            fee_product_accrued=fee_product_accrued[idx],
+            fee_lip_accrued=fee_lip_accrued[idx],
+            primary_alive=primary_alive[idx],
+            spouse_alive=(
+                spouse_alive[idx]
+                if policy.spouse
+                else np.zeros(idx.size, dtype=bool)
+            ),
+            joint_income_cover=cover[idx],
+            joint_survival_primary=joint_surv_primary[idx],
+            joint_survival_spouse=joint_surv_spouse[idx],
+            previous_reference_return=previous_reference_return[idx],
+            previous_credited_return=previous_credited_return[idx],
+            performance_gap=performance_shortfall[idx],
+            announced_cap=announced[idx],
+            just_elected=just_elected[idx],
+        )
+
+    def income_transition_mortality_shock(
+        interval_index: int,
+        state: IncomeActionState,
+        primary_draw: Optional[Array],
+        spouse_draw: Optional[Array],
+    ) -> tuple[
+        Array,
+        NDArray[np.bool_],
+        NDArray[np.bool_],
+        NDArray[np.bool_],
+        Array,
+        Array,
+    ]:
+        """Mortality shock for a pending Income state, independent of action."""
+        idx = state.path_index
+        if pathwise_joint_life:
+            if primary_draw is None or spouse_draw is None or dec.q_spouse_m is None:
+                raise RuntimeError(
+                    "Pathwise Income transition mortality draws are missing."
+                )
+            primary_died = (
+                state.primary_alive
+                & (np.asarray(primary_draw)[idx] < dec.q_primary_m[interval_index])
+            )
+            spouse_died = (
+                state.spouse_alive
+                & (np.asarray(spouse_draw)[idx] < dec.q_spouse_m[interval_index])
+            )
+            next_primary = state.primary_alive & ~primary_died
+            next_spouse = state.spouse_alive & ~spouse_died
+            continue_joint = (
+                state.joint_income_cover
+                & (
+                    policy.spouse_death_election
+                    == SpouseDeathElection.CONTINUE_INCOME
+                )
+            )
+            terminating = np.where(
+                continue_joint,
+                ~next_primary & ~next_spouse,
+                primary_died,
+            )
+            return (
+                terminating.astype(float),
+                next_primary,
+                next_spouse,
+                state.joint_income_cover,
+                state.joint_survival_primary,
+                state.joint_survival_spouse,
+            )
+
+        primary_probability = np.full(
+            state.n_paths, dec.q_primary_m[interval_index]
+        )
+        next_joint_primary = state.joint_survival_primary.copy()
+        next_joint_spouse = state.joint_survival_spouse.copy()
+        death_probability = primary_probability
+        if (
+            dec.q_spouse_m is not None
+            and policy.spouse_death_election
+            == SpouseDeathElection.CONTINUE_INCOME
+        ):
+            cover = state.joint_income_cover
+            s1 = state.joint_survival_primary
+            s2 = state.joint_survival_spouse
+            s_ls = s1 + s2 - s1 * s2
+            s1_next = s1 * (1.0 - dec.q_primary_m[interval_index])
+            s2_next = s2 * (1.0 - dec.q_spouse_m[interval_index])
+            s_ls_next = s1_next + s2_next - s1_next * s2_next
+            q_joint = 1.0 - np.divide(
+                s_ls_next,
+                np.maximum(s_ls, 1.0e-300),
+                out=np.ones_like(s_ls_next),
+                where=s_ls > 0.0,
+            )
+            death_probability = np.where(cover, q_joint, death_probability)
+            next_joint_primary = np.where(cover, s1_next, s1)
+            next_joint_spouse = np.where(cover, s2_next, s2)
+        return (
+            np.clip(death_probability, 0.0, 1.0),
+            state.primary_alive,
+            state.spouse_alive,
+            state.joint_income_cover,
+            next_joint_primary,
+            next_joint_spouse,
+        )
+
     def wd_dynamic_rates(step: int, t: float) -> tuple[Array, Array]:
         """Expected free and excess withdrawal rates for the current year.
 
@@ -1558,18 +3049,11 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
 
     def fee_settlement(account_value: Array) -> tuple[Array, Array, Array]:
         """Collectible Product Fee, LIP and post-fee Account Value at an event."""
-        available = np.maximum(np.asarray(account_value, dtype=float), 0.0)
-        outstanding = fee_product_accrued + fee_lip_accrued
-        collected = np.minimum(available, outstanding)
-        scale = np.divide(
-            collected,
-            outstanding,
-            out=np.zeros(n_paths),
-            where=outstanding > 0.0,
+        return _settle_fee_subledger_arrays(
+            account_value,
+            fee_product_accrued,
+            fee_lip_accrued,
         )
-        product_collected = fee_product_accrued * scale
-        lip_collected = fee_lip_accrued * scale
-        return product_collected, lip_collected, available - collected
 
     def post_fee_subledger(step: int) -> None:
         """Post all accrued fees for every currently in-force contract."""
@@ -1662,6 +3146,21 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 scenarios.zero_rate(step, 5.0), name="five-year zero rate",
             ),
             heston_variance=heston_variance,
+            mva_factor=current_mva_signal(step, t),
+            mva_remaining_years=max(
+                product.withdrawals.mva_period_years - float(t), 0.0
+            ),
+            attained_age=np.full(n_paths, policy.age + float(t)),
+            time_to_forced_election=np.full(
+                n_paths,
+                max(age_100_force_step / STEPS_PER_YEAR - float(t), 0.0),
+            ),
+            primary_alive=primary_alive,
+            spouse_alive=(
+                spouse_alive
+                if policy.spouse
+                else np.zeros(n_paths, dtype=bool)
+            ),
             previous_cap=previous_cap,
             previous_reference_return=previous_reference_return,
             previous_credited_return=previous_credited_return,
@@ -1670,6 +3169,158 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             voluntary_election_eligible=eligible & ~forced,
             forced_election=forced,
         )
+
+    def income_action_context(
+        step: int,
+        t: float,
+    ) -> IncomeActionDecisionContext:
+        """Build the post-Fixed-Income voluntary-action context."""
+        _, _, full_post_fee_av = fee_settlement(iv)
+        surrender_value, _ = _surrender_value(
+            product,
+            policy,
+            scenarios,
+            step,
+            t,
+            full_post_fee_av,
+            free_wd_used,
+            phase,
+            aps_active,
+            issue_zero,
+            P0,
+        )
+        guarantee_pv = guarantee_pv_at(step, t)
+        guarantee_ratio = np.divide(
+            guarantee_pv,
+            np.maximum(surrender_value, 1.0e-300),
+            out=np.full(n_paths, np.exp(2.0)),
+            where=surrender_value > 1.0e-12,
+        )
+        guarantee_log_mny = np.log(
+            np.maximum(guarantee_ratio, 1.0e-300)
+        )
+        max_partial = np.maximum(
+            iv - product.withdrawals.min_residual_value, 0.0
+        )
+        income_state = (
+            (phase == Phase.INCOME.value)
+            & (w > 0.0)
+        )
+        partial_eligible = (
+            income_state
+            & (step < n_steps)
+            & (max_partial >= product.withdrawals.min_withdrawal)
+        )
+        positive_income_guarantee = (
+            income_state
+            & (guarantee_pv > 1.0e-12 * gross_premium)
+        )
+        zero_exit_with_guarantee = (
+            (surrender_value <= 1.0e-12 * gross_premium)
+            & positive_income_guarantee
+        )
+        full_eligible = (
+            income_state
+            & (step < n_steps)
+            & ~just_elected
+            & (surrender_value > 1.0e-12 * gross_premium)
+            & ~zero_exit_with_guarantee
+        )
+        if scenarios.variance is None:
+            heston_variance = np.zeros(n_paths)
+        else:
+            heston_variance = np.asarray(
+                scenarios.variance[reference_spec.equity_index][:, step],
+                dtype=float,
+            )
+        return IncomeActionDecisionContext(
+            step=int(step),
+            phase=phase,
+            inforce_weight=w,
+            partial_withdrawal_eligible=partial_eligible,
+            full_withdrawal_eligible=full_eligible,
+            max_partial_gross_amount=max_partial,
+            account_value=iv,
+            locked_annual_income=income_annual,
+            guarantee_pv=guarantee_pv,
+            guarantee_log_moneyness=guarantee_log_mny,
+            mva_factor=current_mva_signal(step, t),
+            surrender_value=surrender_value,
+            short_rate=scenarios.short_rate[:, step],
+            zero_rate_5y=as_path_array(
+                scenarios.zero_rate(step, 5.0), name="five-year zero rate",
+            ),
+            heston_variance=heston_variance,
+            duration_years=float(t),
+            mva_remaining_years=max(
+                product.withdrawals.mva_period_years - float(t), 0.0
+            ),
+            attained_age=np.full(n_paths, policy.age + float(t)),
+            time_to_forced_election=np.full(
+                n_paths,
+                max(age_100_force_step / STEPS_PER_YEAR - float(t), 0.0),
+            ),
+            primary_alive=primary_alive,
+            spouse_alive=(
+                spouse_alive
+                if policy.spouse
+                else np.zeros(n_paths, dtype=bool)
+            ),
+            announced_cap=as_path_array(
+                reference_spec.cap(anniv_step // STEPS_PER_YEAR),
+                name="announced crediting cap",
+            ),
+            previous_reference_return=previous_reference_return,
+            previous_credited_return=previous_credited_return,
+            performance_gap=performance_shortfall,
+            just_elected=just_elected,
+        )
+
+    def choose_income_action(
+        context: IncomeActionDecisionContext,
+    ) -> tuple[NDArray[np.bool_], NDArray[np.bool_], Array]:
+        """Validate one strict hook decision and return executable actions."""
+        if income_action_method is None:
+            return (
+                np.zeros(n_paths, dtype=bool),
+                np.zeros(n_paths, dtype=bool),
+                np.zeros(n_paths),
+            )
+        decision = income_action_method(context=context)
+        if not isinstance(decision, IncomeActionDecision):
+            raise TypeError(
+                "choose_income_action must return an IncomeActionDecision."
+            )
+        if decision.n_paths != n_paths:
+            raise ValueError(
+                "IncomeActionDecision must contain one action per scenario path."
+            )
+
+        action_type = decision.action_type
+        requested_partial = (
+            action_type == IncomeActionType.PARTIAL_WITHDRAWAL.value
+        )
+        full = action_type == IncomeActionType.FULL_WITHDRAWAL.value
+        gross = (
+            decision.partial_fraction_of_max
+            * context.max_partial_gross_amount
+        )
+        # Contract rule: a gross request below the AUD minimum is CONTINUE,
+        # not a smaller Partial Withdrawal.
+        partial = requested_partial & (
+            gross >= product.withdrawals.min_withdrawal
+        )
+        gross = np.where(partial, gross, 0.0)
+
+        if np.any(partial & ~context.partial_withdrawal_eligible):
+            raise ValueError(
+                "Income policy selected PARTIAL_WITHDRAWAL on an ineligible path."
+            )
+        if np.any(full & ~context.full_withdrawal_eligible):
+            raise ValueError(
+                "Income policy selected FULL_WITHDRAWAL on an ineligible path."
+            )
+        return partial, full, gross
 
     def state_aware_dynamic_take_up_probability(
         base_probability: float,
@@ -1717,33 +3368,35 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             )
         return np.clip(probability, 0.0, 1.0)
 
-    def conservative_policy_election_mask(
+    def policy_election_mask(
         context: IncomeElectionDecisionContext,
     ) -> NDArray[np.bool_]:
-        """Return a safe voluntary Policy action; missing/unstable means WAIT."""
+        """Return one strict voluntary Policy action per path."""
         if income_election_policy is None:
             return np.zeros(n_paths, dtype=bool)
         method = getattr(income_election_policy, "start_income_mask", None)
         if method is None or not callable(method):
-            return np.zeros(n_paths, dtype=bool)
-        try:
-            decision = np.asarray(method(context=context))
-            if decision.shape != (n_paths,):
-                return np.zeros(n_paths, dtype=bool)
-            if np.issubdtype(decision.dtype, np.bool_):
-                return decision.astype(bool, copy=True)
-            if not np.issubdtype(decision.dtype, np.number):
-                return np.zeros(n_paths, dtype=bool)
-            if not np.all(np.isfinite(decision)) or not np.all(
-                (decision == 0) | (decision == 1)
-            ):
-                return np.zeros(n_paths, dtype=bool)
-            return decision.astype(bool)
-        except Exception:
-            # An unavailable regression, rank/condition gate or other unstable
-            # voluntary action must never manufacture START_INCOME_NOW.  The
-            # contractual forced gate is applied independently below.
-            return np.zeros(n_paths, dtype=bool)
+            raise TypeError(
+                "income_election_policy must provide a start_income_mask method."
+            )
+        decision = np.asarray(method(context=context))
+        if decision.shape != (n_paths,):
+            raise ValueError(
+                "income_election_policy must return one decision per path."
+            )
+        if np.issubdtype(decision.dtype, np.bool_):
+            return decision.astype(bool, copy=True)
+        if not np.issubdtype(decision.dtype, np.number):
+            raise TypeError(
+                "income_election_policy decisions must be boolean or binary."
+            )
+        if not np.all(np.isfinite(decision)) or not np.all(
+            (decision == 0) | (decision == 1)
+        ):
+            raise ValueError(
+                "income_election_policy decisions must be finite and binary."
+            )
+        return decision.astype(bool)
 
     def income_election_decision(
         step: int,
@@ -1771,7 +3424,7 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         context = income_election_context(step, t, eligible, forced)
 
         if policy_controlled_election:
-            voluntary = conservative_policy_election_mask(context)
+            voluntary = policy_election_mask(context)
             probability = voluntary.astype(float)
         elif dynamic_take_up:
             policy_year = step // STEPS_PER_YEAR
@@ -1933,9 +3586,13 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
     # main loop
     # ------------------------------------------------------------------ #
     final_pre_surrender_cashflows: Optional[dict[str, Array]] = None
+    pending_income_transition: Optional[dict[str, object]] = None
     for k in range(n_steps):
         step = k + 1
         t = times[step]
+        interval_credit_rate = np.zeros(n_paths)
+        primary_mortality_draw: Optional[Array] = None
+        spouse_mortality_draw: Optional[Array] = None
         step_start_cashflows = {
             key: values[:, step].copy() for key, values in cfs.items()
         }
@@ -1985,6 +3642,7 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 Protection.TOTAL,
                 reference_spec.cap(year_idx),
             ))
+            interval_credit_rate = np.asarray(credit, dtype=float).copy()
             previous_reference_return = np.asarray(
                 fund_ratio - 1.0, dtype=float).copy()
             previous_credited_return = np.asarray(credit, dtype=float).copy()
@@ -2090,18 +3748,20 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
             if mortality_rng is None or dec.q_spouse_m is None:
                 raise RuntimeError(
                     "Pathwise Joint-Life mortality was not initialised."
-                )
+            )
             primary_before = primary_alive.copy()
             spouse_before = spouse_alive.copy()
+            primary_mortality_draw = mortality_rng.random(n_paths)
+            spouse_mortality_draw = mortality_rng.random(n_paths)
             primary_died = (
                 alive_mask
                 & primary_before
-                & (mortality_rng.random(n_paths) < dec.q_primary_m[k])
+                & (primary_mortality_draw < dec.q_primary_m[k])
             )
             spouse_died = (
                 alive_mask
                 & spouse_before
-                & (mortality_rng.random(n_paths) < dec.q_spouse_m[k])
+                & (spouse_mortality_draw < dec.q_spouse_m[k])
             )
             primary_alive = primary_before & ~primary_died
             spouse_alive = spouse_before & ~spouse_died
@@ -2263,19 +3923,257 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         fee_product_accrued = np.where(exhausted_av, 0.0, fee_product_accrued)
         fee_lip_accrued = np.where(exhausted_av, 0.0, fee_lip_accrued)
 
+        # ---- read-only Income Bellman transition panel -------------------- #
+        # The previous pre-action state is emitted only now, after the exact
+        # mortality draw and next-boundary market state are known.  This is a
+        # training observer; none of these future fields enters the policy's
+        # IncomeActionDecisionContext above.
+        if (
+            income_transition_observer_method is not None
+            and pending_income_transition is not None
+        ):
+            prior_state = pending_income_transition["state"]
+            if not isinstance(prior_state, IncomeActionState):
+                raise RuntimeError("Pending Income transition state is invalid.")
+            (
+                transition_death_probability,
+                transition_primary_alive,
+                transition_spouse_alive,
+                transition_joint_cover,
+                transition_joint_surv_primary,
+                transition_joint_surv_spouse,
+            ) = income_transition_mortality_shock(
+                k,
+                prior_state,
+                primary_mortality_draw,
+                spouse_mortality_draw,
+            )
+            idx = prior_state.path_index
+            potential_phase = phase.copy()
+            potential_primary_alive = primary_alive.copy()
+            potential_spouse_alive = spouse_alive.copy()
+            potential_joint_cover = joint_income_cover.copy()
+            potential_joint_surv_primary = joint_surv_primary.copy()
+            potential_joint_surv_spouse = joint_surv_spouse.copy()
+            potential_phase[idx] = np.where(
+                transition_death_probability >= 1.0 - 1.0e-15,
+                Phase.TERMINATED.value,
+                Phase.INCOME.value,
+            ).astype(np.int8)
+            potential_primary_alive[idx] = transition_primary_alive
+            potential_spouse_alive[idx] = transition_spouse_alive
+            potential_joint_cover[idx] = transition_joint_cover
+            potential_joint_surv_primary[idx] = transition_joint_surv_primary
+            potential_joint_surv_spouse[idx] = transition_joint_surv_spouse
+            next_annuity_factor = annuity_factor_for_state(
+                step,
+                float(t),
+                potential_phase,
+                potential_primary_alive,
+                potential_spouse_alive,
+                potential_joint_cover,
+                potential_joint_surv_primary,
+                potential_joint_surv_spouse,
+            )[idx]
+            if config.dva_enabled:
+                if is_anniv:
+                    next_dva_factor = (
+                        package_and_zcb(step, 1.0, potential_phase)
+                        if step < n_steps
+                        else np.ones(n_paths)
+                    )
+                else:
+                    tau_to_anniversary = (
+                        STEPS_PER_YEAR - (step - anniv_step)
+                    ) / STEPS_PER_YEAR
+                    next_dva_factor = package_and_zcb(
+                        step, tau_to_anniversary, potential_phase
+                    )
+            else:
+                next_dva_factor = np.ones(n_paths)
+            if scenarios.variance is None:
+                next_heston_variance = np.zeros(n_paths)
+            else:
+                next_heston_variance = np.asarray(
+                    scenarios.variance[reference_spec.equity_index][:, step],
+                    dtype=float,
+                )
+            next_announced_cap = as_path_array(
+                reference_spec.cap(anniv_step // STEPS_PER_YEAR),
+                name="announced crediting cap",
+            )
+            discount_ratio = np.divide(
+                scenarios.discount[idx, step],
+                np.maximum(
+                    scenarios.discount[idx, prior_state.step], 1.0e-300
+                ),
+            )
+            scenario_slice = IncomeMonthScenarioSlice(
+                current_step=prior_state.step,
+                next_step=int(step),
+                current_duration_years=float(
+                    pending_income_transition["duration_years"]
+                ),
+                next_duration_years=float(t),
+                is_anniversary=bool(is_anniv),
+                terminal_next=bool(step >= n_steps),
+                fee_year_fraction=float(fee_day_fractions[k]),
+                current_mva_factor=pending_income_transition["mva_factor"],
+                current_annuity_factor=(
+                    pending_income_transition["annuity_factor"]
+                ),
+                current_short_rate=pending_income_transition["short_rate"],
+                current_zero_rate_5y=pending_income_transition["zero_rate_5y"],
+                current_heston_variance=(
+                    pending_income_transition["heston_variance"]
+                ),
+                anniversary_credit_rate=interval_credit_rate[idx],
+                next_dva_factor=np.asarray(next_dva_factor, dtype=float)[idx],
+                terminating_death_probability=transition_death_probability,
+                next_primary_alive=transition_primary_alive,
+                next_spouse_alive=transition_spouse_alive,
+                next_joint_income_cover=transition_joint_cover,
+                next_joint_survival_primary=transition_joint_surv_primary,
+                next_joint_survival_spouse=transition_joint_surv_spouse,
+                next_mva_factor=current_mva_signal(step, float(t))[idx],
+                next_annuity_factor=next_annuity_factor,
+                next_short_rate=scenarios.short_rate[idx, step],
+                next_zero_rate_5y=as_path_array(
+                    scenarios.zero_rate(step, 5.0), name="five-year zero rate",
+                )[idx],
+                next_heston_variance=next_heston_variance[idx],
+                next_announced_cap=next_announced_cap[idx],
+                next_reference_return=previous_reference_return[idx],
+                next_credited_return=previous_credited_return[idx],
+                next_performance_gap=performance_shortfall[idx],
+                discount_ratio=discount_ratio,
+            )
+            income_transition_observer_method(
+                state=prior_state,
+                scenario_slice=scenario_slice,
+            )
+
+        pending_income_transition = None
+        if income_transition_observer_method is not None and step < n_steps:
+            transition_path_index = np.flatnonzero(
+                (phase == Phase.INCOME.value) & (w > 0.0)
+            ).astype(np.int64)
+            if transition_path_index.size:
+                transition_state = income_transition_state(
+                    step, transition_path_index
+                )
+                if scenarios.variance is None:
+                    current_heston_variance = np.zeros(n_paths)
+                else:
+                    current_heston_variance = np.asarray(
+                        scenarios.variance[
+                            reference_spec.equity_index
+                        ][:, step],
+                        dtype=float,
+                    )
+                pending_income_transition = {
+                    "state": transition_state,
+                    "duration_years": float(t),
+                    "mva_factor": current_mva_signal(step, float(t))[
+                        transition_path_index
+                    ],
+                    "annuity_factor": annuity_factor_at(step, float(t))[
+                        transition_path_index
+                    ],
+                    "short_rate": scenarios.short_rate[
+                        transition_path_index, step
+                    ],
+                    "zero_rate_5y": as_path_array(
+                        scenarios.zero_rate(step, 5.0),
+                        name="five-year zero rate",
+                    )[transition_path_index],
+                    "heston_variance": current_heston_variance[
+                        transition_path_index
+                    ],
+                }
+
         # ---- scheduled partial withdrawals -------------------------------- #
         wb = behaviour.withdrawals
         wd_scheduled = wb.free_utilisation > 0.0 or wb.excess_rate > 0.0
-        if wd_scheduled and (wb.frequency == "monthly" or is_anniv):
-            frac = 1.0 / STEPS_PER_YEAR if wb.frequency == "monthly" else 1.0
-            _apply_partial_withdrawals(product, policy, scenarios, step, t, iv,
-                                       iv_frame, phase, aps_active, cas_base,
-                                       cas_start_t, cas_le, cas_wd, free_wd_used,
-                                       partial_wd_used, wd_limit_base,
-                                       income_annual, w, cfs, wb, issue_zero, P0,
-                                       fraction=frac,
-                                       free_utilisation=free_utilisation,
-                                       excess_rate=excess_rate)
+        if income_action_policy is None:
+            # Keep the historical Static/Dynamic path byte-for-byte isolated
+            # from the new optimal-action branch.
+            if wd_scheduled and (wb.frequency == "monthly" or is_anniv):
+                frac = (
+                    1.0 / STEPS_PER_YEAR
+                    if wb.frequency == "monthly"
+                    else 1.0
+                )
+                _apply_partial_withdrawals(
+                    product, policy, scenarios, step, t, iv,
+                    iv_frame, phase, aps_active, cas_base,
+                    cas_start_t, cas_le, cas_wd, free_wd_used,
+                    partial_wd_used, wd_limit_base,
+                    income_annual, w, cfs, wb, issue_zero, P0,
+                    fraction=frac,
+                    free_utilisation=free_utilisation,
+                    excess_rate=excess_rate,
+                )
+        elif (
+            product.allows_growth_withdrawals
+            and wd_scheduled
+            and (wb.frequency == "monthly" or is_anniv)
+        ):
+            # The unified hook owns Income withdrawals only.  If another
+            # product explicitly permits Growth withdrawals, preserve those
+            # pre-existing Behaviour assumptions without allowing them to
+            # leak into Income paths.
+            frac = (
+                1.0 / STEPS_PER_YEAR
+                if wb.frequency == "monthly"
+                else 1.0
+            )
+            growth_mask = phase == Phase.GROWTH.value
+            _apply_partial_withdrawals(
+                product, policy, scenarios, step, t, iv,
+                iv_frame, phase, aps_active, cas_base,
+                cas_start_t, cas_le, cas_wd, free_wd_used,
+                partial_wd_used, wd_limit_base,
+                income_annual, w, cfs, wb, issue_zero, P0,
+                fraction=frac,
+                free_utilisation=np.where(
+                    growth_mask, free_utilisation, 0.0
+                ),
+                excess_rate=np.where(growth_mask, excess_rate, 0.0),
+            )
+
+        income_action_full_mask = np.zeros(n_paths, dtype=bool)
+        if (
+            income_action_policy is not None
+            and step < n_steps
+            and np.any((phase == Phase.INCOME.value) & (w > 0.0))
+        ):
+            action_context = income_action_context(step, float(t))
+            (
+                income_action_partial_mask,
+                income_action_full_mask,
+                income_action_partial_gross,
+            ) = choose_income_action(action_context)
+            if income_action_partial_mask.any():
+                (
+                    iv,
+                    iv_frame,
+                    income_annual,
+                    income_action_partial_cash,
+                    income_action_partial_mva,
+                ) = _income_partial_action_values(
+                    iv,
+                    iv_frame,
+                    income_annual,
+                    income_action_partial_gross,
+                    current_mva_signal(step, float(t)),
+                )
+                cfs["partial_withdrawals"][:, step] += (
+                    w * income_action_partial_cash
+                )
+                cfs["mva_retained"][:, step] += (
+                    w * income_action_partial_mva
+                )
 
         # ---- lapse / full withdrawal --------------------------------------- #
         lapse_fee_product, lapse_fee_lip, lapse_post_fee_av = fee_settlement(iv)
@@ -2357,6 +4255,19 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
                 phase == Phase.GROWTH.value, growth_performance_prob, 0.0
             ),
         )
+        if income_action_policy is not None:
+            # The unified decision is deterministic conditional on each path.
+            # It replaces both ordinary and performance-driven Income lapse;
+            # Growth Behaviour probabilities remain exactly as configured.
+            income_mask = phase == Phase.INCOME.value
+            ordinary_lapse = np.where(
+                income_mask,
+                income_action_full_mask.astype(float),
+                ordinary_lapse,
+            )
+            performance_lapse = np.where(
+                income_mask, 0.0, performance_lapse
+            )
         # Exact action boundary: everything currently in ``cfs[:, step]`` is
         # common to CONTINUE and FULL_WITHDRAWAL.  Settlement and midpoint
         # expense are booked only after this snapshot.
@@ -2576,6 +4487,31 @@ def project(product: IndexLinkedLifetimeIncomeProduct, policy: PolicySpec,
         cfs["mva_retained"][:, step] += w * base_lapse * mva_amt
         cfs["aps_retained"][:, step] += w * base_lapse * aps_forfeit
         w = w * (1.0 - base_lapse)
+        if income_action_policy is not None:
+            # FULL is a deterministic unified action, not an expected lapse
+            # cohort.  Its contract, guarantee and fee subledger terminate.
+            # Statistical/no-hook lapse paths retain the historical weighted
+            # cohort representation unchanged.
+            deterministic_full = income_action_full_mask & (
+                base_lapse >= 1.0 - 1.0e-15
+            )
+            iv = np.where(deterministic_full, 0.0, iv)
+            iv_frame = np.where(deterministic_full, 0.0, iv_frame)
+            income_annual = np.where(
+                deterministic_full, 0.0, income_annual
+            )
+            fee_product_accrued = np.where(
+                deterministic_full, 0.0, fee_product_accrued
+            )
+            fee_lip_accrued = np.where(
+                deterministic_full, 0.0, fee_lip_accrued
+            )
+            joint_income_cover = np.where(
+                deterministic_full, False, joint_income_cover
+            )
+            phase = np.where(
+                deterministic_full, Phase.TERMINATED.value, phase
+            ).astype(np.int8)
 
         # ---- expenses ----------------------------------------------------- #
         if exp_assum is not None:

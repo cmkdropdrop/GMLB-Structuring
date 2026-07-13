@@ -44,8 +44,14 @@ def test_path_preflight_includes_reconciliation_and_optional_plot_paths():
     without_plots = _expected_job_artifact_paths(job, include_plots=False)
     with_plots = _expected_job_artifact_paths(job, include_plots=True)
 
-    assert all(
-        path.name == "portfolio_aggregation_reconciliation.csv"
+    assert {
+        path.name for path in without_plots
+    } == {
+        "portfolio_aggregation_reconciliation.csv",
+        "lsmc_multi_seed_validation_evaluation.csv",
+    }
+    assert any(
+        path.name == "lsmc_multi_seed_validation_evaluation.csv"
         for path in without_plots
     )
     assert len(with_plots) > len(without_plots)

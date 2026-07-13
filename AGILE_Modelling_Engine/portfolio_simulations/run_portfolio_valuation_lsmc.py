@@ -2,13 +2,18 @@
 
 The market, product, mortality, cost, model-point and aggregation mechanics are
 the same as in ``run_portfolio_valuation.py``.  An independently trained,
-phase-aware annual-grid LSMC lower-bound policy maximises the risk-neutral
-value of Policyholder cashflows over ``WAIT | START_INCOME_NOW`` in Growth and
-``CONTINUE | FULL_WITHDRAWAL`` in Income.  The frozen policy is evaluated from
-contract inception on independent paths by the unchanged monthly cashflow
-projector.  The model-point ``income_start_year`` is retained only for explicit
+phase-aware LSMC lower-bound policy maximises the risk-neutral value of
+Policyholder cashflows over annual ``WAIT | START_INCOME_NOW`` decisions in
+Growth and monthly ``CONTINUE | PARTIAL_WITHDRAWAL | FULL_WITHDRAWAL``
+decisions in Income.  Validation and final evaluation use separate held-out
+samples.  Exactly three predeclared training-seed triplets are fitted and each
+must independently pass Election-, Income-action- and Combined-policy gates on
+the same validation paths; all three frozen policies are then reported on the
+same final paths without evaluation-based selection.  The first seed remains
+the predeclared primary policy for the canonical V00/V01/V10/V11 outputs.  The
+model-point ``income_start_year`` is retained only for explicit
 deterministic validation benchmarks.  A paired dynamic-behaviour benchmark is
-produced on the same evaluation scenarios by default.
+produced on the same final evaluation scenarios by default.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -45,6 +50,8 @@ from agile_engine import (  # noqa: E402
     DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
     FeeSpec,
     HedgeCapLegMode,
+    IncomeActionDecision,
+    IncomeActionType,
     IndexLinkedLifetimeIncomeProduct,
     MortalityTable,
     ProjectionConfig,
@@ -55,6 +62,7 @@ from agile_engine import (  # noqa: E402
     load_dynamic_behaviour_assumptions,
     load_market_assumptions,
     load_policyholder_model_points,
+    value_contract,
     value_policyholder_portfolio,
 )
 from agile_engine.esg import Measure  # noqa: E402
@@ -72,6 +80,10 @@ from agile_engine.portfolio_stresses import (  # noqa: E402
     portfolio_scenario_transform,
 )
 from agile_engine.pricing import build_scenarios, resolve_horizon  # noqa: E402
+from agile_engine.optimal_behaviour_validation import (  # noqa: E402
+    OptimalBehaviourValidationResult,
+    paired_noninferiority_gate,
+)
 from agile_engine.product import PolicySpec  # noqa: E402
 
 from run_portfolio_valuation import (  # noqa: E402
@@ -136,6 +148,51 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=10197,
         help="independent pathwise Joint-Life mortality seed for LSMC training",
     )
+    parser.add_argument(
+        "--train-seed-2",
+        type=int,
+        default=32026,
+        help="market seed for the second independently validated LSMC fit",
+    )
+    parser.add_argument(
+        "--train-take-up-seed-2",
+        type=int,
+        default=30097,
+        help="Election stream for the second independently validated LSMC fit",
+    )
+    parser.add_argument(
+        "--train-mortality-seed-2",
+        type=int,
+        default=30197,
+        help="mortality stream for the second independently validated LSMC fit",
+    )
+    parser.add_argument(
+        "--train-seed-3",
+        type=int,
+        default=42026,
+        help="market seed for the third independently validated LSMC fit",
+    )
+    parser.add_argument(
+        "--train-take-up-seed-3",
+        type=int,
+        default=40097,
+        help="Election stream for the third independently validated LSMC fit",
+    )
+    parser.add_argument(
+        "--train-mortality-seed-3",
+        type=int,
+        default=40197,
+        help="mortality stream for the third independently validated LSMC fit",
+    )
+    parser.add_argument(
+        "--n-validation",
+        type=int,
+        default=2_000,
+        help="independent paths used only for frozen-policy validation gates",
+    )
+    parser.add_argument("--validation-seed", type=int, default=22026)
+    parser.add_argument("--validation-take-up-seed", type=int, default=20097)
+    parser.add_argument("--validation-mortality-seed", type=int, default=20197)
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--hedge-cap-leg-mode",
@@ -153,12 +210,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="shared stress applied to LSMC training and all evaluations",
     )
     parser.add_argument("--lsmc-folds", type=int, default=5)
-    parser.add_argument("--lsmc-ridge", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--lsmc-ridge",
+        type=float,
+        choices=(0.0, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2),
+        default=1.0e-6,
+        help=(
+            "legacy single-Ridge setting; v2 selection always uses the exact "
+            "documented five-value grid"
+        ),
+    )
     parser.add_argument(
         "--exercise-buffer-rmse-multiplier",
         type=float,
         default=0.25,
-        help="conservative Election and Full-Withdrawal advantage screen",
+        help="conservative buffer for every fitted action advantage",
     )
     parser.add_argument("--crediting-cap-rate", type=float, default=None)
     parser.add_argument("--portfolio-contract-count", type=float, default=None)
@@ -167,6 +233,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-dynamic-benchmark", action="store_true")
     parser.add_argument(
+        "--no-factorial-benchmarks",
+        action="store_true",
+        help=(
+            "skip the V00/V01 counterfactual valuation outputs; retain only "
+            "the full V11 policy and the internal V10 Continue validation "
+            "control"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -174,7 +249,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--log-file", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    for name in ("n_paths", "n_train", "heston_substeps"):
+    for name in ("n_paths", "n_train", "n_validation", "heston_substeps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.lsmc_folds < 2:
@@ -186,18 +261,50 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "train_seed",
         "train_take_up_seed",
         "train_mortality_seed",
+        "train_seed_2",
+        "train_take_up_seed_2",
+        "train_mortality_seed_2",
+        "train_seed_3",
+        "train_take_up_seed_3",
+        "train_mortality_seed_3",
+        "validation_seed",
+        "validation_take_up_seed",
+        "validation_mortality_seed",
     )
     if any(getattr(args, name) < 0 for name in seed_names):
         parser.error("all seeds must be non-negative")
-    if args.seed == args.train_seed:
-        parser.error("--seed and --train-seed must differ for out-of-sample LSMC")
-    if args.take_up_seed == args.train_take_up_seed:
+    market_seeds = (
+        args.train_seed,
+        args.train_seed_2,
+        args.train_seed_3,
+        args.validation_seed,
+        args.seed,
+    )
+    take_up_seeds = (
+        args.train_take_up_seed,
+        args.train_take_up_seed_2,
+        args.train_take_up_seed_3,
+        args.validation_take_up_seed,
+        args.take_up_seed,
+    )
+    mortality_seeds = (
+        args.train_mortality_seed,
+        args.train_mortality_seed_2,
+        args.train_mortality_seed_3,
+        args.validation_mortality_seed,
+        args.mortality_seed,
+    )
+    if len(set(market_seeds)) != len(market_seeds):
         parser.error(
-            "--take-up-seed and --train-take-up-seed must differ"
+            "all three training, validation and evaluation market seeds must differ"
         )
-    if args.mortality_seed == args.train_mortality_seed:
+    if len(set(take_up_seeds)) != len(take_up_seeds):
         parser.error(
-            "--mortality-seed and --train-mortality-seed must differ"
+            "all three training, validation and evaluation take-up seeds must differ"
+        )
+    if len(set(mortality_seeds)) != len(mortality_seeds):
+        parser.error(
+            "all three training, validation and evaluation mortality seeds must differ"
         )
     if not math.isfinite(args.lsmc_ridge) or args.lsmc_ridge < 0.0:
         parser.error("--lsmc-ridge must be finite and non-negative")
@@ -267,7 +374,7 @@ def _fresh_policy(fit: OptimalBehaviourPolicyFit) -> OptimalBehaviourPolicy:
 
 
 class _ElectionOnlyPolicy:
-    """Deploy the fitted Election rule while suppressing Income surrender."""
+    """Deploy the fitted Election rule while suppressing Income actions."""
 
     anniversary_only = True
 
@@ -284,6 +391,192 @@ class _ElectionOnlyPolicy:
     def surrender_mask(*, context: object) -> np.ndarray:
         n_paths = int(getattr(context, "n_paths"))
         return np.zeros(n_paths, dtype=bool)
+
+
+class _FixedIncomeActionPolicy:
+    """Pre-declared feasible Income policy used only for validation."""
+
+    def __init__(self, mode: str, fraction: float = 0.0) -> None:
+        if mode not in {"full_first", "partial_once", "partial_annual"}:
+            raise ValueError(f"Unknown fixed Income benchmark mode: {mode}.")
+        if mode.startswith("partial") and not 0.0 < fraction <= 1.0:
+            raise ValueError("Fixed Partial benchmark fraction must be in (0, 1].")
+        self.mode = mode
+        self.fraction = float(fraction)
+        self._acted: Optional[np.ndarray] = None
+        self.provenance_fingerprint = f"validation:{mode}:{fraction:.6f}"
+
+    def choose_income_action(self, *, context: object) -> IncomeActionDecision:
+        n_paths = int(getattr(context, "n_paths"))
+        if self._acted is None:
+            self._acted = np.zeros(n_paths, dtype=bool)
+        if self._acted.shape != (n_paths,):
+            raise ValueError("Fixed validation policy cannot be reused across samples.")
+        actions = np.full(
+            n_paths, IncomeActionType.CONTINUE, dtype=object
+        )
+        fractions = np.zeros(n_paths)
+        if self.mode == "full_first":
+            selected = (
+                np.asarray(getattr(context, "full_withdrawal_eligible"), dtype=bool)
+                & ~self._acted
+            )
+            actions[selected] = IncomeActionType.FULL_WITHDRAWAL
+        else:
+            selected = np.asarray(
+                getattr(context, "partial_withdrawal_eligible"), dtype=bool
+            )
+            selected &= (
+                np.asarray(
+                    getattr(context, "max_partial_gross_amount"), dtype=float
+                )
+                * self.fraction
+                >= 100.0 - 1.0e-10
+            )
+            if self.mode == "partial_once":
+                selected &= ~self._acted
+            else:
+                selected &= int(getattr(context, "step")) % 12 == 0
+            actions[selected] = IncomeActionType.PARTIAL_WITHDRAWAL
+            fractions[selected] = self.fraction
+        self._acted[selected] = True
+        return IncomeActionDecision(
+            action_type=actions,
+            partial_fraction_of_max=fractions,
+        )
+
+
+_POLICYHOLDER_VALIDATION_CASHFLOWS = (
+    "income_paid",
+    "death_benefits",
+    "surrender_benefits",
+    "partial_withdrawals",
+    "terminal_closeout",
+)
+
+
+def _validation_election_year(
+    policy: PolicySpec,
+    product: IndexLinkedLifetimeIncomeProduct,
+    strategy: str,
+) -> float:
+    earliest = float(product.min_years_before_income)
+    forced = max(earliest, float(math.floor(100.0 - policy.age) + 1))
+    candidates = {
+        "earliest": earliest,
+        "year_5": max(earliest, 5.0),
+        "year_10": max(earliest, 10.0),
+        "model_point": float(policy.effective_income_start_year(product)),
+        "forced": forced,
+    }
+    if strategy not in candidates:
+        raise ValueError(f"Unknown validation Election strategy: {strategy}.")
+    return candidates[strategy]
+
+
+def _validation_policyholder_path_values(
+    *,
+    product: IndexLinkedLifetimeIncomeProduct,
+    model_points: object,
+    esg_config: object,
+    mortality: MortalityTable,
+    behaviour: object,
+    expenses: object,
+    settings: ValuationSettings,
+    scenarios: object,
+    policy_transform: Optional[Callable[[PolicySpec], PolicySpec]] = None,
+    hooks_factory: Optional[
+        Callable[[PolicySpec], tuple[Optional[object], Optional[object], Optional[object]]]
+    ] = None,
+) -> tuple[np.ndarray, float]:
+    """Aggregate pathwise PH values without collapsing the validation sample."""
+
+    points = tuple(getattr(model_points, "model_points"))
+    weight_sum = float(sum(point.contract_weight for point in points))
+    if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise ValueError("Validation model-point weights must be positive.")
+    aggregate = np.zeros(int(settings.n_paths))
+    aggregate_premium = 0.0
+    for point in points:
+        original_policy = point.policy
+        valuation_policy = (
+            original_policy
+            if policy_transform is None
+            else policy_transform(original_policy)
+        )
+        election_policy: Optional[object] = None
+        income_action_policy: Optional[object] = None
+        surrender_policy: Optional[object] = None
+        if hooks_factory is not None:
+            election_policy, income_action_policy, surrender_policy = (
+                hooks_factory(original_policy)
+            )
+        valuation = value_contract(
+            product,
+            valuation_policy,
+            esg_config,
+            mortality,
+            behaviour,
+            expenses=expenses,
+            settings=settings,
+            scenarios=scenarios,
+            income_election_policy=election_policy,
+            income_action_policy=income_action_policy,
+            surrender_policy=surrender_policy,
+        )
+        projection = valuation.projection
+        cashflows = sum(
+            projection.cashflows[name]
+            for name in _POLICYHOLDER_VALIDATION_CASHFLOWS
+        )
+        columns = cashflows.shape[1]
+        path_values = np.sum(
+            cashflows * scenarios.discount[:, :columns], axis=1
+        )
+        weight = float(point.contract_weight) / weight_sum
+        aggregate += weight * np.asarray(path_values, dtype=float)
+        aggregate_premium += weight * float(valuation.premium)
+    if not np.all(np.isfinite(aggregate)):
+        raise ValueError("Validation produced non-finite Policyholder values.")
+    return aggregate, aggregate_premium
+
+
+def _write_validation_manifest(
+    path: Path,
+    result: OptimalBehaviourValidationResult,
+    *,
+    settings: ValuationSettings,
+) -> None:
+    payload = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "valid": result.valid,
+        "scenario_fingerprint": result.scenario_fingerprint,
+        "n_paths": settings.n_paths,
+        "seed": settings.seed,
+        "take_up_seed": settings.projection.take_up_seed,
+        "mortality_seed": settings.projection.mortality_seed,
+        "gates": [gate.as_dict() for gate in result.gates],
+        "benchmark_means_aud": dict(result.benchmark_means_aud),
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+
+
+def _deduplicate_validation_benchmarks(
+    benchmarks: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Remove pathwise-identical benchmark variants without using means."""
+
+    unique: dict[str, np.ndarray] = {}
+    for name, values in benchmarks.items():
+        candidate = np.asarray(values, dtype=float)
+        if any(np.array_equal(candidate, existing) for existing in unique.values()):
+            continue
+        unique[str(name)] = candidate
+    if not unique:
+        raise ValueError("Validation benchmark library is empty after filtering.")
+    return unique
 
 
 def _comparison_rows(
@@ -478,7 +771,8 @@ def _write_comparison_report(
     lines.extend([
         "",
         "Der LSMC-Hauptlauf optimiert auf zulässigen Policy Anniversaries "
-        "WAIT gegen START_INCOME_NOW und danach CONTINUE gegen FULL_WITHDRAWAL. "
+        "WAIT gegen START_INCOME_NOW und danach monatlich CONTINUE gegen "
+        "PARTIAL_WITHDRAWAL und FULL_WITHDRAWAL. "
         "Der Modellpunkttermin bleibt ausschließlich ein separat ausgewiesener "
         "deterministischer Validierungsbenchmark; Growth-Surrender und "
         "Growth-Withdrawals bleiben vertraglich ausgeschlossen.",
@@ -494,7 +788,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     started = time.perf_counter()
 
     try:
-        logger.info("[1/7] LSMC-Portfoliolauf gestartet | Output: %s", output)
+        logger.info("[1/8] LSMC-Portfoliolauf gestartet | Output: %s", output)
+        stale_multi_seed_report = (
+            output / "lsmc_multi_seed_validation_evaluation.csv"
+        ).resolve()
+        if stale_multi_seed_report.parent != output:
+            raise RuntimeError("Unsafe stale multi-seed report path.")
+        if stale_multi_seed_report.is_file():
+            stale_multi_seed_report.unlink()
+        # Remove completion markers and validation artifacts before any fit.
+        # A failed rerun must never leave an older apparently complete report
+        # beside the new invalid diagnostics.
+        for artifact_name in (
+            "run_manifest.json",
+            "portfolio_summary.csv",
+            "model_point_results.csv",
+            "portfolio_aggregation_reconciliation.csv",
+            "income_election_distribution.csv",
+            "lsmc_regression_diagnostics.csv",
+            "lsmc_action_summary.csv",
+            "lsmc_vs_continue_summary.csv",
+            "behaviour_decomposition.csv",
+            "lsmc_validation_summary.csv",
+            "lsmc_validation_manifest.json",
+        ):
+            stale_artifact = (output / artifact_name).resolve()
+            if stale_artifact.parent != output:
+                raise RuntimeError("Unsafe stale LSMC-output path.")
+            if stale_artifact.is_file():
+                stale_artifact.unlink()
         if args.no_dynamic_benchmark:
             stale_dynamic = (output / "dynamic_benchmark").resolve()
             if stale_dynamic.parent != output:
@@ -581,6 +903,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 heston_cos=False,
                 take_up_seed=args.take_up_seed,
                 mortality_seed=args.mortality_seed,
+                force_pathwise_joint_life=True,
             ),
             real_world_model="hull_white_bs",
         )
@@ -589,35 +912,83 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             resolve_horizon(horizon_basis, point.policy)
             for point in model_points.model_points
         )
-        training_projection = replace(
-            costs.projection,
-            record_paths=True,
-            heston_cos=False,
-            take_up_seed=args.train_take_up_seed,
-            mortality_seed=args.train_mortality_seed,
+        training_seed_triplets = (
+            {
+                "seed_index": 1,
+                "market_seed": args.train_seed,
+                "take_up_seed": args.train_take_up_seed,
+                "mortality_seed": args.train_mortality_seed,
+                "primary": True,
+            },
+            {
+                "seed_index": 2,
+                "market_seed": args.train_seed_2,
+                "take_up_seed": args.train_take_up_seed_2,
+                "mortality_seed": args.train_mortality_seed_2,
+                "primary": False,
+            },
+            {
+                "seed_index": 3,
+                "market_seed": args.train_seed_3,
+                "take_up_seed": args.train_take_up_seed_3,
+                "mortality_seed": args.train_mortality_seed_3,
+                "primary": False,
+            },
         )
-        training_settings = ValuationSettings(
-            model="heston_hull_white",
-            n_paths=args.n_train,
-            seed=args.train_seed,
-            heston_substeps=args.heston_substeps,
-            horizon_years=common_horizon,
-            projection=training_projection,
-            real_world_model="hull_white_bs",
-        )
+        training_projections: list[ProjectionConfig] = []
+        training_scenarios_by_seed: list[object] = []
         logger.info(
-            "[2/7] Unabhängige LSMC-Trainingspfade erzeugen | paths=%d | "
-            "seed=%d | horizon=%.1f",
-            args.n_train, args.train_seed, common_horizon,
+            "[2/8] Drei getrennte LSMC-Trainingssamples erzeugen | "
+            "paths je Sample=%d | horizon=%.1f",
+            args.n_train,
+            common_horizon,
         )
-        training_scenarios = build_scenarios(
-            stressed_esg,
-            training_settings,
-            measure=Measure.RISK_NEUTRAL,
-            horizon_years=common_horizon,
+        for seed_triplet in training_seed_triplets:
+            training_projection_i = replace(
+                costs.projection,
+                record_paths=True,
+                heston_cos=False,
+                take_up_seed=int(seed_triplet["take_up_seed"]),
+                mortality_seed=int(seed_triplet["mortality_seed"]),
+                force_pathwise_joint_life=True,
+            )
+            training_settings_i = ValuationSettings(
+                model="heston_hull_white",
+                n_paths=args.n_train,
+                seed=int(seed_triplet["market_seed"]),
+                heston_substeps=args.heston_substeps,
+                horizon_years=common_horizon,
+                projection=training_projection_i,
+                real_world_model="hull_white_bs",
+            )
+            logger.info(
+                "LSMC-Trainingssample %d/3 | market=%d | take-up=%d | "
+                "mortality=%d",
+                seed_triplet["seed_index"],
+                seed_triplet["market_seed"],
+                seed_triplet["take_up_seed"],
+                seed_triplet["mortality_seed"],
+            )
+            training_scenarios_i = build_scenarios(
+                stressed_esg,
+                training_settings_i,
+                measure=Measure.RISK_NEUTRAL,
+                horizon_years=common_horizon,
+            )
+            if scenario_transform is not None:
+                training_scenarios_i = scenario_transform(training_scenarios_i)
+            training_projections.append(training_projection_i)
+            training_scenarios_by_seed.append(training_scenarios_i)
+        training_projection = training_projections[0]
+        training_scenarios = training_scenarios_by_seed[0]
+        training_scenario_fingerprints = tuple(
+            scenario.content_fingerprint
+            for scenario in training_scenarios_by_seed
         )
-        if scenario_transform is not None:
-            training_scenarios = scenario_transform(training_scenarios)
+        if len(set(training_scenario_fingerprints)) != 3:
+            raise RuntimeError(
+                "The three LSMC training samples must have distinct fingerprints."
+            )
         lsmc_settings = OptimalBehaviourLSMCSettings(
             ridge=args.lsmc_ridge,
             n_folds=args.lsmc_folds,
@@ -629,35 +1000,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             policy_labels.setdefault(_policy_signature(point.policy), []).append(
                 point.model_point_id)
 
-        fits: dict[tuple[object, ...], OptimalBehaviourPolicyFit] = {}
+        fits_by_seed: list[
+            dict[tuple[object, ...], OptimalBehaviourPolicyFit]
+        ] = [{}, {}, {}]
+        # The primary seed remains the only fit driving the canonical
+        # V00/V01/V10/V11 output files.  Seeds two and three are independent
+        # robustness replications and are never candidates for selection.
+        fits = fits_by_seed[0]
 
-        def ensure_fit(policy_object: object) -> OptimalBehaviourPolicyFit:
+        def ensure_fit(
+            policy_object: object,
+            training_seed_index: int = 0,
+        ) -> OptimalBehaviourPolicyFit:
             if not isinstance(policy_object, PolicySpec):
                 raise TypeError("LSMC policy factory requires PolicySpec.")
+            if training_seed_index not in (0, 1, 2):
+                raise ValueError("training_seed_index must be zero, one or two.")
+            selected_fits = fits_by_seed[training_seed_index]
             key = _policy_signature(policy_object)
-            if key not in fits:
+            if key not in selected_fits:
                 labels = ",".join(policy_labels.get(key, ["unlabelled"]))
+                seed_triplet = training_seed_triplets[training_seed_index]
                 logger.info(
-                    "LSMC-Fit | %s | age=%.0f | premium=%.0f | spouse=%s",
+                    "LSMC-Fit seed=%d | %s | age=%.0f | premium=%.0f | "
+                    "spouse=%s",
+                    seed_triplet["seed_index"],
                     labels, policy_object.age, policy_object.initial_investment,
                     policy_object.spouse,
                 )
-                fits[key] = fit_optimal_behaviour_policy(
+                selected_fits[key] = fit_optimal_behaviour_policy(
                     costs.product,
                     policy_object,
-                    training_scenarios,
+                    training_scenarios_by_seed[training_seed_index],
                     mortality,
                     expenses=stressed_expenses,
-                    projection_config=training_projection,
+                    projection_config=training_projections[training_seed_index],
                     settings=lsmc_settings,
                     fit_basis_inputs={
                         "stress_scenario": stress_audit,
+                        "training_seed_index": int(
+                            seed_triplet["seed_index"]
+                        ),
+                        "training_seed_triplet": {
+                            "market_seed": int(seed_triplet["market_seed"]),
+                            "take_up_seed": int(seed_triplet["take_up_seed"]),
+                            "mortality_seed": int(
+                                seed_triplet["mortality_seed"]
+                            ),
+                        },
                         "crediting_cap_rate": (
                             costs.product.reference_fund.effective_maximum_return
                         ),
                     },
                 )
-            return fits[key]
+            return selected_fits[key]
 
         deployed_policies: dict[
             tuple[object, ...], OptimalBehaviourPolicy
@@ -665,7 +1061,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         election_only_policies: dict[
             tuple[object, ...], _ElectionOnlyPolicy
         ] = {}
-        deterministic_surrender_policies: dict[tuple[object, ...], object] = {}
+        deterministic_income_action_policies: dict[
+            tuple[object, ...], object
+        ] = {}
 
         def combined_policy_factory(policy_object: object) -> object:
             if not isinstance(policy_object, PolicySpec):
@@ -685,24 +1083,483 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             return election_only_policies[key]
 
-        def deterministic_surrender_policy_factory(
+        def deterministic_income_action_policy_factory(
             policy_object: object,
         ) -> object:
             if not isinstance(policy_object, PolicySpec):
                 raise TypeError("LSMC policy factory requires PolicySpec.")
             key = _policy_signature(policy_object)
-            if key not in deterministic_surrender_policies:
-                deterministic_surrender_policies[key] = _fresh_policy(
+            if key not in deterministic_income_action_policies:
+                deterministic_income_action_policies[key] = _fresh_policy(
                     ensure_fit(policy_object)
-                ).surrender_policy
-            return deterministic_surrender_policies[key]
+                )
+            return deterministic_income_action_policies[key]
+
+        validation_projection = replace(
+            costs.projection,
+            record_paths=False,
+            heston_cos=False,
+            take_up_seed=args.validation_take_up_seed,
+            mortality_seed=args.validation_mortality_seed,
+            force_pathwise_joint_life=True,
+        )
+        validation_settings = ValuationSettings(
+            model="heston_hull_white",
+            n_paths=args.n_validation,
+            seed=args.validation_seed,
+            heston_substeps=args.heston_substeps,
+            horizon_years=common_horizon,
+            projection=validation_projection,
+            real_world_model="hull_white_bs",
+        )
+        logger.info(
+            "[3/8] Eingefrorene LSMC-Policy auf getrennten "
+            "Validierungspfaden validieren | paths=%d | seed=%d",
+            args.n_validation,
+            args.validation_seed,
+        )
+        validation_scenarios = build_scenarios(
+            stressed_esg,
+            validation_settings,
+            measure=Measure.RISK_NEUTRAL,
+            horizon_years=common_horizon,
+        )
+        if scenario_transform is not None:
+            validation_scenarios = scenario_transform(validation_scenarios)
+        if validation_scenarios.content_fingerprint in set(
+            training_scenario_fingerprints
+        ):
+            raise ValueError(
+                "All training and validation scenario sets must be independent."
+            )
+
+        def validation_combined_hooks(
+            policy_object: PolicySpec,
+            training_seed_index: int = 0,
+        ) -> tuple[object, object, None]:
+            policy = _fresh_policy(
+                ensure_fit(policy_object, training_seed_index)
+            )
+            return policy, policy, None
+
+        def validation_election_hooks(
+            policy_object: PolicySpec,
+            training_seed_index: int = 0,
+        ) -> tuple[object, None, None]:
+            policy = _ElectionOnlyPolicy(_fresh_policy(
+                ensure_fit(policy_object, training_seed_index)
+            ))
+            return policy, None, None
+
+        def validation_income_hooks(
+            policy_object: PolicySpec,
+            training_seed_index: int = 0,
+        ) -> tuple[None, object, None]:
+            return (
+                None,
+                _fresh_policy(ensure_fit(policy_object, training_seed_index)),
+                None,
+            )
+
+        for training_seed_index in range(3):
+            for point in model_points.model_points:
+                ensure_fit(point.policy, training_seed_index)
+        invalid_fit_records = [
+            (training_seed_index, key, fit)
+            for training_seed_index, selected_fits in enumerate(fits_by_seed)
+            for key, fit in selected_fits.items()
+            if not fit.valid
+        ]
+        if invalid_fit_records:
+            invalid_diagnostic_rows = [
+                {
+                    "training_seed_index": training_seed_index + 1,
+                    "training_market_seed": training_seed_triplets[
+                        training_seed_index
+                    ]["market_seed"],
+                    "policy_signature": repr(key),
+                    "fit_basis_fingerprint": fit.fit_basis_fingerprint,
+                    "fit_valid": fit.valid,
+                    "fit_invalid_reasons": "|".join(fit.invalid_reasons),
+                    **diagnostic.as_dict(),
+                }
+                for training_seed_index, key, fit in invalid_fit_records
+                for diagnostic in fit.diagnostics
+            ]
+            if invalid_diagnostic_rows:
+                _write_csv(
+                    output / "lsmc_regression_diagnostics.csv",
+                    invalid_diagnostic_rows,
+                )
+            invalid_rows = [
+                {
+                    "valid": False,
+                    "status": "fit_invalid",
+                    "training_seed_index": training_seed_index + 1,
+                    "training_market_seed": training_seed_triplets[
+                        training_seed_index
+                    ]["market_seed"],
+                    "policy_signature": repr(key),
+                    "fit_basis_fingerprint": fit.fit_basis_fingerprint,
+                    "invalid_reasons": "|".join(fit.invalid_reasons),
+                }
+                for training_seed_index, key, fit in invalid_fit_records
+            ]
+            _write_csv(output / "lsmc_validation_summary.csv", invalid_rows)
+            invalid_payload = {
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "valid": False,
+                "status": "fit_invalid",
+                "scenario_fingerprint": (
+                    validation_scenarios.content_fingerprint
+                ),
+                "training_scenario_fingerprints": list(
+                    training_scenario_fingerprints
+                ),
+                "training_seed_triplets": list(training_seed_triplets),
+                "gates": [],
+                "invalid_fits": invalid_rows,
+            }
+            with (output / "lsmc_validation_manifest.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(
+                    invalid_payload,
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                handle.write("\n")
+            raise RuntimeError(
+                "One or more LSMC fits are invalid; see validation diagnostics."
+            )
+
+        validation_candidates_by_seed: list[dict[str, np.ndarray]] = []
+        validation_premium: Optional[float] = None
+        for training_seed_index in range(3):
+            election_candidate, election_premium = (
+                _validation_policyholder_path_values(
+                    product=costs.product,
+                    model_points=model_points,
+                    esg_config=stressed_esg,
+                    mortality=mortality,
+                    behaviour=lsmc_behaviour,
+                    expenses=stressed_expenses,
+                    settings=validation_settings,
+                    scenarios=validation_scenarios,
+                    hooks_factory=(
+                        lambda policy, selected=training_seed_index: (
+                            validation_election_hooks(policy, selected)
+                        )
+                    ),
+                )
+            )
+            income_candidate, income_premium = (
+                _validation_policyholder_path_values(
+                    product=costs.product,
+                    model_points=model_points,
+                    esg_config=stressed_esg,
+                    mortality=mortality,
+                    behaviour=lsmc_behaviour,
+                    expenses=stressed_expenses,
+                    settings=validation_settings,
+                    scenarios=validation_scenarios,
+                    hooks_factory=(
+                        lambda policy, selected=training_seed_index: (
+                            validation_income_hooks(policy, selected)
+                        )
+                    ),
+                )
+            )
+            combined_candidate, combined_premium = (
+                _validation_policyholder_path_values(
+                    product=costs.product,
+                    model_points=model_points,
+                    esg_config=stressed_esg,
+                    mortality=mortality,
+                    behaviour=lsmc_behaviour,
+                    expenses=stressed_expenses,
+                    settings=validation_settings,
+                    scenarios=validation_scenarios,
+                    hooks_factory=(
+                        lambda policy, selected=training_seed_index: (
+                            validation_combined_hooks(policy, selected)
+                        )
+                    ),
+                )
+            )
+            premiums = (election_premium, income_premium, combined_premium)
+            if not all(math.isclose(
+                election_premium, premium, rel_tol=0.0, abs_tol=1.0e-10
+            ) for premium in premiums[1:]):
+                raise RuntimeError(
+                    "Validation premium changed between policy components."
+                )
+            if validation_premium is None:
+                validation_premium = election_premium
+            elif not math.isclose(
+                validation_premium,
+                election_premium,
+                rel_tol=0.0,
+                abs_tol=1.0e-10,
+            ):
+                raise RuntimeError(
+                    "Validation premium changed between training seeds."
+                )
+            validation_candidates_by_seed.append({
+                "election_only": election_candidate,
+                "income_action_only": income_candidate,
+                "combined_policy": combined_candidate,
+            })
+        if validation_premium is None:
+            raise RuntimeError("No validation premium was produced.")
+
+        election_strategies: dict[str, tuple[float, ...]] = {}
+        for strategy in (
+            "earliest",
+            "year_5",
+            "year_10",
+            "model_point",
+            "forced",
+        ):
+            signature = tuple(
+                _validation_election_year(
+                    point.policy,
+                    costs.product,
+                    strategy,
+                )
+                for point in model_points.model_points
+            )
+            if signature not in election_strategies.values():
+                election_strategies[strategy] = signature
+
+        election_benchmarks: dict[str, np.ndarray] = {}
+        for strategy in election_strategies:
+            values, _ = _validation_policyholder_path_values(
+                product=costs.product,
+                model_points=model_points,
+                esg_config=stressed_esg,
+                mortality=mortality,
+                behaviour=lsmc_behaviour,
+                expenses=stressed_expenses,
+                settings=validation_settings,
+                scenarios=validation_scenarios,
+                policy_transform=lambda policy, selected=strategy: replace(
+                    policy,
+                    income_start_year=_validation_election_year(
+                        policy,
+                        costs.product,
+                        selected,
+                    ),
+                ),
+            )
+            election_benchmarks[strategy] = values
+        election_benchmarks = _deduplicate_validation_benchmarks(
+            election_benchmarks
+        )
+
+        income_benchmark_specs: tuple[tuple[str, Optional[str], float], ...] = (
+            ("continue_only", None, 0.0),
+            ("full_first_eligible", "full_first", 0.0),
+            ("partial_once_25pct", "partial_once", 0.25),
+            ("partial_once_50pct", "partial_once", 0.50),
+            ("partial_once_100pct", "partial_once", 1.00),
+            ("partial_annual_25pct", "partial_annual", 0.25),
+            ("partial_annual_50pct", "partial_annual", 0.50),
+        )
+        income_benchmarks: dict[str, np.ndarray] = {}
+        for name, mode, fraction in income_benchmark_specs:
+            hooks_factory = None
+            if mode is not None:
+                hooks_factory = (
+                    lambda _policy, selected=mode, amount=fraction: (
+                        None,
+                        _FixedIncomeActionPolicy(selected, amount),
+                        None,
+                    )
+                )
+            values, _ = _validation_policyholder_path_values(
+                product=costs.product,
+                model_points=model_points,
+                esg_config=stressed_esg,
+                mortality=mortality,
+                behaviour=lsmc_behaviour,
+                expenses=stressed_expenses,
+                settings=validation_settings,
+                scenarios=validation_scenarios,
+                hooks_factory=hooks_factory,
+            )
+            income_benchmarks[name] = values
+        income_benchmarks = _deduplicate_validation_benchmarks(income_benchmarks)
+
+        combined_benchmarks: dict[str, np.ndarray] = {}
+        for election_name in election_strategies:
+            for income_name, mode, fraction in income_benchmark_specs:
+                hooks_factory = None
+                if mode is not None:
+                    hooks_factory = (
+                        lambda _policy, selected=mode, amount=fraction: (
+                            None,
+                            _FixedIncomeActionPolicy(selected, amount),
+                            None,
+                        )
+                    )
+                values, _ = _validation_policyholder_path_values(
+                    product=costs.product,
+                    model_points=model_points,
+                    esg_config=stressed_esg,
+                    mortality=mortality,
+                    behaviour=lsmc_behaviour,
+                    expenses=stressed_expenses,
+                    settings=validation_settings,
+                    scenarios=validation_scenarios,
+                    policy_transform=(
+                        lambda policy, selected=election_name: replace(
+                            policy,
+                            income_start_year=_validation_election_year(
+                                policy,
+                                costs.product,
+                                selected,
+                            ),
+                        )
+                    ),
+                    hooks_factory=hooks_factory,
+                )
+                combined_benchmarks[
+                    f"{election_name}|{income_name}"
+                ] = values
+        combined_benchmarks = _deduplicate_validation_benchmarks(
+            combined_benchmarks
+        )
+
+        benchmark_means = {
+            **{
+                f"election_only:{name}": float(np.mean(values))
+                for name, values in election_benchmarks.items()
+            },
+            **{
+                f"income_action_only:{name}": float(np.mean(values))
+                for name, values in income_benchmarks.items()
+            },
+            **{
+                f"combined_policy:{name}": float(np.mean(values))
+                for name, values in combined_benchmarks.items()
+            },
+        }
+        validation_results_by_seed: list[
+            OptimalBehaviourValidationResult
+        ] = []
+        validation_summary_rows: list[dict[str, object]] = []
+        for training_seed_index, candidates in enumerate(
+            validation_candidates_by_seed
+        ):
+            validation_gates_i = (
+                paired_noninferiority_gate(
+                    candidates["election_only"],
+                    election_benchmarks,
+                    premium_aud=validation_premium,
+                    component="election_only",
+                ),
+                paired_noninferiority_gate(
+                    candidates["income_action_only"],
+                    income_benchmarks,
+                    premium_aud=validation_premium,
+                    component="income_action_only",
+                ),
+                paired_noninferiority_gate(
+                    candidates["combined_policy"],
+                    combined_benchmarks,
+                    premium_aud=validation_premium,
+                    component="combined_policy",
+                ),
+            )
+            result_i = OptimalBehaviourValidationResult(
+                scenario_fingerprint=(
+                    validation_scenarios.content_fingerprint
+                ),
+                gates=validation_gates_i,
+                benchmark_means_aud=benchmark_means,
+            )
+            validation_results_by_seed.append(result_i)
+            seed_triplet = training_seed_triplets[training_seed_index]
+            for row in result_i.rows():
+                validation_summary_rows.append({
+                    "training_seed_index": training_seed_index + 1,
+                    "primary_training_seed": bool(seed_triplet["primary"]),
+                    "training_market_seed": seed_triplet["market_seed"],
+                    "training_take_up_seed": seed_triplet["take_up_seed"],
+                    "training_mortality_seed": seed_triplet["mortality_seed"],
+                    "training_scenario_fingerprint": (
+                        training_scenario_fingerprints[training_seed_index]
+                    ),
+                    **row,
+                })
+        validation_result = validation_results_by_seed[0]
+        validation_summary_path = output / "lsmc_validation_summary.csv"
+        validation_manifest_path = output / "lsmc_validation_manifest.json"
+        _write_csv(validation_summary_path, validation_summary_rows)
+        multi_seed_validation_payload = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "valid": all(result.valid for result in validation_results_by_seed),
+            "scenario_fingerprint": validation_scenarios.content_fingerprint,
+            "n_paths": validation_settings.n_paths,
+            "seed": validation_settings.seed,
+            "take_up_seed": validation_settings.projection.take_up_seed,
+            "mortality_seed": validation_settings.projection.mortality_seed,
+            "training_seed_count": 3,
+            "seed_selection_using_evaluation": False,
+            "primary_training_seed_index": 1,
+            "gates": validation_summary_rows,
+            "training_runs": [
+                {
+                    **dict(training_seed_triplets[index]),
+                    "training_scenario_fingerprint": (
+                        training_scenario_fingerprints[index]
+                    ),
+                    "valid": result.valid,
+                    "gates": [gate.as_dict() for gate in result.gates],
+                    "fit_basis_fingerprints": {
+                        repr(key): fit.fit_basis_fingerprint
+                        for key, fit in sorted(
+                            fits_by_seed[index].items(),
+                            key=lambda item: str(item[0]),
+                        )
+                    },
+                }
+                for index, result in enumerate(validation_results_by_seed)
+            ],
+            "benchmark_means_aud": benchmark_means,
+        }
+        with validation_manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                multi_seed_validation_payload,
+                handle,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            handle.write("\n")
+        failed_seed_gates = [
+            f"seed_{index + 1}:{gate.component}"
+            for index, result in enumerate(validation_results_by_seed)
+            for gate in result.gates
+            if not gate.valid
+        ]
+        if failed_seed_gates:
+            failed = ", ".join(failed_seed_gates)
+            raise RuntimeError(
+                "At least one frozen LSMC seed fit failed independent "
+                "non-inferiority "
+                f"validation: {failed}."
+            )
 
         dynamic_result = None
         if not args.no_dynamic_benchmark:
             if dynamic_behaviour is None:
                 raise ValueError("Dynamic benchmark behaviour was not loaded.")
             logger.info(
-                "[3/7] Dynamic-Behaviour-Benchmark auf Evaluationspfaden | "
+                "[4/8] Dynamic-Behaviour-Benchmark auf Evaluationspfaden | "
                 "paths=%d | seed=%d",
                 args.n_paths, args.seed,
             )
@@ -720,41 +1577,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 scenario_transform=scenario_transform,
             )
         else:
-            logger.info("[3/7] Dynamic-Behaviour-Benchmark deaktiviert")
+            logger.info("[4/8] Dynamic-Behaviour-Benchmark deaktiviert")
 
         logger.info(
-            "[4/7] Deterministische und kombinierte LSMC-Policies out of sample "
-            "im Monatsprojektor bewerten"
+            "[5/8] %s out of sample im Monatsprojektor bewerten",
+            (
+                "LSMC V11 plus internen V10-Validierungskontrolllauf"
+                if args.no_factorial_benchmarks
+                else "Deterministische und kombinierte LSMC-Policies"
+            ),
         )
-        # V00: legacy deterministic model-point Election with no voluntary exit.
-        continue_result = value_policyholder_portfolio(
-            costs.product,
-            model_points,
-            stressed_esg,
-            mortality,
-            lsmc_behaviour,
-            stressed_expenses,
-            settings=evaluation_settings,
-            portfolio_contract_count=args.portfolio_contract_count,
-            profitability_materiality_bp=args.profitability_materiality_bp,
-            progress_callback=_make_progress_callback(logger),
-            scenario_transform=scenario_transform,
-        )
-        # V01: legacy deterministic Election plus the fitted Income rule.
-        deterministic_surrender_result = value_policyholder_portfolio(
-            costs.product,
-            model_points,
-            stressed_esg,
-            mortality,
-            lsmc_behaviour,
-            stressed_expenses,
-            settings=evaluation_settings,
-            portfolio_contract_count=args.portfolio_contract_count,
-            profitability_materiality_bp=args.profitability_materiality_bp,
-            progress_callback=_make_progress_callback(logger),
-            surrender_policy_factory=deterministic_surrender_policy_factory,
-            scenario_transform=scenario_transform,
-        )
+        continue_result = None
+        deterministic_surrender_result = None
+        if not args.no_factorial_benchmarks:
+            # V00: legacy deterministic model-point Election with no
+            # voluntary exit.
+            continue_result = value_policyholder_portfolio(
+                costs.product,
+                model_points,
+                stressed_esg,
+                mortality,
+                lsmc_behaviour,
+                stressed_expenses,
+                settings=evaluation_settings,
+                portfolio_contract_count=args.portfolio_contract_count,
+                profitability_materiality_bp=(
+                    args.profitability_materiality_bp
+                ),
+                progress_callback=_make_progress_callback(logger),
+                scenario_transform=scenario_transform,
+            )
+            # V01: deterministic model-point Election plus the fitted monthly
+            # Continue/Partial/Full Income rule.
+            deterministic_surrender_result = value_policyholder_portfolio(
+                costs.product,
+                model_points,
+                stressed_esg,
+                mortality,
+                lsmc_behaviour,
+                stressed_expenses,
+                settings=evaluation_settings,
+                portfolio_contract_count=args.portfolio_contract_count,
+                profitability_materiality_bp=(
+                    args.profitability_materiality_bp
+                ),
+                progress_callback=_make_progress_callback(logger),
+                income_action_policy_factory=(
+                    deterministic_income_action_policy_factory
+                ),
+                scenario_transform=scenario_transform,
+            )
         # V10: deploy the common fit's Election rule but suppress Income exit
         # only in this counterfactual rollout; no action is reselected OOS.
         election_continue_result = value_policyholder_portfolio(
@@ -786,14 +1658,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             combined_policy_factory=combined_policy_factory,
             scenario_transform=scenario_transform,
         )
+        lsmc_results_by_seed = [lsmc_result]
+        deployed_policies_by_seed: list[
+            dict[tuple[object, ...], OptimalBehaviourPolicy]
+        ] = [deployed_policies]
+        for training_seed_index in (1, 2):
+            evaluation_policy_cache: dict[
+                tuple[object, ...], OptimalBehaviourPolicy
+            ] = {}
+
+            def replicated_combined_policy_factory(
+                policy_object: object,
+                *,
+                selected_seed_index: int = training_seed_index,
+                selected_cache: dict[
+                    tuple[object, ...], OptimalBehaviourPolicy
+                ] = evaluation_policy_cache,
+            ) -> object:
+                if not isinstance(policy_object, PolicySpec):
+                    raise TypeError("LSMC policy factory requires PolicySpec.")
+                key = _policy_signature(policy_object)
+                if key not in selected_cache:
+                    selected_cache[key] = _fresh_policy(
+                        ensure_fit(policy_object, selected_seed_index)
+                    )
+                return selected_cache[key]
+
+            logger.info(
+                "Finale Evaluation des eingefrorenen Trainings-Seeds %d/3 "
+                "auf identischen Evaluationspfaden",
+                training_seed_index + 1,
+            )
+            replicated_result = value_policyholder_portfolio(
+                costs.product,
+                model_points,
+                stressed_esg,
+                mortality,
+                lsmc_behaviour,
+                stressed_expenses,
+                settings=evaluation_settings,
+                portfolio_contract_count=args.portfolio_contract_count,
+                profitability_materiality_bp=(
+                    args.profitability_materiality_bp
+                ),
+                progress_callback=_make_progress_callback(logger),
+                combined_policy_factory=replicated_combined_policy_factory,
+                scenario_transform=scenario_transform,
+            )
+            lsmc_results_by_seed.append(replicated_result)
+            deployed_policies_by_seed.append(evaluation_policy_cache)
+        if len(lsmc_results_by_seed) != 3:
+            raise RuntimeError("Exactly three final LSMC evaluations are required.")
         evaluation_fingerprints = {
-            "continue": continue_result.scenario_fingerprint,
-            "deterministic_surrender": (
-                deterministic_surrender_result.scenario_fingerprint
-            ),
             "election_continue": election_continue_result.scenario_fingerprint,
             "combined_lsmc": lsmc_result.scenario_fingerprint,
+            "combined_lsmc_seed_2": (
+                lsmc_results_by_seed[1].scenario_fingerprint
+            ),
+            "combined_lsmc_seed_3": (
+                lsmc_results_by_seed[2].scenario_fingerprint
+            ),
         }
+        if continue_result is not None:
+            evaluation_fingerprints["continue"] = (
+                continue_result.scenario_fingerprint
+            )
+        if deterministic_surrender_result is not None:
+            evaluation_fingerprints["deterministic_surrender"] = (
+                deterministic_surrender_result.scenario_fingerprint
+            )
         if dynamic_result is not None:
             evaluation_fingerprints["dynamic"] = (
                 dynamic_result.scenario_fingerprint
@@ -803,10 +1736,115 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "All dynamic, deterministic and LSMC evaluations must share "
                 "one common scenario set."
             )
-        if training_scenarios.content_fingerprint == lsmc_result.scenario_fingerprint:
-            raise ValueError("Training and evaluation scenario sets must be independent.")
+        if lsmc_result.scenario_fingerprint in set(
+            training_scenario_fingerprints
+        ):
+            raise ValueError(
+                "All training and evaluation scenario sets must be independent."
+            )
+        if (
+            validation_scenarios.content_fingerprint
+            == lsmc_result.scenario_fingerprint
+        ):
+            raise ValueError(
+                "Validation and evaluation scenario sets must be independent."
+            )
 
-        logger.info("[5/7] Vollständige Ergebnisse und Vergleiche schreiben")
+        multi_seed_objective_key = (
+            "normalised_average_pv_policyholder_benefits_aud"
+        )
+        continue_evaluation_result = (
+            election_continue_result
+            if continue_result is None
+            else continue_result
+        )
+        continue_evaluation_summary = continue_evaluation_result.summary_dict()
+        continue_evaluation_objective = float(
+            continue_evaluation_summary[multi_seed_objective_key]
+        )
+        multi_seed_report_rows: list[dict[str, object]] = []
+        for training_seed_index, replicated_result in enumerate(
+            lsmc_results_by_seed
+        ):
+            seed_triplet = training_seed_triplets[training_seed_index]
+            replicated_summary = replicated_result.summary_dict()
+            replicated_objective = float(
+                replicated_summary[multi_seed_objective_key]
+            )
+            selected_fits = fits_by_seed[training_seed_index]
+            report_row: dict[str, object] = {
+                "training_seed_index": training_seed_index + 1,
+                "primary_training_seed": bool(seed_triplet["primary"]),
+                "training_market_seed": seed_triplet["market_seed"],
+                "training_take_up_seed": seed_triplet["take_up_seed"],
+                "training_mortality_seed": seed_triplet["mortality_seed"],
+                "training_scenario_fingerprint": (
+                    training_scenario_fingerprints[training_seed_index]
+                ),
+                "fit_count": len(selected_fits),
+                "all_fits_valid": all(
+                    fit.valid for fit in selected_fits.values()
+                ),
+                "fit_basis_fingerprints_json": json.dumps(
+                    {
+                        repr(key): fit.fit_basis_fingerprint
+                        for key, fit in sorted(
+                            selected_fits.items(),
+                            key=lambda item: str(item[0]),
+                        )
+                    },
+                    sort_keys=True,
+                ),
+                "validation_scenario_fingerprint": (
+                    validation_scenarios.content_fingerprint
+                ),
+                "validation_valid": validation_results_by_seed[
+                    training_seed_index
+                ].valid,
+                "evaluation_scenario_fingerprint": (
+                    replicated_result.scenario_fingerprint
+                ),
+                "evaluation_policyholder_value_aud": replicated_objective,
+                "evaluation_continue_value_aud": (
+                    continue_evaluation_objective
+                ),
+                "evaluation_minus_continue_aud": (
+                    replicated_objective - continue_evaluation_objective
+                ),
+                "selected_for_primary_outputs": bool(seed_triplet["primary"]),
+                "selection_rule": "predeclared_seed_1_not_evaluation_based",
+                "evaluation_used_for_seed_selection": False,
+            }
+            for gate in validation_results_by_seed[
+                training_seed_index
+            ].gates:
+                prefix = f"validation_{gate.component}"
+                report_row[f"{prefix}_valid"] = gate.valid
+                report_row[f"{prefix}_benchmark"] = gate.benchmark_name
+                report_row[f"{prefix}_lcb95_aud"] = (
+                    gate.lower_confidence_bound_95_aud
+                )
+                report_row[f"{prefix}_margin_aud"] = (
+                    gate.noninferiority_margin_aud
+                )
+                report_row[f"{prefix}_paired_mean_aud"] = (
+                    gate.paired_difference_mean_aud
+                )
+            multi_seed_report_rows.append(report_row)
+        if not all(
+            bool(row["all_fits_valid"])
+            and bool(row["validation_valid"])
+            for row in multi_seed_report_rows
+        ):
+            raise RuntimeError(
+                "Every training seed must have valid fits and validation gates."
+            )
+        multi_seed_report_path = (
+            output / "lsmc_multi_seed_validation_evaluation.csv"
+        )
+        _write_csv(multi_seed_report_path, multi_seed_report_rows)
+
+        logger.info("[6/8] Ergebnisse und Vergleiche schreiben")
         lsmc_summary = lsmc_result.summary_dict()
         lsmc_summary.update({
             "valuation_as_of_date": market.curve_metadata["as_of_date"],
@@ -819,13 +1857,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "lsmc_training_seed": args.train_seed,
             "lsmc_training_take_up_seed": args.train_take_up_seed,
             "lsmc_training_mortality_seed": args.train_mortality_seed,
+            "lsmc_training_seed_count": 3,
+            "lsmc_training_seed_triplets_json": json.dumps(
+                list(training_seed_triplets), sort_keys=True
+            ),
+            "lsmc_training_scenario_fingerprints_json": json.dumps(
+                list(training_scenario_fingerprints)
+            ),
+            "lsmc_validation_paths": args.n_validation,
+            "lsmc_validation_seed": args.validation_seed,
+            "lsmc_validation_take_up_seed": args.validation_take_up_seed,
+            "lsmc_validation_mortality_seed": args.validation_mortality_seed,
             "lsmc_evaluation_seed": args.seed,
             "lsmc_evaluation_take_up_seed": args.take_up_seed,
             "lsmc_evaluation_mortality_seed": args.mortality_seed,
             "lsmc_training_scenario_fingerprint": (
                 training_scenarios.content_fingerprint),
+            "lsmc_validation_scenario_fingerprint": (
+                validation_scenarios.content_fingerprint
+            ),
+            "lsmc_validation_valid": all(
+                result.valid for result in validation_results_by_seed
+            ),
+            "lsmc_validation_all_three_seeds_valid": all(
+                result.valid for result in validation_results_by_seed
+            ),
+            "lsmc_final_evaluation_all_three_seeds_reported": True,
+            "lsmc_primary_seed_selection_rule": (
+                "predeclared_first_seed_not_evaluation_based"
+            ),
+            "lsmc_policy_iteration_converged": all(
+                fit.policy_iteration_converged for fit in fits.values()
+            ),
+            "lsmc_policy_iteration_count_max": max(
+                (fit.policy_iteration_count for fit in fits.values()),
+                default=0,
+            ),
+            "lsmc_income_action_exposure_coverage_min": min(
+                (fit.income_action_exposure_coverage for fit in fits.values()),
+                default=1.0,
+            ),
+            "lsmc_final_action_agreement_min": min(
+                (fit.final_action_agreement for fit in fits.values()),
+                default=1.0,
+            ),
+            "lsmc_final_policy_value_change_abs_max_aud": max(
+                (abs(fit.final_policy_value_change_aud) for fit in fits.values()),
+                default=0.0,
+            ),
             "scenario_fingerprint": lsmc_result.scenario_fingerprint,
             "lsmc_fit_basis_fingerprint_count": len(fits),
+            "lsmc_fit_basis_fingerprint_count_all_training_seeds": sum(
+                len(selected_fits) for selected_fits in fits_by_seed
+            ),
             "lsmc_election_fallback_policy_count": sum(
                 fit.election_fallback_used for fit in fits.values()
             ),
@@ -834,13 +1918,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             "lsmc_action_set": (
                 "growth:wait|start_income_now;"
-                "income:continue|full_withdrawal"
+                "income:continue|partial_withdrawal|full_withdrawal"
             ),
             "lsmc_income_election": "pathwise_optimal_bellman_policy",
             "income_take_up_mode": "optimal_lsmc",
             "income_take_up_source": "frozen_combined_lsmc_policy",
             "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
-            "lsmc_decision_grid": "contractual_policy_anniversaries",
+            "lsmc_decision_grid": (
+                "growth:contractual_policy_anniversaries;income:monthly"
+            ),
             "lsmc_forced_election_rule": (
                 "first_policy_anniversary_strictly_after_attained_age_100"
             ),
@@ -869,79 +1955,92 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         comparison_rows: list[dict[str, object]] = []
         model_point_comparison_rows: list[dict[str, object]] = []
         benchmark_directories = behaviour_benchmark_directories(output)
-        continue_dir = benchmark_directories[
-            "deterministic_election_continue"
-        ]
-        continue_summary = continue_result.summary_dict()
-        continue_summary.update({
-            "stress_scenario_id": stress.stress_id,
-            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
-            "scenario_fingerprint": continue_result.scenario_fingerprint,
-        })
-        _validate_hedge_backing_summary(
-            continue_summary, args.hedge_cap_leg_mode
-        )
-        continue_rows = continue_result.model_point_rows()
-        continue_summary_path = continue_dir / "portfolio_summary.csv"
-        continue_model_point_path = continue_dir / "model_point_results.csv"
-        continue_recon_path = (
-            continue_dir / "portfolio_aggregation_reconciliation.csv")
-        _write_csv(continue_summary_path, [continue_summary])
-        _write_csv(continue_model_point_path, continue_rows)
-        _write_csv(
-            continue_recon_path,
-            _build_aggregation_reconciliation(continue_summary, continue_rows),
-        )
+        continue_summary_path = None
+        continue_model_point_path = None
+        continue_recon_path = None
+        deterministic_surrender_summary_path = None
+        deterministic_surrender_model_point_path = None
+        deterministic_surrender_recon_path = None
+        continue_summary = None
+        deterministic_surrender_summary = None
+        if not args.no_factorial_benchmarks:
+            if continue_result is None or deterministic_surrender_result is None:
+                raise RuntimeError("Factorial benchmark results are missing.")
+            continue_dir = benchmark_directories[
+                "deterministic_election_continue"
+            ]
+            continue_summary = continue_result.summary_dict()
+            continue_summary.update({
+                "stress_scenario_id": stress.stress_id,
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+                "scenario_fingerprint": continue_result.scenario_fingerprint,
+            })
+            _validate_hedge_backing_summary(
+                continue_summary, args.hedge_cap_leg_mode
+            )
+            continue_rows = continue_result.model_point_rows()
+            continue_summary_path = continue_dir / "portfolio_summary.csv"
+            continue_model_point_path = continue_dir / "model_point_results.csv"
+            continue_recon_path = (
+                continue_dir / "portfolio_aggregation_reconciliation.csv")
+            _write_csv(continue_summary_path, [continue_summary])
+            _write_csv(continue_model_point_path, continue_rows)
+            _write_csv(
+                continue_recon_path,
+                _build_aggregation_reconciliation(
+                    continue_summary, continue_rows
+                ),
+            )
 
-        deterministic_surrender_dir = benchmark_directories[
-            "deterministic_election_post_behaviour"
-        ]
-        deterministic_surrender_summary = (
-            deterministic_surrender_result.summary_dict()
-        )
-        deterministic_surrender_summary.update({
-            "stress_scenario_id": stress.stress_id,
-            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
-            "scenario_fingerprint": (
-                deterministic_surrender_result.scenario_fingerprint
-            ),
-            "benchmark_treatment": (
-                "deterministic_model_point_election_with_fitted_"
-                "post_election_full_withdrawal"
-            ),
-            "surrender_rule_refitted_under_deterministic_election": False,
-        })
-        _validate_hedge_backing_summary(
-            deterministic_surrender_summary, args.hedge_cap_leg_mode
-        )
-        deterministic_surrender_rows = (
-            deterministic_surrender_result.model_point_rows()
-        )
-        deterministic_surrender_summary_path = (
-            deterministic_surrender_dir / "portfolio_summary.csv"
-        )
-        deterministic_surrender_model_point_path = (
-            deterministic_surrender_dir / "model_point_results.csv"
-        )
-        deterministic_surrender_recon_path = (
-            deterministic_surrender_dir
-            / "portfolio_aggregation_reconciliation.csv"
-        )
-        _write_csv(
-            deterministic_surrender_summary_path,
-            [deterministic_surrender_summary],
-        )
-        _write_csv(
-            deterministic_surrender_model_point_path,
-            deterministic_surrender_rows,
-        )
-        _write_csv(
-            deterministic_surrender_recon_path,
-            _build_aggregation_reconciliation(
-                deterministic_surrender_summary,
+            deterministic_surrender_dir = benchmark_directories[
+                "deterministic_election_post_behaviour"
+            ]
+            deterministic_surrender_summary = (
+                deterministic_surrender_result.summary_dict()
+            )
+            deterministic_surrender_summary.update({
+                "stress_scenario_id": stress.stress_id,
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+                "scenario_fingerprint": (
+                    deterministic_surrender_result.scenario_fingerprint
+                ),
+                "benchmark_treatment": (
+                    "deterministic_model_point_election_with_fitted_"
+                    "monthly_post_election_income_actions"
+                ),
+                "income_action_rule_refitted_under_deterministic_election": False,
+            })
+            _validate_hedge_backing_summary(
+                deterministic_surrender_summary, args.hedge_cap_leg_mode
+            )
+            deterministic_surrender_rows = (
+                deterministic_surrender_result.model_point_rows()
+            )
+            deterministic_surrender_summary_path = (
+                deterministic_surrender_dir / "portfolio_summary.csv"
+            )
+            deterministic_surrender_model_point_path = (
+                deterministic_surrender_dir / "model_point_results.csv"
+            )
+            deterministic_surrender_recon_path = (
+                deterministic_surrender_dir
+                / "portfolio_aggregation_reconciliation.csv"
+            )
+            _write_csv(
+                deterministic_surrender_summary_path,
+                [deterministic_surrender_summary],
+            )
+            _write_csv(
+                deterministic_surrender_model_point_path,
                 deterministic_surrender_rows,
-            ),
-        )
+            )
+            _write_csv(
+                deterministic_surrender_recon_path,
+                _build_aggregation_reconciliation(
+                    deterministic_surrender_summary,
+                    deterministic_surrender_rows,
+                ),
+            )
 
         election_continue_dir = benchmark_directories[
             "variable_election_continue"
@@ -954,7 +2053,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 election_continue_result.scenario_fingerprint
             ),
             "benchmark_treatment": (
-                "election_rule_from_combined_fit_with_full_withdrawal_"
+                "election_rule_from_combined_fit_with_income_actions_"
                 "suppressed_in_evaluation"
             ),
             "election_rule_refitted_under_continue": False,
@@ -988,14 +2087,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
         )
 
-        decomposition_rows = _behaviour_decomposition_rows(
-            continue_summary,
-            deterministic_surrender_summary,
-            election_continue_summary,
-            lsmc_summary,
-        )
-        decomposition_path = output / "lsmc_behaviour_decomposition.csv"
-        _write_csv(decomposition_path, decomposition_rows)
+        decomposition_path = None
+        if (
+            continue_summary is not None
+            and deterministic_surrender_summary is not None
+        ):
+            decomposition_rows = _behaviour_decomposition_rows(
+                continue_summary,
+                deterministic_surrender_summary,
+                election_continue_summary,
+                lsmc_summary,
+            )
+            decomposition_path = output / "lsmc_behaviour_decomposition.csv"
+            _write_csv(decomposition_path, decomposition_rows)
 
         continue_comparison_rows = _comparison_rows(
             election_continue_summary,
@@ -1074,10 +2178,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         diagnostic_rows: list[dict[str, object]] = []
         action_rows: list[dict[str, object]] = []
+        for training_seed_index in (1, 2):
+            seed_triplet = training_seed_triplets[training_seed_index]
+            for key, fit in fits_by_seed[training_seed_index].items():
+                labels = "|".join(policy_labels.get(key, ["unlabelled"]))
+                for diagnostic in fit.diagnostics:
+                    diagnostic_rows.append({
+                        "training_seed_index": training_seed_index + 1,
+                        "primary_training_seed": False,
+                        "training_market_seed": seed_triplet["market_seed"],
+                        "training_take_up_seed": seed_triplet["take_up_seed"],
+                        "training_mortality_seed": seed_triplet[
+                            "mortality_seed"
+                        ],
+                        "policy_labels": labels,
+                        "training_scenario_fingerprint": (
+                            fit.training_scenario_fingerprint
+                        ),
+                        "fit_basis_fingerprint": fit.fit_basis_fingerprint,
+                        "training_policyholder_value_aud": (
+                            fit.training_policyholder_value_aud
+                        ),
+                        "training_wait_policyholder_value_aud": (
+                            fit.training_wait_policyholder_value_aud
+                        ),
+                        "training_no_action_policyholder_value_aud": (
+                            fit.training_no_action_policyholder_value_aud
+                        ),
+                        "training_candidate_policyholder_value_aud": (
+                            fit.training_candidate_policyholder_value_aud
+                        ),
+                        "training_optionality_uplift_aud": (
+                            fit.training_optionality_uplift_aud
+                        ),
+                        "training_fallback_used": fit.training_fallback_used,
+                        "election_fallback_used": fit.election_fallback_used,
+                        "surrender_fallback_used": fit.surrender_fallback_used,
+                        "fit_valid": fit.valid,
+                        "fit_invalid_reasons": "|".join(fit.invalid_reasons),
+                        "income_action_exposure_coverage": (
+                            fit.income_action_exposure_coverage
+                        ),
+                        "policy_iteration_count": fit.policy_iteration_count,
+                        "policy_iteration_converged": (
+                            fit.policy_iteration_converged
+                        ),
+                        "final_action_agreement": fit.final_action_agreement,
+                        "final_policy_value_change_aud": (
+                            fit.final_policy_value_change_aud
+                        ),
+                        **diagnostic.as_dict(),
+                    })
         for key, fit in fits.items():
             labels = "|".join(policy_labels.get(key, ["unlabelled"]))
             for diagnostic in fit.diagnostics:
                 diagnostic_rows.append({
+                    "training_seed_index": 1,
+                    "primary_training_seed": True,
+                    "training_market_seed": args.train_seed,
+                    "training_take_up_seed": args.train_take_up_seed,
+                    "training_mortality_seed": args.train_mortality_seed,
                     "policy_labels": labels,
                     "training_scenario_fingerprint": (
                         fit.training_scenario_fingerprint),
@@ -1095,6 +2255,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "training_fallback_used": fit.training_fallback_used,
                     "election_fallback_used": fit.election_fallback_used,
                     "surrender_fallback_used": fit.surrender_fallback_used,
+                    "fit_valid": fit.valid,
+                    "fit_invalid_reasons": "|".join(fit.invalid_reasons),
+                    "income_action_exposure_coverage": (
+                        fit.income_action_exposure_coverage
+                    ),
+                    "policy_iteration_count": fit.policy_iteration_count,
+                    "policy_iteration_converged": (
+                        fit.policy_iteration_converged
+                    ),
+                    "final_action_agreement": fit.final_action_agreement,
+                    "final_policy_value_change_aud": (
+                        fit.final_policy_value_change_aud
+                    ),
                     **diagnostic.as_dict(),
                 })
             policy_action_rows = 0
@@ -1106,28 +2279,55 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 evaluation_statistics.items()
             ):
                 eligible = stats["eligible_path_count"]
-                action_rows.append({
-                    "policy_labels": labels,
-                    "action_type": action_type,
-                    "phase": (
-                        "growth"
-                        if action_type == "income_election"
-                        else "income"
-                    ),
-                    "policy_year": step // 12,
-                    "decision_step": step,
-                    **stats,
-                    "evaluation_action_rate": (
-                        stats["action_path_count"] / eligible
-                        if eligible else 0.0
-                    ),
-                    "training_fallback_used": fit.training_fallback_used,
-                    "election_fallback_used": fit.election_fallback_used,
-                    "surrender_fallback_used": fit.surrender_fallback_used,
-                })
-                policy_action_rows += 1
+                if action_type == "income_action":
+                    partial_count = int(stats.get("partial_path_count", 0))
+                    full_count = int(stats.get("full_path_count", 0))
+                    continue_count = int(stats.get(
+                        "continue_path_count",
+                        max(int(eligible) - partial_count - full_count, 0),
+                    ))
+                    distributions = (
+                        ("continue", continue_count),
+                        ("partial_withdrawal", partial_count),
+                        ("full_withdrawal", full_count),
+                    )
+                else:
+                    distributions = (
+                        (action_type, int(stats["action_path_count"])),
+                    )
+                for reported_action, selected_count in distributions:
+                    action_rows.append({
+                        "training_seed_index": 1,
+                        "primary_training_seed": True,
+                        "training_market_seed": args.train_seed,
+                        "training_take_up_seed": args.train_take_up_seed,
+                        "training_mortality_seed": args.train_mortality_seed,
+                        "policy_labels": labels,
+                        "action_type": reported_action,
+                        "phase": (
+                            "growth"
+                            if reported_action == "income_election"
+                            else "income"
+                        ),
+                        "policy_year": step // 12,
+                        "decision_step": step,
+                        **stats,
+                        "action_path_count": selected_count,
+                        "evaluation_action_rate": (
+                            selected_count / eligible if eligible else 0.0
+                        ),
+                        "training_fallback_used": fit.training_fallback_used,
+                        "election_fallback_used": fit.election_fallback_used,
+                        "surrender_fallback_used": fit.surrender_fallback_used,
+                    })
+                    policy_action_rows += 1
             if policy_action_rows == 0:
                 action_rows.append({
+                    "training_seed_index": 1,
+                    "primary_training_seed": True,
+                    "training_market_seed": args.train_seed,
+                    "training_take_up_seed": args.train_take_up_seed,
+                    "training_mortality_seed": args.train_mortality_seed,
                     "policy_labels": labels,
                     "action_type": None,
                     "phase": None,
@@ -1141,15 +2341,115 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "election_fallback_used": fit.election_fallback_used,
                     "surrender_fallback_used": fit.surrender_fallback_used,
                 })
+        # Robustness fits are evaluated on the same final paths, so their
+        # monthly action distributions and Partial amount bands are reported
+        # as well; only seed 1 remains the predeclared canonical output.
+        for training_seed_index in (1, 2):
+            seed_triplet = training_seed_triplets[training_seed_index]
+            selected_deployed = deployed_policies_by_seed[
+                training_seed_index
+            ]
+            for key, fit in fits_by_seed[training_seed_index].items():
+                labels = "|".join(policy_labels.get(key, ["unlabelled"]))
+                deployed = selected_deployed.get(key)
+                evaluation_statistics = (
+                    {} if deployed is None else deployed.evaluation_statistics
+                )
+                policy_action_rows = 0
+                for (action_type, step), stats in sorted(
+                    evaluation_statistics.items()
+                ):
+                    eligible = stats["eligible_path_count"]
+                    if action_type == "income_action":
+                        partial_count = int(stats.get("partial_path_count", 0))
+                        full_count = int(stats.get("full_path_count", 0))
+                        continue_count = int(stats.get(
+                            "continue_path_count",
+                            max(
+                                int(eligible) - partial_count - full_count,
+                                0,
+                            ),
+                        ))
+                        distributions = (
+                            ("continue", continue_count),
+                            ("partial_withdrawal", partial_count),
+                            ("full_withdrawal", full_count),
+                        )
+                    else:
+                        distributions = (
+                            (action_type, int(stats["action_path_count"])),
+                        )
+                    for reported_action, selected_count in distributions:
+                        action_rows.append({
+                            "training_seed_index": training_seed_index + 1,
+                            "primary_training_seed": False,
+                            "training_market_seed": seed_triplet[
+                                "market_seed"
+                            ],
+                            "training_take_up_seed": seed_triplet[
+                                "take_up_seed"
+                            ],
+                            "training_mortality_seed": seed_triplet[
+                                "mortality_seed"
+                            ],
+                            "policy_labels": labels,
+                            "action_type": reported_action,
+                            "phase": (
+                                "growth"
+                                if reported_action == "income_election"
+                                else "income"
+                            ),
+                            "policy_year": step // 12,
+                            "decision_step": step,
+                            **stats,
+                            "action_path_count": selected_count,
+                            "evaluation_action_rate": (
+                                selected_count / eligible if eligible else 0.0
+                            ),
+                            "training_fallback_used": (
+                                fit.training_fallback_used
+                            ),
+                            "election_fallback_used": (
+                                fit.election_fallback_used
+                            ),
+                            "surrender_fallback_used": (
+                                fit.surrender_fallback_used
+                            ),
+                        })
+                        policy_action_rows += 1
+                if policy_action_rows == 0:
+                    action_rows.append({
+                        "training_seed_index": training_seed_index + 1,
+                        "primary_training_seed": False,
+                        "training_market_seed": seed_triplet["market_seed"],
+                        "training_take_up_seed": seed_triplet[
+                            "take_up_seed"
+                        ],
+                        "training_mortality_seed": seed_triplet[
+                            "mortality_seed"
+                        ],
+                        "policy_labels": labels,
+                        "action_type": None,
+                        "phase": None,
+                        "policy_year": None,
+                        "decision_step": None,
+                        "eligible_path_count": 0,
+                        "action_path_count": 0,
+                        "forced_path_count": 0,
+                        "evaluation_action_rate": 0.0,
+                        "training_fallback_used": fit.training_fallback_used,
+                        "election_fallback_used": fit.election_fallback_used,
+                        "surrender_fallback_used": fit.surrender_fallback_used,
+                    })
         _write_csv(output / "lsmc_regression_diagnostics.csv", diagnostic_rows)
         _write_csv(output / "lsmc_action_summary.csv", action_rows)
 
         figure_paths: dict[str, str] = {}
         matplotlib_version: Optional[str] = None
         if args.no_plots:
-            logger.info("[6/7] Grafiken deaktiviert")
+            logger.info("[7/8] Grafiken deaktiviert")
         else:
-            logger.info("[6/7] LSMC-Portfolio-Grafiken erstellen")
+            logger.info("[7/8] LSMC-Portfolio-Grafiken erstellen")
             figure_paths, matplotlib_version = _create_plots(
                 lsmc_summary,
                 lsmc_rows,
@@ -1160,20 +2460,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 logger=logger,
             )
 
-        fit_basis_fingerprints = {
-            (
-                f"fit_{index:04d}|labels="
-                f"{'|'.join(policy_labels.get(key, ['unlabelled']))}"
-                f"|policy_signature={key!r}"
-            ): fit.fit_basis_fingerprint
-            for index, (key, fit) in enumerate(
-                sorted(fits.items(), key=lambda item: str(item[0])),
-                start=1,
-            )
+        fit_basis_fingerprints_by_seed = {
+            f"training_seed_{training_seed_index + 1}": {
+                (
+                    f"fit_{index:04d}|labels="
+                    f"{'|'.join(policy_labels.get(key, ['unlabelled']))}"
+                    f"|policy_signature={key!r}"
+                ): fit.fit_basis_fingerprint
+                for index, (key, fit) in enumerate(
+                    sorted(
+                        selected_fits.items(), key=lambda item: str(item[0])
+                    ),
+                    start=1,
+                )
+            }
+            for training_seed_index, selected_fits in enumerate(fits_by_seed)
         }
+        fit_basis_fingerprints = fit_basis_fingerprints_by_seed[
+            "training_seed_1"
+        ]
         if len(fit_basis_fingerprints) != len(fits):
             raise RuntimeError(
                 "LSMC fit-basis provenance keys are not unique."
+            )
+        if any(
+            len(fit_basis_fingerprints_by_seed[f"training_seed_{index + 1}"])
+            != len(fits_by_seed[index])
+            for index in range(3)
+        ):
+            raise RuntimeError(
+                "Multi-seed LSMC fit-basis provenance keys are not unique."
             )
         accepted_election_regression_count = sum(
             diagnostic.regression_accepted_for_action
@@ -1187,6 +2503,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for diagnostic in fit.diagnostics
             if diagnostic.action_type == "full_withdrawal"
         )
+        accepted_partial_regression_count = sum(
+            diagnostic.regression_accepted_for_action
+            for fit in fits.values()
+            for diagnostic in fit.diagnostics
+            if diagnostic.action_type == "partial_withdrawal"
+        )
         election_regression_fallback_count = sum(
             not diagnostic.regression_accepted_for_action
             for fit in fits.values()
@@ -1199,8 +2521,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for diagnostic in fit.diagnostics
             if diagnostic.action_type == "full_withdrawal"
         )
+        partial_regression_fallback_count = sum(
+            not diagnostic.regression_accepted_for_action
+            for fit in fits.values()
+            for diagnostic in fit.diagnostics
+            if diagnostic.action_type == "partial_withdrawal"
+        )
 
-        logger.info("[7/7] Run-Manifest schreiben")
+        logger.info("[8/8] Run-Manifest schreiben")
         manifest_path = output / "run_manifest.json"
         manifest = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1216,13 +2544,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "lsmc_objective": "maximise_policyholder_cashflow_pv",
                 "lsmc_action_set": {
                     "growth": ["wait", "start_income_now"],
-                    "income": ["continue", "full_withdrawal"],
+                    "income": [
+                        "continue",
+                        "partial_withdrawal",
+                        "full_withdrawal",
+                    ],
                 },
                 "income_election": "pathwise_optimal_bellman_policy",
                 "model_point_income_start_year_use": (
                     "deterministic_validation_benchmarks_only"
                 ),
-                "decision_frequency": "contractual_policy_anniversaries",
+                "decision_frequency": {
+                    "income_election": "contractual_policy_anniversaries",
+                    "income_actions": "monthly",
+                },
                 "earliest_income_election": (
                     "product_min_years_before_income"
                 ),
@@ -1232,9 +2567,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "first_income_payment": "one_month_after_election",
                 "same_step_election_and_full_withdrawal_allowed": False,
                 "policy_characterisation": (
-                    "conservative_lower_bound_on_annual_exercise_grid"),
-                "partial_withdrawal_reduction": (
-                    "dominated_convex_combination_of_continue_and_full_withdrawal"
+                    "cross_fitted_lower_bound_with_annual_election_and_"
+                    "monthly_income_actions"
+                ),
+                "partial_withdrawal_grid": (
+                    "aud_100_and_25_50_75_100pct_of_max_with_local_midpoints"
                 ),
                 "growth_surrender_allowed": False,
                 "growth_withdrawal_allowed": False,
@@ -1260,18 +2597,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "monthly_cashflow_grid"
                 ),
                 "customer_liability_uses_performance_fund_as_backing": False,
-                "behaviour_benchmarks": {
-                    "deterministic_election_continue": "V00",
-                    "deterministic_election_post_behaviour": "V01",
-                    "variable_election_continue": "V10",
-                    "combined_variable_election_post_behaviour": "V11",
-                },
+                "behaviour_benchmarks": (
+                    {
+                        "variable_election_continue": (
+                            "V10_internal_validation_control"
+                        ),
+                        "combined_variable_election_post_behaviour": "V11",
+                    }
+                    if args.no_factorial_benchmarks
+                    else {
+                        "deterministic_election_continue": "V00",
+                        "deterministic_election_post_behaviour": "V01",
+                        "variable_election_continue": "V10",
+                        "combined_variable_election_post_behaviour": "V11",
+                    }
+                ),
+                "factorial_benchmark_outputs_enabled": (
+                    not args.no_factorial_benchmarks
+                ),
             },
             "lsmc_settings": {
                 "n_train": args.n_train,
                 "train_seed": args.train_seed,
                 "train_take_up_seed": args.train_take_up_seed,
                 "train_mortality_seed": args.train_mortality_seed,
+                "training_seed_count": 3,
+                "primary_training_seed_index": 1,
+                "primary_seed_selection_rule": (
+                    "predeclared_first_seed_not_evaluation_based"
+                ),
+                "evaluation_used_for_training_seed_selection": False,
+                "training_seed_triplets": list(training_seed_triplets),
                 "force_pathwise_joint_life": (
                     training_projection.force_pathwise_joint_life
                 ),
@@ -1282,7 +2638,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "training_scenario_fingerprint": (
                     training_scenarios.content_fingerprint),
+                "training_scenario_fingerprints": list(
+                    training_scenario_fingerprints
+                ),
                 "fit_basis_fingerprints": fit_basis_fingerprints,
+                "fit_basis_fingerprints_by_training_seed": (
+                    fit_basis_fingerprints_by_seed
+                ),
                 "fit_basis_includes": [
                     "training_scenario_content",
                     "crediting_cap",
@@ -1296,13 +2658,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ],
                 "n_folds": args.lsmc_folds,
                 "ridge": args.lsmc_ridge,
+                "ridge_grid": list(lsmc_settings.ridge_grid),
+                "ridge_selection": "oof_decision_loss_one_standard_error",
                 "exercise_buffer_rmse_multiplier": (
                     args.exercise_buffer_rmse_multiplier),
+                "relative_svd_cutoff": lsmc_settings.relative_svd_cutoff,
+                "minimum_regression_observations": (
+                    lsmc_settings.minimum_regression_observations
+                ),
+                "observations_per_coefficient": (
+                    lsmc_settings.observations_per_coefficient
+                ),
                 "maximum_condition_number": (
                     lsmc_settings.maximum_condition_number),
                 "fallback_to_no_action_if_training_underperforms": (
                     lsmc_settings.fallback_to_no_action_if_training_underperforms),
+                "fallback_semantics": (
+                    "compatibility_flag_invalidates_fit;no_material_wait_or_"
+                    "continue_policy_is_deployed"
+                ),
+                "material_fit_failure_policy": "hard_abort_after_diagnostics",
                 "unique_policy_fits": len(fits),
+                "unique_policy_fits_across_three_training_seeds": sum(
+                    len(selected_fits) for selected_fits in fits_by_seed
+                ),
+                "all_fits_valid_across_three_training_seeds": all(
+                    fit.valid
+                    for selected_fits in fits_by_seed
+                    for fit in selected_fits.values()
+                ),
+                "primary_only_diagnostic_counts": True,
                 "training_fallback_policy_count": sum(
                     fit.training_fallback_used for fit in fits.values()),
                 "election_fallback_policy_count": sum(
@@ -1315,11 +2700,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "accepted_surrender_regression_count": (
                     accepted_surrender_regression_count
                 ),
+                "accepted_partial_regression_count": (
+                    accepted_partial_regression_count
+                ),
                 "election_regression_fallback_count": (
                     election_regression_fallback_count
                 ),
                 "surrender_regression_fallback_count": (
                     surrender_regression_fallback_count
+                ),
+                "partial_regression_fallback_count": (
+                    partial_regression_fallback_count
+                ),
+                "income_action_exposure_coverage_min": min(
+                    (fit.income_action_exposure_coverage for fit in fits.values()),
+                    default=1.0,
+                ),
+                "policy_iteration_converged_all": all(
+                    fit.policy_iteration_converged for fit in fits.values()
+                ),
+                "policy_iteration_count_max": max(
+                    (fit.policy_iteration_count for fit in fits.values()),
+                    default=0,
+                ),
+                "final_action_agreement_min": min(
+                    (fit.final_action_agreement for fit in fits.values()),
+                    default=1.0,
+                ),
+                "final_policy_value_change_abs_max_aud": max(
+                    (
+                        abs(fit.final_policy_value_change_aud)
+                        for fit in fits.values()
+                    ),
+                    default=0.0,
                 ),
                 "out_of_sample_policyholder_value_dominates_continue": (
                     out_of_sample_dominates_continue),
@@ -1364,13 +2777,125 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "training_and_evaluation_market_seeds_distinct": (
                     args.train_seed != args.seed
                 ),
+                "all_training_and_evaluation_market_seeds_distinct": (
+                    args.seed not in {
+                        args.train_seed,
+                        args.train_seed_2,
+                        args.train_seed_3,
+                    }
+                ),
                 "training_and_evaluation_take_up_seeds_distinct": (
                     args.train_take_up_seed != args.take_up_seed
+                ),
+                "all_training_and_evaluation_take_up_seeds_distinct": (
+                    args.take_up_seed not in {
+                        args.train_take_up_seed,
+                        args.train_take_up_seed_2,
+                        args.train_take_up_seed_3,
+                    }
                 ),
                 "training_and_evaluation_mortality_seeds_distinct": (
                     args.train_mortality_seed != args.mortality_seed
                 ),
+                "all_training_and_evaluation_mortality_seeds_distinct": (
+                    args.mortality_seed not in {
+                        args.train_mortality_seed,
+                        args.train_mortality_seed_2,
+                        args.train_mortality_seed_3,
+                    }
+                ),
+                "all_three_frozen_training_policies_evaluated": True,
+                "training_seed_selected_using_evaluation": False,
+                "multi_seed_evaluation_scenario_fingerprints": [
+                    result.scenario_fingerprint
+                    for result in lsmc_results_by_seed
+                ],
+                "multi_seed_final_evaluation": [
+                    {
+                        "training_seed_index": row["training_seed_index"],
+                        "primary_training_seed": row[
+                            "primary_training_seed"
+                        ],
+                        "training_market_seed": row[
+                            "training_market_seed"
+                        ],
+                        "training_take_up_seed": row[
+                            "training_take_up_seed"
+                        ],
+                        "training_mortality_seed": row[
+                            "training_mortality_seed"
+                        ],
+                        "training_scenario_fingerprint": row[
+                            "training_scenario_fingerprint"
+                        ],
+                        "evaluation_scenario_fingerprint": row[
+                            "evaluation_scenario_fingerprint"
+                        ],
+                        "evaluation_policyholder_value_aud": row[
+                            "evaluation_policyholder_value_aud"
+                        ],
+                        "evaluation_continue_value_aud": row[
+                            "evaluation_continue_value_aud"
+                        ],
+                        "evaluation_minus_continue_aud": row[
+                            "evaluation_minus_continue_aud"
+                        ],
+                        "fit_count": row["fit_count"],
+                        "all_fits_valid": row["all_fits_valid"],
+                        "validation_valid": row["validation_valid"],
+                        "selected_for_primary_outputs": row[
+                            "selected_for_primary_outputs"
+                        ],
+                        "selection_rule": row["selection_rule"],
+                        "evaluation_used_for_seed_selection": row[
+                            "evaluation_used_for_seed_selection"
+                        ],
+                    }
+                    for row in multi_seed_report_rows
+                ],
                 "common_random_numbers_across_behaviour_rollouts": True,
+            },
+            "validation_settings": {
+                "valid": all(
+                    result.valid for result in validation_results_by_seed
+                ),
+                "training_seed_count": 3,
+                "n_paths": args.n_validation,
+                "seed": args.validation_seed,
+                "take_up_seed": args.validation_take_up_seed,
+                "mortality_seed": args.validation_mortality_seed,
+                "scenario_fingerprint": (
+                    validation_scenarios.content_fingerprint
+                ),
+                "training_validation_evaluation_fingerprints_distinct": (
+                    len({
+                        *training_scenario_fingerprints,
+                        validation_scenarios.content_fingerprint,
+                        lsmc_result.scenario_fingerprint,
+                    }) == 5
+                ),
+                "common_random_numbers_across_policy_and_benchmarks": True,
+                "confidence_level": 0.95,
+                "noninferiority_margin_basis_points_of_premium": 1.0,
+                "gates": validation_summary_rows,
+                "primary_training_seed_gates": [
+                    gate.as_dict() for gate in validation_result.gates
+                ],
+                "gates_by_training_seed": {
+                    f"training_seed_{index + 1}": [
+                        gate.as_dict() for gate in result.gates
+                    ]
+                    for index, result in enumerate(validation_results_by_seed)
+                },
+                "every_seed_passes_election_income_combined": all(
+                    result.valid
+                    and {gate.component for gate in result.gates} == {
+                        "election_only",
+                        "income_action_only",
+                        "combined_policy",
+                    }
+                    for result in validation_results_by_seed
+                ),
             },
             "sources": {
                 "model_points": model_points.source_metadata(),
@@ -1384,23 +2909,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "model_limitations": [
                 "Research valuation gross of reinsurance.",
                 "Mortality is illustrative and not an approved production basis.",
-                "Optimal behaviour is an annual LSMC lower-bound policy on an "
-                "independent evaluation sample.",
-                "The annual exercise grid is coarser than the monthly Full-"
-                "Withdrawal event grid in the cashflow projector.",
-                "Partial withdrawal is removed from the optimal action grid "
-                "because proportional AV and Locked-Income reduction makes it a "
-                "convex combination of Continue and Full Withdrawal for this "
-                "generic non-APS design.",
+                "Optimal behaviour is a cross-fitted LSMC lower-bound policy "
+                "with annual Election and monthly Income actions.",
+                "Partial Withdrawal uses a finite adaptive amount grid rather "
+                "than a continuous optimiser.",
                 "The five-year government-bond sleeve, monthly 50/50 rebalancing, "
                 "absence of bond term premium and other fixed proxy assumptions "
                 "remain unchanged from the dynamic benchmark.",
-                "The fitted-Election/Continue decomposition rollout suppresses "
-                "Income surrender after fitting; its Election rule is not "
-                "separately re-optimised under a Continue-only terminal policy.",
-                "The deterministic-Election/fitted-surrender decomposition "
-                "rollout deploys the Income rule from the combined fit; it is "
-                "not separately re-fitted under deterministic Election.",
+                (
+                    "The fitted-Election/Continue rollout is retained only as "
+                    "an internal final-sample validation control; it is not a "
+                    "reported Behaviour-effect decomposition."
+                    if args.no_factorial_benchmarks
+                    else "The fitted-Election/Continue decomposition rollout "
+                    "suppresses all voluntary Income actions after fitting; "
+                    "its Election rule is not separately re-optimised under a "
+                    "Continue-only terminal policy."
+                ),
             ],
             "outputs": {
                 "portfolio_summary_csv": str(summary_path),
@@ -1423,12 +2948,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     output / "lsmc_regression_diagnostics.csv"),
                 "lsmc_action_summary_csv": str(
                     output / "lsmc_action_summary.csv"),
+                "lsmc_validation_summary_csv": str(validation_summary_path),
+                "lsmc_validation_manifest_json": str(
+                    validation_manifest_path
+                ),
+                "lsmc_multi_seed_validation_evaluation_csv": str(
+                    multi_seed_report_path
+                ),
                 "lsmc_vs_continue_summary_csv": str(
                     output / "lsmc_vs_continue_summary.csv"),
                 "continue_benchmark": {
                     "semantics": (
                         "election_rule_from_combined_fit_with_"
-                        "full_withdrawal_suppressed_in_evaluation"
+                        "income_actions_suppressed_in_evaluation"
                     ),
                     "portfolio_summary_csv": str(
                         election_continue_summary_path
@@ -1440,23 +2972,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         election_continue_recon_path
                     ),
                 },
-                "deterministic_election_continue_benchmark": {
-                    "portfolio_summary_csv": str(continue_summary_path),
-                    "model_point_results_csv": str(continue_model_point_path),
-                    "aggregation_reconciliation_csv": str(continue_recon_path),
-                },
-                "deterministic_election_post_behaviour_benchmark": {
-                    "portfolio_summary_csv": str(
-                        deterministic_surrender_summary_path
-                    ),
-                    "model_point_results_csv": str(
-                        deterministic_surrender_model_point_path
-                    ),
-                    "aggregation_reconciliation_csv": str(
-                        deterministic_surrender_recon_path
-                    ),
-                },
-                "behaviour_decomposition_csv": str(decomposition_path),
+                "deterministic_election_continue_benchmark": (
+                    None
+                    if continue_summary_path is None
+                    else {
+                        "portfolio_summary_csv": str(continue_summary_path),
+                        "model_point_results_csv": str(
+                            continue_model_point_path
+                        ),
+                        "aggregation_reconciliation_csv": str(
+                            continue_recon_path
+                        ),
+                    }
+                ),
+                "deterministic_election_post_behaviour_benchmark": (
+                    None
+                    if deterministic_surrender_summary_path is None
+                    else {
+                        "portfolio_summary_csv": str(
+                            deterministic_surrender_summary_path
+                        ),
+                        "model_point_results_csv": str(
+                            deterministic_surrender_model_point_path
+                        ),
+                        "aggregation_reconciliation_csv": str(
+                            deterministic_surrender_recon_path
+                        ),
+                    }
+                ),
+                "behaviour_decomposition_csv": (
+                    None if decomposition_path is None else str(decomposition_path)
+                ),
                 "dynamic_benchmark": dynamic_outputs,
                 "figures": figure_paths,
                 "log": str(log_path),
@@ -1470,12 +3016,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             handle.write("\n")
 
         logger.info(
-            "LSMC-Lauf abgeschlossen | fits=%d | runtime=%.1fs | summary=%s",
-            len(fits), time.perf_counter() - started, summary_path,
+            "LSMC-Lauf abgeschlossen | fits=%d aus drei Trainings-Seeds | "
+            "runtime=%.1fs | summary=%s",
+            sum(len(selected_fits) for selected_fits in fits_by_seed),
+            time.perf_counter() - started,
+            summary_path,
         )
         return 0
-    except Exception:
+    except Exception as exc:
         logger.exception("LSMC-Portfoliolauf fehlgeschlagen")
+        # A policy-hook or validation-construction error must not leave a
+        # prior successful manifest in place or look like an unvalidated
+        # completed run.  Fit-invalid and statistical-gate failures write
+        # richer artifacts before raising; this is the fail-closed catch-all
+        # for earlier unexpected validation errors.
+        validation_manifest = output / "lsmc_validation_manifest.json"
+        validation_summary = output / "lsmc_validation_summary.csv"
+        if not validation_manifest.exists():
+            failure_row = {
+                "valid": False,
+                "status": "validation_or_fit_exception",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            if not validation_summary.exists():
+                _write_csv(validation_summary, [failure_row])
+            with validation_manifest.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "generated_at_utc": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        **failure_row,
+                        "gates": [],
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                handle.write("\n")
         return 1
 
 
