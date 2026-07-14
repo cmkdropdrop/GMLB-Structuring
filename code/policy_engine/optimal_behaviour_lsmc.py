@@ -1117,7 +1117,22 @@ def _cross_fitted_regression(
             or np.any(selected >= raw.shape[1]) \
             or np.unique(selected).size != selected.size:
         raise ValueError("Regression feature indices are invalid.")
-    if n_obs <= settings.minimum_regression_observations:
+    # A sparse but economically material far-tail Income boundary can have too
+    # few surviving paths for the full or core state basis even in a large
+    # simulation. The final member of the documented hierarchy is an
+    # intercept-only advantage regression. It still uses complete-path
+    # cross-fitting and the direct expected-advantage argmax, so it is an
+    # estimator on a coarser information set rather than a behavioural
+    # Continue/fixed-policy fallback.
+    sparse_constant_advantage = bool(
+        advantage_target and selected.size == 0
+    )
+    total_observation_floor = (
+        max(2 * settings.n_folds, settings.observations_per_coefficient)
+        if sparse_constant_advantage
+        else settings.minimum_regression_observations
+    )
+    if n_obs <= total_observation_floor:
         raise ValueError(
             "LSMC requires more observations than the per-regression minimum; "
             f"got {n_obs}."
@@ -1153,8 +1168,13 @@ def _cross_fitted_regression(
                 feature_indices=feature_indices,
                 basis_level=basis_level,
             )
+            regression_observation_floor = (
+                settings.observations_per_coefficient
+                if sparse_constant_advantage
+                else settings.minimum_regression_observations
+            )
             minimum_train = max(
-                settings.minimum_regression_observations,
+                regression_observation_floor,
                 settings.observations_per_coefficient
                 * prepared.effective_rank,
             )

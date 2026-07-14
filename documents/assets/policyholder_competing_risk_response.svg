@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="500" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
   <title id="title">Competing-risk conversion and probability cap</title>
   <desc id="desc">A schematic x-y chart for the case where ordinary probability is below the cap. The implemented Full-Withdrawal probability follows the raw combined-risk curve until it reaches a horizontal plateau; if ordinary probability is already higher, total probability remains at least ordinary.</desc>
   <rect width="760" height="500" fill="#ffffff"/>

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="500" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
   <title id="title">Dynamic action response to decision-specific guarantee moneyness</title>
   <desc id="desc">A schematic x-y chart in which Income Election rises with its decision-specific guarantee moneyness, while ordinary Full Withdrawal and the expected Excess-Withdrawal rate fall with their respective decision-specific moneyness measures.</desc>
   <rect width="760" height="500" fill="#ffffff"/>

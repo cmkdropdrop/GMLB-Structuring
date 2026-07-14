@@ -167,10 +167,10 @@ $$
   <img src="assets/mortality-annual-to-monthly.svg" width="900" alt="X-y chart of expected survival exposure by month for a teaching example with annual q equal to 12 percent; exposure decreases from 1,000 at month zero to approximately 938.1 at month six and 880 at month twelve.">
 </p>
 
-*Figure 3 — Annual-to-monthly reconciliation. Markers and steps are monthly
+**Figure 3 — Annual-to-monthly reconciliation.** Markers and steps are monthly
 model-grid points. The deliberately visible annual input $q_x=0.12$ (12%) is a
 teaching input, not a modelpoint result. The monthly rate is about 1.0596%, not
-1%.*
+1%.
 
 On the monthly grid, expected survival and death mass obey
 
@@ -184,8 +184,8 @@ $$
 
 The last identity is the monthly mass-control: every unit of exposure is either
 alive at the next grid point or dies in the interval. A projection that starts
-between anniversaries first uses the remainder of the already anchored policy-
-year rate. The start duration must lie on the monthly grid.
+between anniversaries first uses the remainder of the already anchored
+policy-year rate. The start duration must lie on the monthly grid.
 
 The twelve-month reconciliation applies outside the terminal policy year. In
 the terminal year, the ordinary anchored rate is converted first and the

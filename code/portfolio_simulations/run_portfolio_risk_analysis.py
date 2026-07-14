@@ -1590,8 +1590,8 @@ def _execute_scenario_job(job: ScenarioJob, blas_threads: int) -> None:
         raise ValueError("V11-only jobs must not contain Dynamic benchmarks.")
     lsmc_started = time.perf_counter()
     log_to_console(
-        f"START 2/2 | {job.label} | LSMC V11 candidate: training, validation, "
-        f"evaluation | Output: {job.lsmc_output}"
+        f"START 2/2 | {job.label} | direct single-sample LSMC V11 fit and "
+        f"rollout | Output: {job.lsmc_output}"
     )
     _run_logged_command(
         job.lsmc_command,

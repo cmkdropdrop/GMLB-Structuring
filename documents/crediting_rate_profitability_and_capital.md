@@ -36,7 +36,7 @@ The standard objective is
 
 $$
 \mathrm{CSM}^{\mathrm{proxy}}
-=\operatorname{PV}(F)+\operatorname{PV}(O)-\operatorname{PV}(K)-\operatorname{PV}(C),
+=\mathrm{PV}(F)+\mathrm{PV}(O)-\mathrm{PV}(K)-\mathrm{PV}(C),
 $$
 
 where $F$ is Fee Income, $O$ Other Income, $K$ Claims and $C$ Costs.
@@ -56,7 +56,7 @@ margin such as fees less guarantee claims and call it CSM.
 For annual return $R$ and cap $C$, the customer payoff is
 
 $$
-\min\!\left(\max(R,0),C\right)=\max(R,0)-\max(R-C,0).
+\min\left(\max(R,0),C\right)=\max(R,0)-\max(R-C,0).
 $$
 
 The insurer buys the lower call and sells the cap call in the capital market.
@@ -78,8 +78,8 @@ reference-fund performance and does not change customer crediting.
 
 ## Risk measures in the repository
 
-The portfolio-risk workflow reports market-consistent values and shock-and-
-revalue sensitivities, including:
+The portfolio-risk workflow reports market-consistent values and
+shock-and-revalue sensitivities, including:
 
 - CSM proxy and its four components;
 - guarantee claims and hedge cost;
@@ -89,8 +89,8 @@ revalue sensitivities, including:
 - differences between statistical dynamic and deployed LSMC behaviour.
 
 The current outputs are not pathwise shareholder-loss VaR/CTE, APRA LAGIC
-capital or a complete IFRS 17 risk adjustment. Any research capital or cost-of-
-capital quantity is labelled as a proxy.
+capital or a complete IFRS 17 risk adjustment. Any research capital or
+cost-of-capital quantity is labelled as a proxy.
 
 ## Dynamic-only MLL capital proxy
 
@@ -106,10 +106,10 @@ For each fixed cap, common-random-number revaluations apply:
 
 | Module | Revaluation |
 |---|---|
-| Mortality | permanent $+15\%$ multiplier to annual $q_x$ |
-| Longevity | permanent $-20\%$ multiplier to annual $q_x$ |
-| Lapse up | permanent $+50\%$ multiplier to ordinary lapse baselines and the performance-sensitive excess-hazard cap |
-| Lapse down | permanent $-50\%$ multiplier to ordinary lapse baselines and the performance-sensitive excess-hazard cap |
+| Mortality | permanent 15% increase in annual $q_x$ |
+| Longevity | permanent 20% decrease in annual $q_x$ |
+| Lapse up | permanent 50% increase in ordinary lapse baselines and the performance-sensitive excess-hazard cap |
+| Lapse down | permanent 50% decrease in ordinary lapse baselines and the performance-sensitive excess-hazard cap |
 
 The first two factors and the lapse up/down factors mirror the repository's
 existing Solvency-II-style research defaults. The corresponding European
@@ -162,10 +162,10 @@ the mass-lapse proxy binds. The primary fixed-cap ranking therefore uses the AUD
 economic-value-added proxy
 
 $$
-J^{\text{capital-adjusted}}(C)=J(C)-hK_{\mathrm{MLL}}(C),
+J_{\mathrm{adj}}(C)=J(C)-hK_{\mathrm{MLL}}(C),
 $$
 
-where the current research hurdle is $h=6\%$. This is a one-year capital
+where the current research hurdle is $h=0.06$ (6%). This is a one-year capital
 charge, not a full projected Risk Margin. The lifetime efficiency diagnostic
 $J/K_{\mathrm{MLL}}$ is reported only when capital exceeds a premium-relative
 materiality threshold; no epsilon denominator is introduced.
@@ -174,8 +174,8 @@ For product-design discretion relative to the contractual 6% cap,
 
 $$
 \Delta^{\mathrm{design}}_{\mathrm{capital}}
-=J^{\text{capital-adjusted}}_{\text{selected fixed}}
--J^{\text{capital-adjusted}}_{6\%}.
+=J_{\mathrm{adj}}(C_{\mathrm{selected}})
+-J_{\mathrm{adj}}(0.06).
 $$
 
 For annual adaptive discretion, the comparison remains adaptive versus best
@@ -213,7 +213,7 @@ The economic value of flexibility is the paired OOS difference
 
 $$
 \Delta^{\mathrm{flex}}=\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{adaptive}}
--\mathrm{CSM}^{\mathrm{proxy}}_{\text{best fixed}}.
+-\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{best}}.
 $$
 
 The best fixed cap is selected on its own sample. The adaptive candidate is
@@ -229,8 +229,8 @@ It does not validate annual state-contingent management discretion.
 
 ## Accounting interpretation
 
-Management discretion over future crediting may be relevant to fulfilment-
-cashflow and contractual-service assessments if it is substantive and reflected
+Management discretion over future crediting may be relevant to
+fulfilment-cashflow and contractual-service assessments if it is substantive and reflected
 in the applicable accounting policy. This repository only estimates cashflows
 under an assumed management rule. It does not demonstrate IFRS recognition,
 group-level CSM or release patterns. Accounting conclusions require separate

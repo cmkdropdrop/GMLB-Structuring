@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 520" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520" role="img" aria-labelledby="title desc">
   <title id="title">Schematic held-out LSMC validation gate</title>
   <desc id="desc">Two x-y lower-bound plots illustrate a passing and a failing paired non-inferiority test of the frozen LSMC candidate against the best predeclared fixed baseline.</desc>
   <rect width="1100" height="520" fill="#ffffff"/>

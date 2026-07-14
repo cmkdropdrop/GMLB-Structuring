@@ -64,8 +64,8 @@ At an anniversary, information is used in contractual order:
 
 Scheduled Income is then paid monthly in arrears; the election month has no
 Income payment. On the current statistical basis, the expected Excess
-Withdrawal is applied at its configured annual boundary before the monthly Full-
-Withdrawal settlement. Under LSMC, the Income Full-Withdrawal decision is an
+Withdrawal is applied at its configured annual boundary before the monthly
+Full-Withdrawal settlement. Under LSMC, the Income Full-Withdrawal decision is an
 anniversary-only action and Partial / Excess Withdrawal is suppressed.
 
 This order matters: Election uses the post-fee Account Value and information
@@ -87,7 +87,7 @@ prospective guarantee with the value relevant to the action. Define
 
 $$
 r = \frac{G}{\max(E,\varepsilon)}, \qquad
-m = \min\{m_{\max},\max\{m_{\min},\log(r)\}\}.
+m = \min(m_{\max},\max(m_{\min},\log(r))).
 $$
 
 Here $G$ is the pathwise present value of the guarantee, $E$ is the
@@ -135,7 +135,7 @@ $$
 $$
 \eta=\beta_m m+\beta_z z+\beta_{mz}mz+\eta_s,
 \qquad
-q=\min\{U,\max\{L,e^{\eta}\}\},
+q=\min(U,\max(L,e^{\eta})),
 $$
 
 $$
@@ -174,7 +174,7 @@ $$
 After a deadband $d$, the effective non-negative shortfall is
 
 $$
-g=\min\{g_{\max},\max\{0,\Delta-d\}\}.
+g=\min(g_{\max},\max(0,\Delta-d)).
 $$
 
 The additional annual integrated hazard rises smoothly towards its configured
@@ -182,11 +182,11 @@ limit and is reduced when guarantee moneyness is positive. First define the
 bounded positive moneyness used by this response:
 
 $$
-m_+=\min\{m_{\mathrm{perf,max}},\max\{m,0\}\}.
+m_+=\min(m_{\mathrm{perf,max}},\max(m,0)).
 $$
 
 $$
-a(m)=\max\{a_{\min},e^{-\gamma m_+}\},
+a(m)=\max(a_{\min},e^{-\gamma m_+}),
 $$
 
 $$
@@ -207,8 +207,8 @@ combined-probability cap is
 
 $$
 p_{\mathrm{total}}
-=\max\{p_{\mathrm{ordinary}},
-\min\{p_{\mathrm{raw}},p_{\mathrm{cap}}\}\}.
+=\max(p_{\mathrm{ordinary}},
+\min(p_{\mathrm{raw}},p_{\mathrm{cap}})).
 $$
 
 The cap therefore limits incremental performance risk but never reduces an

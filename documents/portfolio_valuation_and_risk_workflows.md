@@ -212,9 +212,9 @@ losses use permanent 15% and -20% mortality-rate shocks. The lapse module takes
 the largest adverse permanent 50% up/down shock and a separately disclosed 40%
 mass-lapse proxy on positive model-point CSM; the three modules are then
 aggregated with the documented life-risk correlation matrix. The primary
-selection measure is
+selection measure is the capital-adjusted CSM, denoted
 
-$\mathrm{CSM}^{\text{capital-adjusted}}=\mathrm{CSM}-hK_{\mathrm{MLL}}$.
+$\mathrm{CSM}_{\mathrm{adj}}=\mathrm{CSM}-hK_{\mathrm{MLL}}$.
 
 This evaluates a fixed product-design choice. It does not establish that an
 annually adaptive discretionary cap rule has value. Outputs include the full
@@ -241,8 +241,8 @@ Every evidence-quality run should retain:
 `results/document_figures/` is reserved for a small set of reviewed figures
 promoted from completed runs. A promoted figure should have a nearby documented
 provenance link to its completed run manifest and must not be copied from a
-smoke, interrupted, rejected or source-mismatched run. The curated Dynamic-
-behaviour cap study records a completed current-source optimisation run.
+smoke, interrupted, rejected or source-mismatched run. The curated
+Dynamic-behaviour cap study records a completed current-source optimisation run.
 Completed base-only portfolio-risk run `20260714T002637.233689Z` supplies the
 separate four-model-point cap and behaviour comparison. It uses 1,000 evaluation
 paths, 4,000 LSMC training paths, 1,000 LSMC validation paths and one training

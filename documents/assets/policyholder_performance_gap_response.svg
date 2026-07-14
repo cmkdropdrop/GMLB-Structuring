@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="500" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
   <title id="title">Performance-sensitive Full-Withdrawal hazard after a crediting deadband</title>
   <desc id="desc">A schematic x-y chart showing zero excess hazard inside a log return-factor deadband, followed by a rising bounded hazard. A valuable guarantee attenuates the response relative to a weak guarantee.</desc>
   <rect width="760" height="500" fill="#ffffff"/>

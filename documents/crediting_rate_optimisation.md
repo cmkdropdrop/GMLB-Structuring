@@ -7,12 +7,12 @@ Maximum Return. Workflow names call this quantity the **crediting rate**, but
 the contractual payoff is a floor-at-zero, cap-at-$C_y$ annual index credit:
 
 $$
-g_y=\min\!\left(\max\!\left(R_y^{\mathrm{fund}},0\right),C_y\right),
+g_y=\min\left(\max\left(R_y^{\mathrm{fund}},0\right),C_y\right),
 \qquad C_y\in\mathcal C.
 $$
 
-The standard full action grid is
-$\mathcal C=\{0.25\%,1\%,2\%,\ldots,20\%\}$. The LSMC-policyholder runner
+The standard full action grid is `{0.25%, 1%, 2%, ..., 20%}`. The
+LSMC-policyholder runner
 also offers a predeclared coarse screening grid for faster research runs. The
 6% case-study cap remains the contractual base; optimisation grids are
 counterfactual management-action studies and do not reprice all other product
@@ -34,8 +34,8 @@ The insurer and policyholder objectives are never blended.
 At time zero the optimiser maximises
 
 $$
-J(\pi)=\mathbb{E}^{\mathbb{Q}}\!\left[
-\operatorname{PV}(F)+\operatorname{PV}(O)-\operatorname{PV}(K)-\operatorname{PV}(C)\mid \pi
+J(\pi)=\mathbb{E}^{\mathbb{Q}}\left[
+\mathrm{PV}(F)+\mathrm{PV}(O)-\mathrm{PV}(K)-\mathrm{PV}(C)\mid \pi
 \right],
 $$
 
@@ -67,10 +67,10 @@ stresses, adds the explicitly labelled model-point mass-lapse proxy, aggregates
 the MLL research capital amount and ranks the supplied grid by
 
 $$
-J^{\text{capital-adjusted}}(C)=J(C)-hK_{\mathrm{MLL}}(C).
+J_{\mathrm{adj}}(C)=J(C)-hK_{\mathrm{MLL}}(C).
 $$
 
-The current hurdle $h=6\%$ is a one-year capital charge. $J/K_{\mathrm{MLL}}$ is a
+The current hurdle $h=0.06$ (6%) is a one-year capital charge. $J/K_{\mathrm{MLL}}$ is a
 secondary lifetime value-to-capital diagnostic and is not annualised RAROC. The
 runner hard-blocks Policyholder LSMC, auto-prepares missing exact cache entries
 through the sole authorised precompute runner, and then launches only strict
@@ -124,10 +124,10 @@ recursion schematically as
 
 $$
 V_y(A_y,X_y)=\max_{c\in\mathcal C}
-\left\{r_y(A_y,X_y,c)+
-\mathbb{E}^{\mathbb{Q}}\!\left[
+\left(r_y(A_y,X_y,c)+
+\mathbb{E}^{\mathbb{Q}}\left[
 V_{y+1}(A_{y+1},X_{y+1})\mid A_y,X_y,c
-\right]\right\}.
+\right]\right).
 $$
 
 Here $X_y$ is exogenous market/portfolio state and the monthly projector
@@ -136,17 +136,19 @@ inventory $A_{y+1}$. Control-randomised cap histories, including a
 persistent-exploration subset, provide state/action support.
 
 Account value is placed on an adaptive quantile grid. At each node the
-continuation regression uses the compact economic basis
+continuation regression uses a constant, the ATM one-year call value
+$H_y^{\mathrm{ATM}}$, the reference-fund level $S_y$ and the overnight rate
+$r_y$:
 
 $$
-\phi(X_y)=\left\{1,\ \text{ATM one-year call},\ \text{reference-fund level},\ \text{overnight rate}\right\}.
+\phi(X_y)=\left(1,H_y^{\mathrm{ATM}},S_y,r_y\right).
 $$
 
 The action-Q regression is fitted directly to the pathwise Bellman target
 
 $$
 Y_{i,y}^{c}=r_{i,y}^{c}
-+\widehat V_{y+1}\!\left(A_{i,y+1}^{c},X_{i,y+1}\right),
++\widehat V_{y+1}\left(A_{i,y+1}^{c},X_{i,y+1}\right),
 $$
 
 where the next-year grid value is interpolated at that path's **realised** next
@@ -155,10 +157,12 @@ or account-value transition. This avoids evaluating a nonlinear continuation
 surface at a conditional-mean inventory, which would introduce a Jensen-type
 approximation.
 
-Both fit and frozen deployment use the same six-column direct-Q basis
+Both fit and frozen deployment use the same six-column direct-Q basis, where
+$z_H$, $z_S$, $z_r$ and $z_A$ are the standardised call, fund, rate and
+inventory features:
 
 $$
-\{1,\ z(\text{ATM call}),\ z(\text{fund level}),\ z(r),\ z(A),\ z(A)^2\}.
+\left(1,z_H,z_S,z_r,z_A,z_A^2\right).
 $$
 
 There is no second projection onto a larger rollout basis and no second argmax.
@@ -230,8 +234,8 @@ paired. Let $\Delta_i$ be that pathwise/paired portfolio difference. The
 validation rule requires operational diagnostics to pass and
 
 $$
-\overline{\Delta}_{\mathrm{val}}>1.96\,
-\operatorname{SE}(\Delta_{\mathrm{val}}).
+\overline{\Delta}_{\mathrm{val}}>
+1.96\times\mathrm{SE}(\Delta_{\mathrm{val}}).
 $$
 
 The dynamic optimiser also requires an executable locally masked policy and a

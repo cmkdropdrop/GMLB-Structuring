@@ -12,8 +12,8 @@ The primary profitability measure is the signed new-business CSM proxy
 
 $$
 \mathrm{CSM}^{\mathrm{proxy}}
-=\operatorname{PV}(\text{Fee Income})+\operatorname{PV}(\text{Other Income})
--\operatorname{PV}(\text{Claims})-\operatorname{PV}(\text{Costs}).
+=\mathrm{PV}_{\mathrm{fees}}+\mathrm{PV}_{\mathrm{other}}
+-\mathrm{PV}_{\mathrm{claims}}-\mathrm{PV}_{\mathrm{costs}}.
 $$
 
 It is not a complete IFRS 17 CSM because the code does not perform grouping,
@@ -66,7 +66,7 @@ The reference fund is rebalanced monthly:
 
 $$
 R^{\mathrm{fund}}
-=0.30R^{\text{global equity}}+0.70R^{\text{5y government bond}}.
+=0.30R^{\mathrm{global}}+0.70R^{\mathrm{bond}}.
 $$
 
 The preferred bond return is obtained from pathwise Hull–White zero-coupon

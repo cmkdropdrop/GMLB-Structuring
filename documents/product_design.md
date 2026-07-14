@@ -66,10 +66,10 @@ return and $C_y$ the cap announced by the insurer. The contractual simple
 credit is
 
 $$
-g_y=\min\!\left(\max\!\left(R_y^{\mathrm{fund}},0\right),C_y\right).
+g_y=\min\left(\max\left(R_y^{\mathrm{fund}},0\right),C_y\right).
 $$
 
-A 0.25% guaranteed minimum cap means $C_y\ge 0.25\%$. It does not prevent a
+A 0.25% guaranteed minimum cap means $C_y\ge 0.0025$. It does not prevent a
 0% credit when the reference fund falls. The active base case uses a 6% cap;
 the optimisation studies allow the insurer to reset the cap annually on the
 predeclared admissible grid.

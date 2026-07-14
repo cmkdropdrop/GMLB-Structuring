@@ -1184,6 +1184,34 @@ def test_collinear_v2_design_produces_finite_stable_advantages():
     assert np.isfinite(regression.predict_features(raw)).all()
 
 
+def test_sparse_material_tail_uses_cross_fitted_constant_advantage_basis():
+    """A thin late-life boundary remains an estimated argmax, not fallback."""
+    n_paths = 36
+    raw = np.zeros((n_paths, len(FEATURE_NAMES)))
+    raw[:, 0] = np.linspace(-1.0, 1.0, n_paths)
+    target = np.full(n_paths, 250.0)
+    settings = OptimalBehaviourLSMCSettings(n_folds=5)
+
+    regression, oof, folds, fold_regressions = (
+        optimal_behaviour_module._cross_fitted_advantage_regression(
+            raw,
+            target,
+            100_000.0,
+            settings,
+            np.arange(n_paths, dtype=np.int64),
+            core_feature_indices=(
+                optimal_behaviour_module.CORE_FEATURE_INDICES
+            ),
+        )
+    )
+
+    assert folds == settings.n_folds
+    assert regression.basis_level == "constant"
+    assert all(item.basis_level == "constant" for item in fold_regressions)
+    np.testing.assert_allclose(oof, target)
+    assert np.all(oof > settings.exercise_tolerance_aud)
+
+
 def test_partial_action_replicas_keep_the_complete_path_fold(monkeypatch):
     context = _synthetic_income_action_context(n_paths=384)
     premium = 100_000.0

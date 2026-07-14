@@ -7719,7 +7719,8 @@ class TimeZeroManagementLSMCResult:
     scalarisation_converged: bool
     scalarisation_stationarity_gap: float
     fitted_chain_count: int
-    estimator: str = "full_sample_time_zero_scalarised_lsmc"
+    selected_candidate_source: str
+    estimator: str
 
 
 def _management_payload_and_activity_exposure(
@@ -7981,12 +7982,47 @@ def _time_zero_management_lsmc(
     rolling_result = _policy_level_csm_mll_from_payload(
         rolling.selected_payload, objective_spec
     )
-    candidates.append(("rolling_ratio_start", 0, rolling, rolling_result))
-
-    starts = (
-        ("rolling_ratio", rolling.selected_payload),
-        ("best_fixed_cap", np.asarray(fixed_cap_start_payload, dtype=float)),
+    iteration_rows.append({
+        "start": "rolling_ratio_start",
+        "iteration": 0,
+        "first_year_cap": float(ACTION_CAPS[rolling.chosen_action]),
+        "csm": rolling_result.csm,
+        "mll_capital": rolling_result.mll.capital,
+        "csm_to_mll_ratio": rolling_result.csm_to_mll_ratio,
+        "linear_support_gap": None,
+        "relative_payload_change": None,
+        "absolute_ratio_change": None,
+        "admissible_ratio_candidate": (
+            rolling_result.csm_to_mll_ratio is not None
+        ),
+        "candidate_status": (
+            "admissible"
+            if rolling_result.csm_to_mll_ratio is not None
+            else "discarded_immaterial_mll"
+        ),
+        "uses_all_paths": True,
+        "oos": False,
+    })
+    if rolling_result.csm_to_mll_ratio is not None:
+        candidates.append(("rolling_ratio_start", 0, rolling, rolling_result))
+    LOGGER.info(
+        "Time-0 conditional-ratio chain | first cap %.2f%% | CSM %.2f | "
+        "MLL %.2f | ratio=%s",
+        100.0 * float(ACTION_CAPS[rolling.chosen_action]),
+        rolling_result.csm,
+        rolling_result.mll.capital,
+        (
+            "undefined"
+            if rolling_result.csm_to_mll_ratio is None
+            else f"{rolling_result.csm_to_mll_ratio:.8g}"
+        ),
     )
+
+    starts = [
+        ("best_fixed_cap", np.asarray(fixed_cap_start_payload, dtype=float)),
+    ]
+    if rolling_result.csm_to_mll_ratio is not None:
+        starts.insert(0, ("rolling_ratio", rolling.selected_payload))
     converged_any = False
     for start_name, start_payload in starts:
         current = _reconcile_single_model_point_payload(
@@ -8049,8 +8085,21 @@ def _time_zero_management_lsmc(
             # ranking and stop this scalarisation start because no next ratio
             # subgradient exists at that value vector.
             if result.csm_to_mll_ratio is None:
+                LOGGER.info(
+                    "Time-0 scalarisation | start=%s | iteration=%d | "
+                    "discarded: immaterial MLL",
+                    start_name, iteration,
+                )
                 break
             candidates.append((start_name, iteration, estimate, result))
+            LOGGER.info(
+                "Time-0 scalarisation | start=%s | iteration=%d | "
+                "first cap %.2f%% | ratio %.8g | relative change %.3g",
+                start_name, iteration,
+                100.0 * float(ACTION_CAPS[estimate.chosen_action]),
+                result.csm_to_mll_ratio,
+                payload_change,
+            )
             if payload_change <= convergence_tolerance or (
                 previous_ratio is not None
                 and ratio_change <= convergence_tolerance
@@ -8061,6 +8110,10 @@ def _time_zero_management_lsmc(
             previous_ratio = float(result.csm_to_mll_ratio)
             current = estimate.selected_payload
 
+    if not candidates:
+        raise RuntimeError(
+            "Management LSMC produced no candidate with material MLL."
+        )
     ratios = np.asarray([
         -1.0e100 if item[3].csm_to_mll_ratio is None
         else float(item[3].csm_to_mll_ratio)
@@ -8091,6 +8144,11 @@ def _time_zero_management_lsmc(
     scale = max(1.0, abs(float(final_weights @ best_estimate.selected_payload)))
     scalarisation_converged = bool(
         converged_any and stationarity_gap <= convergence_tolerance * scale
+    )
+    estimator = (
+        "full_sample_time_zero_conditional_ratio_lsmc"
+        if best_source == "rolling_ratio_start"
+        else "full_sample_time_zero_mll_subgradient_lsmc"
     )
 
     action_rows: list[Mapping[str, object]] = []
@@ -8165,6 +8223,8 @@ def _time_zero_management_lsmc(
         scalarisation_converged=scalarisation_converged,
         scalarisation_stationarity_gap=stationarity_gap,
         fitted_chain_count=fitted_chain_count,
+        selected_candidate_source=best_source,
+        estimator=estimator,
     )
 
 
@@ -15180,6 +15240,9 @@ def main() -> None:
         "model_point_id": model_point.model_point_id,
         "customer_behaviour": "dynamic_statistical_no_customer_lsmc",
         "management_estimator": flexible.estimator,
+        "selected_management_candidate_source": (
+            flexible.selected_candidate_source
+        ),
         "oos_used": False,
         "forward_roll_used": False,
         "deployment_strategy_output": False,
@@ -15291,8 +15354,16 @@ def main() -> None:
             "regulatory capital.",
             "The estimator uses the complete Q sample in-sample as requested; "
             "there is no OOS performance claim or bootstrap interval.",
-            "The nonlinear ratio is handled by a common Time-0 MLL-subgradient "
-            "scalarisation within the fitted LSMC policy class.",
+            (
+                "The selected management value is the direct conditional-"
+                "ratio LSMC chain. The supplementary global Time-0 MLL-"
+                "subgradient search did not converge and is not the reported "
+                "candidate."
+                if flexible.selected_candidate_source == "rolling_ratio_start"
+                else "The nonlinear ratio is handled by a common "
+                "Time-0 MLL-subgradient scalarisation within the fitted LSMC "
+                "policy class; the stationarity flag is reported separately."
+            ),
             "Exactly one illustrative modelpoint is used; mass lapse therefore "
             "equals the configured fraction of positive total base CSM.",
         ],
