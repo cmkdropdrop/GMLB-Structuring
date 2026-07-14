@@ -1,0 +1,16 @@
+#refs {
+  font-size: 8.5pt;
+  line-height: 1.22;
+}
+
+table {
+  font-size: 8.5pt;
+}
+
+#refs .csl-entry {
+  margin-bottom: 0.14em;
+}
+
+#refs a {
+  overflow-wrap: anywhere;
+}

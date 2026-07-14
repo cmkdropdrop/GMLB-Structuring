@@ -1,0 +1,506 @@
+"""Focused safety tests for the alternative dynamic-Behaviour cap study."""
+
+import json
+from dataclasses import replace
+
+import numpy as np
+
+from policy_engine import ProjectionConfig
+from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import (
+    ACTION_CAPS,
+    CONTROL_STATE_FEATURE_NAMES,
+    SLIM_DIRECT_Q_BASIS_DIMENSION,
+    PortfolioPathData,
+    _adaptive_policy_passes_validation,
+    _backward_induction,
+    _constant_first_year_policy,
+    _direct_transition_target,
+    _fit_direct_q_chain,
+    _grid_continuation_lookup,
+    _lower_cap_argmax,
+    _masked_lower_cap_argmax,
+    _pathwise_outer_fold_ids,
+    _policy_action_values,
+    _projection_configs_by_sample,
+    _screened_policy_component_values,
+    _screened_policy_actions,
+    _shell_neutral_argv_display,
+    _slim_direct_q_design,
+)
+
+
+def _constant_policy(*, values, standard_errors, deployable):
+    raw = np.zeros((8, len(CONTROL_STATE_FEATURE_NAMES)))
+    outputs = np.zeros((len(ACTION_CAPS), 10))
+    outputs[:, 0] = np.asarray(values, dtype=float)
+    policy = _constant_first_year_policy(
+        year=0,
+        raw_state=raw,
+        action_values=outputs,
+        action_standard_errors=np.asarray(standard_errors, dtype=float),
+        feature_names=CONTROL_STATE_FEATURE_NAMES,
+    )
+    return replace(
+        policy,
+        action_deployable_mask=np.asarray(deployable, dtype=bool),
+    )
+
+
+def _portfolio_path_data(*, fees, raw_states, exposure=None):
+    fees = np.asarray(fees, dtype=float)
+    states = np.asarray(raw_states, dtype=float)
+    zeros = np.zeros_like(fees)
+    if exposure is None:
+        exposure = np.ones_like(fees)
+    feature_names = (
+        "log_reference_fund_level",
+        "short_rate",
+        "heston_variance_global",
+        "account_value_per_initial_premium",
+    )
+    return PortfolioPathData(
+        guarantee_claims=zeros.copy(),
+        other_insurer_funded_benefits=zeros.copy(),
+        fees_product=fees,
+        fees_lip=zeros.copy(),
+        crediting_margin=zeros.copy(),
+        money_market_income=zeros.copy(),
+        hedge_gain=zeros.copy(),
+        mva_retained=zeros.copy(),
+        aps_retained=zeros.copy(),
+        expenses=zeros.copy(),
+        hedge_costs=zeros.copy(),
+        income_paid=zeros.copy(),
+        death_benefits=zeros.copy(),
+        surrender_benefits=zeros.copy(),
+        partial_withdrawals=zeros.copy(),
+        terminal_closeout=zeros.copy(),
+        lapse_events=zeros.copy(),
+        inforce_exposure=np.asarray(exposure, dtype=float),
+        raw_states=states,
+        state_feature_names=feature_names,
+        pre_action_states=None,
+        pre_action_state_feature_names=(),
+        representative_initial_premium=100.0,
+    )
+
+
+def _synthetic_direct_q_data(paths_per_action: int = 12):
+    rng = np.random.default_rng(812_377)
+    n_actions = len(ACTION_CAPS)
+    observed = np.repeat(np.arange(n_actions, dtype=np.int64), paths_per_action)
+    n_paths = observed.size
+    action_indices = np.column_stack((observed, np.roll(observed, 3)))
+    feature_names = (
+        "log_reference_fund_level",
+        "short_rate",
+        "heston_variance_global",
+        "account_value_per_initial_premium",
+    )
+    raw_states = np.zeros((n_paths, 3, len(feature_names)))
+    for year in range(3):
+        raw_states[:, year, 0] = rng.normal(0.02 * year, 0.16, n_paths)
+        raw_states[:, year, 1] = rng.normal(0.025, 0.012, n_paths)
+        raw_states[:, year, 2] = rng.uniform(0.01, 0.09, n_paths)
+        raw_states[:, year, 3] = rng.uniform(0.35, 1.65, n_paths)
+    fees = np.column_stack((
+        2.0 + 8.0 * ACTION_CAPS[action_indices[:, 0]]
+        + 0.4 * raw_states[:, 0, 3] + rng.normal(0.0, 0.03, n_paths),
+        1.0 + 5.0 * ACTION_CAPS[action_indices[:, 1]]
+        + 0.2 * raw_states[:, 1, 3] + rng.normal(0.0, 0.03, n_paths),
+    ))
+    data = _portfolio_path_data(fees=fees, raw_states=raw_states)
+    return data, action_indices
+
+
+def test_projection_rng_namespaces_are_distinct_but_reproducible():
+    first = _projection_configs_by_sample(ProjectionConfig())
+    second = _projection_configs_by_sample(ProjectionConfig())
+
+    assert first == second
+    assert len({item.take_up_seed for item in first.values()}) == 4
+    assert len({item.mortality_seed for item in first.values()}) == 4
+
+
+def test_cache_remediation_argv_display_is_shell_neutral_and_lossless():
+    argv = [
+        "C:/Program Files/Python/python.exe",
+        "C:/repo with spaces/precompute.py",
+        "--cap-grid",
+        "0.0025,0.01",
+        "apostrophe's-value",
+    ]
+
+    display = _shell_neutral_argv_display(argv)
+
+    assert json.loads(display) == argv
+    assert not display.lstrip().startswith("&")
+
+
+def test_grid_interpolation_is_pathwise_linear_and_clamps_boundaries():
+    grid = np.array([0.0, 1.0, 3.0])
+    node_values = np.zeros((4, 3, 9))
+    node_values[:, :, 0] = np.array([0.0, 2.0, 10.0])
+    query = np.array([-1.0, 0.25, 2.0, 4.0])
+
+    interpolated, delta = _grid_continuation_lookup(
+        node_values, grid, query
+    )
+
+    np.testing.assert_allclose(interpolated[:, 0], [0.0, 0.5, 6.0, 10.0])
+    np.testing.assert_allclose(delta[:, 0], [2.0, 2.0, 8.0, 8.0])
+
+
+def test_direct_transition_target_uses_each_realised_next_inventory():
+    grid = np.array([0.0, 1.0, 2.0])
+    next_values = np.zeros((2, 3, 9))
+    next_values[:, :, 0] = np.array([0.0, 1.0, 4.0])
+    immediate = np.zeros((2, 9))
+
+    direct = _direct_transition_target(
+        immediate,
+        next_node_values=next_values,
+        inventory_grid=grid,
+        realised_next_inventory=np.array([0.5, 1.5]),
+    )
+    at_mean_transition = _direct_transition_target(
+        immediate,
+        next_node_values=next_values,
+        inventory_grid=grid,
+        realised_next_inventory=np.ones(2),
+    )
+
+    np.testing.assert_allclose(direct[:, 0], [0.5, 2.5])
+    np.testing.assert_allclose(at_mean_transition[:, 0], [1.0, 1.0])
+    assert np.mean(direct[:, 0]) != np.mean(at_mean_transition[:, 0])
+
+
+def test_two_year_screened_target_matches_frozen_direct_rollout_rule():
+    fallback = 0
+    alternative = 5
+    component_values = np.zeros(len(ACTION_CAPS))
+    component_values[fallback] = 2.0
+    component_values[alternative] = 10.0
+    policy = _constant_policy(
+        values=component_values,
+        standard_errors=np.full(len(ACTION_CAPS), 4.0),
+        deployable=np.ones(len(ACTION_CAPS), dtype=bool),
+    )
+    coefficients = policy.coefficients.copy()
+    # Component zero is fee income, so its derived CSM agrees with the constant
+    # Q value used by the rollout screen.
+    coefficients[:, 0, 1] = component_values
+    policy = replace(policy, coefficients=coefficients)
+    raw_next_state = np.zeros((4, len(CONTROL_STATE_FEATURE_NAMES)))
+
+    screened_components, chosen = _screened_policy_component_values(
+        policy=policy,
+        raw_state=raw_next_state,
+        feature_names=CONTROL_STATE_FEATURE_NAMES,
+        fallback_action=fallback,
+        advantage_screen_multiplier=1.96,
+    )
+    all_values = _policy_action_values(
+        policy, raw_next_state, CONTROL_STATE_FEATURE_NAMES
+    )
+    rows = np.arange(raw_next_state.shape[0])
+    immediate = np.zeros((raw_next_state.shape[0], 9))
+    immediate[:, 0] = np.arange(1.0, 5.0)
+    node_values = np.repeat(screened_components[:, None, :], 3, axis=1)
+    bellman_target = _direct_transition_target(
+        immediate,
+        next_node_values=node_values,
+        inventory_grid=np.array([0.0, 1.0, 2.0]),
+        realised_next_inventory=np.array([0.0, 0.4, 1.3, 2.0]),
+    )
+    direct_rollout_value = immediate + all_values[rows, chosen, 1:]
+
+    np.testing.assert_array_equal(chosen, np.full(4, fallback))
+    np.testing.assert_allclose(bellman_target, direct_rollout_value)
+
+
+def test_complete_path_outer_fold_is_held_out_from_every_recursive_fit():
+    data, actions = _synthetic_direct_q_data()
+    fold_ids = _pathwise_outer_fold_ids(actions, folds=3, seed=91)
+    held_out = fold_ids == 0
+    training = ~held_out
+    first = _fit_direct_q_chain(
+        data=data,
+        action_indices=actions,
+        fit_mask=training,
+        folds=3,
+        ridge=1.0e-6,
+        inventory_nodes=5,
+        inventory_quantile_clip=0.0,
+        minimum_training_count=SLIM_DIRECT_Q_BASIS_DIMENSION,
+    )
+
+    changed_fees = data.fees_product.copy()
+    changed_fees[held_out, :] += 1.0e8
+    changed = replace(data, fees_product=changed_fees)
+    second = _fit_direct_q_chain(
+        data=changed,
+        action_indices=actions,
+        fit_mask=training,
+        folds=3,
+        ridge=1.0e-6,
+        inventory_nodes=5,
+        inventory_quantile_clip=0.0,
+        minimum_training_count=SLIM_DIRECT_Q_BASIS_DIMENSION,
+    )
+
+    assert set(np.unique(fold_ids)) == {0, 1, 2}
+    for year in (0, 1):
+        np.testing.assert_allclose(
+            first.policies[year].coefficients,
+            second.policies[year].coefficients,
+            rtol=0.0,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            first.grid_values[year].node_coefficients,
+            second.grid_values[year].node_coefficients,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_fit_and_deployment_share_basis_and_therefore_argmax():
+    data, actions = _synthetic_direct_q_data()
+    chain = _fit_direct_q_chain(
+        data=data,
+        action_indices=actions,
+        fit_mask=np.ones(actions.shape[0], dtype=bool),
+        folds=2,
+        ridge=1.0e-6,
+        inventory_nodes=5,
+        inventory_quantile_clip=0.0,
+        minimum_training_count=SLIM_DIRECT_Q_BASIS_DIMENSION,
+    )
+    policy = chain.policies[1]
+    raw = data.raw_states[:80, 1, :]
+    design, _, _ = _slim_direct_q_design(
+        raw,
+        data.state_feature_names,
+        policy.raw_mean,
+        policy.raw_scale,
+    )
+    unbounded = np.einsum("pb,abo->pao", design, policy.coefficients)
+    lower = np.asarray(policy.value_lower_bounds)
+    upper = np.asarray(policy.value_upper_bounds)
+    bounded = np.minimum(np.maximum(unbounded, lower[None, :, :]), upper[None, :, :])
+    bounded[:, :, 0] = (
+        bounded[:, :, 1] + bounded[:, :, 2] + bounded[:, :, 3]
+        + bounded[:, :, 4] + bounded[:, :, 5] - bounded[:, :, 6]
+        - bounded[:, :, 7] - bounded[:, :, 8] - bounded[:, :, 9]
+    )
+    deployed = _policy_action_values(policy, raw, data.state_feature_names)
+    mask = np.asarray(policy.action_deployable_mask, dtype=bool)
+
+    assert policy.compact_q_basis
+    assert policy.coefficients.shape[1] == SLIM_DIRECT_Q_BASIS_DIMENSION
+    np.testing.assert_array_equal(
+        _masked_lower_cap_argmax(bounded[:, :, 0], mask, axis=1),
+        _masked_lower_cap_argmax(deployed[:, :, 0], mask, axis=1),
+    )
+
+
+def test_backward_diagnostics_are_complete_path_outer_fold_oos():
+    data, actions = _synthetic_direct_q_data(paths_per_action=60)
+    result = _backward_induction(
+        data,
+        actions,
+        folds=2,
+        ridge=1.0e-6,
+        seed=71,
+        inventory_nodes=5,
+        inventory_quantile_clip=0.0,
+    )
+
+    assert result.first_year_cap in ACTION_CAPS
+    assert all(policy.compact_q_basis for policy in result.policy_years)
+    assert all(row["outer_fold_pure"] for row in result.regression_rows)
+    assert all(row["outer_fold_count"] == 2 for row in result.regression_rows)
+    assert all(
+        row["direct_realised_transition_target"]
+        and row["fit_feature_basis"] == row["deployment_feature_basis"]
+        for row in result.regression_rows
+    )
+    assert sum(
+        row["holdout_path_count"] for row in result.first_year_action_rows
+    ) == actions.shape[0]
+
+
+def test_deterministic_time_zero_action_is_fold_seed_invariant_and_not_r2_masked():
+    paths_per_action = 64
+    observed = np.repeat(
+        np.arange(len(ACTION_CAPS), dtype=np.int64), paths_per_action
+    )
+    actions = observed[:, None]
+    n_paths = observed.size
+    raw_states = np.zeros((n_paths, 2, 4))
+    raw_states[:, :, 1] = 0.025
+    raw_states[:, :, 2] = 0.04
+    raw_states[:, :, 3] = 1.0
+    noise = 0.05 * np.sin(np.arange(n_paths, dtype=float) * 1.61803398875)
+    fees = (1_000.0 * ACTION_CAPS[observed] + noise)[:, None]
+    data = _portfolio_path_data(fees=fees, raw_states=raw_states)
+
+    results = [
+        _backward_induction(
+            data,
+            actions,
+            folds=2,
+            ridge=1.0e-6,
+            seed=seed,
+            inventory_nodes=3,
+            inventory_quantile_clip=0.0,
+        )
+        for seed in (71, 999)
+    ]
+
+    assert [result.first_year_cap for result in results] == [
+        ACTION_CAPS[-1], ACTION_CAPS[-1]
+    ]
+    masks = [
+        [row["deployable_for_frozen_policy"] for row in result.regression_rows]
+        for result in results
+    ]
+    assert masks[0] == masks[1] == [True] * len(ACTION_CAPS)
+    assert all(
+        "outer_oof_r_squared_below_threshold"
+        not in row["action_fit_mask_reasons"]
+        for result in results
+        for row in result.regression_rows
+    )
+
+
+def test_year_specific_reachable_inventory_support_avoids_false_node_mask():
+    data, actions = _synthetic_direct_q_data(paths_per_action=12)
+    raw_states = data.raw_states.copy()
+    within_action = np.tile(
+        np.linspace(0.0, 1.0, 12), len(ACTION_CAPS)
+    )
+    raw_states[:, 0, 3] = 0.90 + 0.20 * within_action
+    raw_states[:, 1, 3] = 0.04 + 0.04 * within_action
+    raw_states[:, 2, 3] = 0.03 + 0.03 * within_action
+    data = replace(data, raw_states=raw_states)
+
+    chain = _fit_direct_q_chain(
+        data=data,
+        action_indices=actions,
+        fit_mask=np.ones(actions.shape[0], dtype=bool),
+        folds=2,
+        ridge=1.0e-6,
+        inventory_nodes=5,
+        inventory_quantile_clip=0.0,
+        minimum_training_count=SLIM_DIRECT_Q_BASIS_DIMENSION,
+    )
+
+    assert chain.grids[0][0] >= 0.90
+    assert chain.grids[1][-1] <= 0.08
+    assert chain.grids[1][-1] < chain.grids[0][0]
+    assert np.all(chain.policies[1].action_deployable_mask)
+    assert all(
+        "clip" not in reason
+        for reasons in chain.action_mask_reasons[1]
+        for reason in reasons
+    )
+
+
+def test_lower_cap_argmax_identity_is_stable_under_numeric_ties():
+    values = np.array([[1.0, 1.0 + 5.0e-11, 0.0], [0.0, 2.0, 2.0]])
+    np.testing.assert_array_equal(_lower_cap_argmax(values, axis=1), [0, 1])
+
+
+def test_action_mask_excludes_only_the_unreliable_high_q_cap():
+    fallback = 3
+    unreliable = 7
+    stable_alternative = 5
+    values = np.zeros(len(ACTION_CAPS))
+    values[unreliable] = 100.0
+    values[stable_alternative] = 20.0
+    deployable = np.ones(len(ACTION_CAPS), dtype=bool)
+    deployable[unreliable] = False
+    policy = _constant_policy(
+        values=values,
+        standard_errors=np.zeros(len(ACTION_CAPS)),
+        deployable=deployable,
+    )
+
+    chosen, diagnostics = _screened_policy_actions(
+        policy=policy,
+        raw_state=np.zeros((4, len(CONTROL_STATE_FEATURE_NAMES))),
+        feature_names=CONTROL_STATE_FEATURE_NAMES,
+        fallback_action=fallback,
+        advantage_screen_multiplier=1.96,
+    )
+
+    np.testing.assert_array_equal(chosen, np.full(4, stable_alternative))
+    assert diagnostics["masked_action_count"] == 1
+    assert diagnostics["adaptive_action_count"] == 4
+
+
+def test_local_advantage_screen_and_unsafe_fallback_fit_retain_fixed_cap():
+    fallback = 3
+    alternative = 5
+    values = np.zeros(len(ACTION_CAPS))
+    values[alternative] = 1.0
+    standard_errors = np.ones(len(ACTION_CAPS))
+    deployable = np.ones(len(ACTION_CAPS), dtype=bool)
+    policy = _constant_policy(
+        values=values,
+        standard_errors=standard_errors,
+        deployable=deployable,
+    )
+
+    screened, diagnostics = _screened_policy_actions(
+        policy=policy,
+        raw_state=np.zeros((3, len(CONTROL_STATE_FEATURE_NAMES))),
+        feature_names=CONTROL_STATE_FEATURE_NAMES,
+        fallback_action=fallback,
+        advantage_screen_multiplier=1.96,
+    )
+    np.testing.assert_array_equal(screened, np.full(3, fallback))
+    assert diagnostics["advantage_screen_fallback_count"] == 3
+
+    unsafe_fallback = replace(
+        policy,
+        action_deployable_mask=np.asarray([
+            action != fallback for action in range(len(ACTION_CAPS))
+        ]),
+    )
+    retained, diagnostics = _screened_policy_actions(
+        policy=unsafe_fallback,
+        raw_state=np.zeros((3, len(CONTROL_STATE_FEATURE_NAMES))),
+        feature_names=CONTROL_STATE_FEATURE_NAMES,
+        fallback_action=fallback,
+        advantage_screen_multiplier=0.0,
+    )
+    np.testing.assert_array_equal(retained, np.full(3, fallback))
+    assert diagnostics["fit_mask_fallback_count"] == 3
+
+
+def test_validation_gate_accepts_significant_uplift_and_rejects_fallback_cases():
+    assert _adaptive_policy_passes_validation(
+        masked_candidate_executable=True,
+        policyholder_validation_passed=True,
+        causal_rollout_valid=True,
+        csm_delta_aud=196.01,
+        paired_standard_error_aud=100.0,
+    )
+    for override in (
+        {"masked_candidate_executable": False},
+        {"policyholder_validation_passed": False},
+        {"causal_rollout_valid": False},
+        {"csm_delta_aud": 196.0},
+    ):
+        arguments = {
+            "masked_candidate_executable": True,
+            "policyholder_validation_passed": True,
+            "causal_rollout_valid": True,
+            "csm_delta_aud": 196.01,
+            "paired_standard_error_aud": 100.0,
+        }
+        arguments.update(override)
+        assert not _adaptive_policy_passes_validation(**arguments)

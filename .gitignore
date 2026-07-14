@@ -1,53 +1,49 @@
-# Python bytecode and caches
+# Python caches and build artefacts
 __pycache__/
 *.py[cod]
-*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.pytype/
-.hypothesis/
-
-# Test and coverage artefacts
 .coverage
-.coverage.*
-coverage.xml
 htmlcov/
-.tox/
-.nox/
-
-# Packaging and build artefacts
 build/
 dist/
 *.egg-info/
-.eggs/
 *.egg
 
-# Local Python environments
+# Local environments and secrets
 .venv/
 venv/
 env/
-ENV/
-
-# Local configuration and secrets
 .env
 .env.*
 !.env.example
-!.env.template
 
-# Jupyter
-.ipynb_checkpoints/
+# Generated runtime results.  Curated documentation figures are versioned.
+/results/runs/
+/results/cache/
+/results/runtime_cache/
+/results/diagnostics/
+/results/archive/
+/results/portfolio_valuation/
+/results/portfolio_risk_analysis/
+/results/crediting_rate_scenarios/
+/results/crediting_rate_optimisation/
+/results/behaviour_comparison/
 
-# Generated model and analysis outputs
-/AGILE_Modelling_Engine/examples/output/
-/AGILE_Modelling_Engine/portfolio_simulations/output/
-/AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths/
-/AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices/
-/_review_work/runner_workaround_reproduction/
+# Temporary compatibility tree retained only while a pre-restructure local
+# process is still running. Active source and inputs live under code/ and
+# input_data/; the historical material is archived under old/.
+/AGILE_Modelling_Engine/
 
-# Research paper collections and derived paper code
-/Code based on Papers/
-/Papers on Pricing/
+# Archived third-party papers and binary review artefacts are kept locally
+# but are not redistributed by this repository.
+/old/papers/**/*.pdf
+/old/**/*.docx
+/old/**/*.html
+/old/**/*.htm
+/old/agile_product/results/
+/old/review_artifacts/runner_workaround_reproduction/
 
 # Runtime files
 *.log
@@ -56,57 +52,16 @@ ENV/
 *.tmp
 *.temp
 
-# IDE and editor settings
+# IDE and operating-system metadata
 .idea/
 .vscode/
 *.code-workspace
 *.swp
 *.swo
 *~
-
-# Microsoft Office lock files
-~$*
-
-# Excel workbooks and templates
-*.xls
-*.xlsx
-*.xlsm
-*.xlsb
-*.xlt
-*.xltx
-*.xltm
-*.xla
-*.xlam
-
-# Tabular data and bibliography files
-*.csv
-!input_model_points_policyholders/model_points_policyholders_1_point_proxy.csv
-!input_dynamic_behaviour/dynamic_behaviour_baselines.csv
-!input_dynamic_behaviour/dynamic_behaviour_coefficients.csv
-!input_MC_analysis/portfolio_analysis.csv
-!input_equity_allocation/equity_allocation.csv
-*.bib
-
-# Stylesheets and text files
-*.css
-*.txt
-
-# PDF documents
-*.pdf
-
-# HTML and Word documents
-*.html
-*.htm
-*.docx
-
-# Generated images
-*.png
-
-# PowerShell scripts
-*.ps1
-
-# Operating-system metadata
 .DS_Store
 Thumbs.db
 Desktop.ini
-$RECYCLE.BIN/
+
+# Microsoft Office lock files
+~$*

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "index-linked-lifetime-income-engine"
+version = "3.0.0"
+description = "Research engine for a generic Australian index-linked lifetime-income case study"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pandas>=2.0",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+precompute-q-cache = "portfolio_simulations.precompute_q_market_and_hedge_cache:main"
+portfolio-risk-analysis = "portfolio_simulations.run_portfolio_risk_analysis:main"
+crediting-capital-analysis = "portfolio_simulations.run_crediting_rate_capital_analysis:main"
+optimise-crediting-dynamic = "portfolio_simulations.run_crediting_rate_optimisation:dynamic_main"
+optimise-crediting-lsmc = "portfolio_simulations.run_crediting_rate_optimisation:lsmc_main"
+
+[tool.setuptools]
+package-dir = {"" = "code"}
+
+[tool.setuptools.packages.find]
+where = ["code"]
+include = ["policy_engine*", "portfolio_simulations*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["code"]

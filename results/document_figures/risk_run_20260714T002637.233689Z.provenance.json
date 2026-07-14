@@ -1,0 +1,163 @@
+{
+  "provenance_schema_version": "1.0",
+  "run_id": "20260714T002637.233689Z",
+  "run_status": "completed",
+  "run_created_utc": "2026-07-14T00:26:37.233689+00:00",
+  "results_generated_utc": "2026-07-14T00:40:22.730862+00:00",
+  "local_run_directory": "results/runs/portfolio_risk_analysis/20260714T002637.233689Z",
+  "runner": "code/portfolio_simulations/run_portfolio_risk_analysis.py",
+  "study_label": "four-model-point base-only development study",
+  "behaviour_comparison_label": "Dynamic V11 versus validated deployed annual-action LSMC fallback",
+  "model_point_source": "input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv",
+  "model_point_ids": [
+    "ALT4-01",
+    "ALT4-02",
+    "ALT4-03",
+    "ALT4-04"
+  ],
+  "model_point_count": 4,
+  "valuation_measure": "risk-neutral",
+  "market_model": "Heston-Hull-White",
+  "hedge_pricing_method": "mc_conditional",
+  "market_and_hedge_caches_required": true,
+  "market_scenario_horizon_years": 53.0,
+  "crediting_cap_percent_grid": [
+    0.25,
+    1.0,
+    6.0,
+    12.0
+  ],
+  "contractual_base_cap_percent": 6.0,
+  "stress_analysis_requested": false,
+  "stress_scenario_count": 0,
+  "samples": {
+    "evaluation": {
+      "path_count": 1000,
+      "market_seed": 2026,
+      "take_up_seed": 97,
+      "mortality_seed": 197
+    },
+    "training": {
+      "path_count": 4000,
+      "training_seed_count": 1,
+      "market_seed": 12026,
+      "take_up_seed": 10097,
+      "mortality_seed": 10197,
+      "selection_rule": "predeclared_seed_1_not_evaluation_based"
+    },
+    "validation": {
+      "path_count": 1000,
+      "market_seed": 22026,
+      "take_up_seed": 20097,
+      "mortality_seed": 20197
+    }
+  },
+  "lsmc_deployed_policy_by_cap_percent": {
+    "0.25": {
+      "policy": "earliest|continue_only",
+      "validated_fallback": true
+    },
+    "1.0": {
+      "policy": "earliest|continue_only",
+      "validated_fallback": true
+    },
+    "6.0": {
+      "policy": "earliest|continue_only",
+      "validated_fallback": true
+    },
+    "12.0": {
+      "policy": "V00_model_point_fixed_continue",
+      "validated_fallback": true
+    }
+  },
+  "csm_results_aud": {
+    "0.25": {
+      "dynamic_v11": 57630.46086506374,
+      "validated_deployed_lsmc_fallback": 1882.3789054234003,
+      "dynamic_minus_lsmc_fallback": 55748.08195964034
+    },
+    "1.0": {
+      "dynamic_v11": 48944.22555795289,
+      "validated_deployed_lsmc_fallback": -1357.9381500028176,
+      "dynamic_minus_lsmc_fallback": 50302.163707955704
+    },
+    "6.0": {
+      "dynamic_v11": -6696.55357557183,
+      "validated_deployed_lsmc_fallback": -22010.838525358064,
+      "dynamic_minus_lsmc_fallback": 15314.284949786233
+    },
+    "12.0": {
+      "dynamic_v11": -39516.633294451894,
+      "validated_deployed_lsmc_fallback": -47030.500585598405,
+      "dynamic_minus_lsmc_fallback": 7513.867291146511
+    }
+  },
+  "selected_numeric_findings": {
+    "base_6pct": {
+      "dynamic_v11_csm_to_premium_percent": -1.9872129888547592,
+      "lsmc_fallback_csm_to_premium_percent": -6.531751552430642,
+      "dynamic_v11_guarantee_claims_to_premium_percent": 16.893689885100036,
+      "lsmc_fallback_guarantee_claims_to_premium_percent": 17.273384958995036,
+      "dynamic_v11_net_guarantee_value_to_premium_percent": 6.479154053298297,
+      "lsmc_fallback_net_guarantee_value_to_premium_percent": 8.732935898359652,
+      "dynamic_v11_mean_income_start_year": 5.347807615314192,
+      "lsmc_fallback_mean_income_start_year": 1.0,
+      "dynamic_v11_income_election_share_percent": 91.56409869009784,
+      "lsmc_fallback_income_election_share_percent": 98.96991281854617,
+      "dynamic_v11_total_income_lapse_rate_percent": 0.0330446709789277,
+      "lsmc_fallback_total_income_lapse_rate_percent": 0.0
+    },
+    "hedge_costs_aud": {
+      "dynamic_v11_0.25pct": 12755.273071925712,
+      "dynamic_v11_12pct": 208453.77757959758,
+      "lsmc_fallback_0.25pct": 10466.440847954998,
+      "lsmc_fallback_12pct": 206192.9929005082
+    }
+  },
+  "figure_regeneration": {
+    "method": "All seven run figures were regenerated deterministically from the validated root portfolio_risk_by_crediting_cap.csv after a plot-only legend-classification fix.",
+    "numerical_tables_manifests_and_valuation_artifacts_changed": false,
+    "figure_regeneration_script_sha256": "7e5877ba4db6acc9438e395942e1010e2bf2bae1e9aa8e71c798bf1a3af4be1a",
+    "visual_review_date": "2026-07-14",
+    "all_seven_regenerated_figures_visually_reviewed": true,
+    "selected_figures": {
+      "risk_behaviour_comparison_by_cap.png": {
+        "source": "figures/02_income_election_behaviour_by_crediting_cap.png",
+        "sha256": "672bc77178ed3da26d24945803443a4481663e4a64326f495b864b428e834769",
+        "selection_reason": "Directly compares Income-Election timing and post-Election behaviour under Dynamic V11 and the validated deployed LSMC fallback."
+      },
+      "risk_csm_value_drivers_by_cap.png": {
+        "source": "figures/05_csm_and_value_drivers_by_crediting_cap.png",
+        "sha256": "ee060f015513e8692ab6134a2ef30e778e25845ea0259695654db84c86ac169b",
+        "selection_reason": "Shows reconciled CSM, income, claims and call-spread costs while identifying the LSMC series as a validated fallback."
+      },
+      "risk_valuation_exposures_by_cap.png": {
+        "source": "figures/01_valuation_exposure_risks_by_crediting_cap.png",
+        "sha256": "99b0dbd28cf56ae8b9c502897efab9a7c968c2146ec78e338bd0b84984d91776",
+        "selection_reason": "Adds genuinely distinct premium-normalised guarantee, BEL, CSM, fee-coverage and hedge-cost exposures."
+      }
+    },
+    "excluded_run_figures": {
+      "03_phase_value_exposures_by_crediting_cap.png": "Useful phase detail but redundant with the selected behaviour and value-driver figures.",
+      "04_policy_year_behaviour_profile.png": "Detailed policy-year profile retained in the run directory.",
+      "07_model_point_risk_by_crediting_cap.png": "Four-model-point heterogeneity diagnostics are too sample-specific for the minimal documentation set.",
+      "08_lsmc_model_risk_diagnostics.png": "Technical fit diagnostics are retained in the run directory and the fallback status is documented directly."
+    }
+  },
+  "curated_source_data": {
+    "directory": "results/document_figures/source_data/risk_run_20260714T002637.233689Z",
+    "files": {
+      "analysis_manifest.json": "82ae5364c772218f86e2ba33c7c907da116b80719d31b53512079326ac469c76",
+      "crediting_cap_risk_sensitivities.csv": "695e62977202dca196fea60f4262b02e08091d5acbcbe016b9778566d0ec2149",
+      "portfolio_risk_by_crediting_cap.csv": "8fd1f507fd4bd3483d54ce16662fefd31c6b3b4710de7171eb49bc7aae41050f"
+    }
+  },
+  "limitations": [
+    "This is a four-model-point base-only development study, not the full portfolio.",
+    "No explicit stress analysis was run.",
+    "No pathwise portfolio loss distribution, VaR, TVaR or CTE is available.",
+    "Only one LSMC training seed was used; no repeated-seed confidence interval is available.",
+    "All four LSMC cells deployed validation fallbacks, so the comparison is not evidence about an accepted LSMC candidate policy.",
+    "The results are expected risk-neutral present values, not a Real-World forecast."
+  ]
+}

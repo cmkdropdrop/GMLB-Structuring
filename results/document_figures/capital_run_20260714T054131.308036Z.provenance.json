@@ -1,0 +1,88 @@
+{
+  "engine_version": "3.0.0",
+  "generated_at_utc": "2026-07-14T05:42:50.135010+00:00",
+  "limitations": [
+    "The MLL amount is a partial research life-risk capital proxy, not APRA capital or total SCR.",
+    "Mass lapse is a model-point positive-value proxy, not an immediate-surrender revaluation.",
+    "The capital charge is one year at the selected hurdle rate, not a full projected risk margin.",
+    "Dynamic Behaviour and Gompertz-Makeham mortality are illustrative, uncalibrated proxies.",
+    "The selected cap is the best point on the supplied discrete grid, not a continuous global optimum.",
+    "The analysis values fixed cap designs; it does not establish value for an annual adaptive cap policy."
+  ],
+  "method": {
+    "cache_writer": "C:\\Users\\user\\Documents\\GMLB Structuring\\code\\portfolio_simulations\\precompute_q_market_and_hedge_cache.py",
+    "capital_adjustment": "one_year_hurdle_charge_not_full_risk_margin",
+    "capital_scope": "mortality_longevity_lapse_research_proxy",
+    "hedge_cache_required": true,
+    "market_cache_required": true,
+    "market_model": "heston_hull_white",
+    "mass_lapse_method": "model_point_positive_value_proxy_not_revaluation",
+    "not_apra_capital": true,
+    "not_total_scr": true,
+    "policyholder_behaviour": "dynamic_statistical",
+    "policyholder_lsmc_hard_block": true,
+    "policyholder_lsmc_used": false,
+    "valuation_measure": "risk_neutral",
+    "valuation_reader": "C:\\Users\\user\\Documents\\GMLB Structuring\\code\\portfolio_simulations\\run_portfolio_valuation.py"
+  },
+  "outputs": {
+    "crediting_capital_results_csv": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\runs\\crediting_rate_capital_analysis\\20260714T054131.308036Z\\crediting_capital_results.csv",
+    "dynamic_stress_revaluations_csv": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\runs\\crediting_rate_capital_analysis\\20260714T054131.308036Z\\dynamic_stress_revaluations_by_crediting_cap.csv",
+    "plots": {
+      "capital_modules": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\runs\\crediting_rate_capital_analysis\\20260714T054131.308036Z\\plots\\02_mll_capital_modules_by_crediting_cap.png",
+      "csm_and_capital": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\runs\\crediting_rate_capital_analysis\\20260714T054131.308036Z\\plots\\01_csm_and_mll_capital_by_crediting_cap.png",
+      "dynamic_lapse": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\runs\\crediting_rate_capital_analysis\\20260714T054131.308036Z\\plots\\03_dynamic_lapse_response_by_crediting_cap.png"
+    }
+  },
+  "runtime_seconds": 78.826474,
+  "selection": {
+    "baseline_capital_adjusted_csm_aud": -7342.901811971592,
+    "capital_adjusted_value_vs_baseline_aud": 63269.45175803259,
+    "capital_release_vs_baseline_aud": -17626.04471004916,
+    "contractual_baseline_cap": 0.06,
+    "csm_uplift_vs_baseline_aud": 64327.01444063554,
+    "selected_cap": 0.0025,
+    "selected_cap_percent": 0.25,
+    "selection_objective": "capital_adjusted_csm",
+    "selection_objective_value": 55926.549946061
+  },
+  "settings": {
+    "baseline_cap": 0.06,
+    "blas_threads": 1,
+    "cap_grid": [
+      0.0025,
+      0.01,
+      0.06,
+      0.12
+    ],
+    "capital_hurdle_rate": 0.06,
+    "capital_materiality_bp": 1.0,
+    "hedge_pricing_method": "mc_conditional",
+    "heston_substeps": 4,
+    "horizon_years": 53.0,
+    "market_seed": 2026,
+    "mass_lapse_fraction": 0.4,
+    "max_workers": 4,
+    "mortality_seed": 197,
+    "n_paths": 1000,
+    "objective": "capital_adjusted_csm",
+    "stress_ids": [
+      "base",
+      "mortality",
+      "longevity",
+      "lapse_up",
+      "lapse_down"
+    ],
+    "take_up_seed": 97
+  },
+  "sources": {
+    "cost_assumptions": "C:\\Users\\user\\Documents\\GMLB Structuring\\input_data\\cost_assumptions\\cost_assumptions.csv",
+    "dynamic_behaviour": "C:\\Users\\user\\Documents\\GMLB Structuring\\input_data\\dynamic_behaviour",
+    "hedge_cache_root": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\cache\\q_hedge_prices",
+    "market_cache_root": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\cache\\q_market_paths",
+    "model_parameters": "C:\\Users\\user\\Documents\\GMLB Structuring\\input_data\\market_data\\model_parameters.csv",
+    "model_points": "C:\\Users\\user\\Documents\\GMLB Structuring\\input_data\\model_points_policyholders\\model_points_policyholders_4_point_proxy.csv",
+    "zero_curve": "C:\\Users\\user\\Documents\\GMLB Structuring\\input_data\\market_data\\australian_zero_curve.csv"
+  },
+  "started_at_utc": "2026-07-14T05:41:31.308536+00:00"
+}

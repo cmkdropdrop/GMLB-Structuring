@@ -1,0 +1,1839 @@
+"""Run the generic policyholder-portfolio valuation.
+
+Every repository model point is valued as a separate representative contract
+under one shared risk-neutral Heston-Hull-White scenario set.  The runner then
+aggregates the scalar model-point results using ``contract_weight``.  Absolute
+portfolio totals are produced only when an explicit total contract count is
+provided; otherwise all aggregate monetary values are labelled as normalised
+weighted-average values per representative contract.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import math
+import sys
+import time
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
+
+
+if __package__:
+    from ._mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
+else:
+    from _mc_analysis_inputs import (
+        load_mc_analysis_inputs,
+        require_mc_samples,
+    )
+
+
+ENGINE_ROOT = Path(__file__).resolve().parents[1]
+if str(ENGINE_ROOT) not in sys.path:
+    sys.path.insert(0, str(ENGINE_ROOT))
+
+from policy_engine import (  # noqa: E402
+    DEFAULT_AUSTRALIAN_ZERO_CURVE_PATH,
+    DEFAULT_COST_ASSUMPTIONS_PATH,
+    DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY,
+    DEFAULT_MODEL_PARAMETERS_PATH,
+    DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
+    FeeSpec,
+    HedgeCapLegMode,
+    IndexLinkedLifetimeIncomeProduct,
+    MortalityTable,
+    ProjectionConfig,
+    ReferenceFundSpec,
+    ValuationSettings,
+    __version__ as ENGINE_VERSION,
+    load_cost_assumptions,
+    load_dynamic_behaviour_assumptions,
+    load_equity_allocation,
+    load_market_assumptions,
+    load_policyholder_model_points,
+    value_policyholder_portfolio,
+)
+from policy_engine.portfolio_stresses import (  # noqa: E402
+    PORTFOLIO_STRESS_CHOICES,
+    apply_portfolio_behaviour_stress,
+    apply_portfolio_input_stress,
+    get_portfolio_stress,
+    portfolio_scenario_transform,
+)
+from policy_engine.repository_paths import (  # noqa: E402
+    Q_HEDGE_PRICE_CACHE_ROOT as DEFAULT_HEDGE_CACHE_ROOT,
+    Q_MARKET_PATH_CACHE_ROOT as DEFAULT_MARKET_CACHE_ROOT,
+    run_output_directory,
+)
+
+DEFAULT_OUTPUT_DIRECTORY = run_output_directory("portfolio_valuation")
+LOGGER_NAME = "policy_engine.portfolio_runner"
+
+
+def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        raise ValueError(f"Cannot write empty CSV: {path}")
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _as_float(value: object) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _aud_axis(value: float, _position: object = None) -> str:
+    absolute = abs(value)
+    if absolute >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}bn"
+    if absolute >= 1_000_000:
+        return f"{value / 1_000_000:.1f}m"
+    if absolute >= 1_000:
+        return f"{value / 1_000:.0f}k"
+    return f"{value:.0f}"
+
+
+def _summary_value(
+    summary: Mapping[str, object],
+    metric: str,
+    *,
+    absolute: bool,
+) -> Optional[float]:
+    prefix = "portfolio_total_" if absolute else "normalised_average_"
+    return _as_float(summary.get(f"{prefix}{metric}"))
+
+
+def _detail_text(detail: object) -> str:
+    if detail is None or detail == "":
+        return ""
+    if isinstance(detail, Mapping):
+        return json.dumps(detail, sort_keys=True, default=str)
+    return str(detail)
+
+
+def _make_progress_callback(logger: logging.Logger):
+    """Translate Core ``PortfolioProgress`` events into concise INFO logs."""
+
+    def report(event: object) -> None:
+        raw_stage = getattr(event, "stage", "portfolio_progress")
+        stage = getattr(raw_stage, "value", raw_stage)
+        completed = getattr(event, "completed", None)
+        total = getattr(event, "total", None)
+        model_point_id = getattr(event, "model_point_id", None)
+        detail = _detail_text(getattr(event, "detail", None))
+
+        parts = [str(stage)]
+        if completed is not None and total is not None:
+            parts.append(f"{completed}/{total}")
+        if model_point_id:
+            parts.append(str(model_point_id))
+        if detail:
+            parts.append(detail)
+        message = "Portfolio progress | %s"
+        payload = " | ".join(parts)
+        stage_text = str(stage)
+        verbose_solver_event = (
+            "evaluation" in stage_text
+            or (
+                stage_text.startswith("portfolio_")
+                and "model_point_completed" in stage_text
+            )
+        )
+        if verbose_solver_event:
+            logger.debug(message, payload)
+        else:
+            logger.info(message, payload)
+
+    return report
+
+
+def _configure_logging(
+    output: Path,
+    requested_log_file: Optional[Path],
+    level_name: str,
+) -> tuple[logging.Logger, Path]:
+    log_path = (
+        output / "portfolio_valuation.log"
+        if requested_log_file is None
+        else requested_log_file.expanduser().resolve()
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(getattr(logging, level_name.upper()))
+    logger.propagate = False
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
+    return logger, log_path
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    mc_inputs = load_mc_analysis_inputs()
+    evaluation_input = require_mc_samples(
+        mc_inputs, "evaluation", 1
+    )[0]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model-points",
+        type=Path,
+        default=DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
+        help="policyholder model-point CSV",
+    )
+    parser.add_argument(
+        "--cost-assumptions",
+        type=Path,
+        default=DEFAULT_COST_ASSUMPTIONS_PATH,
+        help="repository cost_assumptions.csv",
+    )
+    parser.add_argument(
+        "--cost-assumption-set",
+        default=None,
+        help="optional assumption_set_id in the cost CSV",
+    )
+    parser.add_argument(
+        "--dynamic-behaviour",
+        type=Path,
+        default=DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY,
+        help="repository input_data/dynamic_behaviour directory",
+    )
+    parser.add_argument(
+        "--behaviour-assumption-set",
+        default=None,
+        help="optional assumption_set_id in the behaviour CSVs",
+    )
+    parser.add_argument(
+        "--zero-curve",
+        type=Path,
+        default=DEFAULT_AUSTRALIAN_ZERO_CURVE_PATH,
+        help="repository Australian zero-curve CSV",
+    )
+    parser.add_argument(
+        "--model-parameters",
+        type=Path,
+        default=DEFAULT_MODEL_PARAMETERS_PATH,
+        help="repository market-model-parameter CSV",
+    )
+    parser.add_argument(
+        "--n-paths", type=int, default=evaluation_input.n_paths
+    )
+    parser.add_argument(
+        "--seed", type=int, default=evaluation_input.market_seed
+    )
+    parser.add_argument("--heston-substeps", type=int, default=4)
+    parser.add_argument(
+        "--market-cache-root", type=Path, default=DEFAULT_MARKET_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-cache-root", type=Path, default=DEFAULT_HEDGE_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--hedge-pricing-method",
+        choices=("mc_conditional", "moment_matched_bs"),
+        default="mc_conditional",
+    )
+    parser.add_argument(
+        "--require-market-cache", action="store_true", default=True,
+        help="require the exact validated Q-market cache (always enforced)",
+    )
+    parser.add_argument(
+        "--require-hedge-cache", action="store_true", default=True,
+        help="require the exact path-congruent hedge cache for mc_conditional",
+    )
+    parser.add_argument(
+        "--hedge-cap-leg-mode",
+        choices=tuple(mode.value for mode in HedgeCapLegMode),
+        default=HedgeCapLegMode.SOLD.value,
+        help=(
+            "sold uses the standard capped call spread; not_sold buys the "
+            "uncapped call and records performance above the customer cap as "
+            "an insurer hedge gain"
+        ),
+    )
+    parser.add_argument(
+        "--income-election-mode",
+        choices=("dynamic", "deterministic"),
+        default="dynamic",
+        help=(
+            "dynamic re-evaluates statistical take-up at every eligible "
+            "Anniversary; deterministic is the explicit backwards-compatible "
+            "model-point benchmark"
+        ),
+    )
+    parser.add_argument(
+        "--post-income-behaviour",
+        choices=("dynamic", "continue"),
+        default="dynamic",
+        help=(
+            "dynamic retains statistical Income lapse/withdrawal; continue "
+            "removes voluntary post-Election exits for behaviour decomposition"
+        ),
+    )
+    parser.add_argument(
+        "--take-up-seed",
+        type=int,
+        default=evaluation_input.take_up_seed,
+        help="independent common-random-number seed for Dynamic Election",
+    )
+    parser.add_argument(
+        "--mortality-seed",
+        type=int,
+        default=evaluation_input.mortality_seed,
+        help=(
+            "independent common-random-number life-status seed for pathwise "
+            "Joint-Life states in every portfolio Behaviour arm"
+        ),
+    )
+    parser.add_argument(
+        "--stress-scenario",
+        choices=PORTFOLIO_STRESS_CHOICES,
+        default="base",
+        help=(
+            "shared market/life/expense revaluation scenario; default base "
+            "preserves the contractual valuation"
+        ),
+    )
+    parser.add_argument(
+        "--crediting-cap-rate",
+        type=float,
+        default=None,
+        help=(
+            "optional non-contractual constant Maximum-Return scenario as a "
+            "decimal (for example 0.08 for 8%%); the contractual base remains 6%%"
+        ),
+    )
+    parser.add_argument(
+        "--portfolio-contract-count",
+        type=float,
+        default=None,
+        help=(
+            "total number of represented contracts; if omitted, monetary "
+            "aggregates remain normalised weighted averages per contract"
+        ),
+    )
+    parser.add_argument(
+        "--fair-lip",
+        action="store_true",
+        help="solve guarantee-neutral Lifetime Income Premium per model point",
+    )
+    parser.add_argument(
+        "--commercial-break-even-lip",
+        action="store_true",
+        help="solve insurer-NPV-neutral LIP per model point",
+    )
+    parser.add_argument(
+        "--portfolio-fair-lip",
+        action="store_true",
+        help="solve one guarantee-neutral LIP against the aggregated portfolio",
+    )
+    parser.add_argument(
+        "--portfolio-commercial-break-even-lip",
+        action="store_true",
+        help="solve one insurer-NPV-neutral LIP against the aggregated portfolio",
+    )
+    parser.add_argument("--fair-fee-lower", type=float, default=0.0)
+    parser.add_argument("--fair-fee-upper", type=float, default=0.05)
+    parser.add_argument("--fair-fee-maximum-upper", type=float, default=0.25)
+    parser.add_argument("--fair-fee-tolerance", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--profitability-materiality-bp",
+        type=float,
+        default=1.0,
+        help=(
+            "materiality threshold in basis points of premium for classifying "
+            "positive, negative or approximately break-even model-point value"
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIRECTORY,
+        help="output directory for CSV, JSON, log and figure results",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="do not create the default headless matplotlib figures",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="console and file logging level",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help=(
+            "optional log-file path; default is "
+            "<output>/portfolio_valuation.log"
+        ),
+    )
+    args = parser.parse_args(argv)
+    args.require_market_cache = True
+    args.require_hedge_cache = args.hedge_pricing_method == "mc_conditional"
+
+    if args.n_paths <= 0:
+        parser.error("--n-paths must be positive")
+    if args.seed < 0 or args.take_up_seed < 0 or args.mortality_seed < 0:
+        parser.error("all seeds must be non-negative")
+    if args.heston_substeps <= 0:
+        parser.error("--heston-substeps must be positive")
+    if args.hedge_pricing_method == "mc_conditional" \
+            and args.hedge_cap_leg_mode != HedgeCapLegMode.SOLD.value:
+        parser.error(
+            "mc_conditional supports the standard sold-cap call spread only"
+        )
+    if args.crediting_cap_rate is not None and (
+        not math.isfinite(args.crediting_cap_rate)
+        or not 0.0 <= args.crediting_cap_rate <= 1.0
+    ):
+        parser.error("--crediting-cap-rate must be between 0 and 1")
+    if (
+        args.portfolio_contract_count is not None
+        and (
+            not math.isfinite(args.portfolio_contract_count)
+            or args.portfolio_contract_count <= 0.0
+        )
+    ):
+        parser.error("--portfolio-contract-count must be positive and finite")
+    fair_controls = (
+        args.fair_fee_lower,
+        args.fair_fee_upper,
+        args.fair_fee_maximum_upper,
+        args.fair_fee_tolerance,
+    )
+    if (
+        not all(math.isfinite(value) for value in fair_controls)
+        or args.fair_fee_lower < 0.0
+        or args.fair_fee_upper <= args.fair_fee_lower
+        or args.fair_fee_maximum_upper < args.fair_fee_upper
+        or args.fair_fee_tolerance <= 0.0
+    ):
+        parser.error("invalid fair-fee bracket or tolerance")
+    if (
+        not math.isfinite(args.profitability_materiality_bp)
+        or args.profitability_materiality_bp < 0.0
+    ):
+        parser.error("--profitability-materiality-bp must be finite and non-negative")
+    return args
+
+
+def _build_aggregation_reconciliation(
+    summary: Mapping[str, object],
+    model_point_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    reconciliation: list[dict[str, object]] = []
+    basis_definitions = (
+        ("normalised_weighted_average", "normalised_average_", "normalised_contribution_"),
+        ("absolute_portfolio", "portfolio_total_", "portfolio_contribution_"),
+    )
+    for basis, summary_prefix, contribution_prefix in basis_definitions:
+        metrics = sorted(
+            key[len(summary_prefix):]
+            for key in summary
+            if key.startswith(summary_prefix)
+        )
+        for metric in metrics:
+            contribution_column = f"{contribution_prefix}{metric}"
+            values = [
+                _as_float(row.get(contribution_column))
+                for row in model_point_rows
+            ]
+            if not values or any(value is None for value in values):
+                continue
+            reported = _as_float(summary.get(f"{summary_prefix}{metric}"))
+            if reported is None:
+                continue
+            summed = math.fsum(value for value in values if value is not None)
+            difference = summed - reported
+            relative = (
+                difference / reported
+                if not math.isclose(reported, 0.0, abs_tol=1.0e-16)
+                else difference
+            )
+            tolerance = max(1.0e-8, abs(reported) * 1.0e-12)
+            reconciliation.append({
+                "aggregation_basis": basis,
+                "metric": metric,
+                "model_point_contribution_column": contribution_column,
+                "portfolio_summary_column": f"{summary_prefix}{metric}",
+                "model_point_contribution_sum": summed,
+                "portfolio_reported_value": reported,
+                "absolute_difference": difference,
+                "relative_difference": relative,
+                "within_numerical_tolerance": abs(difference) <= tolerance,
+            })
+    total_contract_count = _as_float(summary.get("portfolio_contract_count"))
+    if total_contract_count is not None and total_contract_count > 0.0:
+        normalised_metrics = sorted(
+            key[len("normalised_average_"):]
+            for key in summary
+            if key.startswith("normalised_average_")
+        )
+        for metric in normalised_metrics:
+            normalised = _as_float(summary.get(f"normalised_average_{metric}"))
+            absolute_total = _as_float(summary.get(f"portfolio_total_{metric}"))
+            if normalised is None or absolute_total is None:
+                continue
+            absolute_per_contract = absolute_total / total_contract_count
+            difference = absolute_per_contract - normalised
+            relative = (
+                difference / normalised
+                if not math.isclose(normalised, 0.0, abs_tol=1.0e-16)
+                else difference
+            )
+            tolerance = max(1.0e-8, abs(normalised) * 1.0e-12)
+            reconciliation.append({
+                "aggregation_basis": "absolute_vs_normalised_average",
+                "metric": metric,
+                "model_point_contribution_column": None,
+                "portfolio_summary_column": f"portfolio_total_{metric}",
+                "model_point_contribution_sum": absolute_total,
+                "portfolio_reported_value": normalised,
+                "absolute_portfolio_total": absolute_total,
+                "normalised_reported_value": normalised,
+                "absolute_total_contract_count": total_contract_count,
+                "absolute_value_per_contract": absolute_per_contract,
+                "absolute_difference": difference,
+                "relative_difference": relative,
+                "within_numerical_tolerance": abs(difference) <= tolerance,
+            })
+    if not reconciliation:
+        raise ValueError(
+            "No portfolio aggregation reconciliation could be built. Expected "
+            "normalised_average_/normalised_contribution_ result columns were "
+            "not found."
+        )
+    failed = [
+        row for row in reconciliation
+        if row.get("within_numerical_tolerance") is not True
+    ]
+    if failed:
+        labels = ", ".join(
+            f"{row['aggregation_basis']}:{row['metric']}"
+            for row in failed[:10]
+        )
+        raise ValueError(
+            "Portfolio aggregation reconciliation failed for " + labels
+        )
+
+    # These task-critical insurer fields must never disappear silently when a
+    # runner's summary/model-point schema changes.  Other non-additive summary
+    # diagnostics may legitimately have no contribution column.
+    required_metrics = {
+        "pv_crediting_margin_aud",
+        "pv_money_market_income_aud",
+        "pv_hedge_gain_aud",
+        "pv_hedge_costs_aud",
+        "pv_hedge_option_fair_value_costs_aud",
+        "pv_hedge_option_markup_costs_aud",
+        "pv_hedge_management_fee_costs_aud",
+        "pv_hedge_execution_costs_aud",
+        "pv_hedge_cost_reconciliation_gap_aud",
+        "pv_crediting_margin_reconciliation_gap_aud",
+    }
+    required_bases = {"normalised_weighted_average"}
+    if bool(summary.get("absolute_portfolio_values_available")):
+        required_bases.add("absolute_portfolio")
+        required_bases.add("absolute_vs_normalised_average")
+    available = {
+        (str(row["aggregation_basis"]), str(row["metric"]))
+        for row in reconciliation
+    }
+    missing = sorted(
+        (basis, metric)
+        for basis in required_bases
+        for metric in required_metrics
+        if (basis, metric) not in available
+    )
+    if missing:
+        labels = ", ".join(
+            f"{basis}:{metric}" for basis, metric in missing[:10]
+        )
+        raise ValueError(
+            "Portfolio aggregation reconciliation is incomplete for " + labels
+        )
+    return reconciliation
+
+
+def _validate_hedge_backing_summary(
+    summary: Mapping[str, object],
+    hedge_cap_leg_mode: str,
+) -> None:
+    """Fail before output if insurer hedge/backing aggregates do not close."""
+    mode = HedgeCapLegMode(hedge_cap_leg_mode)
+    prefixes = ["normalised_average_"]
+    if bool(summary.get("absolute_portfolio_values_available")):
+        prefixes.append("portfolio_total_")
+
+    def value(prefix: str, metric: str) -> float:
+        field = f"{prefix}{metric}"
+        parsed = _as_float(summary.get(field))
+        if parsed is None:
+            raise ValueError(f"Missing hedge/backing audit field {field}.")
+        return parsed
+
+    for prefix in prefixes:
+        hedge_costs = value(prefix, "pv_hedge_costs_aud")
+        hedge_components = math.fsum((
+            value(prefix, "pv_hedge_option_fair_value_costs_aud"),
+            value(prefix, "pv_hedge_option_markup_costs_aud"),
+            value(prefix, "pv_hedge_management_fee_costs_aud"),
+            value(prefix, "pv_hedge_execution_costs_aud"),
+        ))
+        money_market_income = value(prefix, "pv_money_market_income_aud")
+        hedge_gain = value(prefix, "pv_hedge_gain_aud")
+        crediting_margin = value(prefix, "pv_crediting_margin_aud")
+        reported_hedge_gap = value(
+            prefix, "pv_hedge_cost_reconciliation_gap_aud")
+        reported_crediting_gap = value(
+            prefix, "pv_crediting_margin_reconciliation_gap_aud")
+        hedge_gap = hedge_costs - hedge_components
+        crediting_gap = crediting_margin - money_market_income - hedge_gain
+        tolerance = max(
+            1.0e-8,
+            1.0e-10 * max(
+                abs(hedge_costs), abs(crediting_margin), abs(hedge_gain), 1.0,
+            ),
+        )
+        if not math.isclose(
+            hedge_costs, hedge_components, rel_tol=1.0e-10, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} hedge costs do not reconcile to their components."
+            )
+        if not math.isclose(
+            reported_hedge_gap,
+            hedge_gap,
+            rel_tol=1.0e-10,
+            abs_tol=tolerance,
+        ) or not math.isclose(
+            reported_hedge_gap, 0.0, rel_tol=0.0, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} reported hedge-cost reconciliation gap is invalid."
+            )
+        if not math.isclose(
+            crediting_margin,
+            money_market_income + hedge_gain,
+            rel_tol=1.0e-10,
+            abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} crediting margin does not reconcile to Money-"
+                "Market income plus hedge gain."
+            )
+        if not math.isclose(
+            reported_crediting_gap,
+            crediting_gap,
+            rel_tol=1.0e-10,
+            abs_tol=tolerance,
+        ) or not math.isclose(
+            reported_crediting_gap, 0.0, rel_tol=0.0, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} reported crediting-margin reconciliation gap is "
+                "invalid."
+            )
+        if mode is HedgeCapLegMode.SOLD and not math.isclose(
+            hedge_gain, 0.0, rel_tol=0.0, abs_tol=tolerance,
+        ):
+            raise ValueError(
+                f"{prefix} sold cap-leg mode must not report an Above-Cap gain."
+            )
+
+
+def _build_fair_fee_rows(
+    model_point_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if not model_point_rows:
+        return []
+    available: list[str] = []
+    for row in model_point_rows:
+        for key in row:
+            if key not in available:
+                available.append(key)
+
+    identity_columns = [
+        "model_point_id",
+        "source_row_number",
+        "contract_weight",
+        "represented_contract_count",
+        "primary_age",
+        "primary_sex",
+        "spouse",
+        "secondary_age",
+        "secondary_sex",
+        "income_start_year",
+        "effective_income_start_year",
+        "behaviour_treatment",
+        "per_contract_spouse_survival_to_income_election",
+        "charged_lip_rate",
+        "profitability_classification",
+        "new_business_margin_before_risk_margin",
+        "per_contract_new_business_margin_before_risk_margin",
+        "per_contract_profitability_materiality_bp",
+        "per_contract_profitability_materiality_aud",
+        "per_contract_guarantee_value_aud",
+        "per_contract_insurer_net_present_value_before_risk_margin_aud",
+        "normalised_contribution_insurer_net_present_value_before_risk_margin_aud",
+        "portfolio_contribution_insurer_net_present_value_before_risk_margin_aud",
+    ]
+    diagnostic_columns = [
+        key for key in available
+        if key.startswith("fair_lip_")
+        or key.startswith("commercial_break_even_lip_")
+        or key.startswith("charged_minus_fair_lip_")
+        or key.startswith("charged_minus_commercial_break_even_lip_")
+    ]
+    if not diagnostic_columns:
+        return []
+    selected = [
+        key for key in identity_columns if key in available
+    ] + [key for key in diagnostic_columns if key not in identity_columns]
+    return [{key: row.get(key) for key in selected} for row in model_point_rows]
+
+
+def _plot_component_decomposition(
+    plt: Any,
+    FuncFormatter: Any,
+    summary: Mapping[str, object],
+    output: Path,
+    *,
+    absolute: bool,
+    footer: str,
+) -> Optional[Path]:
+    definitions = (
+        ("Guarantee Claims", ("pv_guarantee_claims_aud",), 1.0),
+        ("Operating Expenses", ("pv_expenses_aud",), 1.0),
+        ("Fair Option Package", ("pv_hedge_option_fair_value_costs_aud",), 1.0),
+        ("Option Purchase Markup", ("pv_hedge_option_markup_costs_aud",), 1.0),
+        ("Hedge Management Fee", ("pv_hedge_management_fee_costs_aud",), 1.0),
+        ("Legacy Execution Proxy", ("pv_hedge_execution_costs_aud",), 1.0),
+        ("Product Fees", ("pv_product_fees_aud",), -1.0),
+        ("LIP", ("pv_lifetime_income_premiums_aud",), -1.0),
+        ("Money-Market Income", ("pv_money_market_income_aud",), -1.0),
+        ("Retained Excess Hedge Gain", ("pv_hedge_gain_aud",), -1.0),
+        ("MVA retained", ("pv_mva_retained_aud",), -1.0),
+    )
+    labels: list[str] = []
+    values: list[float] = []
+    for label, metrics, sign in definitions:
+        components = [
+            _summary_value(summary, metric, absolute=absolute)
+            for metric in metrics
+        ]
+        if all(component is not None for component in components):
+            value = sum(float(component) for component in components)
+            labels.append(label)
+            values.append(sign * value)
+    if not values:
+        return None
+
+    fig, ax = plt.subplots(figsize=(13.5, 7.5))
+    colors = ["#C4314B" if value >= 0.0 else "#168A45" for value in values]
+    bars = ax.bar(range(len(values)), values, color=colors)
+    ax.axhline(0.0, color="#1F2937", linewidth=0.9)
+    ax.set_xticks(range(len(labels)), labels, rotation=25, ha="right")
+    ax.yaxis.set_major_formatter(FuncFormatter(_aud_axis))
+    basis = "absolute portfolio" if absolute else "normalised average contract"
+    ax.set_ylabel(f"Present value in AUD ({basis})")
+    ax.set_title("Components of the Non-Unit Best Estimate Liability", loc="left")
+    ax.text(
+        0.0,
+        1.02,
+        "Positive values increase the liability; negative values reduce it.",
+        transform=ax.transAxes,
+        color="#5B6573",
+        fontsize=9,
+    )
+    for bar, value in zip(bars, values):
+        offset = 4 if value >= 0.0 else -4
+        alignment = "bottom" if value >= 0.0 else "top"
+        ax.annotate(
+            _aud_axis(value),
+            (bar.get_x() + bar.get_width() / 2.0, value),
+            xytext=(0, offset),
+            textcoords="offset points",
+            ha="center",
+            va=alignment,
+            fontsize=8,
+        )
+    fig.text(0.01, 0.01, footer, fontsize=8, color="#5B6573")
+    fig.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
+    path = output / "01_portfolio_nonunit_bel_components.png"
+    fig.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
+
+
+def _plot_model_point_contributions(
+    plt: Any,
+    FuncFormatter: Any,
+    rows: list[dict[str, object]],
+    output: Path,
+    *,
+    absolute: bool,
+    footer: str,
+) -> Optional[Path]:
+    prefix = "portfolio_contribution_" if absolute else "normalised_contribution_"
+    column = f"{prefix}insurer_net_present_value_before_risk_margin_aud"
+    points = [
+        (str(row.get("model_point_id", "")), _as_float(row.get(column)))
+        for row in rows
+    ]
+    points = [(identifier, value) for identifier, value in points if value is not None]
+    if not points:
+        return None
+    points.sort(key=lambda item: item[1])
+    identifiers = [item[0] for item in points]
+    values = [item[1] for item in points]
+
+    height = max(8.0, 0.28 * len(points) + 2.0)
+    fig, ax = plt.subplots(figsize=(13.5, height))
+    positions = list(range(len(points)))
+    colors = ["#168A45" if value >= 0.0 else "#C4314B" for value in values]
+    ax.barh(positions, values, color=colors)
+    ax.set_yticks(positions, identifiers)
+    ax.axvline(0.0, color="#1F2937", linewidth=0.9)
+    ax.xaxis.set_major_formatter(FuncFormatter(_aud_axis))
+    basis = "absolute portfolio value" if absolute else "weighted average value"
+    ax.set_xlabel(f"Contribution to the {basis} in AUD")
+    ax.set_title(
+        "Model-point contributions to insurer NPV before risk margin",
+        loc="left",
+    )
+    fig.text(0.01, 0.01, footer, fontsize=8, color="#5B6573")
+    fig.tight_layout(rect=(0.0, 0.035, 1.0, 1.0))
+    path = output / "02_model_point_npv_contributions.png"
+    fig.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
+
+
+def _plot_model_point_profitability(
+    plt: Any,
+    np: Any,
+    PercentFormatter: Any,
+    rows: list[dict[str, object]],
+    output: Path,
+    *,
+    footer: str,
+) -> Optional[Path]:
+    value_column_candidates = (
+        "new_business_margin_before_risk_margin",
+        "per_contract_new_business_margin_before_risk_margin",
+    )
+    premium_column_candidates = ("per_contract_premium_aud", "premium_aud")
+
+    observations: list[tuple[str, bool, float, float, float]] = []
+    for row in rows:
+        margin = next(
+            (
+                value
+                for key in value_column_candidates
+                if (value := _as_float(row.get(key))) is not None
+            ),
+            None,
+        )
+        premium = next(
+            (
+                value
+                for key in premium_column_candidates
+                if (value := _as_float(row.get(key))) is not None
+            ),
+            None,
+        )
+        age = _as_float(row.get("primary_age"))
+        if margin is None or premium is None or age is None:
+            continue
+        observations.append((
+            str(row.get("primary_sex", "")),
+            _as_bool(row.get("spouse")),
+            age,
+            premium,
+            margin,
+        ))
+    if not observations:
+        return None
+
+    groups = sorted({(sex, spouse) for sex, spouse, _, _, _ in observations})
+    ages = sorted({age for _, _, age, _, _ in observations})
+    premiums = sorted({premium for _, _, _, premium, _ in observations})
+    max_abs = max(abs(item[4]) for item in observations)
+    max_abs = max(max_abs, 1.0e-6)
+
+    fig, axes = plt.subplots(2, 2, figsize=(15.5, 10.0), squeeze=False)
+    image = None
+    for index, axis in enumerate(axes.ravel()):
+        if index >= len(groups):
+            axis.set_visible(False)
+            continue
+        sex, spouse = groups[index]
+        matrix = np.full((len(premiums), len(ages)), np.nan)
+        for obs_sex, obs_spouse, age, premium, margin in observations:
+            if obs_sex == sex and obs_spouse == spouse:
+                matrix[premiums.index(premium), ages.index(age)] = margin
+        image = axis.imshow(
+            matrix,
+            cmap="RdYlGn",
+            vmin=-max_abs,
+            vmax=max_abs,
+            aspect="auto",
+        )
+        axis.set_xticks(range(len(ages)), [f"{age:g}" for age in ages])
+        axis.set_yticks(
+            range(len(premiums)),
+            [_aud_axis(premium) for premium in premiums],
+        )
+        axis.set_xlabel("Entry age")
+        axis.set_ylabel("Single premium (AUD)")
+        axis.set_title(f"Sex {sex} | {'Joint Life' if spouse else 'Single Life'}")
+        for row_index in range(len(premiums)):
+            for column_index in range(len(ages)):
+                value = matrix[row_index, column_index]
+                if np.isfinite(value):
+                    text_color = "white" if abs(value) > 0.65 * max_abs else "#1F2937"
+                    axis.text(
+                        column_index,
+                        row_index,
+                        f"{100.0 * value:.1f}%",
+                        ha="center",
+                        va="center",
+                        color=text_color,
+                        fontsize=8.5,
+                    )
+    if image is not None:
+        colorbar = fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.82)
+        colorbar.ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        colorbar.set_label("New Business Margin before Risk Margin")
+    fig.suptitle("Profitability by model point", fontsize=16, x=0.06, ha="left")
+    fig.text(0.01, 0.01, footer, fontsize=8, color="#5B6573")
+    fig.subplots_adjust(top=0.90, bottom=0.08, left=0.09, right=0.90, hspace=0.30)
+    path = output / "03_model_point_profitability_heatmaps.png"
+    fig.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
+
+
+def _plot_exposure_mix(
+    plt: Any,
+    PercentFormatter: Any,
+    rows: list[dict[str, object]],
+    output: Path,
+    *,
+    footer: str,
+) -> Optional[Path]:
+    ages = sorted({
+        age for row in rows
+        if (age := _as_float(row.get("primary_age"))) is not None
+    })
+    if not ages:
+        return None
+
+    contract_mix = {(age, spouse): 0.0 for age in ages for spouse in (False, True)}
+    premium_mix = {(age, spouse): 0.0 for age in ages for spouse in (False, True)}
+    for row in rows:
+        age = _as_float(row.get("primary_age"))
+        contract_weight = _as_float(row.get("normalised_contract_share"))
+        if contract_weight is None:
+            contract_weight = _as_float(row.get("contract_weight"))
+        premium_weight = _as_float(row.get("premium_volume_weight_control"))
+        if age is None:
+            continue
+        spouse = _as_bool(row.get("spouse"))
+        if contract_weight is not None:
+            contract_mix[(age, spouse)] += contract_weight
+        if premium_weight is not None:
+            premium_mix[(age, spouse)] += premium_weight
+
+    fig, axes = plt.subplots(1, 2, figsize=(15.0, 7.3), sharey=True)
+    positions = list(range(len(ages)))
+    colors = {False: "#007AB3", True: "#00A6A6"}
+    for axis, values, title in (
+        (axes[0], contract_mix, "Normalised Contract Share"),
+        (axes[1], premium_mix, "Premium Volume Weight (control view)"),
+    ):
+        bottom = [0.0] * len(ages)
+        for spouse in (False, True):
+            heights = [values[(age, spouse)] for age in ages]
+            axis.bar(
+                positions,
+                heights,
+                bottom=bottom,
+                color=colors[spouse],
+                label="Joint Life" if spouse else "Single Life",
+            )
+            bottom = [left + right for left, right in zip(bottom, heights)]
+        axis.set_xticks(positions, [f"{age:g}" for age in ages])
+        axis.set_xlabel("Entry age")
+        axis.set_title(title, loc="left")
+        axis.yaxis.set_major_formatter(PercentFormatter(1.0))
+        axis.legend()
+    axes[0].set_ylabel("Share of total portfolio")
+    fig.suptitle("Composition of the model-point population", fontsize=16, x=0.06, ha="left")
+    fig.text(
+        0.01,
+        0.01,
+        footer + " | Premium Volume Weight is not used as a second PV weight.",
+        fontsize=8,
+        color="#5B6573",
+    )
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 0.94))
+    path = output / "04_portfolio_exposure_mix.png"
+    fig.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
+
+
+def _plot_fair_fee_gaps(
+    plt: Any,
+    rows: list[dict[str, object]],
+    output: Path,
+    *,
+    footer: str,
+) -> Optional[Path]:
+    series = (
+        ("charged_minus_fair_lip_bp", "Charged minus fair LIP", "#007AB3", "o"),
+        (
+            "charged_minus_commercial_break_even_lip_bp",
+            "Charged minus commercial break-even LIP",
+            "#E87722",
+            "D",
+        ),
+    )
+    identifiers = [str(row.get("model_point_id", "")) for row in rows]
+    available = {
+        key: [_as_float(row.get(key)) for row in rows]
+        for key, _, _, _ in series
+    }
+    if not any(any(value is not None for value in values) for values in available.values()):
+        return None
+
+    height = max(8.0, 0.28 * len(rows) + 2.0)
+    fig, ax = plt.subplots(figsize=(13.5, height))
+    positions = list(range(len(rows)))
+    for key, label, color, marker in series:
+        x_values = []
+        y_values = []
+        for position, value in zip(positions, available[key]):
+            if value is not None:
+                x_values.append(value)
+                y_values.append(position)
+        if x_values:
+            ax.scatter(x_values, y_values, label=label, color=color, marker=marker, s=30)
+    ax.axvline(0.0, color="#1F2937", linewidth=0.9)
+    ax.set_yticks(positions, identifiers)
+    ax.invert_yaxis()
+    ax.set_xlabel("Fee difference in basis points")
+    ax.set_title("Model-point fair-fee diagnostics", loc="left")
+    ax.text(
+        0.0,
+        1.01,
+        "Positive values mean the charged LIP exceeds the model-implied rate.",
+        transform=ax.transAxes,
+        color="#5B6573",
+        fontsize=9,
+    )
+    ax.legend()
+    fig.text(0.01, 0.01, footer, fontsize=8, color="#5B6573")
+    fig.tight_layout(rect=(0.0, 0.035, 1.0, 1.0))
+    path = output / "05_model_point_fair_fee_gaps.png"
+    fig.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
+
+
+def _create_plots(
+    summary: Mapping[str, object],
+    model_point_rows: list[dict[str, object]],
+    output: Path,
+    *,
+    absolute: bool,
+    include_fair_fee_plot: bool,
+    logger: logging.Logger,
+) -> tuple[dict[str, str], str]:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter, PercentFormatter
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "Default portfolio plots require the project dependency matplotlib. "
+            "Reinstall the project dependencies or rerun explicitly with "
+            "--no-plots."
+        ) from exc
+
+    plt.rcParams.update({
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "axes.edgecolor": "#B8C0CC",
+        "axes.grid": True,
+        "grid.color": "#DDE2E8",
+        "grid.alpha": 0.7,
+        "grid.linewidth": 0.7,
+        "font.family": "DejaVu Sans",
+        "font.size": 10,
+        "legend.frameon": False,
+    })
+
+    output.mkdir(parents=True, exist_ok=True)
+    basis = (
+        "absolute portfolio aggregation"
+        if absolute
+        else "normalised weighted averages"
+    )
+    footer = (
+        f"Market-consistent research valuation | {basis} | "
+        "Heston-Hull-White under Q | not a production basis"
+    )
+    candidates = [
+        _plot_component_decomposition(
+            plt,
+            FuncFormatter,
+            summary,
+            output,
+            absolute=absolute,
+            footer=footer,
+        ),
+        _plot_model_point_contributions(
+            plt,
+            FuncFormatter,
+            model_point_rows,
+            output,
+            absolute=absolute,
+            footer=footer,
+        ),
+        _plot_model_point_profitability(
+            plt,
+            np,
+            PercentFormatter,
+            model_point_rows,
+            output,
+            footer=footer,
+        ),
+        _plot_exposure_mix(
+            plt,
+            PercentFormatter,
+            model_point_rows,
+            output,
+            footer=footer,
+        ),
+    ]
+    if include_fair_fee_plot:
+        candidates.append(
+            _plot_fair_fee_gaps(
+                plt,
+                model_point_rows,
+                output,
+                footer=footer,
+            )
+        )
+
+    paths = [path for path in candidates if path is not None]
+    if include_fair_fee_plot and not any("fair_fee" in path.name for path in paths):
+        logger.warning(
+            "Fair-fee plot skipped: no model point has a solved fee."
+        )
+    result = {path.stem: str(path) for path in paths}
+    return result, str(matplotlib.__version__)
+
+
+def _result_attribute(result: object, name: str, fallback: object = None) -> object:
+    return getattr(result, name, fallback)
+
+
+def _select_portfolio_behaviour(
+    loaded: object,
+    *,
+    income_election_mode: str,
+    post_income_behaviour: str,
+) -> object:
+    """Apply explicit benchmark switches without altering the loaded source."""
+    if income_election_mode not in ("dynamic", "deterministic"):
+        raise ValueError("Unsupported Income-Election mode.")
+    if post_income_behaviour not in ("dynamic", "continue"):
+        raise ValueError("Unsupported post-Income Behaviour mode.")
+    selected = loaded
+    if income_election_mode == "deterministic":
+        selected = replace(
+            selected,
+            take_up=replace(selected.take_up, mode="deterministic"),
+        )
+    if post_income_behaviour == "continue":
+        selected = selected.without_post_election_behaviour()
+    return selected
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    output = args.output.expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    logger, log_path = _configure_logging(output, args.log_file, args.log_level)
+    started = time.perf_counter()
+
+    try:
+        logger.info("[1/6] Portfolio run started | Output: %s", output)
+        stress = get_portfolio_stress(args.stress_scenario)
+        stress_audit = stress.audit_dict(
+            applied_to_training=False,
+            applied_to_evaluation=True,
+        )
+        logger.info(
+            "Stress scenario | %s | %s",
+            stress.stress_id,
+            stress.label,
+        )
+        logger.info("[2/6] Load market, cost, behaviour and model-point data")
+        equity_allocation = load_equity_allocation()
+        logger.info(
+            "Equity allocation | id=%s | equity=%.2f%% | bonds=%.2f%% | %s",
+            equity_allocation.allocation_id,
+            100.0 * equity_allocation.equity_weight,
+            100.0 * equity_allocation.bond_weight,
+            equity_allocation.source_path,
+        )
+        market = load_market_assumptions(args.zero_curve, args.model_parameters)
+        generic_base_product = IndexLinkedLifetimeIncomeProduct(
+            reference_fund=ReferenceFundSpec(
+                equity_weight=equity_allocation.equity_weight,
+                scenario_maximum_return=args.crediting_cap_rate,
+            ),
+            fees=FeeSpec(lip_waived_in_income_phase_if_aps=False),
+            dividend_yield={
+                index: parameters.dividend_yield
+                for index, parameters in market.esg.equity.items()
+            },
+        )
+        portfolio_projection = ProjectionConfig(
+            record_paths=False,
+            heston_cos=False,
+            take_up_seed=args.take_up_seed,
+            mortality_seed=args.mortality_seed,
+            force_pathwise_joint_life=True,
+            hedge_cap_leg_mode=HedgeCapLegMode(args.hedge_cap_leg_mode),
+            hedge_pricing_method=args.hedge_pricing_method,
+        )
+        costs = load_cost_assumptions(
+            args.cost_assumptions,
+            assumption_set_id=args.cost_assumption_set,
+            value_basis="base",
+            product=generic_base_product,
+            projection=portfolio_projection,
+        )
+        behaviour_assumptions = load_dynamic_behaviour_assumptions(
+            args.dynamic_behaviour,
+            assumption_set_id=args.behaviour_assumption_set,
+            value_basis="base",
+        )
+        portfolio_behaviour = _select_portfolio_behaviour(
+            behaviour_assumptions.behaviour,
+            income_election_mode=args.income_election_mode,
+            post_income_behaviour=args.post_income_behaviour,
+        )
+        portfolio_behaviour = apply_portfolio_behaviour_stress(
+            stress,
+            portfolio_behaviour,
+        )
+        model_points = load_policyholder_model_points(
+            args.model_points,
+            expected_market_parameter_set_id=market.parameter_set_id,
+            expected_yield_curve_id=market.curve_id,
+        )
+        model_point_count = len(model_points.model_points)
+        joint_continue_income_count = sum(
+            1
+            for point in model_points.model_points
+            if point.policy.spouse
+            and point.policy.spouse_death_election.value == "continue_income"
+        )
+        automatic_start_override_count = sum(
+            1
+            for point in model_points.model_points
+            if point.policy.effective_income_start_year(costs.product)
+            != int(round(point.policy.income_start_year))
+        )
+        logger.info(
+            "%d model points loaded | contract_weight sum=%.12f | "
+            "premium_volume_weight sum=%.12f",
+            model_point_count,
+            model_points.contract_weight_sum,
+            model_points.premium_volume_weight_sum,
+        )
+        if joint_continue_income_count:
+            logger.info(
+                "%d continue-income Joint-Life model points: Primary and "
+                "Spouse life statuses are sampled separately on the same "
+                "market paths. All behaviour benchmark arms use the same "
+                "mortality draws; state-dependent Election and Post-Election "
+                "functions act only on the life status actually observed.",
+                joint_continue_income_count,
+            )
+        if automatic_start_override_count and args.income_election_mode == "deterministic":
+            logger.info(
+                "%d model points start earlier than income_start_year because "
+                "of the contractual automatic-age backstop; the effective "
+                "date also applies to the rate card and pathwise Spouse life "
+                "status.",
+                automatic_start_override_count,
+            )
+        source_contract_count = model_points.total_exposure_count
+        if source_contract_count is not None:
+            logger.info(
+                "Absolute source exposures available | N_total=%s | "
+                "represented_contract_count is taken directly from "
+                "exposure_count for each model point.",
+                f"{source_contract_count:,.6g}",
+            )
+            if args.portfolio_contract_count is not None:
+                logger.info(
+                    "Explicit --portfolio-contract-count=%s is validated "
+                    "against the source exposures.",
+                    f"{args.portfolio_contract_count:,.6g}",
+                )
+        elif args.portfolio_contract_count is None:
+            logger.warning(
+                "No absolute contract count was supplied. Results are reported "
+                "as weighted averages per representative contract; the %d "
+                "model-point rows are not assumed to represent %d policies.",
+                model_point_count,
+                model_point_count,
+            )
+        else:
+            logger.info(
+                "Absolute portfolio aggregation with N_total=%s; model-point "
+                "exposure is N_total * contract_weight.",
+                f"{args.portfolio_contract_count:,.6g}",
+            )
+
+        # Explicitly illustrative research mortality, not a governed Australian
+        # insured-lives production basis.
+        mortality = MortalityTable.gompertz_makeham()
+        stressed_esg, mortality, stressed_expenses = apply_portfolio_input_stress(
+            stress,
+            market.esg,
+            mortality,
+            costs.expenses,
+        )
+        scenario_transform = portfolio_scenario_transform(stress)
+        settings = ValuationSettings(
+            model="heston_hull_white",
+            n_paths=args.n_paths,
+            seed=args.seed,
+            heston_substeps=args.heston_substeps,
+            horizon_years=None,
+            projection=costs.projection,
+            real_world_model="hull_white_bs",
+            market_cache_root=str(args.market_cache_root),
+            market_curve_sha256=market.source_sha256["curve"],
+            market_model_parameters_sha256=(
+                market.source_sha256["model_parameters"]
+            ),
+            market_variant=(
+                stress.stress_id
+                if stress.stress_id in {
+                    "interest_up", "interest_down", "equity_level_down",
+                    "equity_volatility_up",
+                }
+                else "base"
+            ),
+            require_market_cache=args.require_market_cache,
+            hedge_cache_root=str(args.hedge_cache_root),
+            hedge_cap_grid=(
+                float(costs.product.reference_fund.effective_maximum_return),
+            ),
+            hedge_equity_allocation=equity_allocation.equity_weight,
+            hedge_equity_index=costs.product.reference_fund.equity_index,
+            hedge_allocation_input_sha256=equity_allocation.source_sha256,
+            require_hedge_cache=args.require_hedge_cache,
+        )
+
+        logger.info(
+            "[3/6] Value model points individually and aggregate the portfolio "
+            "| paths=%d | seed=%d | Heston substeps=%d",
+            args.n_paths,
+            args.seed,
+            args.heston_substeps,
+        )
+        result = value_policyholder_portfolio(
+            costs.product,
+            model_points,
+            stressed_esg,
+            mortality,
+            portfolio_behaviour,
+            stressed_expenses,
+            settings=settings,
+            portfolio_contract_count=args.portfolio_contract_count,
+            calculate_fair_lip=args.fair_lip,
+            calculate_commercial_break_even_lip=args.commercial_break_even_lip,
+            calculate_portfolio_fair_lip=args.portfolio_fair_lip,
+            calculate_portfolio_commercial_break_even_lip=(
+                args.portfolio_commercial_break_even_lip
+            ),
+            profitability_materiality_bp=args.profitability_materiality_bp,
+            fair_fee_lower_rate=args.fair_fee_lower,
+            fair_fee_upper_rate=args.fair_fee_upper,
+            fair_fee_maximum_upper_rate=args.fair_fee_maximum_upper,
+            fair_fee_tolerance=args.fair_fee_tolerance,
+            progress_callback=_make_progress_callback(logger),
+            scenario_transform=scenario_transform,
+        )
+
+        summary = result.summary_dict()
+        summary.update({
+            "valuation_as_of_date": market.curve_metadata["as_of_date"],
+            "valuation_currency": market.curve_metadata["currency"],
+            "market_parameter_set_id": market.parameter_set_id,
+            "yield_curve_id": market.curve_id,
+            "cost_assumption_set_id": costs.assumption_set_id,
+            "behaviour_assumption_set_id": behaviour_assumptions.assumption_set_id,
+            "stress_scenario_id": stress.stress_id,
+            "income_election_mode": args.income_election_mode,
+            "take_up_seed": args.take_up_seed,
+            "mortality_seed": args.mortality_seed,
+            "post_income_behaviour": args.post_income_behaviour,
+            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+            "scenario_fingerprint": result.scenario_fingerprint,
+            "hedge_pricing_method": args.hedge_pricing_method,
+        })
+        model_point_rows = result.model_point_rows()
+        if len(model_point_rows) != model_point_count:
+            raise ValueError(
+                "Portfolio result row count does not match loaded model-point "
+                f"count: {len(model_point_rows)} != {model_point_count}."
+            )
+        _validate_hedge_backing_summary(summary, args.hedge_cap_leg_mode)
+
+        logger.info("[4/6] Write CSV results and aggregation reconciliation")
+        summary_path = output / "portfolio_summary.csv"
+        model_point_path = output / "model_point_results.csv"
+        reconciliation_path = output / "portfolio_aggregation_reconciliation.csv"
+        manifest_path = output / "run_manifest.json"
+        _write_csv(summary_path, [summary])
+        _write_csv(model_point_path, model_point_rows)
+        reconciliation_rows = _build_aggregation_reconciliation(
+            summary,
+            model_point_rows,
+        )
+        _write_csv(reconciliation_path, reconciliation_rows)
+
+        fair_fee_path: Optional[Path] = None
+        if args.fair_lip or args.commercial_break_even_lip:
+            fair_fee_rows = _build_fair_fee_rows(model_point_rows)
+            if fair_fee_rows:
+                fair_fee_path = output / "model_point_fair_fee_results.csv"
+                _write_csv(fair_fee_path, fair_fee_rows)
+            else:
+                logger.warning(
+                    "Individual fair fees were requested, but no fair-fee "
+                    "diagnostic fields were returned."
+                )
+
+        absolute = bool(summary.get("absolute_portfolio_values_available"))
+        resolved_portfolio_contract_count = _result_attribute(
+            result,
+            "portfolio_contract_count",
+        )
+        figure_paths: dict[str, str] = {}
+        matplotlib_version: Optional[str] = None
+        if args.no_plots:
+            logger.info("[5/6] Plot creation disabled by --no-plots")
+        else:
+            logger.info("[5/6] Create headless portfolio plots")
+            figure_paths, matplotlib_version = _create_plots(
+                summary,
+                model_point_rows,
+                output / "figures",
+                absolute=absolute,
+                include_fair_fee_plot=(
+                    args.fair_lip or args.commercial_break_even_lip
+                ),
+                logger=logger,
+            )
+            logger.info("%d plots created", len(figure_paths))
+
+        logger.info("[6/6] Write run manifest")
+        runtime = time.perf_counter() - started
+        outputs: dict[str, object] = {
+            "portfolio_summary_csv": str(summary_path),
+            "model_point_results_csv": str(model_point_path),
+            "portfolio_aggregation_reconciliation_csv": str(reconciliation_path),
+            "run_manifest_json": str(manifest_path),
+            "run_log": str(log_path),
+            "figures": figure_paths,
+        }
+        if fair_fee_path is not None:
+            outputs["model_point_fair_fee_results_csv"] = str(fair_fee_path)
+
+        model_limitations = [
+            "Research valuation gross of reinsurance.",
+            "Mortality is illustrative and not an approved production basis.",
+            "Joint-Life mortality uses independent Primary/Spouse life-status "
+            "draws in every portfolio Behaviour benchmark arm; divorce, "
+            "removal, common shocks and legal eligibility changes are not "
+            "modelled.",
+            "Intra-year DVA is a moment-matched Black-Scholes proxy on the "
+            "complete reference fund; COS is not used.",
+            "Annual new-issue call-spread fair values use the selected "
+            f"{args.hedge_pricing_method} method; no nested MC is used.",
+            "Dynamic take-up, lapse and withdrawal inputs are uncalibrated "
+            "Behaviour proxies rather than a fully calibrated forecast.",
+            "The five-year government-bond sleeve and monthly rebalancing to "
+            "the CSV-configured target allocation are product-model proxy "
+            "conventions.",
+            "No bond term premium, credit spreads, defaults, FX layer or "
+            "transaction costs are modelled. The customer Reference Fund has "
+            "no internal charge; the insurer hedge reference carries the "
+            "separate fixed management-fee proxy from cost_assumptions.csv.",
+        ]
+        if not absolute:
+            model_limitations.append(
+                "No total contract count was supplied; aggregate monetary "
+                "results are normalised weighted averages per representative "
+                "contract and are not absolute portfolio totals."
+            )
+
+        result_settings = _result_attribute(result, "settings", settings)
+        manifest = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "runtime_seconds": runtime,
+            "engine_version": ENGINE_VERSION,
+            "stress_scenario": stress_audit,
+            "reporting": {
+                "plots_requested": not args.no_plots,
+                "matplotlib_version": matplotlib_version,
+            },
+            "method": {
+                "product": "generic_index_linked_lifetime_income_case_study",
+                "valuation_measure": "risk_neutral",
+                "market_model": "heston_hull_white",
+                "simulation": "plain_monte_carlo",
+                "market_cache_key": summary.get("market_cache_key"),
+                "scenario_fingerprint": summary.get("scenario_fingerprint"),
+                "hedge_cache_key": summary.get("hedge_cache_key"),
+                "hedge_price_surface_fingerprint": summary.get(
+                    "hedge_price_surface_fingerprint"
+                ),
+                "hedge_pricing_method": args.hedge_pricing_method,
+                "hedge_training_scenario_fingerprint": summary.get(
+                    "hedge_training_scenario_fingerprint"
+                ),
+                "hedge_cross_fit_folds": summary.get("hedge_cross_fit_folds"),
+                "hedge_cap_grid": summary.get("hedge_cap_grid"),
+                "hedge_equity_allocation": summary.get(
+                    "hedge_equity_allocation"
+                ),
+                "dva_mark_method": "moment_matched_bs",
+                "nested_mc_used": False,
+                "shared_market_scenarios_across_model_points": True,
+                "model_points_valued_separately_before_aggregation": True,
+                "income_take_up": (
+                    "dynamic_state_dependent_at_eligible_policy_anniversaries"
+                    if args.income_election_mode == "dynamic"
+                    else "deterministic_effective_model_point_income_start_"
+                    "year_including_automatic_age_backstop"
+                ),
+                "spouse_election_eligibility": (
+                    "pathwise_primary_and_spouse_life_status_at_election"
+                ),
+                "joint_life_behaviour": (
+                    "pathwise_primary_and_spouse_life_statuses_with_separate_"
+                    "decisions;state_dependent_actions_when_enabled"
+                ),
+                "income_lapse_after_account_value_exhaustion": (
+                    "blocked_when_surrender_value_is_exhausted_and_positive_"
+                    "income_guarantee_remains"
+                    if args.post_income_behaviour == "dynamic"
+                    else "disabled_continue_benchmark"
+                ),
+                "monthly_mortality": (
+                    "annual_q_anchored_at_policy_anniversary_then_constant_"
+                    "force_converted_for_12_months"
+                ),
+                "terminal_mortality_age": 115,
+                "short_horizon_residual": "separate_terminal_closeout_cashflow",
+                "cos_used": False,
+                "lsmc_used": False,
+                "record_state_paths": False,
+                "income_election_action_set": (
+                    ["wait", "start_income_now"]
+                    if args.income_election_mode == "dynamic"
+                    else ["scheduled_model_point_start"]
+                ),
+                "income_election_decision_grid": "policy_anniversaries_only",
+                "post_income_action_set": (
+                    [
+                        "continue",
+                        "statistical_partial_excess_withdrawal",
+                        "statistical_full_withdrawal",
+                    ]
+                    if args.post_income_behaviour == "dynamic"
+                    else ["continue"]
+                ),
+                "minimum_income_start": "first_policy_anniversary",
+                "forced_income_start": (
+                    "first_policy_anniversary_after_primary_attains_age_100"
+                ),
+                "intra_year_dva": (
+                    "moment_matched_black_scholes_proxy_on_complete_reference_fund"
+                ),
+                "insurer_backing_asset": (
+                    "administrative_crediting_frame_in_stochastic_aud_"
+                    "overnight_money_market_account"
+                ),
+                "money_market_accrual": (
+                    "pathwise_integrated_short_rate_daily_roll_equivalent_on_"
+                    "monthly_cashflow_grid"
+                ),
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+                "hedge_cap_leg_interpretation": (
+                    "short_cap_call_sold"
+                    if args.hedge_cap_leg_mode == HedgeCapLegMode.SOLD.value
+                    else "cap_call_not_sold_and_excess_payoff_retained"
+                ),
+                "customer_liability_uses_performance_fund_as_backing": False,
+                "crediting_cap_rate": (
+                    costs.product.reference_fund.effective_maximum_return
+                ),
+                "reference_fund": {
+                    "allocation_input": equity_allocation.source_metadata(),
+                    "specification_vintage": (
+                        costs.product.reference_fund.specification_vintage
+                    ),
+                    "global_equity_weight": costs.product.reference_fund.equity_weight,
+                    "australian_government_bond_weight": (
+                        1.0 - costs.product.reference_fund.equity_weight
+                    ),
+                    "bond_tenor_years": (
+                        costs.product.reference_fund.bond_tenor_years
+                    ),
+                    "rebalance_frequency_months": (
+                        costs.product.reference_fund.rebalance_frequency_months
+                    ),
+                    "contractual_maximum_return": (
+                        costs.product.reference_fund.maximum_return
+                    ),
+                    "scenario_maximum_return_override": (
+                        costs.product.reference_fund.scenario_maximum_return
+                    ),
+                },
+            },
+            "mortality": {
+                "basis": "illustrative_gompertz_makeham",
+                "calibration_status": "not_calibrated_for_production",
+                "description": (
+                    "Illustrative Gompertz-Makeham shape approximating ALT "
+                    "2020-22; replace with an approved insured-lives basis for "
+                    "production use."
+                ),
+                "base_year": mortality.base_year,
+                "annual_improvement_rate": mortality.improvement_rate,
+                "improvement_taper_age": mortality.improvement_taper_age,
+                "improvement_end_age": mortality.improvement_end_age,
+                "monthly_conversion": (
+                    "policy_year_annual_q_constant_force_with_annual_"
+                    "survival_reconciliation"
+                ),
+                "terminal_age": 115,
+                "terminal_convention": (
+                    "death_probability_one_in_interval_ending_at_terminal_age"
+                ),
+                "behaviour_annuity_factor": (
+                    "monthly_in_arrears_on_same_monthly_mortality_curve"
+                ),
+            },
+            "portfolio": {
+                "aggregation_basis": summary.get(
+                    "aggregation_basis",
+                    _result_attribute(result, "aggregation_basis"),
+                ),
+                "absolute_portfolio_totals_available": absolute,
+                "portfolio_contract_count": resolved_portfolio_contract_count,
+                "source_exposure_counts_available": (
+                    model_points.total_exposure_count is not None
+                ),
+                "input_model_point_count": model_point_count,
+                "output_model_point_row_count": len(model_point_rows),
+                "each_csv_row_assumed_to_be_one_policy": False,
+                "normalised_pv_weight_source": summary.get(
+                    "aggregation_weight_source"
+                ),
+                "contract_weight_is_sole_pv_weight": (
+                    model_points.total_exposure_count is None
+                ),
+                "source_exposure_count_is_absolute_pv_weight": (
+                    model_points.total_exposure_count is not None
+                ),
+                "premium_volume_weight_is_not_a_pv_weight": True,
+                "scenario_horizon_years": _result_attribute(
+                    result, "scenario_horizon_years"
+                ),
+                "scenario_fingerprint": _result_attribute(
+                    result, "scenario_fingerprint"
+                ),
+            },
+            "valuation_settings": {
+                "n_paths": int(result_settings.n_paths),
+                "seed": int(result_settings.seed),
+                "heston_substeps": int(result_settings.heston_substeps),
+                "horizon_years": result_settings.horizon_years,
+                "record_paths": result_settings.projection.record_paths,
+                "heston_cos": result_settings.projection.heston_cos,
+                "income_election_mode": args.income_election_mode,
+                "take_up_seed": args.take_up_seed,
+                "mortality_seed": args.mortality_seed,
+                "force_pathwise_joint_life": (
+                    result_settings.projection.force_pathwise_joint_life
+                ),
+                "post_income_behaviour": args.post_income_behaviour,
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+                "option_fair_value_markup": (
+                    result_settings.projection.option_fair_value_markup
+                ),
+                "hedge_reference_management_fee": (
+                    result_settings.projection.hedge_reference_management_fee
+                ),
+                "hedge_vol_spread": (
+                    result_settings.projection.hedge_vol_spread
+                ),
+                "hedge_pricing_method": (
+                    result_settings.projection.hedge_pricing_method
+                ),
+                "market_cache_root": str(args.market_cache_root),
+                "hedge_cache_root": str(args.hedge_cache_root),
+                "require_market_cache": args.require_market_cache,
+                "require_hedge_cache": args.require_hedge_cache,
+                "crediting_margin_enabled": (
+                    result_settings.projection.crediting_margin_enabled
+                ),
+                "fair_lip_per_model_point_requested": args.fair_lip,
+                "commercial_break_even_lip_per_model_point_requested": (
+                    args.commercial_break_even_lip
+                ),
+                "portfolio_fair_lip_requested": args.portfolio_fair_lip,
+                "portfolio_commercial_break_even_lip_requested": (
+                    args.portfolio_commercial_break_even_lip
+                ),
+                "fair_fee_lower_rate": args.fair_fee_lower,
+                "fair_fee_upper_rate": args.fair_fee_upper,
+                "fair_fee_maximum_upper_rate": args.fair_fee_maximum_upper,
+                "fair_fee_tolerance": args.fair_fee_tolerance,
+                "profitability_materiality_bp": args.profitability_materiality_bp,
+            },
+            "sources": {
+                "model_points": model_points.source_metadata(),
+                "market": market.source_metadata(),
+                "costs": costs.source_metadata(),
+                "equity_allocation": equity_allocation.source_metadata(),
+                "dynamic_behaviour": {
+                    **behaviour_assumptions.source_metadata(),
+                    "portfolio_application": {
+                        "income_take_up": (
+                            "state_dependent_from_loaded_csv_at_each_eligible_"
+                            "anniversary"
+                            if args.income_election_mode == "dynamic"
+                            else "explicit_deterministic_model_point_benchmark"
+                        ),
+                        "single_life_and_lump_sum_spouse": (
+                            "dynamic_income_lapse_and_withdrawal_coefficients"
+                            if args.post_income_behaviour == "dynamic"
+                            else "continue_benchmark_without_voluntary_exit"
+                        ),
+                        "joint_life": (
+                            "pathwise_separate_primary_and_spouse_life_"
+                            "statuses_for_all_behaviour_benchmark_arms"
+                        ),
+                        "growth_lapse_and_withdrawals": (
+                            "loaded_for_provenance_but_product_gate_forces_zero"
+                        ),
+                    },
+                },
+            },
+            "model_limitations": model_limitations,
+            "outputs": outputs,
+            "summary": summary,
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                manifest,
+                handle,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+                default=str,
+            )
+            handle.write("\n")
+
+        basis_prefix = "portfolio_total_" if absolute else "normalised_average_"
+        logger.info(
+            "Valuation basis: %s",
+            "absolute portfolio values"
+            if absolute
+            else "normalised values per representative contract",
+        )
+        for label, metric in (
+            ("Market-Consistent BEL Total", "market_consistent_bel_total_aud"),
+            ("Present Value of Future Charges (PVFC)", "pv_future_fees_aud"),
+            (
+                "Insurer NPV before Risk Margin",
+                "insurer_net_present_value_before_risk_margin_aud",
+            ),
+        ):
+            value = _as_float(summary.get(f"{basis_prefix}{metric}"))
+            if value is not None:
+                logger.info("%s: AUD %s", label, f"{value:,.2f}")
+        logger.info("Portfolio summary: %s", summary_path)
+        logger.info("Model-point results: %s", model_point_path)
+        logger.info("Aggregation reconciliation: %s", reconciliation_path)
+        logger.info("Run manifest: %s", manifest_path)
+        logger.info("Run completed in %.1f seconds", time.perf_counter() - started)
+        return 0
+    except Exception:
+        logger.exception("Portfolio run failed")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

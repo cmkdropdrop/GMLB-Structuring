@@ -1,0 +1,118 @@
+{
+  "provenance_schema_version": "1.0",
+  "run_id": "20260713T233802.157326Z",
+  "run_status": "completed",
+  "run_created_utc": "2026-07-13T23:38:02.157326+00:00",
+  "local_run_directory": "results/runs/crediting_rate_optimisation_dynamic_behaviour/20260713T233802.157326Z",
+  "runner": "code/portfolio_simulations/optimize_crediting_rate_dynamic_behaviour_alt.py",
+  "numerical_run_script_sha256": "4f9b4b9c757cf72705f8825962ab7fb6dcc59df692ababb60381cdffd879449c",
+  "engine_version": "3.0.0",
+  "model_point_source": "input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv",
+  "model_point_source_sha256": "b06409388463a13e62c24154d7774abdc0e3fc0df9a101c520ada0b1173a00a8",
+  "model_point_count": 4,
+  "market_model": "Heston-Hull-White under Q",
+  "hedge_pricing_method": "mc_conditional",
+  "market_scenario_horizon_years": 58.0,
+  "training_sample": {
+    "path_count": 4200,
+    "market_seed": 2026,
+    "take_up_seed": 100100,
+    "mortality_seed": 100196,
+    "scenario_fingerprint": "b38aef9d75767f1aae3b5eb1cba8d54f94677d7721c8e27b34ae9cc24a535849",
+    "market_cache_key": "8f19dbd9128be386d98451ce9bb9e887463b49614907abb16ff9dc4b6b889797",
+    "hedge_cache_key": "87226af9eed3fa2c6c3fe88d8fc42b74c907303f4cca23b7708d8a7a30f144ce",
+    "hedge_surface_fingerprint": "af07f449acc9cfbb1146a5d7cdea9d6c1bd630b3a80c189779e520a2b610649b"
+  },
+  "benchmark_parent_sample": {
+    "path_count": 1260,
+    "market_seed": 2027,
+    "scenario_fingerprint": "1eb2bf06597b3d194b9adf07b5ac695ecb969bd1f25aa0d88706db10819ce5b7",
+    "market_cache_key": "2fceccc6bf9ee25dff6fa55d86f301a5d6eefde24fb3a09898d7ea6b02cf1679",
+    "hedge_cache_key": "efa5419f509cb3170613d2bba863237f134afab630089e0afb9f6b31a15d887e",
+    "hedge_surface_fingerprint": "37c283dbdef739f40c718433ad90c896bd207e50e5e8e6948e3ceb808b207905"
+  },
+  "independent_benchmark_subsamples": {
+    "fixed_cap_selection": {
+      "path_count": 420,
+      "take_up_seed": 200100,
+      "mortality_seed": 200196,
+      "scenario_fingerprint": "2d6f41058c2b720e3e385fa0bc2464ecbffb89590e76b38669c54c4d8bba62ce"
+    },
+    "adaptive_validation": {
+      "path_count": 420,
+      "take_up_seed": 300104,
+      "mortality_seed": 300200,
+      "scenario_fingerprint": "c44252e8c7a1e4b9561d0ced98eac15115c8b780ecb4bcb20d73eb742fcf509f"
+    },
+    "final_evaluation": {
+      "path_count": 420,
+      "take_up_seed": 400106,
+      "mortality_seed": 400202,
+      "scenario_fingerprint": "bec14249635ae826353f1306070933d266828e75038c6722a6b65b39e752e9d9"
+    }
+  },
+  "validation_result": {
+    "adaptive_candidate_delta_vs_best_fixed_csm_aud": -4934.469384680989,
+    "paired_standard_error_aud": 304.797851917518,
+    "normal_approximation_95pct_interval_aud": [
+      -5531.87317443932,
+      -4337.06559492265
+    ],
+    "selection_rule": "Deploy the adaptive rule only if its validation delta exceeds 1.96 paired standard errors; otherwise deploy the admissible fixed fallback.",
+    "adaptive_candidate_selected": false
+  },
+  "independent_final_evaluation_result": {
+    "best_fixed_cap_percent": 0.25,
+    "best_fixed_cap_csm_aud": 60125.156115039856,
+    "best_fixed_cap_mc_standard_error_aud": 2481.7062007649643,
+    "adaptive_candidate_first_year_cap_percent": 0.25,
+    "adaptive_candidate_csm_aud": 55045.26981434227,
+    "adaptive_candidate_mc_standard_error_aud": 2503.402882517998,
+    "adaptive_candidate_delta_vs_best_fixed_csm_aud": -5079.886300697593,
+    "adaptive_candidate_paired_standard_error_aud": 264.76277974853014,
+    "adaptive_candidate_normal_approximation_95pct_interval_aud": [
+      -5598.82134900471,
+      -4560.95125239047
+    ],
+    "evaluation_used_for_policy_selection": false
+  },
+  "deployed_policy_result": {
+    "adaptive_policy_actually_deployed": false,
+    "deployment_source": "validation_rejected_adaptive_candidate",
+    "deployed_fixed_cap_percent": 0.25,
+    "deployed_csm_aud": 60125.156115039856,
+    "deployed_csm_mc_standard_error_aud": 2481.7062007649643,
+    "deployed_delta_vs_best_fixed_csm_aud": 0.0,
+    "interpretation": "There is no validated positive flexibility value in this run. The research candidate is retained only as a rejected diagnostic."
+  },
+  "boundary_warning": "The best fixed cap is the 0.25% lower action-grid boundary.",
+  "figure_curation": {
+    "method": "Byte-for-byte copies from the completed run; no numerical table or plot was regenerated.",
+    "visual_review_date": "2026-07-14",
+    "figures": {
+      "dynamic_adaptive_policy_validation.png": {
+        "source": "plots/00_flexibility_value.png",
+        "sha256": "d674277041003c2e6736466f7ed8a71c8e092201e39eea365e68f522d71e0314"
+      },
+      "dynamic_fixed_cap_pv_decomposition.png": {
+        "source": "plots/03_fixed_cap_pv_decomposition.png",
+        "sha256": "097fa025298cc422e4ee4ab48fe14d525fba79b9f2f7dd127777dc9b06fe1ee5"
+      },
+      "dynamic_lapse_response_by_fixed_cap.png": {
+        "source": "plots/06_lapse_behaviour_by_cap.png",
+        "sha256": "7247fcbe8b9b9a270df919795906ca50d62daf6112670d7027c64b4d67f41c5a"
+      }
+    }
+  },
+  "curated_source_data": {
+    "directory": "results/document_figures/source_data/dynamic_run_20260713T233802.157326Z",
+    "files": {
+      "adaptive_candidate_policy_by_year.csv": "9e78fd2ca64c6f07c01a33c2c41770d5f780c4258cfa73c1ac609c0ba75cec81",
+      "first_year_action_values.csv": "10a1451d175cc5070bc1005d9a2ceac5903ba30ffb64ceb982c16bf1e93ff6b8",
+      "fixed_cap_behaviour_benchmarks.csv": "e9088ecc1ae61266c3530a3c4e3141fca1fefcd6402b7c92fd7553d69a34a53c",
+      "optimization_summary.json": "ba9362d6aaa87d7659648cb9688d6af7087ec977719dd2481f1348175d2fe345",
+      "run_manifest.json": "b1f6e75125536256e9024a2053ea0c19642942f5ffcb7832ed295478f88be377",
+      "validated_deployed_policy_by_year.csv": "94f236c0ba07cfc35dfe52adf20e41d8aaa4c0e4a59433fe9d68d49fd7434323"
+    }
+  }
+}

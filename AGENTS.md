@@ -3,7 +3,7 @@
 ## Eingabedaten
 
 Marktdaten und Parameter für Marktmodelle sind aus
-`C:\Users\user\Documents\GMLB Structuring\AGILE_Modelling_Engine\input_market_data`
+`input_data/market_data`
 zu verwenden. Die australische Zinskurve ist die einzige laufend einzulesende
 Marktdatenquelle. Weitere Marktzeitreihen, Volatilitätsflächen, Credit-Spread-
 Kurven oder separate Kalibrierungsdateien sollen für das vereinfachte
@@ -18,10 +18,10 @@ Für reguläre marktkonsistente Bewertungen und Optimierungen dürfen
 risikoneutrale Kapitalmarktpfade, monatliche pfadweise Discountfaktoren und die
 daraus abgeleiteten Referenzfonds-Pfade ausschließlich aus einem exakt
 passenden, validierten Marktpfad-Cache unter
-`AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths` geladen
+`results/cache/q_market_paths` geladen
 werden. Jährliche MC-basierte Preise der jeweils neu gestarteten Call-Spreads
 dürfen ausschließlich aus dem zugehörigen, pfadkongruenten Hedgepreis-Cache
-unter `AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices`
+unter `results/cache/q_hedge_prices`
 stammen.
 
 Diese beiden Cache-Verzeichnisse sind damit die einzigen zulässigen operativen
@@ -31,7 +31,7 @@ noch in einem Bewertungs-, Behaviour- oder Optimierungslauf ad hoc erzeugt
 werden.
 
 Nur
-`AGILE_Modelling_Engine/portfolio_simulations/precompute_q_market_and_hedge_cache.py`
+`code/portfolio_simulations/precompute_q_market_and_hedge_cache.py`
 darf diese Cache-Einträge erzeugen oder schreiben. Bewertungs-, Behaviour- und
 Optimierungsrunner sind reine Cache-Leser und dürfen fehlende oder
 inkonsistente Q-Pfade beziehungsweise Hedgepreise nicht selbst neu simulieren,
@@ -39,6 +39,15 @@ neu schätzen, überschreiben oder durch einen nur ungefähr passenden Cache
 ersetzen. Operative Aufrufe sollen deshalb die exakte Cache-Verwendung mit
 `--require-market-cache` und bei `mc_conditional` zusätzlich mit
 `--require-hedge-cache` erzwingen.
+
+Fehlt ein exakt benötigter Cache-Eintrag, soll der übergeordnete Orchestrator
+automatisch den autorisierten Precompute-Runner mit exakt denselben
+Markteingaben, Pfadzahlen, Seeds, Horizonten, Marktstress-Varianten,
+Aktienallokationen und Cap-Grids auslösen. Vorhandene valide Einträge sind dabei
+nur zu laden und zu validieren; nur fehlende Einträge werden berechnet. Erst
+nach erfolgreicher Vorberechnung dürfen die reinen Bewertungs-Reader starten.
+Das automatische Triggern ändert nicht, dass ausschließlich der
+Precompute-Runner die Cache-Verzeichnisse schreiben darf.
 
 Ein anderer Seed, eine andere Pfadzahl, ein anderer Horizont, geänderte
 Markteingaben oder ein Marktstress benötigen einen eigenen Marktcache. Ein
@@ -158,7 +167,7 @@ dies im Repo noch nicht überall konsequent umgesetzt ist.
 
 Keine Scripte laufen lassen, ausser ich sage es spezifisch
 Der Stack wurde ursprünglich für das AGILE Produkt konzipiert, soll nun aber schrittweise auf ein generisches, aber sehr ähnliches Produkt umgestellt werden
-Die Produktlogik für das generische Produkt ist in Produktdesign_Index_Linked_Lifetime_Income_Fallbeispiel.md beschrieben
+Die Produktlogik für das generische Produkt ist in `documents/product_design.md` beschrieben.
 
 
 Bei der Modellierung der Verhaltensweisen der Policyholder sollen 2 Arten im Vordergrund stehen: 1) optimales Verhalten nach LSMC und 2) dynamisches Verhalten. In beiden Fällen ist damit gemeint wann sich der Policyholder entscheidet die Growth Phase zu beenden und die Income Phase zu starten, und wann die Policyholder während der Income Phase mehr oder weniger entnehmen als vorgesehen, bzw. Lapsen. Bei 2) ist es wichtig, dass die Funktion dafür unter anderem von der Moneyness abhängt und in ähnlicher Form auch in der Praxis verwendet wird

@@ -1,0 +1,17 @@
+﻿WordVersion=16.0
+Pages=51
+Words=12381
+Characters=87709
+Paragraphs=1659
+Sections=1
+Tables=24
+InlineShapes=10
+FloatingShapes=0
+Hyperlinks=202
+Fields=305
+TOCs=1
+OMaths=161
+Comments=0
+Revisions=0
+TrackRevisions=False
+PageSetup=595.35x841.95pt;Margins=56.7,56.7,56.7,56.7;HeaderFooter=28.35,28.35;PaperSize=7

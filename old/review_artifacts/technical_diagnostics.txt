@@ -1,0 +1,299 @@
+
+[FILES]
+AGILE_Modelling_Fachpaper.md: bytes=75082 sha256=b27fea58845c7a6f7bbf8b5de953c7cb273e8969b5e4b9bae1be7c8ed0eea41e
+AGILE_Modelling_Fachpaper.docx: bytes=1783805 sha256=6992976907be4eecc509add05e4c9ab9aa9a84f24505a030681a2f6f168434ab
+AGILE_Modelling_Fachpaper.pdf: bytes=1458887 sha256=ab0afd6bdbffab3390679abfb2ff41910cbf54e63691b1a9f4ff0bcb80480cce
+
+[MARKDOWN]
+utf8_strict=yes; bom=False
+line_endings: CRLF=0; LF_total=1771; CR_total=1; lone_CR=1
+control: byte=0x0d; offset=24227; line=567; col=2; context='ps je Monat. Der negative Default\n(\rho_{Sv}=-0{,}60) beziehungsweise −0,65 erzeugt Equit'
+control: byte=0x0b; offset=25128; line=589; col=30; context='e mit\ncharakteristischer Funktion (\x0barphi(u)) und Intervall ([a,b]) wird der\nOptionswert d'
+pandoc_parse_exit=0
+ast_counts: Header=101; Table=23; Image=10; Math=0; Cite=39; Link=81; CodeBlock=2; RawBlock=3; RawInline=113
+math_nodes: {}
+explicit_math_reader_exit=0; math_nodes={'DisplayMath': 48}; RawInline=12; RawBlock=0; raw_tex_values=['\\ge 0', '\\le 1', '\\times', '\\max', '\\ge 1', '\\ge1', '\\rho', '\\sigma', '\\times ', '\\max', '\\times', '\\max']
+headers=101; duplicate_header_ids=[]
+heading_level_jumps=0
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/01_executive_dashboard.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/02_pricing_margin_waterfall.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/03_profit_capital_runoff.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/04_sensitivity_tornado.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/05_customer_outcomes.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/06_product_design_tradeoffs.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/07_income_start_tradeoff.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/08_behaviour_liquidity_surfaces.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/09_model_mc_stability.png; exists=True
+markdown_image: target=AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/10_market_risk_greeks.png; exists=True
+citation_ids=30; bib_ids=33; unresolved=[]
+suspicious_parenthesized_tex_lines=62
+  line 257: \min(0,R+0{,}10), & R<0.
+  line 277: Mit (X=S_T/S_0), normiertem Strike 1 und Call-/Put-Werten (Call(K)) und
+  line 285: V_{\mathrm{PP10}}=Call(1)-Call(1+C)-Put(0{,}90).
+  line 376: 1-\left(\frac{1+z_{\mathrm{issue}}+s}{1+z_t+s}\right)^{\tau}
+  line 391: p_z(t)=P(t,T_{\mathrm{anniv}})+V_{\mathrm{package}}(t).
+  line 408: (B), verstrichener Zeit (e_t), Lebenserwartung (LE) und bereits erfolgten
+  line 409: Entnahmen (W_t) linear ab:
+  line 412: MWV_t=\max\left\{B\left(1-\frac{e_t}{LE}\right)-W_t,0\right\}.
+  line 489: - Marktvariablen (S_t), gegebenenfalls (v_t) und (r_t).
+  line 500: Risikoprämie bewertet. Der modellierte Present Value eines Cashflows (CF_t)
+  line 505: D_t=\exp\left(-\int_0^t r_s\,ds\right).
+  line 540: \frac{dS_{i,t}}{S_{i,t}}=(r_t-q_i)dt+\sigma_i\,dW_{i,t}^{Q}.
+  line 543: Die Vertragsindizes sind Return-Indizes; der Default-Carry (q_i) ist daher
+  line 545: Dividenden dadurch doppelt. Im Basislauf gelten (sigma_{AUS}=16\%),
+  line 546: (sigma_{Global}=15\%) und eine Equity-Korrelation von 0,75.
+  line 557: \frac{dS_t}{S_t}=(r_t-q)dt+\sqrt{v_t}\,dW_t^S,
+  line 561: dv_t=\kappa(\theta-v_t)dt+\xi\sqrt{v_t}\,dW_t^v,
+  line 581: (a=0{,}03), (sigma_r=0{,}008) und eine Equity-Rate-Korrelation von −0,20.
+  line 588: Die Engine bewertet deshalb die Crediting Packages bedingt auf (v_t) mit
+  line 602: wobei (U_k) die Payoff-Koeffizienten und der Strich das Halbgewicht des
+  line 627: q_x=1-\exp\left(-\int_x^{x+1}\mu(u)\,du\right).
+  line 647: q_x^{(m)}=1-(1-q_x)^{1/12}.
+  line 688: \{1-\beta(M_t-M_0),m_{\min},m_{\max}\}.
+  line 710: \{1-\gamma(M_t-M_0),u_{\min},u_{\max}\}.
+  line 716: u_t^{MVA}=\operatorname{clip}(1-\gamma_{MVA}f_{MVA,t},0,1)
+  line 790: Der faire LIP-Satz (f^*_{LIP}) löst
+  line 793: GV(f^*_{LIP})=0.
+  line 803: Investment Value (p_z(s)\le 1). Die Engine bucht
+  line 812: m=(1-V_{package})e^{r_{fwd}}-1.
+  line 910: Profit_y=Signature_y+Interest(BEL_{y-1})-\Delta BEL_y.
+  line 946: V_n(X_n)=\max_{a\in\mathcal{A}(X_n)}
+  line 947: \left\{CF_n(X_n,a)+
+  line 948: \mathbb{E}^Q[D_{n,n+1}V_{n+1}(X_{n+1})\mid X_n,a]\right\}.
+  line 1025: | Heston (\rho_{Sv}), nur Modellvergleich | −0,60 / −0,65 |
+  line 1026: | Hull--White (a,\sigma_r), nur Modellvergleich | 0,03 / 0,008 |
+  line 1067: | approximatives 95-%-MC-Halbintervall | ±AUD 82,81 | (1{,}96\times SE) |
+  line 1080: ![Abbildung 1: Executive Dashboard des instrumentierten 1.3.0-Laufs. Alle Werte sind illustrative Research-Resultate.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/01_executive_dashboard.png){width=95%}
+  line 1106: ![Abbildung 2: Pricing- und Margin-Waterfall.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/02_pricing_margin_waterfall.png){width=95%}
+  line 1150: ![Abbildung 3: Profit-, BEL- und Kapital-Runoff.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/03_profit_capital_runoff.png){width=95%}
+  line 1179: | Longevity: (q_x\) −10 % | −2.852 | −1.629 | 11.780 | −1.183 | −1.117 |
+  line 1180: | Mortality: (q_x\) +10 % | 207 | +1.431 | 8.600 | 913 | +979 |
+  line 1191: ![Abbildung 4: Sensitivitäts-Tornado; ohne Kapital und Risk Margin.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/04_sensitivity_tornado.png){width=95%}
+  line 1205: 4. **Langlebigkeit belastet.** Niedrigere (q_x) verlängern Income Claims.
+  line 1232: ![Abbildung 5: Verteilung von Investment Value, Income und Account Depletion.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/05_customer_outcomes.png){width=95%}
+  line 1260: ![Abbildung 6: Bedingte Produktdesign-Trade-offs.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/06_product_design_tradeoffs.png){width=95%}
+  line 1279: ![Abbildung 7: Trade-off des Income-Start-Zeitpunkts.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/07_income_start_tradeoff.png){width=95%}
+  line 1305: ![Abbildung 8: Behaviour- und Withdrawal-Surfaces.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/08_behaviour_liquidity_surfaces.png){width=95%}
+  line 1338: ![Abbildung 9: Stochastisches Modellrisiko und Seed-Stabilität.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/09_model_mc_stability.png){width=95%}
+  line 1357: ![Abbildung 10: Instrumentierte Greek-Ausgabe und Marktstress-Proxy.](AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workaround/10_market_risk_greeks.png){width=95%}
+  line 1474: shocked = dataclasses.replace(base_scen, index_levels=levels)
+  line 1645: 6. Berechne den ungefähren 95-%-MC-Halbintervall aus (SE=42{,}25).
+  line 1703: | (S_t) | Stand des Referenzindex |
+  line 1704: | (R=S_T/S_0-1) | jährliche Point-to-Point-Indexrendite |
+  line 1707: | (IV_t) | Investment Value |
+  line 1708: | (I_t) | jährliches Locked Lifetime Income |
+  line 1710: | (D_t) | Money-Market-Diskontfaktor |
+  line 1711: | (v_t) | Heston-Varianz |
+  line 1712: | (r_t) | Short Rate |
+  line 1713: | (q_x) | jährliche Todeswahrscheinlichkeit im Alter (x) |
+  line 1714: | (MWV_t) | Age-Pension+-Maximum Withdrawal Value |
+  line 1716: | (BEL_{NU}) | Non-unit Best Estimate Liability |
+  line 1717: | (VNB_{gross}) | risikoneutraler Versichererwert vor Risk Margin |
+
+[DOCX_PACKAGE]
+zip_entries=26; testzip=None
+core.title='AGILE Modelling'
+core.subject=''
+core.creator='Interne Fach- und Lernunterlage'
+core.keywords=''
+core.lastModifiedBy=''
+core.created='2026-07-11T05:32:59Z'
+core.modified='2026-07-11T05:32:59Z'
+core.revision=''
+app.Application='Microsoft Word 12.0.0'
+app.AppVersion='12.0000'
+app.Pages='1'
+app.Words='83'
+app.Characters='475'
+app.Paragraphs='8'
+app.Lines='12'
+app.Company=''
+document_counts: tables=23; drawings=10; hyperlinks=81; bookmarks=132; oMath=48; oMathPara=48; sectPr=1
+headers=0; footers=0
+internal_link_anchors=53; broken_internal_anchors=[]
+external_relationships=28
+external_rel: id=rId183; scheme=https; target=https://arxiv.org/abs/2605.27182
+external_rel: id=rId139; scheme=https; target=https://content.actuaries.asn.au/resources/resource-ce6yyqn64sx3-2093352434-60129
+external_rel: id=rId175; scheme=https; target=https://doi.org/10.1007/s12297-012-0193-3
+external_rel: id=rId181; scheme=https; target=https://doi.org/10.1007/s13385-014-0093-0
+external_rel: id=rId189; scheme=https; target=https://doi.org/10.1016/j.insmatheco.2005.06.012
+external_rel: id=rId167; scheme=https; target=https://doi.org/10.1016/j.insmatheco.2014.06.010
+external_rel: id=rId195; scheme=https; target=https://doi.org/10.1016/j.insmatheco.2015.04.001
+external_rel: id=rId169; scheme=https; target=https://doi.org/10.1016/j.insmatheco.2016.05.018
+external_rel: id=rId193; scheme=https; target=https://doi.org/10.1016/j.insmatheco.2017.06.008
+external_rel: id=rId191; scheme=https; target=https://doi.org/10.1080/10920277.2011.10597609
+external_rel: id=rId177; scheme=https; target=https://doi.org/10.1080/14697688.2015.1088962
+external_rel: id=rId151; scheme=https; target=https://doi.org/10.1080/14697688.2017.1357832
+external_rel: id=rId171; scheme=https; target=https://doi.org/10.1080/14697688.2018.1490806
+external_rel: id=rId159; scheme=https; target=https://doi.org/10.1086/260062
+external_rel: id=rId185; scheme=https; target=https://doi.org/10.1093/rfs/14.1.113
+external_rel: id=rId179; scheme=https; target=https://doi.org/10.1093/rfs/3.4.573
+external_rel: id=rId173; scheme=https; target=https://doi.org/10.1093/rfs/6.2.327
+external_rel: id=rId165; scheme=https; target=https://doi.org/10.1137/080718061
+external_rel: id=rId163; scheme=https; target=https://doi.org/10.21314/JCF.2017.331
+external_rel: id=rId161; scheme=https; target=https://doi.org/10.2143/AST.36.1.2014145
+external_rel: id=rId157; scheme=https; target=https://doi.org/10.2143/AST.38.2.2033356
+external_rel: id=rId187; scheme=https; target=https://doi.org/10.2307/3003143
+external_rel: id=rId143; scheme=https; target=https://www.allianzretireplus.com.au/adviser-resources/agile-rates.html
+external_rel: id=rId147; scheme=https; target=https://www.allianzretireplus.com.au/content/dam/onemarketing/azau/allianzretireplus_com_au/documents/rate-sheets/2026/july26/AGILE_Guaranteed_Minimums_Jul26.pdf
+external_rel: id=rId149; scheme=https; target=https://www.allianzretireplus.com.au/content/dam/onemarketing/azau/allianzretireplus_com_au/documents/rate-sheets/2026/july26/AGILE_Lifetime_Income_Rates_Jul26.pdf
+external_rel: id=rId145; scheme=https; target=https://www.allianzretireplus.com.au/content/dam/onemarketing/azau/allianzretireplus_com_au/pds-2026/AGILE_PDS_19%20Jan_2026_F1.pdf
+external_rel: id=rId153; scheme=https; target=https://www.apra.gov.au/standards/lps-110
+external_rel: id=rId155; scheme=https; target=https://www.apra.gov.au/standards/lps-114
+field_code_fragments=1; field_types={'TOC': 1}
+font_table=['Aptos', 'Aptos Display', 'Calibri', 'Cambria', 'Cambria Math', 'Courier New', 'Times New Roman']; embedded_font_parts=[]
+media_parts=10
+inline_image=1; part=rId69.png; pixels=2842x1602; display=5.542x3.124in; effective_dpi=512.8x512.8; alt='Abbildung 1: Executive Dashboard des instrumentierten 1.3.0-Laufs. Alle Werte sind illustrative Research-Resultate.'
+inline_image=2; part=rId73.png; pixels=2216x1341; display=5.542x3.354in; effective_dpi=399.9x399.9; alt='Abbildung 2: Pricing- und Margin-Waterfall.'
+inline_image=3; part=rId78.png; pixels=2366x1602; display=5.542x3.752in; effective_dpi=426.9x426.9; alt='Abbildung 3: Profit-, BEL- und Kapital-Runoff.'
+inline_image=4; part=rId82.png; pixels=2671x1602; display=5.542x3.324in; effective_dpi=482.0x482.0; alt='Abbildung 4: Sensitivitäts-Tornado; ohne Kapital und Risk Margin.'
+inline_image=5; part=rId87.png; pixels=2712x1776; display=5.542x3.629in; effective_dpi=489.4x489.4; alt='Abbildung 5: Verteilung von Investment Value, Income und Account Depletion.'
+inline_image=6; part=rId91.png; pixels=2948x1393; display=5.542x2.619in; effective_dpi=532.0x532.0; alt='Abbildung 6: Bedingte Produktdesign-Trade-offs.'
+inline_image=7; part=rId95.png; pixels=2492x1341; display=5.542x2.982in; effective_dpi=449.7x449.7; alt='Abbildung 7: Trade-off des Income-Start-Zeitpunkts.'
+inline_image=8; part=rId99.png; pixels=2706x1341; display=5.542x2.746in; effective_dpi=488.3x488.3; alt='Abbildung 8: Behaviour- und Withdrawal-Surfaces.'
+inline_image=9; part=rId103.png; pixels=2714x1776; display=5.542x3.626in; effective_dpi=489.7x489.7; alt='Abbildung 9: Stochastisches Modellrisiko und Seed-Stabilität.'
+inline_image=10; part=rId107.png; pixels=2463x1306; display=5.542x2.938in; effective_dpi=444.5x444.5; alt='Abbildung 10: Instrumentierte Greek-Ausgabe und Marktstress-Proxy.'
+
+[PDF]
+pages=48; metadata={'format': 'PDF 1.7', 'title': '', 'author': '', 'subject': '', 'keywords': '', 'creator': 'Microsoft® Word for Microsoft 365', 'producer': 'Microsoft® Word for Microsoft 365', 'creationDate': "D:20260711073333+02'00'", 'modDate': "D:20260711073333+02'00'", 'trapped': '', 'encryption': None}
+toc_outline_entries=0; page_labels=[]
+catalog.MarkInfo=('dict', '<</Marked true>>')
+catalog.Lang=('string', 'de')
+catalog.StructTreeRoot=('xref', '350 0 R')
+catalog.Outlines=('null', 'null')
+catalog.PageMode=('null', 'null')
+catalog.ViewerPreferences=('xref', '4197 0 R')
+catalog.Metadata=('xref', '4196 0 R')
+embedded_files=52; embedded_file_names=['equation-1.xml', 'equation-2.xml', 'equation-3.xml', 'equation-4.xml', 'equation-5.xml', 'equation-6.xml', 'equation-7.xml', 'equation-8.xml', 'equation-9.xml', 'equation-10.xml', 'equation-11.xml', 'equation-12.xml', 'equation-13.xml', 'equation-14.xml', 'equation-15.xml', 'equation-16.xml', 'equation-17.xml', 'equation-18.xml', 'equation-19.xml', 'equation-20.xml', 'equation-21.xml', 'equation-22.xml', 'equation-23.xml', 'equation-24.xml', 'equation-25.xml', 'equation-26.xml', 'equation-27.xml', 'equation-28.xml', 'equation-29.xml', 'equation-30.xml', 'equation-31.xml', 'equation-32.xml', 'equation-33.xml', 'equation-34.xml', 'equation-35.xml', 'equation-36.xml', 'equation-37.xml', 'equation-38.xml', 'equation-39.xml', 'equation-40.xml', 'equation-41.xml', 'equation-42.xml', 'equation-43.xml', 'equation-44.xml', 'equation-45.xml', 'equation-46.xml', 'equation-47.xml', 'equation-48.xml', 'equation-49.xml', 'equation-50.xml', 'equation-51.xml', 'equation-52.xml']
+link_kind_counts={1: 166, 2: 32}; invalid_links=0
+font_xrefs=13
+font: xref=5; ext=ttf; type=TrueType; base=BCDEEE+Aptos Display; encoding=WinAnsiEncoding; embedded_bytes=31480
+font: xref=9; ext=ttf; type=Type0; base=BCDFEE+Aptos Display; encoding=Identity-H; embedded_bytes=31480
+font: xref=18; ext=ttf; type=TrueType; base=BCDGEE+Aptos; encoding=WinAnsiEncoding; embedded_bytes=34732
+font: xref=59; ext=ttf; type=Type0; base=BCDHEE+Aptos; encoding=Identity-H; embedded_bytes=34732
+font: xref=139; ext=ttf; type=TrueType; base=BCDIEE+Consolas; encoding=WinAnsiEncoding; embedded_bytes=65776
+font: xref=171; ext=ttf; type=TrueType; base=BCDJEE+Aptos,Bold; encoding=WinAnsiEncoding; embedded_bytes=31256
+font: xref=174; ext=ttf; type=TrueType; base=BCDKEE+ArialMT; encoding=WinAnsiEncoding; embedded_bytes=52484
+font: xref=177; ext=ttf; type=Type0; base=BCDLEE+Aptos,Bold; encoding=Identity-H; embedded_bytes=31256
+font: xref=182; ext=ttf; type=Type0; base=BCDMEE+SymbolMT; encoding=Identity-H; embedded_bytes=11088
+font: xref=203; ext=ttf; type=TrueType; base=BCDNEE+Aptos,Italic; encoding=WinAnsiEncoding; embedded_bytes=31672
+font: xref=211; ext=ttf; type=Type0; base=BCDOEE+CambriaMath; encoding=Identity-H; embedded_bytes=167636
+font: xref=253; ext=ttf; type=TrueType; base=BCDPEE+CambriaMath; encoding=WinAnsiEncoding; embedded_bytes=167636
+font: xref=293; ext=ttf; type=TrueType; base=BCEAEE+Consolas-Bold; encoding=WinAnsiEncoding; embedded_bytes=34524
+pdf_image: page=25; xref=268; pixels=1108x624; bbox=Rect(70.8499984741211, 308.3299865722656, 469.83001708984375, 533.22998046875); effective_dpi=199.9x199.8
+pdf_image: page=26; xref=270; pixels=1108x670; bbox=Rect(70.8499984741211, 275.17999267578125, 469.8500061035156, 516.6300048828125); effective_dpi=199.9x199.8
+pdf_image: page=28; xref=273; pixels=1108x750; bbox=Rect(70.8499984741211, 94.3800048828125, 469.8399963378906, 364.5299987792969); effective_dpi=199.9x199.9
+pdf_image: page=30; xref=276; pixels=1108x664; bbox=Rect(70.8499984741211, 151.2899932861328, 469.83001708984375, 390.5899963378906); effective_dpi=199.9x199.8
+pdf_image: page=31; xref=278; pixels=1108x725; bbox=Rect(70.8499984741211, 384.1600341796875, 469.7900085449219, 645.4100341796875); effective_dpi=200.0x199.8
+pdf_image: page=32; xref=280; pixels=1108x523; bbox=Rect(70.8499984741211, 473.8499755859375, 469.77001953125, 662.3499755859375); effective_dpi=200.0x199.8
+pdf_image: page=33; xref=284; pixels=1108x596; bbox=Rect(70.8499984741211, 286.1099853515625, 469.83001708984375, 500.80999755859375); effective_dpi=199.9x199.9
+pdf_image: page=34; xref=286; pixels=1108x549; bbox=Rect(70.8499984741211, 249.74000549316406, 469.7900085449219, 447.44000244140625); effective_dpi=200.0x199.9
+pdf_image: page=35; xref=288; pixels=1108x725; bbox=Rect(70.8499984741211, 208.98001098632812, 469.77001953125, 470.0299987792969); effective_dpi=200.0x200.0
+pdf_image: page=36; xref=290; pixels=1108x587; bbox=Rect(70.8499984741211, 70.84999084472656, 469.80999755859375, 282.3999938964844); effective_dpi=200.0x199.8
+clipped_spans=0; near_edge_spans=0; printed_page_number_pages=[]
+blank_pages=[]
+page_extent: page=1; chars=3272; x=70.8..543.1; y=70.8..726.2
+page_extent: page=2; chars=4020; x=70.8..543.1; y=70.8..734.0
+page_extent: page=3; chars=3999; x=70.8..543.1; y=70.8..734.0
+page_extent: page=4; chars=3018; x=70.8..543.1; y=70.8..732.1
+page_extent: page=5; chars=2885; x=70.8..540.5; y=70.8..723.1
+page_extent: page=6; chars=2177; x=70.8..542.6; y=70.9..721.4
+page_extent: page=7; chars=2940; x=70.8..541.9; y=72.6..725.0
+page_extent: page=8; chars=2101; x=70.8..541.9; y=72.6..691.8
+page_extent: page=9; chars=2191; x=70.8..538.6; y=70.8..706.6
+page_extent: page=10; chars=2373; x=70.8..543.6; y=72.6..734.5
+page_extent: page=11; chars=2236; x=70.8..541.5; y=70.8..705.8
+page_extent: page=12; chars=2375; x=70.8..542.4; y=70.8..724.6
+page_extent: page=13; chars=2340; x=70.8..535.1; y=72.6..726.2
+page_extent: page=14; chars=1903; x=70.8..536.7; y=70.8..715.5
+page_extent: page=15; chars=2005; x=70.8..541.0; y=70.8..679.7
+page_extent: page=16; chars=2097; x=70.8..541.3; y=70.8..712.7
+page_extent: page=17; chars=2361; x=70.8..541.8; y=70.8..710.3
+page_extent: page=18; chars=1883; x=70.8..539.1; y=70.8..697.2
+page_extent: page=19; chars=1711; x=70.8..540.4; y=70.8..724.7
+page_extent: page=20; chars=1712; x=70.8..542.7; y=70.8..720.1
+page_extent: page=21; chars=2134; x=70.8..535.6; y=70.8..719.0
+page_extent: page=22; chars=2269; x=70.8..543.0; y=70.8..724.7
+page_extent: page=23; chars=2001; x=70.8..531.0; y=70.8..727.3
+page_extent: page=24; chars=1869; x=70.8..532.2; y=72.6..719.9
+page_extent: page=25; chars=1560; x=70.8..543.7; y=72.6..721.4
+page_extent: page=26; chars=1037; x=70.8..540.3; y=72.6..721.8
+page_extent: page=27; chars=1116; x=70.8..538.3; y=70.8..446.9
+page_extent: page=28; chars=1176; x=70.8..543.7; y=70.8..715.3
+page_extent: page=29; chars=1431; x=70.8..543.7; y=72.6..727.3
+page_extent: page=30; chars=1369; x=70.8..543.7; y=72.6..687.8
+page_extent: page=31; chars=1555; x=70.8..543.6; y=70.8..723.1
+page_extent: page=32; chars=1454; x=70.8..543.7; y=70.8..725.4
+page_extent: page=33; chars=1657; x=70.8..543.7; y=70.8..703.9
+page_extent: page=34; chars=1605; x=70.8..543.7; y=72.6..730.6
+page_extent: page=35; chars=1379; x=70.8..540.2; y=70.8..728.4
+page_extent: page=36; chars=1673; x=70.8..541.6; y=292.5..707.5
+page_extent: page=37; chars=1989; x=70.8..532.1; y=70.8..731.5
+page_extent: page=38; chars=2181; x=70.8..543.3; y=70.9..722.5
+page_extent: page=39; chars=1977; x=70.8..543.1; y=70.8..712.1
+page_extent: page=40; chars=2313; x=70.8..541.7; y=70.8..671.2
+page_extent: page=41; chars=2114; x=70.8..540.9; y=70.8..735.1
+page_extent: page=42; chars=2360; x=70.8..541.3; y=70.8..696.1
+page_extent: page=43; chars=2251; x=70.8..542.7; y=70.8..724.4
+page_extent: page=44; chars=2114; x=70.8..543.2; y=72.6..722.5
+page_extent: page=45; chars=2311; x=70.8..541.3; y=70.9..706.3
+page_extent: page=46; chars=2592; x=70.8..542.3; y=70.8..708.4
+page_extent: page=47; chars=2754; x=70.8..543.0; y=70.8..708.4
+page_extent: page=48; chars=319; x=70.8..536.7; y=70.8..154.1
+suspicious_pdf_math_lines=51
+  page 7: AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_workarou
+  page 10: Mit (X=S_T/S_0), normiertem Strike 1 und Call-/Put-Werten (Call(K)) und (Put(K)) kann der
+  page 12: verstrichener Zeit (e_t), Lebenserwartung (LE) und bereits erfolgten Entnahmen (W_t) linear
+  page 14:    •  Marktvariablen (S_t), gegebenenfalls (v_t) und (r_t).
+  page 14: bewertet. Der modellierte Present Value eines Cashflows (CF_t) ist
+  page 15: Die Vertragsindizes sind Return-Indizes; der Default-Carry (q_i) ist daher null. Eine frühere
+  page 15: Basislauf gelten (sigma_{AUS}=16%), (sigma_{Global}=15%) und eine Equity-Korrelation
+  page 15: vier Substeps je Monat. Der negative Default (ho_{Sv}=-0{,}60) beziehungsweise −0,65
+  page 16: wobei (phi(t)) die anfängliche Kurve fitten soll. Defaults sind (a=0{,}03), (sigma_r=0{,}008)
+  page 16: bewertet deshalb die Crediting Packages bedingt auf (v_t) mit der Fourier-Cosine-(COS-
+  page 16: (arphi(u)) und Intervall ([a,b]) wird der Optionswert durch eine endliche Cosinusreihe
+  page 16: wobei (U_k) die Payoff-Koeffizienten und der Strich das Halbgewicht des ersten Terms
+  page 19: ausgegeben. Der Gross VNB beziehungsweise insurer_net_value vor Risk Margin ist das
+  page 19: Der faire LIP-Satz (f^*_{LIP}) löst
+  page 19: (p_z(s)). Die Engine bucht
+  page 23: Heston (_{Sv}), nur Modellvergleich                      −0,60 / −0,65
+  page 23: Hull–White (a,_r), nur Modellvergleich                     0,03 / 0,008
+  page 24: approximatives 95-%-                    ±AUD 82,81  (1{,}96SE)
+  page 29: : (q_x)
+  page 29: (q_x) +10
+  page 30:     4. Langlebigkeit belastet. Niedrigere (q_x) verlängern Income Claims.
+  page 38: Feld index_levels einen neuen Wert zu. Der unveränderte Runner bricht reproduzierbar
+  page 38: dataclasses.FrozenInstanceError: cannot assign to field 'index_levels'
+  page 38: levels = {ix: lv.copy() for ix, lv in base_scen.index_levels.items()}
+  page 38: shocked = dataclasses.replace(base_scen, index_levels=levels)
+  page 42:     6. Berechne den ungefähren 95-%-MC-Halbintervall aus (SE=42{,}25).
+  page 43: (S_t)          Stand des Referenzindex
+  page 43: (R=S_T/S_0-1)  jährliche Point-to-Point-Indexrendite
+  page 43: (IV_t)          Investment Value
+  page 43: (I_t)            jährliches Locked Lifetime Income
+  page 43: (D_t)          Money-Market-Diskontfaktor
+  page 43: (v_t)           Heston-Varianz
+  page 43: (r_t)           Short Rate
+  page 43: (q_x)            jährliche Todeswahrscheinlichkeit im Alter (x)
+  page 43: (MWV_t)      Age-Pension+-Maximum Withdrawal Value
+  page 44: (BEL_{NU})     Non-unit Best Estimate Liability
+  page 44: (VNB_{gross})   risikoneutraler Versichererwert vor Risk Margin
+  page 44: NBM                  VNB / Premium                 in executive_kpis.csv nach
+  page 44:    •  AGILE_Modelling_Engine/README.md — Architektur und Use Limitations;
+  page 44:    •  AGILE_Modelling_Engine/METHODOLOGY.md — Modellmethodik und Fix-Historie;
+  page 44:    •  AGILE_Modelling_Engine/AUDIT_REPORT.md — Auditbefunde und Blocker;
+  page 44:    •  AGILE_Modelling_Engine/agile_engine/ — ausführbarer Quellcode;
+  page 44:    •  AGILE_Modelling_Engine/tests/ — 122 Tests;
+  page 44:    •  AGILE_Modelling_Engine/examples/output/insurer_analysis/ — historischer
+  page 44:    •  AGILE_Modelling_Engine/examples/output/insurer_analysis_v1_3_runtime_wo
+  page 45: https://www.allianzretireplus.com.au/content/dam/onemarketing/azau/allianzretireplus_c
+  page 45: om_au/pds-2026/AGILE_PDS_19%20Jan_2026_F1.pdf.
+  page 46: https://www.allianzretireplus.com.au/content/dam/onemarketing/azau/allianzretireplus_c
+  page 46: om_au/documents/rate-sheets/2026/july26/AGILE_Guaranteed_Minimums_Jul26.pdf.
+  page 46: https://www.allianzretireplus.com.au/content/dam/onemarketing/azau/allianzretireplus_c
+  page 46: om_au/documents/rate-sheets/2026/july26/AGILE_Lifetime_Income_Rates_Jul26.pdf.
+
+[DOCX_PDF_CONSISTENCY]
+word_pages_reported=48; pdf_pages=48
+docx_plain_tokens=10578; pdf_tokens=11037; multiset_common=10078; coverage_docx=0.95273; coverage_pdf=0.91311
+markdown_headers_not_found_in_pdf=[]
