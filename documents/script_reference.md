@@ -91,7 +91,7 @@ stand-alone losses, permanent and approximate mass-lapse amounts, correlated
 MLL life-risk capital proxy, capital-adjusted CSM, secondary CSM/capital ratio,
 selection result, manifest and plots.
 
-The default ranking is `CSM - 6% * MLL capital`. This is a one-year research
+The default ranking is $\mathrm{CSM}-6\%\times K_{\mathrm{MLL}}$. This is a one-year research
 capital charge, not a full Risk Margin. The MLL amount is partial and the mass-
 lapse leg is a model-point positive-value proxy rather than a revaluation; the
 runner must not be used or described as an APRA capital calculation.

@@ -6,11 +6,18 @@ from dataclasses import replace
 import numpy as np
 
 from policy_engine import ProjectionConfig
+from policy_engine.crediting_capital import (
+    PairedBootstrapRatioDelta,
+    score_lsmc_value_vectors,
+)
 from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import (
     ACTION_CAPS,
     CONTROL_STATE_FEATURE_NAMES,
     SLIM_DIRECT_Q_BASIS_DIMENSION,
+    BackwardResult,
     PortfolioPathData,
+    ManagementObjectiveSpec,
+    _adaptive_policy_passes_ratio_validation,
     _adaptive_policy_passes_validation,
     _backward_induction,
     _constant_first_year_policy,
@@ -19,11 +26,16 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _grid_continuation_lookup,
     _lower_cap_argmax,
     _masked_lower_cap_argmax,
+    _mll_metrics_from_payload,
+    _objective_from_payload,
+    parse_args,
     _pathwise_outer_fold_ids,
     _policy_action_values,
+    _policy_payload,
     _projection_configs_by_sample,
     _screened_policy_component_values,
     _screened_policy_actions,
+    _select_best_fixed_label,
     _shell_neutral_argv_display,
     _slim_direct_q_design,
 )
@@ -504,3 +516,229 @@ def test_validation_gate_accepts_significant_uplift_and_rejects_fallback_cases()
         }
         arguments.update(override)
         assert not _adaptive_policy_passes_validation(**arguments)
+
+
+def test_ratio_parser_uses_four_full_samples_with_distinct_default_seeds():
+    args = parse_args(["--n-paths", "882", "--seed", "17"])
+
+    assert args.optimisation_objective == "csm_to_mll"
+    assert args.benchmark_paths == args.n_paths == 882
+    assert (
+        args.seed,
+        args.fixed_selection_seed,
+        args.validation_seed,
+        args.evaluation_seed,
+    ) == (17, 18, 19, 20)
+
+
+def test_optimizer_mll_score_matches_central_vector_arithmetic():
+    payload = np.array([
+        100.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        80.0, 90.0, 95.0, 85.0,
+        60.0, 40.0,
+    ])
+    spec = ManagementObjectiveSpec(
+        kind="csm_to_mll",
+        model_point_count=2,
+        capital_materiality=0.01,
+        mass_lapse_fraction=0.40,
+    )
+
+    csm, capital, ratio = _mll_metrics_from_payload(payload, spec)
+    central = score_lsmc_value_vectors(
+        payload,
+        capital_materiality=0.01,
+    )
+
+    assert csm == central.csm
+    assert capital == central.mll_capital
+    assert ratio == central.csm_to_mll_ratio
+
+
+def test_ratio_objective_can_prefer_lower_csm_with_better_risk_profile():
+    spec = ManagementObjectiveSpec(
+        kind="csm_to_mll",
+        model_point_count=1,
+        capital_materiality=0.01,
+        mass_lapse_fraction=0.40,
+    )
+    high_csm_high_risk = np.array([
+        120.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        40.0, 50.0, 60.0, 60.0,
+        120.0,
+    ])
+    lower_csm_low_risk = np.array([
+        100.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        90.0, 92.0, 94.0, 94.0,
+        20.0,
+    ])
+
+    assert _objective_from_payload(lower_csm_low_risk, spec) > (
+        _objective_from_payload(high_csm_high_risk, spec)
+    )
+
+
+def test_ratio_is_formed_after_value_vector_aggregation():
+    spec = ManagementObjectiveSpec(
+        kind="csm_to_mll",
+        model_point_count=1,
+        capital_materiality=0.01,
+        mass_lapse_fraction=0.40,
+    )
+    paths = np.array([
+        [100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+         70.0, 85.0, 90.0, 90.0, 100.0],
+        [50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+         45.0, 45.0, 45.0, 45.0, 5.0],
+    ])
+
+    ratio_of_mean_vector = float(_objective_from_payload(
+        np.mean(paths, axis=0), spec
+    ))
+    mean_of_path_ratios = float(np.mean(
+        _objective_from_payload(paths, spec)
+    ))
+
+    assert not np.isclose(ratio_of_mean_vector, mean_of_path_ratios)
+
+
+def test_ratio_validation_gate_uses_bootstrap_interval_and_operational_flags():
+    passing = PairedBootstrapRatioDelta(
+        estimate=0.20,
+        standard_error=0.05,
+        ci_lower=0.01,
+        ci_upper=0.31,
+        confidence_level=0.95,
+        n_resamples=100,
+        seed=7,
+    )
+    failing = replace(passing, ci_lower=-0.01)
+
+    assert _adaptive_policy_passes_ratio_validation(
+        masked_candidate_executable=True,
+        policyholder_validation_passed=True,
+        causal_rollout_valid=True,
+        bootstrap=passing,
+    )
+    assert not _adaptive_policy_passes_ratio_validation(
+        masked_candidate_executable=True,
+        policyholder_validation_passed=True,
+        causal_rollout_valid=True,
+        bootstrap=failing,
+    )
+    assert not _adaptive_policy_passes_ratio_validation(
+        masked_candidate_executable=False,
+        policyholder_validation_passed=True,
+        causal_rollout_valid=True,
+        bootstrap=passing,
+    )
+
+
+def test_fixed_grid_selection_uses_ratio_instead_of_higher_csm():
+    labels = ("fixed_cap_low", "fixed_cap_high")
+    csm_paths = {
+        "fixed_cap_low": np.array([90.0, 90.0]),
+        "fixed_cap_high": np.array([120.0, 120.0]),
+    }
+    ratios = {"fixed_cap_low": 2.1, "fixed_cap_high": 1.7}
+
+    assert _select_best_fixed_label(
+        labels,
+        selection_csm_paths=csm_paths,
+        selection_csm_to_mll=ratios,
+        objective_kind="csm_to_mll",
+    ) == "fixed_cap_low"
+    assert _select_best_fixed_label(
+        labels,
+        selection_csm_paths=csm_paths,
+        selection_csm_to_mll=None,
+        objective_kind="csm",
+    ) == "fixed_cap_high"
+
+
+def test_ratio_policy_json_serializes_payload_coefficients_and_bounds_only():
+    raw = np.zeros((8, len(CONTROL_STATE_FEATURE_NAMES)))
+    base = _constant_first_year_policy(
+        year=0,
+        raw_state=raw,
+        action_values=np.zeros((len(ACTION_CAPS), 10)),
+        action_standard_errors=np.zeros(len(ACTION_CAPS)),
+        feature_names=CONTROL_STATE_FEATURE_NAMES,
+    )
+    spec = ManagementObjectiveSpec(
+        kind="csm_to_mll",
+        model_point_count=1,
+        capital_materiality=0.01,
+        mass_lapse_fraction=0.40,
+    )
+    output_count = spec.payload_width + 1
+    coefficients = np.zeros((*base.coefficients.shape[:2], output_count))
+    lower = np.full((len(ACTION_CAPS), output_count), -10.0)
+    upper = np.full((len(ACTION_CAPS), output_count), 10.0)
+    policy = replace(
+        base,
+        coefficients=coefficients,
+        value_lower_bounds=lower,
+        value_upper_bounds=upper,
+        objective_spec=spec,
+    )
+    result = BackwardResult(
+        first_year_cap=float(ACTION_CAPS[0]),
+        pv_new_business_csm_proxy=1.0,
+        pv_guarantee_claims=0.0,
+        pv_other_insurer_funded_benefits=0.0,
+        pv_fees_product=1.0,
+        pv_fees_lip=0.0,
+        pv_crediting_margin=0.0,
+        pv_mva_retained=0.0,
+        pv_aps_retained=0.0,
+        pv_expenses=0.0,
+        pv_hedge_costs=0.0,
+        standard_error_new_business_csm_proxy=0.0,
+        first_year_action_rows=[],
+        policy_year_rows=[],
+        regression_rows=[],
+        policy_years=[policy],
+        reconciliation_gap=0.0,
+        economically_active_policy_years=(1,),
+        inactive_market_tail_year_count=0,
+        management_objective="csm_to_mll",
+        management_objective_value=2.0,
+        mll_capital_proxy=0.5,
+        csm_to_mll_ratio=2.0,
+    )
+    bootstrap = PairedBootstrapRatioDelta(
+        estimate=0.1,
+        standard_error=0.02,
+        ci_lower=0.01,
+        ci_upper=0.2,
+        confidence_level=0.95,
+        n_resamples=100,
+        seed=5,
+    )
+
+    payload = _policy_payload(
+        result,
+        CONTROL_STATE_FEATURE_NAMES,
+        {},
+        fixed_fallback_cap=float(ACTION_CAPS[0]),
+        deployed_first_year_cap=float(ACTION_CAPS[0]),
+        adaptive_policy_selected=True,
+        validation_delta_aud=1.0,
+        validation_paired_standard_error_aud=0.2,
+        validation_ratio_bootstrap=bootstrap,
+        model_point_ids=("mp-1",),
+    )
+    year = payload["years"][0]
+
+    assert len(payload["coefficient_output_layout"]) == spec.payload_width
+    assert np.asarray(year["coefficients_by_action_basis_output"]).shape[-1] == (
+        spec.payload_width
+    )
+    assert np.asarray(year["value_lower_bounds_by_action_output"]).shape[-1] == (
+        spec.payload_width
+    )
+    assert year["management_objective_recomputed_from_payload"]

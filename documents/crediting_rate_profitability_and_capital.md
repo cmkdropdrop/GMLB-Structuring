@@ -35,7 +35,8 @@ life of the portfolio.
 The standard objective is
 
 $$
-\mathrm{CSM}^{proxy}=PV(F)+PV(O)-PV(K)-PV(C),
+\mathrm{CSM}^{\mathrm{proxy}}
+=\operatorname{PV}(F)+\operatorname{PV}(O)-\operatorname{PV}(K)-\operatorname{PV}(C),
 $$
 
 where $F$ is Fee Income, $O$ Other Income, $K$ Claims and $C$ Costs.
@@ -55,7 +56,7 @@ margin such as fees less guarantee claims and call it CSM.
 For annual return $R$ and cap $C$, the customer payoff is
 
 $$
-\min(\max(R,0),C)=\max(R,0)-\max(R-C,0).
+\min\!\left(\max(R,0),C\right)=\max(R,0)-\max(R-C,0).
 $$
 
 The insurer buys the lower call and sells the cap call in the capital market.
@@ -127,7 +128,7 @@ factors in this repository therefore must not be described as APRA capital:
 For signed CSM proxy $J$, each stand-alone amount is
 
 $$
-K_i=[J_{base}-J_{stress,i}]_+.
+K_i=\left[J_{\mathrm{base}}-J_{\mathrm{stress},i}\right]_+.
 $$
 
 The lapse module is the maximum of lapse up, lapse down and a 40% mass-lapse
@@ -140,12 +141,12 @@ with this proxy and the permanent-lapse-only amount must be disclosed.
 The Mortality/Longevity/Lapse submodules use the existing correlation submatrix
 
 $$
-\rho_{MLL}=\begin{pmatrix}
+\rho_{\mathrm{MLL}}=\begin{pmatrix}
 1&-0.25&0\\
 -0.25&1&0.25\\
 0&0.25&1
 \end{pmatrix},\qquad
-K_{MLL}=\sqrt{\mathbf K^\top\rho_{MLL}\mathbf K}.
+K_{\mathrm{MLL}}=\sqrt{\mathbf{K}^{\mathsf T}\rho_{\mathrm{MLL}}\mathbf{K}}.
 $$
 
 This partial result excludes market, expense, catastrophe, operational,
@@ -161,20 +162,20 @@ the mass-lapse proxy binds. The primary fixed-cap ranking therefore uses the AUD
 economic-value-added proxy
 
 $$
-J^{capital\ adjusted}(C)=J(C)-hK_{MLL}(C),
+J^{\text{capital-adjusted}}(C)=J(C)-hK_{\mathrm{MLL}}(C),
 $$
 
 where the current research hurdle is $h=6\%$. This is a one-year capital
 charge, not a full projected Risk Margin. The lifetime efficiency diagnostic
-$J/K_{MLL}$ is reported only when capital exceeds a premium-relative
+$J/K_{\mathrm{MLL}}$ is reported only when capital exceeds a premium-relative
 materiality threshold; no epsilon denominator is introduced.
 
 For product-design discretion relative to the contractual 6% cap,
 
 $$
-\Delta^{design}_{capital}
-=J^{capital\ adjusted}_{selected\ fixed}
--J^{capital\ adjusted}_{6\%}.
+\Delta^{\mathrm{design}}_{\mathrm{capital}}
+=J^{\text{capital-adjusted}}_{\text{selected fixed}}
+-J^{\text{capital-adjusted}}_{6\%}.
 $$
 
 For annual adaptive discretion, the comparison remains adaptive versus best
@@ -211,8 +212,8 @@ capital charge is AUD 63,269 per representative contract.
 The economic value of flexibility is the paired OOS difference
 
 $$
-\Delta^{flex}=\mathrm{CSM}^{proxy}_{adaptive}
--\mathrm{CSM}^{proxy}_{best\ fixed}.
+\Delta^{\mathrm{flex}}=\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{adaptive}}
+-\mathrm{CSM}^{\mathrm{proxy}}_{\text{best fixed}}.
 $$
 
 The best fixed cap is selected on its own sample. The adaptive candidate is

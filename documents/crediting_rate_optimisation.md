@@ -7,7 +7,7 @@ Maximum Return. Workflow names call this quantity the **crediting rate**, but
 the contractual payoff is a floor-at-zero, cap-at-$C_y$ annual index credit:
 
 $$
-g_y=\min\!\left(\max(R_y^{fund},0),C_y\right),
+g_y=\min\!\left(\max\!\left(R_y^{\mathrm{fund}},0\right),C_y\right),
 \qquad C_y\in\mathcal C.
 $$
 
@@ -34,8 +34,8 @@ The insurer and policyholder objectives are never blended.
 At time zero the optimiser maximises
 
 $$
-J(\pi)=\mathbb E^{\mathbb Q}\!\left[
-PV(F)+PV(O)-PV(K)-PV(C)\mid \pi
+J(\pi)=\mathbb{E}^{\mathbb{Q}}\!\left[
+\operatorname{PV}(F)+\operatorname{PV}(O)-\operatorname{PV}(K)-\operatorname{PV}(C)\mid \pi
 \right],
 $$
 
@@ -67,10 +67,10 @@ stresses, adds the explicitly labelled model-point mass-lapse proxy, aggregates
 the MLL research capital amount and ranks the supplied grid by
 
 $$
-J^{capital\ adjusted}(C)=J(C)-hK_{MLL}(C).
+J^{\text{capital-adjusted}}(C)=J(C)-hK_{\mathrm{MLL}}(C).
 $$
 
-The current hurdle $h=6\%$ is a one-year capital charge. `J / K_MLL` is a
+The current hurdle $h=6\%$ is a one-year capital charge. $J/K_{\mathrm{MLL}}$ is a
 secondary lifetime value-to-capital diagnostic and is not annualised RAROC. The
 runner hard-blocks Policyholder LSMC, auto-prepares missing exact cache entries
 through the sole authorised precompute runner, and then launches only strict
@@ -125,7 +125,7 @@ recursion schematically as
 $$
 V_y(A_y,X_y)=\max_{c\in\mathcal C}
 \left\{r_y(A_y,X_y,c)+
-\mathbb E^{\mathbb Q}\!\left[
+\mathbb{E}^{\mathbb{Q}}\!\left[
 V_{y+1}(A_{y+1},X_{y+1})\mid A_y,X_y,c
 \right]\right\}.
 $$
@@ -139,8 +139,7 @@ Account value is placed on an adaptive quantile grid. At each node the
 continuation regression uses the compact economic basis
 
 $$
-\phi(X_y)=\{1,\ \text{ATM one-year call},\
-\text{reference-fund level},\ \text{overnight rate}\}.
+\phi(X_y)=\left\{1,\ \text{ATM one-year call},\ \text{reference-fund level},\ \text{overnight rate}\right\}.
 $$
 
 The action-Q regression is fitted directly to the pathwise Bellman target
@@ -231,8 +230,8 @@ paired. Let $\Delta_i$ be that pathwise/paired portfolio difference. The
 validation rule requires operational diagnostics to pass and
 
 $$
-\overline{\Delta}_{val}>1.96\,
-SE(\Delta_{val}).
+\overline{\Delta}_{\mathrm{val}}>1.96\,
+\operatorname{SE}(\Delta_{\mathrm{val}}).
 $$
 
 The dynamic optimiser also requires an executable locally masked policy and a
@@ -245,7 +244,7 @@ If any required gate fails, the selected fixed cap is deployed on the final
 sample. In that case:
 
 $$
-\Delta^{flex}_{deployed}=0.
+\Delta^{\mathrm{flex}}_{\mathrm{deployed}}=0.
 $$
 
 The rejected adaptive candidate may still be reported as a diagnostic, but it

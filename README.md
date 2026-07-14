@@ -35,10 +35,10 @@ different policyholder models:
 The customer receives the annual simple credit
 
 $$
-g_y=\min\!\left(\max(R_y^{fund},0),C_y\right),
+g_y = \min\!\left(\max\!\left(R_y^{\mathrm{fund}},0\right),C_y\right),
 $$
 
-where $R_y^{fund}$ is the complete annual reference-fund return and $C_y$
+where $R_y^{\mathrm{fund}}$ is the complete annual reference-fund return and $C_y$
 is the Maximum Return announced by the insurer. In this repository, “crediting
 rate” in workflow names normally means this annual cap, not a guaranteed flat
 interest rate. The contractual case-study cap is 6%, with a guaranteed minimum
@@ -86,7 +86,8 @@ current insurer offer.
 The combined monthly fund return is
 
 $$
-R_m^{fund}=0.30R_m^{global\ equity}+0.70R_m^{5y\ government\ bond}.
+R_m^{\mathrm{fund}}
+= 0.30R_m^{\text{global equity}}+0.70R_m^{\text{5y government bond}}.
 $$
 
 Equity and bond returns are combined first; only then is the annual floor/cap
@@ -114,7 +115,7 @@ insurer. Customer index participation is manufactured separately with a
 capital-market bull call spread:
 
 $$
-\min(\max(R,0),C)=\max(R,0)-\max(R-C,0).
+\min\!\left(\max(R,0),C\right)=\max(R,0)-\max(R-C,0).
 $$
 
 The insurer buys the lower call and sells the cap call **to the capital
@@ -127,9 +128,9 @@ the customer cap become retained hedge income.
 The standard profitability objective is the signed new-business CSM proxy
 
 $$
-\mathrm{CSM}^{proxy}
-=PV(\text{Fee Income})+PV(\text{Other Income})
--PV(\text{Claims})-PV(\text{Costs}).
+\mathrm{CSM}^{\mathrm{proxy}}
+=\operatorname{PV}(\text{Fee Income})+\operatorname{PV}(\text{Other Income})
+-\operatorname{PV}(\text{Claims})-\operatorname{PV}(\text{Costs}).
 $$
 
 | Leg | Main modelled components |
@@ -335,8 +336,8 @@ No Policyholder LSMC was fitted or called. Every valuation manifest records
 path-congruent hedge caches. For each revalued module the adverse amount is
 
 $$
-K_i=\max(0,\mathrm{CSM}^{proxy}_{base}
--\mathrm{CSM}^{proxy}_{stress,i}).
+K_i=\max\!\left(0,\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{base}}
+-\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{stress},i}\right).
 $$
 
 Lapse capital is the largest of lapse-up, lapse-down and the disclosed
@@ -348,11 +349,12 @@ Adjustment.
 The primary ranking is no longer mean CSM alone. It uses the robust AUD measure
 
 $$
-\mathrm{CSM}^{capital\ adjusted}(C)
-=\mathrm{CSM}^{proxy}(C)-6\%\,K_{MLL}(C),
+\mathrm{CSM}^{\text{capital-adjusted}}(C)
+=\mathrm{CSM}^{\mathrm{proxy}}(C)-6\%\,K_{\mathrm{MLL}}(C),
 $$
 
-with `CSM / MLL capital` reported only as a secondary lifetime efficiency ratio.
+with $\mathrm{CSM}/K_{\mathrm{MLL}}$ reported only as a secondary lifetime
+efficiency ratio.
 The 6% deduction is a one-year capital hurdle, not a full projected Risk Margin.
 
 | Cap | CSM proxy (AUD) | MLL capital proxy (AUD) | Capital-adjusted CSM (AUD) | CSM / capital | Cumulative Dynamic Income lapse |

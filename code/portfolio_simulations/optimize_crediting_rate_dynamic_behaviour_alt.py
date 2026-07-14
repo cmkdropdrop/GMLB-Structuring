@@ -14,13 +14,11 @@ Exact validated risk-neutral Heston-Hull-White market paths are loaded from the
 repository Q-market cache.  With the default ``mc_conditional`` method, annual
 new-issue call-spread prices are loaded from the path-congruent hedge cache.
 Exploratory cap paths then drive the existing generic monthly contract
-projector.  A backward pass on the account-value
-inventory grid (Boogert & de Jong, 2008; Carmona & Ludkovski, 2010) estimates,
-for every anniversary, admissible cap and grid node,
-
-    E[PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)
-      + continuation value at the resulting account value
-      | information at the cap-setting time].
+projector.  A backward pass on the account-value inventory grid (Boogert & de
+Jong, 2008; Carmona & Ludkovski, 2010) propagates a conditional value vector
+for the nine base-CSM components, four mortality/longevity/lapse stress CSMs
+and the signed base CSM of every modelpoint.  Only after conditional
+aggregation does it form correlated MLL capital and select on CSM/MLL.
 
 The continuation value is fitted by a separate regression per grid node on the
 slim exogenous basis ``{1, ATM one-year call, Reference-Fund level, overnight
@@ -28,14 +26,15 @@ rate}`` and interpolated across nodes.  Direct action-Q regressions use those
 factors plus standardised account value and its square; their targets add the
 one-year cashflow components to the value at each path's realised next account
 value.  The inter-node delta V(A_{k+1}) - V(A_k) is the discrete marginal
-value of account value (the storage shadow price) that determines the optimal
-cap.  The signed objective is the repository's market-consistent insurer net
-value before Risk Margin and is used here as an approximate New Business CSM
-proxy.  The optimisation selects, at each account-value node, the cap with the
-largest proxy value after the projector has applied dynamic Income lapse and
-withdrawal behaviour.  Income Election is also left in the loaded dynamic
-Behaviour mode, subject to the existing contractual eligibility and
-forced-start gates.
+value of account value (the storage shadow price).  Base CSM is the signed
+market-consistent insurer net-value proxy before Risk Margin.  MLL is a partial
+research capital proxy, not total regulatory capital.  Because a ratio, loss
+maxima and a correlation norm are not additive, the backward policy is a
+rolling conditional remaining-lifetime CSM/MLL heuristic, not a proof of the
+global time-zero ratio optimum.  Its economic result is measured by full-size,
+seed-separated policy-level OOS revaluations and a paired ratio bootstrap.
+Income Election remains in the loaded dynamic Behaviour mode, subject to the
+existing contractual eligibility and forced-start gates.
 
 The admissible action grid is ``{0.25%, 1%, 2%, ..., 20%}``, matching the
 documented Guaranteed Minimum Cap while replacing the case study's fixed 6%
@@ -111,6 +110,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Iterator, Mapping, Optional, Sequence
@@ -165,6 +165,7 @@ from policy_engine.crediting_capital import (  # noqa: E402
     PolicyLevelCSMMLLResult,
     calculate_policy_level_csm_mll,
     paired_bootstrap_ratio_delta,
+    score_lsmc_value_vectors,
 )
 from policy_engine.model_points import (  # noqa: E402
     PolicyholderModelPoint,
@@ -250,6 +251,12 @@ DEFAULT_BENCHMARK_CACHE_DIRECTORY = (
     RESULTS_ROOT / "runtime_cache" / "benchmark_projection"
 )
 LOGGER = logging.getLogger("crediting_cap_dynamic_behaviour")
+
+
+@lru_cache(maxsize=16)
+def _capital_stresses_for_mass_lapse(rate: float) -> CapitalStresses:
+    """Reuse validated immutable stress settings inside hot LSMC scoring."""
+    return replace(CapitalStresses(), lapse_mass=float(rate))
 
 
 def _configure_logging(output: Path, level_name: str) -> Path:
@@ -2768,6 +2775,21 @@ def _aggregate_portfolio_paths(
             "The standard sold cap leg must not retain Reference-Fund "
             "performance above the customer cap."
         )
+    if model_point_csm is not None:
+        portfolio_csm = (
+            fees_product + fees_lip + crediting_margin + mva_retained
+            + aps_retained - guarantee_claims
+            - other_insurer_funded_benefits - projected_expenses - hedge_costs
+        )
+        if not np.allclose(
+            np.sum(model_point_csm, axis=0),
+            portfolio_csm,
+            rtol=1.0e-12,
+            atol=1.0e-8,
+        ):
+            raise RuntimeError(
+                "Modelpoint-wise base CSM does not reconcile to the portfolio."
+            )
 
     return PortfolioPathData(
         guarantee_claims=guarantee_claims,
@@ -3407,36 +3429,22 @@ def _mll_metrics_from_payload(
         raise ValueError("CSM/MLL value-vector payload has an invalid width.")
     if not np.all(np.isfinite(values)):
         raise ValueError("CSM/MLL value-vector payload must be finite.")
-    base_components = values[..., :len(INSURER_COMPONENT_NAMES)]
-    base_csm = _csm_from_component_values(base_components)
-    stress_start = len(INSURER_COMPONENT_NAMES)
-    stress_values = values[
-        ..., stress_start:stress_start + len(MLL_STRESS_IDS)
-    ]
-    model_point_values = values[
-        ..., stress_start + len(MLL_STRESS_IDS):
-    ]
-    mortality = np.maximum(base_csm - stress_values[..., 0], 0.0)
-    longevity = np.maximum(base_csm - stress_values[..., 1], 0.0)
-    lapse_up = np.maximum(base_csm - stress_values[..., 2], 0.0)
-    lapse_down = np.maximum(base_csm - stress_values[..., 3], 0.0)
-    mass_lapse = objective_spec.mass_lapse_fraction * np.sum(
-        np.maximum(model_point_values, 0.0), axis=-1
+    score = score_lsmc_value_vectors(
+        values,
+        model_point_weights=np.ones(objective_spec.model_point_count),
+        capital_materiality=objective_spec.capital_materiality,
+        stresses=_capital_stresses_for_mass_lapse(
+            objective_spec.mass_lapse_fraction
+        ),
     )
-    lapse = np.maximum(np.maximum(lapse_up, lapse_down), mass_lapse)
-    quadratic = (
-        mortality ** 2
-        + longevity ** 2
-        + lapse ** 2
-        - 0.5 * mortality * longevity
-        + 0.5 * longevity * lapse
-    )
-    capital = np.sqrt(np.maximum(quadratic, 0.0))
-    selectable = capital > objective_spec.capital_materiality
-    # A finite sentinel keeps regression/plot artefacts JSON-safe while making
-    # an undefined ratio strictly dominated by every defined finite ratio.
-    ratio = np.full_like(base_csm, -1.0e100, dtype=float)
-    np.divide(base_csm, capital, out=ratio, where=selectable)
+    base_csm = np.asarray(score.csm, dtype=float)
+    capital = np.asarray(score.mll_capital, dtype=float)
+    raw_ratio = score.csm_to_mll_ratio
+    if raw_ratio is None:
+        ratio = np.full_like(base_csm, -1.0e100, dtype=float)
+    else:
+        ratio = np.asarray(raw_ratio, dtype=float)
+        ratio = np.where(np.isfinite(ratio), ratio, -1.0e100)
     return base_csm, capital, ratio
 
 
@@ -7613,6 +7621,23 @@ def _backward_induction(
         raise ValueError("advantage_screen_multiplier must be finite and non-negative.")
     raw_states = np.asarray(data.raw_states, dtype=float)
     exposure = np.asarray(data.inforce_exposure, dtype=float)
+    if objective_spec.kind == "csm_to_mll":
+        if stressed_data is None or set(stressed_data) != set(MLL_STRESS_IDS):
+            raise ValueError(
+                "CSM/MLL backward induction requires all four stress projections."
+            )
+        for stress_id in MLL_STRESS_IDS:
+            stressed_exposure = stressed_data[stress_id].inforce_exposure
+            if stressed_exposure is None:
+                raise ValueError(
+                    f"Stress projection {stress_id!r} lacks in-force exposure."
+                )
+            stressed_values = np.asarray(stressed_exposure, dtype=float)
+            if stressed_values.shape != exposure.shape:
+                raise ValueError(
+                    f"Stress projection {stress_id!r} exposure has invalid shape."
+                )
+            exposure = np.maximum(exposure, stressed_values)
     feature_names = tuple(data.state_feature_names)
     _inventory_feature_index(feature_names)
     active_years = [
@@ -7632,10 +7657,8 @@ def _backward_induction(
     if objective_spec.kind == "csm":
         immediate_components = base_components
     else:
-        if stressed_data is None or set(stressed_data) != set(MLL_STRESS_IDS):
-            raise ValueError(
-                "CSM/MLL backward induction requires all four stress projections."
-            )
+        if stressed_data is None:  # narrowed by the exposure validation above
+            raise RuntimeError("CSM/MLL stress data disappeared unexpectedly.")
         if data.model_point_csm is None:
             raise ValueError(
                 "CSM/MLL backward induction requires modelpoint-wise base CSM."
@@ -7682,6 +7705,7 @@ def _backward_induction(
         minimum_training_count=minimum_training_count,
         immediate_components=immediate_components,
         objective_spec=objective_spec,
+        activity_exposure=exposure,
     )
 
     gate_oof_r_squared: dict[int, Array] = {}
@@ -7770,6 +7794,7 @@ def _backward_induction(
         fallback_action=fallback_action,
         advantage_screen_multiplier=advantage_screen_multiplier,
         objective_spec=objective_spec,
+        activity_exposure=exposure,
     )
     oof_prediction = policy_evaluation.prediction
     oof_target = policy_evaluation.target
@@ -7828,6 +7853,7 @@ def _backward_induction(
         minimum_training_count=minimum_training_count,
         immediate_components=immediate_components,
         objective_spec=objective_spec,
+        activity_exposure=exposure,
     )
     if np.any(first_target_count <= 0):
         raise RuntimeError("First-year outer-fold action coverage is incomplete.")
@@ -8244,8 +8270,8 @@ def _evaluate_frozen_cap_csm_mll(
         lapse_down_stressed_csm_paths=stress_paths["lapse_down"],
         model_point_base_csm_paths=np.sum(model_point_values, axis=2).T,
     )
-    stresses = replace(
-        CapitalStresses(), lapse_mass=objective_spec.mass_lapse_fraction
+    stresses = _capital_stresses_for_mass_lapse(
+        objective_spec.mass_lapse_fraction
     )
     result = calculate_policy_level_csm_mll(
         base_csm=float(np.mean(path_values.base_csm_paths)),
@@ -8326,6 +8352,29 @@ def _add_csm_mll_fields(
         f"{stem}mll_framework": result.mll.framework,
         f"{stem}mass_lapse_method": result.mll.mass_lapse_method,
     })
+
+
+def _csm_mll_result_payload(
+    evaluation: FrozenCapCSMMLLEvaluation | None,
+    *,
+    portfolio_scale: float,
+) -> dict[str, object] | None:
+    if evaluation is None:
+        return None
+    result = evaluation.result
+    return {
+        "csm_aud": portfolio_scale * result.csm,
+        "mll_capital_aud": portfolio_scale * result.mll.capital,
+        "csm_to_mll_ratio": result.csm_to_mll_ratio,
+        "mortality_loss_aud": portfolio_scale * result.mll.mortality_loss,
+        "longevity_loss_aud": portfolio_scale * result.mll.longevity_loss,
+        "lapse_loss_aud": portfolio_scale * result.mll.lapse_loss,
+        "lapse_up_loss_aud": portfolio_scale * result.mll.lapse_up_loss,
+        "lapse_down_loss_aud": portfolio_scale * result.mll.lapse_down_loss,
+        "mass_lapse_loss_aud": portfolio_scale * result.mll.mass_lapse_loss,
+        "binding_lapse_stress": result.mll.binding_lapse_stress,
+        "framework": result.mll.framework,
+    }
 
 
 def _summed_csm_components(
@@ -8643,6 +8692,32 @@ def _validate_benchmark_cache_arrays(
         raise ValueError("Cached fixed-cap benchmark values are non-finite.")
 
 
+def _select_best_fixed_label(
+    labels: Sequence[str],
+    *,
+    selection_csm_paths: Mapping[str, Array],
+    selection_csm_to_mll: Mapping[str, float] | None,
+    objective_kind: str,
+) -> str:
+    """Pure fixed-grid selector with the same lower-cap tie convention."""
+    ordered = tuple(labels)
+    if not ordered:
+        raise ValueError("At least one fixed-cap label is required.")
+    if objective_kind == "csm_to_mll":
+        if selection_csm_to_mll is None:
+            raise ValueError("CSM/MLL fixed selection requires ratio values.")
+        values = np.asarray([
+            float(selection_csm_to_mll[label]) for label in ordered
+        ])
+    elif objective_kind == "csm":
+        values = np.asarray([
+            float(np.mean(selection_csm_paths[label])) for label in ordered
+        ])
+    else:
+        raise ValueError(f"Unsupported fixed-cap objective {objective_kind!r}.")
+    return ordered[int(_lower_cap_argmax(values))]
+
+
 def _evaluate_fixed_benchmarks(
     *,
     selection_scenarios: ScenarioSet,
@@ -8835,16 +8910,20 @@ def _evaluate_fixed_benchmarks(
         if label.startswith("fixed_cap_")
         and np.any(np.isclose(cap, ACTION_CAPS))
     ]
-    if use_csm_to_mll:
-        best_label = fixed_labels[int(_lower_cap_argmax(np.asarray([
-            float(selection_mll_evaluations[label].result.csm_to_mll_ratio)
-            for label in fixed_labels
-        ])))]
-    else:
-        best_label = max(
-            fixed_labels,
-            key=lambda label: float(np.mean(selection_path_values[label])),
-        )
+    best_label = _select_best_fixed_label(
+        fixed_labels,
+        selection_csm_paths=selection_path_values,
+        selection_csm_to_mll=(
+            {
+                label: float(
+                    selection_mll_evaluations[label].result.csm_to_mll_ratio
+                )
+                for label in fixed_labels
+            }
+            if use_csm_to_mll else None
+        ),
+        objective_kind=objective_spec.kind,
+    )
     best_paths = evaluation_path_values[best_label]
     selection_means = {
         label: portfolio_scale * float(np.mean(selection_path_values[label]))
@@ -10758,6 +10837,7 @@ def _plot_csm_mll_risk_profile(
     )
     fixed_values = np.asarray([float(best[field]) for field in fields])
     adaptive_values = np.asarray([float(candidate[field]) for field in fields])
+    candidate_accepted = bool(candidate.get("adaptive_policy_selected", False))
     positions = np.arange(len(fields))
     width = 0.36
     risk_axis.bar(
@@ -10766,7 +10846,12 @@ def _plot_csm_mll_risk_profile(
     )
     risk_axis.bar(
         positions + width / 2.0, adaptive_values, width,
-        label="Adaptive candidate", color="#D4882A",
+        label=(
+            "Adaptive candidate (validation passed)"
+            if candidate_accepted
+            else "Adaptive candidate (validation rejected; diagnostic only)"
+        ),
+        color="#D4882A",
     )
     risk_axis.set_xticks(positions, modules)
     risk_axis.set_ylabel("CSM loss / capital (AUD)")
@@ -10778,10 +10863,22 @@ def _plot_csm_mll_risk_profile(
     risk_axis.legend(loc="best")
     fixed_ratio = float(best["csm_to_mll_ratio"])
     adaptive_ratio = float(candidate["csm_to_mll_ratio"])
+    interval_lower = candidate.get(
+        "paired_bootstrap_csm_to_mll_interval_95pct_lower"
+    )
+    interval_upper = candidate.get(
+        "paired_bootstrap_csm_to_mll_interval_95pct_upper"
+    )
+    interval_text = (
+        ""
+        if interval_lower is None or interval_upper is None
+        else f"; OOS 95% CI [{float(interval_lower):+.3f}, "
+        f"{float(interval_upper):+.3f}]"
+    )
     figure.suptitle(
-        "Crediting-rate flexibility: CSM/MLL "
+        "Crediting-rate research candidate: CSM/MLL "
         f"{fixed_ratio:.3f} -> {adaptive_ratio:.3f}; "
-        f"delta {adaptive_ratio - fixed_ratio:+.3f}",
+        f"delta {adaptive_ratio - fixed_ratio:+.3f}{interval_text}",
         fontsize=12,
     )
     figure.tight_layout()
@@ -11128,6 +11225,12 @@ def main() -> None:
         "scalar_behaviour_schedule_validation": "strict_engine_loader",
         "csm_definition": (
             "PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)"
+        ),
+        "management_optimisation_objective": args.optimisation_objective,
+        "mll_capital_scope": (
+            "correlated mortality, longevity and lapse research proxy; no "
+            "Policyholder LSMC and no total regulatory capital"
+            if args.optimisation_objective == "csm_to_mll" else None
         ),
         "new_business_csm_proxy_scope": (
             "Fee Income = Product Fees + LIP Fees; Other Income = pathwise "
@@ -11866,9 +11969,8 @@ def main() -> None:
                 validation_fixed_mll.paths,
                 model_point_weights=np.ones(objective_spec.model_point_count),
                 capital_materiality=objective_spec.capital_materiality,
-                stresses=replace(
-                    CapitalStresses(),
-                    lapse_mass=objective_spec.mass_lapse_fraction,
+                stresses=_capital_stresses_for_mass_lapse(
+                    objective_spec.mass_lapse_fraction
                 ),
                 n_resamples=args.ratio_bootstrap_replicates,
                 confidence_level=0.95,
@@ -12057,9 +12159,8 @@ def main() -> None:
                 evaluation_fixed_mll.paths,
                 model_point_weights=np.ones(objective_spec.model_point_count),
                 capital_materiality=objective_spec.capital_materiality,
-                stresses=replace(
-                    CapitalStresses(),
-                    lapse_mass=objective_spec.mass_lapse_fraction,
+                stresses=_capital_stresses_for_mass_lapse(
+                    objective_spec.mass_lapse_fraction
                 ),
                 n_resamples=args.ratio_bootstrap_replicates,
                 confidence_level=0.95,
@@ -12616,7 +12717,8 @@ def main() -> None:
         "method": (
             "pathwise outer-fold direct-Q gas-storage LSMC with realised "
             "next-state targets, year-specific reachable inventory grids, and "
-            "identical frozen masks/screens in recursion and deployment; "
+            "identical frozen action masks in recursion and deployment; "
+            "vector-valued base/stress/modelpoint continuation regressions; "
             "identical compact fit/deployment basis; "
             "statistical dynamic "
             "Policyholder Income Election, lapse and withdrawal feedback"
@@ -13210,11 +13312,46 @@ def main() -> None:
         model_point_ids=training_data.model_point_ids,
     )
     policy_payload["flexibility_value_evaluation"] = {
+        "management_objective": objective_spec.kind,
         "sample_role": "final_evaluation",
         "used_for_policy_selection": False,
         "common_random_numbers": True,
         "primary_policy_role": "validated_deployed_policy",
+        "validation_ratio_bootstrap": (
+            None
+            if validation_ratio_bootstrap is None
+            else {
+                "estimate": validation_ratio_bootstrap.estimate,
+                "standard_error": validation_ratio_bootstrap.standard_error,
+                "ci_lower": validation_ratio_bootstrap.ci_lower,
+                "ci_upper": validation_ratio_bootstrap.ci_upper,
+                "confidence_level": validation_ratio_bootstrap.confidence_level,
+                "n_resamples": validation_ratio_bootstrap.n_resamples,
+                "seed": validation_ratio_bootstrap.seed,
+                "positive_gate_passed": (
+                    validation_ratio_bootstrap.positive_gate_passed
+                ),
+            }
+        ),
+        "adaptive_candidate_csm_mll": _csm_mll_result_payload(
+            evaluation_adaptive_mll,
+            portfolio_scale=portfolio_scale,
+        ),
+        "best_fixed_csm_mll": _csm_mll_result_payload(
+            evaluation_fixed_mll,
+            portfolio_scale=portfolio_scale,
+        ),
+        "validated_deployed_csm_mll": _csm_mll_result_payload(
+            deployed_mll,
+            portfolio_scale=portfolio_scale,
+        ),
         "validated_deployed_csm_aud": optimal_csm,
+        "validated_deployed_mll_capital_aud": deployed_mll_capital_aud,
+        "validated_deployed_csm_to_mll_ratio": deployed_ratio,
+        "best_fixed_csm_to_mll_ratio": best_fixed_ratio,
+        "validated_deployed_minus_best_fixed_csm_to_mll_ratio": (
+            deployed_ratio_delta
+        ),
         "paired_delta_validated_deployed_minus_best_fixed_aud": (
             deployed_flexibility_delta
         ),
@@ -13236,7 +13373,24 @@ def main() -> None:
             "reconciliation_gap": deployed_decomposition_gap,
         },
         "adaptive_candidate_csm_aud": adaptive_candidate_csm,
+        "adaptive_candidate_csm_to_mll_ratio": adaptive_candidate_ratio,
         "best_fixed_csm_aud": best_fixed_csm,
+        "adaptive_candidate_minus_best_fixed_csm_to_mll_ratio": (
+            candidate_ratio_delta
+        ),
+        "adaptive_candidate_minus_best_fixed_csm_to_mll_bootstrap": (
+            None
+            if evaluation_ratio_bootstrap is None
+            else {
+                "estimate": evaluation_ratio_bootstrap.estimate,
+                "standard_error": evaluation_ratio_bootstrap.standard_error,
+                "ci_lower": evaluation_ratio_bootstrap.ci_lower,
+                "ci_upper": evaluation_ratio_bootstrap.ci_upper,
+                "confidence_level": evaluation_ratio_bootstrap.confidence_level,
+                "n_resamples": evaluation_ratio_bootstrap.n_resamples,
+                "seed": evaluation_ratio_bootstrap.seed,
+            }
+        ),
         "paired_delta_adaptive_minus_best_fixed_aud": flexibility_delta,
         "paired_delta_standard_error_aud": flexibility_delta_se,
         "paired_delta_interval_95pct_aud": [
@@ -13297,7 +13451,7 @@ def main() -> None:
         "dynamic_behaviour_assumptions": loaded_behaviour.source_metadata(),
     }
     manifest = {
-        "output_schema_version": "crediting-cap-dynamic-behaviour-1.5",
+        "output_schema_version": "crediting-cap-dynamic-behaviour-2.0-csm-mll",
         "run_id": run_id,
         "created_utc": run_created_utc,
         "engine_version": ENGINE_VERSION,
@@ -13344,7 +13498,8 @@ def main() -> None:
             ),
             "inactive_year_policy_treatment": (
                 "no cap regression fitted; omitted from policy coefficients and "
-                "tables; shown as a grey zero-exposure tail in the policy plot"
+                "tables only after base and every MLL stress exposure are zero; "
+                "shown as a grey zero-exposure tail in the policy plot"
             ),
         },
         "training_scenario_fingerprint": market_sample_fingerprints["training"],
@@ -13372,12 +13527,35 @@ def main() -> None:
         "heston_substeps": args.heston_substeps,
         "exploration": exploration_metadata,
         "objective_scope": {
+            "management_objective": objective_spec.kind,
             "measurement": (
-                "approximate market-consistent New Business CSM proxy aligned "
-                "with insurer net value before Risk Margin; not IFRS 17 CSM"
+                "rolling conditional remaining-lifetime CSM divided by the "
+                "correlated mortality/longevity/lapse research-capital proxy"
+                if ratio_mode
+                else "approximate market-consistent New Business CSM proxy "
+                "aligned with insurer net value before Risk Margin"
             ),
-            "definition": (
+            "base_csm_definition": (
                 "PV(Fee Income) + PV(Other Income) - PV(Claims) - PV(Costs)"
+            ),
+            "mll_definition": {
+                "framework": MLL_FRAMEWORK,
+                "stress_revaluations": list(MLL_STRESS_IDS),
+                "mass_lapse_fraction": objective_spec.mass_lapse_fraction,
+                "mass_lapse_basis": (
+                    "positive signed base CSM by modelpoint before aggregation"
+                ),
+                "correlation_source": "CapitalStresses MLL submatrix",
+                "capital_materiality_unscaled_aud": (
+                    objective_spec.capital_materiality
+                ),
+                "stress_management_action_treatment": (
+                    "same frozen realised cap matrix; no stress refit"
+                ),
+            },
+            "ratio_dynamic_programming_scope": (
+                "time-consistent rolling conditional heuristic, not a proof of "
+                "the global time-zero ratio optimum"
             ),
             "optimization_direction": "maximize",
             "fee_income": ["fees_product", "fees_lip"],
@@ -13408,8 +13586,8 @@ def main() -> None:
             "excluded": [
                 "premium", "income_paid", "death_benefits",
                 "surrender_benefits", "partial_withdrawals",
-                "terminal_closeout", "capital", "risk_margin", "tax",
-                "cost_of_capital",
+                "terminal_closeout", "market capital", "expense capital",
+                "operational capital", "risk_margin", "tax", "cost_of_capital",
             ],
             "account_value_funded_benefit_treatment": (
                 "Income, death, surrender and withdrawal benefits funded from "
@@ -13425,15 +13603,16 @@ def main() -> None:
             "adaptive_candidate_flexibility_value": (
                 "paired independent direct monthly-projector rollout against "
                 "the selected best fixed cap, regardless of deployment gate; "
-                "research diagnostic, not the primary flexibility value"
+                "reports CSM, MLL, CSM/MLL and paired-bootstrap ratio delta"
             ),
             "validated_deployed_value": (
                 "independent direct rollout of the validation-approved adaptive "
-                "candidate or the preselected fixed fallback; primary "
-                "flexibility value relative to the best fixed cap"
+                "candidate or the preselected fixed fallback; primary CSM/MLL "
+                "risk-steering value relative to the best fixed cap"
             ),
             "bellman_value": (
-                "diagnostic only; never reported or plotted as realised CSM"
+                "conditional value-vector diagnostic only; never substituted "
+                "for the direct OOS policy-level CSM/MLL result"
             ),
         },
         "nonanticipativity": {
@@ -13458,7 +13637,7 @@ def main() -> None:
                 "direct randomised action-cell means with fold-pure future "
                 "continuation targets across all outer folds"
             ),
-            "realised_csm_evaluation_sample": (
+            "realised_policy_value_evaluation_sample": (
                 "independent final ScenarioSet; no control-fit fold"
             ),
             "evaluation_fold_used_in_any_regression_fit": False,
@@ -13492,6 +13671,14 @@ def main() -> None:
             "The New Business CSM measure is a signed market-consistent proxy aligned "
             "with insurer net value before Risk Margin. It is not reported IFRS 17 "
             "CSM and excludes Risk Adjustment, capital, tax and reinsurance.",
+            "MLL is a partial life-risk research proxy, not APRA/LAGIC capital, "
+            "Solvency II SCR or total economic capital. Market, expense, catastrophe, "
+            "operational and other modules are outside the denominator.",
+            "CSM/MLL is nonlinear and not Bellman-additive. The vector backward "
+            "pass maximises a rolling conditional remaining-lifetime ratio and is "
+            "therefore a management heuristic, not a mathematical proof of the "
+            "global time-zero ratio optimum. Economic evidence is based on the "
+            "full independent policy-level OOS revaluations and paired bootstrap.",
             "Account-Value-funded Income, death, surrender and withdrawal payments "
             "are investment-component cashflows and are not deducted again; only "
             "Guarantee Claims and separately named insurer-funded benefits are outgo.",
@@ -13502,25 +13689,29 @@ def main() -> None:
             f"decrements, and death is forced in the interval ending at age "
             f"{MORTALITY_TERMINAL_AGE}.",
             "Market paths continue until the youngest covered life would reach age "
-            "120, but years after all in-force exposure reaches zero are omitted "
-            "from the fitted cap policy and regression diagnostics and are shown "
-            "as an inactive grey tail in the policy plot.",
+            "120. A year is omitted from the fitted cap policy only after base, "
+            "mortality, longevity and both lapse-stress exposures are all zero.",
             "Joint-Life survival assumes independent lives and omits divorce, common "
             "mortality shocks and changing spouse eligibility.",
             "The admissible action and fixed-comparison grid is exactly 0.25%, then "
             "integer caps from 1% through 20%. Zero crediting and no upper cap are "
             "non-contractual sanity checks only.",
-            "The local Q-advantage screen uses residual RMSE/sqrt(n) as a "
-            "conservative stability diagnostic, not as a state-conditional "
-            "confidence interval. Only the paired direct validation and final "
-            "evaluation support policy-level statistical statements.",
+            (
+                "Local CSM standard-error screening is disabled for the ratio "
+                "because its units are incompatible with CSM/MLL. Only the paired "
+                "policy-level validation bootstrap and final evaluation support "
+                "statistical statements."
+                if ratio_mode
+                else "The local Q-advantage screen uses residual RMSE/sqrt(n) as "
+                "a conservative stability diagnostic, not a confidence interval."
+            ),
             "The best fixed admissible cap is selected on its own sample. The "
             "adaptive-versus-fixed deployment gate uses a second, disjoint sample, "
             "and the frozen adaptive candidate is always reported on a third final "
             "sample even if validation rejects deployment. The primary flexible-"
             "minus-fixed value belongs to the validated deployed policy; the "
-            "candidate delta is diagnostic. Both differences are paired on common "
-            "final-evaluation market, Income-Election and mortality draws.",
+            "candidate delta is diagnostic. CSM/MLL inference uses identical paired "
+            "resample indices across base, all stresses, modelpoints and both policies.",
         ],
     }
 
@@ -13651,12 +13842,15 @@ def main() -> None:
     total_elapsed = time.perf_counter() - run_started
     LOGGER.info(
         "RUN COMPLETE | elapsed %.1fs | first-year cap %.2f%% | "
-        "direct flexible CSM %.2f | best fixed cap %.2f%% / CSM %.2f",
+        "deployed CSM %.2f / CSM-to-MLL=%s | best fixed cap %.2f%% / "
+        "CSM %.2f / CSM-to-MLL=%s",
         total_elapsed,
         100.0 * selected_first_year_cap,
         optimal_csm,
+        "n/a" if deployed_ratio is None else f"{deployed_ratio:.6g}",
         100.0 * best_fixed_cap,
         best_fixed_csm,
+        "n/a" if best_fixed_ratio is None else f"{best_fixed_ratio:.6g}",
     )
     LOGGER.info(
         "Outputs | %d CSV | %d JSON | %d plot files | log=%s | directory=%s",

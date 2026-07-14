@@ -214,7 +214,7 @@ mass-lapse proxy on positive model-point CSM; the three modules are then
 aggregated with the documented life-risk correlation matrix. The primary
 selection measure is
 
-`capital-adjusted CSM = CSM - capital hurdle rate * MLL capital`.
+$\mathrm{CSM}^{\text{capital-adjusted}}=\mathrm{CSM}-hK_{\mathrm{MLL}}$.
 
 This evaluates a fixed product-design choice. It does not establish that an
 annually adaptive discretionary cap rule has value. Outputs include the full

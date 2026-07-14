@@ -11,9 +11,9 @@ crediting-cap control.
 The primary profitability measure is the signed new-business CSM proxy
 
 $$
-\mathrm{CSM}^{proxy}
-=PV(\text{Fee Income})+PV(\text{Other Income})
--PV(\text{Claims})-PV(\text{Costs}).
+\mathrm{CSM}^{\mathrm{proxy}}
+=\operatorname{PV}(\text{Fee Income})+\operatorname{PV}(\text{Other Income})
+-\operatorname{PV}(\text{Claims})-\operatorname{PV}(\text{Costs}).
 $$
 
 It is not a complete IFRS 17 CSM because the code does not perform grouping,
@@ -65,7 +65,8 @@ baseline introduces neither a bond term premium nor a market price of rate risk.
 The reference fund is rebalanced monthly:
 
 $$
-R^{fund}=0.30R^{global\ equity}+0.70R^{5y\ government\ bond}.
+R^{\mathrm{fund}}
+=0.30R^{\text{global equity}}+0.70R^{\text{5y government bond}}.
 $$
 
 The preferred bond return is obtained from pathwise Hull–White zero-coupon

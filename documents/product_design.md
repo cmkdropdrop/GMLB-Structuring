@@ -48,7 +48,7 @@ The equity and bond sleeves are combined before protection is applied. For one
 month,
 
 $$
-R^{fund}_{m}=0.30R^{equity}_{m}+0.70R^{bond}_{m}.
+R^{\mathrm{fund}}_{m}=0.30R^{\mathrm{equity}}_{m}+0.70R^{\mathrm{bond}}_{m}.
 $$
 
 The sleeves are reset to their targets after each monthly return. The annual
@@ -61,12 +61,12 @@ inflation-linkage or transaction-cost model.
 
 ## Annual crediting
 
-For crediting year $y$, let $R_y^{fund}$ be the full annual reference-fund
+For crediting year $y$, let $R_y^{\mathrm{fund}}$ be the full annual reference-fund
 return and $C_y$ the cap announced by the insurer. The contractual simple
 credit is
 
 $$
-g_y=\min\left(\max(R_y^{fund},0), C_y\right).
+g_y=\min\!\left(\max\!\left(R_y^{\mathrm{fund}},0\right),C_y\right).
 $$
 
 A 0.25% guaranteed minimum cap means $C_y\ge 0.25\%$. It does not prevent a
