@@ -8,15 +8,24 @@ import pytest
 
 from policy_engine.capital import CapitalStresses
 from policy_engine.crediting_capital import (
+    APRA_LAGIC_CAPITAL_CALCULATED,
+    IFRS17_CSM_CALCULATED,
     MLL_FRAMEWORK,
+    MLL_FUTURE_PROFIT_RISK_FRAMEWORK,
+    MLL_VALUE_BASIS,
+    REGULATORY_CAPITAL_CALCULATED,
     PolicyCSMPathArrays,
     adverse_csm_loss,
+    adverse_future_profit_loss,
     aggregate_mll_capital,
+    aggregate_mll_future_profit_risk,
     calculate_flexibility_delta,
     calculate_mll_capital,
+    calculate_mll_future_profit_risk,
     calculate_policy_level_csm_mll,
     compare_capital_metrics,
     evaluate_capital_adjusted_csm,
+    evaluate_risk_penalized_csm,
     mll_correlation_matrix,
     model_point_mass_lapse_proxy,
     paired_bootstrap_ratio_delta,
@@ -32,6 +41,8 @@ def test_adverse_csm_loss_is_one_sided_and_uses_signed_csm():
         adverse_csm_loss(100.0, math.nan)
     with pytest.raises(TypeError, match="real number"):
         adverse_csm_loss(True, 90.0)
+
+    assert adverse_future_profit_loss(100.0, 70.0) == pytest.approx(30.0)
 
 
 def test_mass_lapse_proxy_applies_positive_part_before_aggregation():
@@ -70,6 +81,9 @@ def test_mll_aggregation_uses_capital_stresses_submatrix():
     )
     # 10^2 + 20^2 + 30^2 - .5*10*20 + .5*20*30 = 1600.
     assert aggregate_mll_capital(10.0, 20.0, 30.0) == pytest.approx(40.0)
+    assert aggregate_mll_future_profit_risk(
+        10.0, 20.0, 30.0
+    ) == pytest.approx(40.0)
     with pytest.raises(ValueError, match="non-negative"):
         aggregate_mll_capital(-1.0, 0.0, 0.0)
 
@@ -99,6 +113,33 @@ def test_mll_capital_selects_largest_lapse_stress_and_uses_custom_mass_rate():
     assert result.framework == MLL_FRAMEWORK
     assert result.mass_lapse_rate == pytest.approx(0.25)
     assert result.mass_lapse_is_revaluation is False
+
+
+def test_mll_future_profit_risk_api_is_numeric_legacy_alias_with_clear_status():
+    arguments = {
+        "base_csm": 100.0,
+        "mortality_stressed_csm": 95.0,
+        "longevity_stressed_csm": 90.0,
+        "lapse_up_stressed_csm": 80.0,
+        "lapse_down_stressed_csm": 85.0,
+        "model_point_csms": [100.0],
+        "model_point_weights": [1.0],
+    }
+    canonical = calculate_mll_future_profit_risk(**arguments)
+    legacy = calculate_mll_capital(**arguments)
+
+    assert canonical == legacy
+    assert canonical.future_profit_risk == pytest.approx(canonical.capital)
+    assert canonical.framework == MLL_FUTURE_PROFIT_RISK_FRAMEWORK
+    assert canonical.framework == MLL_FRAMEWORK
+    assert canonical.risk_measure_basis == MLL_VALUE_BASIS
+    assert canonical.value_basis == MLL_VALUE_BASIS
+    assert canonical.regulatory_capital_calculated is False
+    assert canonical.apra_lagic_capital_calculated is False
+    assert canonical.ifrs17_csm_calculated is False
+    assert REGULATORY_CAPITAL_CALCULATED is False
+    assert APRA_LAGIC_CAPITAL_CALCULATED is False
+    assert IFRS17_CSM_CALCULATED is False
 
 
 def test_lapse_binding_tie_break_is_deterministic():
@@ -134,6 +175,32 @@ def test_capital_adjusted_csm_is_robust_and_ratio_is_optional():
     )
     assert onerous.capital_adjusted_csm == pytest.approx(-10.5)
     assert onerous.csm_to_capital == pytest.approx(-2.0)
+
+
+def test_risk_penalized_csm_properties_are_canonical_numeric_aliases():
+    canonical = evaluate_risk_penalized_csm(
+        100.0,
+        20.0,
+        risk_penalty_weight=0.10,
+        risk_materiality=0.01,
+    )
+    legacy = evaluate_capital_adjusted_csm(
+        100.0,
+        20.0,
+        capital_hurdle=0.10,
+        capital_materiality=0.01,
+    )
+
+    assert canonical == legacy
+    assert canonical.future_profit_risk == pytest.approx(20.0)
+    assert canonical.risk_penalty_weight == pytest.approx(0.10)
+    assert canonical.risk_materiality == pytest.approx(0.01)
+    assert canonical.risk_penalty == pytest.approx(2.0)
+    assert canonical.risk_penalized_csm == pytest.approx(98.0)
+    assert canonical.csm_to_mll_risk_ratio == pytest.approx(5.0)
+    assert canonical.regulatory_capital_calculated is False
+    assert canonical.apra_lagic_capital_calculated is False
+    assert canonical.ifrs17_csm_calculated is False
 
 
 @pytest.mark.parametrize(
@@ -262,6 +329,9 @@ def test_policy_level_ratio_can_reject_higher_csm_with_worse_mll():
     assert higher_csm.csm > lower_csm.csm
     assert higher_csm.mll_capital > lower_csm.mll_capital
     assert higher_csm.csm_to_mll_ratio < lower_csm.csm_to_mll_ratio
+    assert higher_csm.future_profit_risk == higher_csm.mll_capital
+    assert higher_csm.csm_to_mll_risk_ratio == higher_csm.csm_to_mll_ratio
+    assert higher_csm.regulatory_capital_calculated is False
 
 
 def test_policy_level_ratio_is_none_at_materiality_and_mass_lapse_has_no_netting():
@@ -318,6 +388,12 @@ def test_lsmc_value_score_preserves_leading_dimensions_and_scaling():
     assert score.csm_to_mll_ratio[0, 1] == pytest.approx(
         score.csm_to_mll_ratio[0, 0]
     )
+    assert np.array_equal(score.future_profit_risk, score.mll_capital)
+    assert np.array_equal(
+        score.csm_to_mll_risk_ratio,
+        score.csm_to_mll_ratio,
+    )
+    assert score.regulatory_capital_calculated is False
 
     scalar_immaterial = score_lsmc_value_vectors(
         [100.0, 0.0, 0.0, 0.0, 0.0,

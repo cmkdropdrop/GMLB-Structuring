@@ -2,15 +2,17 @@
 
 ## Public command-line entry points
 
-An editable install from the repository root exposes five commands through
-[`pyproject.toml`](../pyproject.toml):
+An editable install from the repository root exposes six command names through
+[`pyproject.toml`](../pyproject.toml). One of them is a legacy alias, so these
+represent five workflow families:
 
 | Command | Implementation | Intended use |
 |---|---|---|
 | `precompute-q-cache` | [`precompute_q_market_and_hedge_cache.py`](../code/portfolio_simulations/precompute_q_market_and_hedge_cache.py) | Create or validate exact Q-market and conditional-MC hedge caches |
 | `portfolio-risk-analysis` | [`run_portfolio_risk_analysis.py`](../code/portfolio_simulations/run_portfolio_risk_analysis.py) | Recommended end-to-end cap, behaviour and optional stress workflow |
-| `crediting-capital-analysis` | [`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py) | Dynamic-only fixed-cap MLL capital and capital-adjusted profitability study |
-| `optimise-crediting-dynamic` | [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py) | Prepare exact caches, then run the strict one-modelpoint Dynamic Time-0 capital-adjusted reader |
+| `crediting-future-profit-risk-analysis` | [`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py) | Dynamic-only fixed-cap MLL-FPAR research study |
+| `crediting-capital-analysis` | [`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py) | Legacy alias for `crediting-future-profit-risk-analysis`; not a regulatory-capital calculation |
+| `optimise-crediting-dynamic` | [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py) | Prepare exact caches, then run the strict one-modelpoint Dynamic Time-0 custom-CSM reader with secondary MLL-FPAR diagnostics |
 | `optimise-crediting-lsmc` | [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py) | Prepare exact caches, then run the strict combined LSMC-policyholder optimiser |
 
 Use `python -m pip install -e ".[test]"` once from the repository root. Direct
@@ -80,23 +82,36 @@ figures.
 
 ### `run_crediting_rate_capital_analysis.py`
 
-This is the prepare-then-read Dynamic-only capital orchestrator. For every cap
-it invokes the authorised precompute runner to validate or create only the
-exact required base market and hedge caches, then launches
+This is the prepare-then-read Dynamic-only MLL future-profit-at-risk
+orchestrator behind the canonical `crediting-future-profit-risk-analysis`
+command. For every cap it invokes the authorised precompute runner to validate
+or create only the exact required base market and hedge caches, then launches
 `run_portfolio_valuation.py` for base, mortality, longevity, lapse-up and
 lapse-down revaluations. Non-market stresses must preserve the base cache keys.
 
 The command hard-codes dynamic Income Election and post-Election behaviour and
 rejects any child output with `lsmc_used=true`. It never calls
-`run_portfolio_valuation_lsmc.py`. Outputs include the reconciled stress CSMs,
-stand-alone losses, permanent and approximate mass-lapse amounts, correlated
-MLL life-risk capital proxy, capital-adjusted CSM, secondary CSM/capital ratio,
-selection result, manifest and plots.
+`run_portfolio_valuation_lsmc.py`. Outputs include the reconciled stressed
+custom-CSM values, stand-alone future-profit losses, permanent and approximate
+mass-lapse amounts, correlated MLL-FPAR, FPAR-penalised CSM sensitivity,
+CSM/MLL-FPAR ratio, selection result, manifest and plots.
 
-The default ranking is $\mathrm{CSM}-0.06K_{\mathrm{MLL}}$. This is a one-year research
-capital charge, not a full Risk Margin. The MLL amount is partial and the
-mass-lapse leg is a model-point positive-value proxy rather than a revaluation; the
-runner must not be used or described as an APRA capital calculation.
+The default and primary ranking is custom CSM. The explicit
+`--objective fpar_penalised_csm` and `--objective csm_to_fpar` choices rank by
+secondary research sensitivities instead. The dimensionless 6% factor in the
+first sensitivity is an FPAR penalty weight, not a capital charge,
+cost-of-capital rate or full Risk Margin. The MLL-FPAR amount is partial and
+the mass-lapse leg is a model-point positive-value proxy rather than a
+revaluation. `crediting-capital-analysis`, the old option names and
+capital-named output columns remain compatibility aliases only.
+
+The runner must not be used or described as an APRA capital calculation. APRA's
+actual boundary is set out in [LPS 115](https://www.apra.gov.au/standards/lps-115)
+for the Insurance Risk Charge, [LPS 112](https://www.apra.gov.au/standards/lps-112)
+for adjusted policy liabilities and capital base, and
+[LPS 110](https://www.apra.gov.au/standards/lps-110) for the prescribed-capital
+and Prudential Capital Requirement framework. The runner also does not
+calculate an IFRS 17 CSM; its custom CSM is a repository profitability proxy.
 
 ### `run_portfolio_valuation_lsmc.py`
 
@@ -110,8 +125,8 @@ action set. It requires exactly one model point.
 The customer objective is the Q-expectation of income, surrender and finite
 terminal-closeout cashflows discounted by today's Australian zero curve. The
 fit contains no mortality or death benefit; configured mortality is restored
-for actuarial and CSM rollout. Whole-path cross-fitting estimates continuation
-values inside one exact Q sample. The V11 rule is deployed directly on that
+for actuarial and custom-CSM rollout. Whole-path cross-fitting estimates
+continuation values inside one exact Q sample. The V11 rule is deployed directly on that
 same sample: there is no separate validation/evaluation sample, policy-selection
 gate, RMSE exercise buffer or fixed-policy substitution. Legacy sample flags
 remain parseable
@@ -157,18 +172,19 @@ risk-neutral expected values discounted to Time 0 with the current curve.
 The gas-storage formulation uses account value per initial premium as an
 endogenous inventory grid. Node continuation fits use an intercept, ATM
 one-year call value, reference-fund level and overnight rate. Each action-Q
-target is the realised annual 14-value Base/Stress CSM payload plus the next
-value interpolated at that same path's realised next account value. The
+target is the realised annual 14-value Base/Stress custom-CSM payload plus the
+next value interpolated at that same path's realised next account value. The
 six-column action basis adds account value and squared account value.
 
-Because MLL is non-additive, the runner fits 21 predeclared additive Base/Stress
-support policies plus one conditional-ratio heuristic, then ranks the finished
-fixed-anchored payloads on the primary Time-0 score
-$\mathrm{CSM}-0.06\,\mathrm{MLL}$. CSM/MLL is a secondary reported efficiency
-measure and does not select the policy. There is no additional CSM constraint;
-best fixed is the explicit comparator under the same 6% score. One complete Q
-sample is shared by fitting, candidate ranking and fixed caps; no OOS sample,
-forward roll, deployment gate or future policy schedule is produced.
+Because MLL-FPAR is non-additive, the runner fits 21 predeclared additive
+Base/Stress support policies plus one conditional-ratio heuristic, then ranks
+the finished fixed-anchored payloads on the primary Time-0 custom-CSM score.
+$\mathrm{CSM}-0.06\,R_{\mathrm{MLL}}$ and CSM/MLL-FPAR are secondary reported
+sensitivities and do not select the policy. There is no additional CSM
+constraint; best fixed is the explicit comparator under custom CSM. One
+complete Q sample is shared by fitting, candidate ranking and fixed caps; no
+OOS sample, forward roll, deployment gate or future policy schedule is
+produced.
 
 The standard hedge is the sold bull call spread. The current cap affects
 statistical behaviour through account value, guarantee moneyness and realised
@@ -214,8 +230,8 @@ Files beginning with `_` are implementation helpers, not public commands:
 | One fixed cap with statistical Dynamic behaviour | `run_portfolio_valuation.py` |
 | One fixed cap with direct optimal-policyholder diagnostics | `run_portfolio_valuation_lsmc.py` |
 | Dynamic versus direct LSMC V11 across caps and optional stresses | `portfolio-risk-analysis` |
-| Fixed caps under Dynamic mortality/longevity/lapse capital | `crediting-capital-analysis` |
-| Time-0 $\mathrm{CSM}-0.06\,\mathrm{MLL}$ value of annual cap flexibility under statistical Dynamic behaviour, with CSM/MLL reported secondarily | `optimise-crediting-dynamic` |
+| Fixed caps under Dynamic mortality/longevity/lapse MLL-FPAR | `crediting-future-profit-risk-analysis` |
+| Time-0 custom-CSM value of annual cap flexibility under statistical Dynamic behaviour, with 6%-FPAR penalty and CSM/MLL-FPAR reported secondarily | `optimise-crediting-dynamic` |
 | LSMC-follower cap research | `optimise-crediting-lsmc` |
 | Prepare one known exact cache specification | `precompute-q-cache` |
 | Debug an optimiser against already prepared exact caches | Direct optimiser implementation file |
@@ -234,8 +250,9 @@ Files beginning with `_` are implementation helpers, not public commands:
    action-cell diagnostics as a deployment rule.
 6. For the separate Customer-LSMC/Stackelberg route, follow its own declared
    sample and deployment restrictions.
-7. Check the CSM and portfolio aggregation reconciliations before interpreting
-   a result.
+7. Check the custom-CSM and portfolio aggregation reconciliations before
+   interpreting a result; do not reinterpret custom CSM as IFRS 17 CSM or
+   MLL-FPAR as required capital.
 8. Treat one-point customer-LSMC runs as method/design sensitivities, not
    portfolio evidence, regardless of path count.
 9. Promote a figure to `results/document_figures/` only from a completed,

@@ -21,6 +21,7 @@ test = ["pytest>=7.0"]
 [project.scripts]
 precompute-q-cache = "portfolio_simulations.precompute_q_market_and_hedge_cache:main"
 portfolio-risk-analysis = "portfolio_simulations.run_portfolio_risk_analysis:main"
+crediting-future-profit-risk-analysis = "portfolio_simulations.run_crediting_rate_capital_analysis:main"
 crediting-capital-analysis = "portfolio_simulations.run_crediting_rate_capital_analysis:main"
 optimise-crediting-dynamic = "portfolio_simulations.run_crediting_rate_optimisation:dynamic_main"
 optimise-crediting-lsmc = "portfolio_simulations.run_crediting_rate_optimisation:lsmc_main"

@@ -1,0 +1,15 @@
+row_type,component,display_label,csm_group,csm_sign,best_fixed_amount_aud,flexible_amount_aud,flexible_minus_best_fixed_amount_aud,best_fixed_csm_contribution_aud,flexible_csm_contribution_aud,flexibility_csm_impact_aud,reconciliation_role,note
+component,fees_product,Product fees,fee_income,1.0,6862.481959463519,8206.80638085919,1344.3244213956714,6862.481959463519,8206.80638085919,1344.3244213956714,additive_csm_component,
+component,fees_lip,LIP fees,fee_income,1.0,26306.180844610157,31459.424459960235,5153.2436153500785,26306.180844610157,31459.424459960235,5153.2436153500785,additive_csm_component,
+component,crediting_margin,Money-market income + retained hedge gain,other_income,1.0,110552.60029898523,161470.44411720306,50917.843818217836,110552.60029898523,161470.44411720306,50917.843818217836,additive_csm_component,Crediting margin equals money-market income plus retained hedge gain; under the standard sold cap leg the retained hedge gain is zero.
+component,mva_retained,Retained MVA,other_income,1.0,797.5335099097028,847.846530434212,50.31302052450917,797.5335099097028,847.846530434212,50.31302052450917,additive_csm_component,
+component,aps_retained,Retained APS,other_income,1.0,0.0,0.0,0.0,0.0,0.0,0.0,additive_csm_component,
+component,guarantee_claims,Guarantee claims,claims,-1.0,71008.58755199493,37244.679747874354,-33763.90780412058,-71008.58755199493,-37244.679747874354,33763.90780412058,additive_csm_component,
+component,other_insurer_funded_benefits,Other insurer-funded benefits,claims,-1.0,0.0,0.0,0.0,-0.0,-0.0,0.0,additive_csm_component,
+component,expenses,Operating expenses,costs,-1.0,8939.384871080772,9035.572349862254,96.18747878148133,-8939.384871080772,-9035.572349862254,-96.18747878148133,additive_csm_component,
+component,hedge_costs,Option / hedge costs,costs,-1.0,12419.554092693556,51863.88872731021,39444.33463461665,-12419.554092693556,-51863.88872731021,-39444.33463461665,additive_csm_component,
+group_total,fee_income,Fee income,fee_income,1.0,33168.662804073676,39666.23084081942,6497.568036745746,33168.662804073676,39666.23084081942,6497.568036745746,subtotals_not_additional_to_components,Subtotal of the detailed component rows above.
+group_total,other_income,Other income,other_income,1.0,111350.13380889493,162318.29064763727,50968.15683874235,111350.13380889493,162318.29064763727,50968.15683874235,subtotals_not_additional_to_components,Subtotal of the detailed component rows above.
+group_total,claims,Claims,claims,-1.0,71008.58755199493,37244.679747874354,-33763.90780412058,-71008.58755199493,-37244.679747874354,33763.90780412058,subtotals_not_additional_to_components,Subtotal of the detailed component rows above.
+group_total,costs,Costs,costs,-1.0,21358.93896377433,60899.46107717246,39540.52211339813,-21358.93896377433,-60899.46107717246,-39540.52211339813,subtotals_not_additional_to_components,Subtotal of the detailed component rows above.
+csm_total,csm,CSM,total,1.0,52151.27009719935,103840.38066340989,51689.11056621054,52151.27009719935,103840.38066340989,51689.11056621054,sum_of_component_rows,Fee income + other income - claims - costs.

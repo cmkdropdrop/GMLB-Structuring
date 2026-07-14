@@ -1,0 +1,54 @@
+{
+  "schema": "crediting-flexibility-time0-capital-adjusted-curation-4.0",
+  "source_run_id": "20260714T151746.544341Z",
+  "source_run_schema": "crediting-flexibility-time0-capital-adjusted-3.2",
+  "source_run_path": "results/crediting_rate_optimisation/time0_csm_mll_one_modelpoint_capital_adjusted_4200_targeted/20260714T151746.544341Z",
+  "source_bundle": "results/document_figures/source_data/time0_crediting_flexibility_20260714T151746.544341Z",
+  "parent_full_grid_run_id": "20260714T084838.270769Z",
+  "parent_full_grid_source_bundle": "results/document_figures/source_data/time0_crediting_flexibility_20260714T084838.270769Z",
+  "parent_full_grid_role": "established base_csm as the highest CSM-minus-6%-MLL candidate across the completed policy-class grid",
+  "recovery_method": {
+    "kind": "targeted_payload_recovery",
+    "candidate_policy_class": "base_csm",
+    "fitted_chain_count": 2,
+    "full_grid_refitted": false,
+    "market_path_count": 4200,
+    "market_seed": 2026,
+    "scenario_fingerprint": "b38aef9d75767f1aae3b5eb1cba8d54f94677d7721c8e27b34ae9cc24a535849",
+    "market_cache_key": "8f19dbd9128be386d98451ce9bb9e887463b49614907abb16ff9dc4b6b889797",
+    "hedge_cache_key": "996de3b7c1508041201ac8983312befb5bba182db4c1b600809f628242b6502f",
+    "elapsed_seconds": 99.6
+  },
+  "endpoint_validation_against_parent_full_grid": {
+    "base_csm_expected_aud": 103840.38066340989,
+    "base_csm_recovered_aud": 103840.38066340989,
+    "base_csm_gap_aud": 0.0,
+    "mll_expected_aud": 45213.133927701914,
+    "mll_recovered_aud": 45213.133927701914,
+    "mll_gap_aud": 0.0,
+    "mll_shapley_reconciliation_gap_aud": 3.637978807091713e-12
+  },
+  "report_only_generation": {
+    "report_id": "20260714T152213.374326Z",
+    "market_cache_loaded": false,
+    "projection_run": false,
+    "management_lsmc_fit": false,
+    "script_sha256": "776ea9c3f5095a91c5c9932dfee070b14eb90b805779555a7976dbb7880a7d7d",
+    "manifest": "source_data/time0_crediting_flexibility_20260714T151746.544341Z/component_report_manifest.json"
+  },
+  "svg_curation": "trailing XML path whitespace was normalized after promotion; geometry and rendered content are unchanged",
+  "promoted_figures_sha256": {
+    "time0_crediting_flexibility_csm_mll.png": "a8a1b455b8581a647b6b424bcccbee23666061b69b9878def28cb44860177641",
+    "time0_crediting_flexibility_csm_mll.svg": "ce5bf7a4b4c1973890bdb2a43635984a9edae52e3762e341af6edfa7fc96a2f3",
+    "time0_crediting_flexibility_component_waterfalls.png": "67a55aac389c7fe1a8ab2f4e64eb99f510d0ccf7e0dfe80874820443e86f8652",
+    "time0_crediting_flexibility_component_waterfalls.svg": "2f4e595eae8eba80cde4719f2a81ac05c3fffe09020b5aec77cb0f23fe10ccd0"
+  },
+  "component_source_sha256": {
+    "management_lsmc_time_zero_value_vector.json": "6a72aaac272fc197e62303d3d2ee2b50f51502642a35074924e20e7d28392e74",
+    "time_zero_flexibility_comparison.csv": "596b5889a0e0191097c0b326e689b70d79f603deef3683a412ff88b5c5cbfdbf",
+    "time_zero_csm_component_comparison.csv": "b037457a193b2fc88c5d6c87d4773a481232c99e23a8c1c243fc4cc61b70f190",
+    "time_zero_mll_component_comparison.csv": "5e25aee6db8a61334e117dc2ce0320fe703e520bca08b5bfe8e489ff938c2453",
+    "optimization_summary.json": "4ead05f165313836a16945e4938278e0d288c9dca4155aa85908ecab6e048707",
+    "run_manifest.json": "564601c0c2365fdb4efc468fb996a341d50c0f03d2ebe555be7d63fe5574e085"
+  }
+}

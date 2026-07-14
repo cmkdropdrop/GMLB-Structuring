@@ -30,9 +30,9 @@ fund value. Conversely, a valuable remaining guarantee can suppress lapse.
 This phase asymmetry is why one fixed cap need not be optimal throughout the
 life of the portfolio.
 
-## New-business CSM proxy
+## New-business custom-CSM profitability proxy
 
-The standard objective is
+The repository's standard profitability objective is
 
 $$
 \mathrm{CSM}^{\mathrm{proxy}}
@@ -49,7 +49,11 @@ where $F$ is Fee Income, $O$ Other Income, $K$ Claims and $C$ Costs.
 | Costs | Acquisition/maintenance and complete option-spread cost | Higher cap generally increases hedge cost |
 
 The signed reconciliation is mandatory. A chart must not compare a partial
-margin such as fees less guarantee claims and call it CSM.
+margin such as fees less guarantee claims and call it CSM. This quantity is a
+repository-specific market-consistent insurer-value/profitability proxy. It is
+not the IFRS 17 contractual service margin: the repository does not perform
+IFRS 17 grouping, initial-recognition, fulfilment-cash-flow, risk-adjustment or
+CSM roll-forward calculations.
 
 ## Option-spread economics
 
@@ -81,7 +85,7 @@ reference-fund performance and does not change customer crediting.
 The portfolio-risk workflow reports market-consistent values and
 shock-and-revalue sensitivities, including:
 
-- CSM proxy and its four components;
+- custom-CSM profitability proxy and its four components;
 - guarantee claims and hedge cost;
 - fee and backing-income duration;
 - lapse and income-election outcomes;
@@ -92,12 +96,13 @@ shock-and-revalue sensitivities, including:
   behaviour in the Time-0 management workflow.
 
 The current outputs are not pathwise shareholder-loss VaR/CTE, APRA LAGIC
-capital or a complete IFRS 17 risk adjustment. Any research capital or
-cost-of-capital quantity is labelled as a proxy.
+capital, an APRA prescribed capital amount or a complete IFRS 17 risk
+adjustment. Stress results derived from the custom-CSM proxy are labelled as
+future-profit-at-risk research sensitivities, not as capital.
 
-## Dynamic-only MLL capital proxy
+## Dynamic-only MLL future-profit-at-risk proxy
 
-The cache-strict capital workflow is
+The cache-strict MLL future-profit-at-risk workflow is
 [`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py).
 It deliberately calls only the statistical-Dynamic portfolio reader. Its hard
 gates require dynamic Income Election, dynamic post-Election behaviour,
@@ -105,16 +110,17 @@ gates require dynamic Income Election, dynamic post-Election behaviour,
 path-congruent hedge-price cache. Missing entries are prepared only by the
 authorised precompute runner.
 
-That runner is the separate fixed-design capital workflow. Its earlier
+That runner is the separate fixed-design MLL-FPAR workflow. Its earlier
 four-modelpoint and 1,000-path documentation results remain historical
 sensitivities; they are not inputs or evidence for the one-modelpoint Time-0
 annual-flexibility value below.
 
 The current annual-flexibility valuation is implemented in
 [`optimize_crediting_rate_dynamic_behaviour_alt.py`](../code/portfolio_simulations/optimize_crediting_rate_dynamic_behaviour_alt.py).
-It applies the same MLL definitions to fixed caps and fitted management-policy
-candidates. It also hard-requires exactly one modelpoint and never calls the
-Customer-LSMC runner. Its LSMC is solely the insurer's Management LSMC.
+It applies the same MLL-FPAR definitions to fixed caps and fitted
+management-policy candidates. It also hard-requires exactly one modelpoint and
+never calls the Customer-LSMC runner. Its LSMC is solely the insurer's
+Management LSMC.
 
 For each fixed cap and each fitted management-policy candidate,
 common-random-number revaluations apply:
@@ -134,17 +140,34 @@ SCR: [mortality Article 137](https://www.eiopa.europa.eu/rulebook/solvency-ii-si
 [longevity Article 138](https://www.eiopa.europa.eu/rulebook/solvency-ii-single-rulebook/article-5758_en) and
 [lapse Article 142](https://www.eiopa.europa.eu/rulebook/solvency-ii-single-rulebook/article-5762_en).
 
-The Australian prudential framework is different. APRA LPS 115 requires an
-insurer to determine appropriate mortality, longevity and lapse stress margins
-at a 99.5% one-year sufficiency level for its own liabilities. The fixed research
-factors in this repository therefore must not be described as APRA capital:
-[APRA LPS 115](https://www.apra.gov.au/standards/lps-115).
+The Australian prudential framework is different. Under
+[APRA LPS 115](https://www.apra.gov.au/standards/lps-115), the Insurance Risk
+Charge is based on the reduction in capital base when adjusted policy
+liabilities are replaced by appropriately stressed liabilities; it is not a
+change in this repository's custom CSM. The adjusted-policy-liability and
+capital-base boundary is specified in
+[APRA LPS 112](https://www.apra.gov.au/standards/lps-112), while
+[APRA LPS 110](https://www.apra.gov.au/standards/lps-110) builds the prescribed
+capital amount from insurance, asset, concentration and operational risk,
+minus the aggregation benefit and plus the combined-stress adjustment; the PCR
+also includes any supervisory adjustment. None of those APRA calculations is
+implemented here. The fixed research factors in this repository therefore
+must not be described as APRA capital. If APRA classifies the product as
+variable-annuity business, LPS 110 Attachment A additionally requires an
+APRA-approved method that considers asset and insurance risks simultaneously;
+the current workflow is not that method.
 
-For signed CSM proxy $J$, each stand-alone amount is
+For signed custom-CSM proxy $J$, each stand-alone future-profit loss is
 
 $$
-K_i=\left[J_{\mathrm{base}}-J_{\mathrm{stress},i}\right]_+.
+R_i=\left[J_{\mathrm{base}}-J_{\mathrm{stress},i}\right]_+.
 $$
+
+The result is called **MLL future profit at risk (MLL-FPAR)**. It measures the
+positive loss of the repository's custom CSM under the declared mortality,
+longevity and lapse stresses. It is neither required capital nor an IFRS 17 CSM
+movement. Historical code, files and column names containing `capital` are
+compatibility aliases for this same research quantity.
 
 The lapse module is the maximum of lapse up, lapse down and a 40% mass-lapse
 proxy. The latter is calculated model point by model point from positive CSM
@@ -157,7 +180,7 @@ The Time-0 flexibility calculation uses exactly one modelpoint. In that special
 case the mass-lapse amount is simply 40% of positive total CSM. If mortality and
 longevity are non-adverse and mass lapse is the only binding module, the ratio
 therefore has the mechanical ceiling
-$\mathrm{CSM}/K_{\mathrm{MLL}}=1/0.40=2.5$. This is a property of the proxy, not
+$\mathrm{CSM}/R_{\mathrm{MLL}}=1/0.40=2.5$. This is a property of the proxy, not
 a universal actuarial optimum.
 
 The Mortality/Longevity/Lapse submodules use the existing correlation submatrix
@@ -168,15 +191,18 @@ $$
 -0.25&1&0.25\\
 0&0.25&1
 \end{pmatrix},\qquad
-K_{\mathrm{MLL}}=\sqrt{\mathbf{K}^{\mathsf T}\rho_{\mathrm{MLL}}\mathbf{K}}.
+R_{\mathrm{MLL}}=\sqrt{\mathbf{R}^{\mathsf T}\rho_{\mathrm{MLL}}\mathbf{R}}.
 $$
 
-This partial result excludes market, expense, catastrophe, operational,
-concentration and tax-absorption effects. Its correct label is **MLL life-risk
-capital proxy**, never total SCR, prescribed capital amount or APRA/LAGIC
-capital.
+This is the repository's Solvency-II-style three-module research submatrix; it
+is not an APRA-prescribed correlation matrix.
 
-## Time-zero capital-adjusted management objective
+This partial result excludes market, expense, catastrophe, operational,
+concentration and tax-absorption effects. Its correct label is **MLL-FPAR
+research proxy**, never total SCR, prescribed capital amount, APRA/LAGIC
+capital or an IFRS 17 CSM change.
+
+## Time-zero management objective and FPAR sensitivity
 
 The current question is the value today of the contractual right to reset the
 crediting cap annually, not the construction or validation of a deployment
@@ -185,24 +211,30 @@ to Time 0 with the current Australian zero curve. The fixed-cap comparator and
 Management LSMC use the same complete cached Q sample. There is no held-out
 sample, different OOS seed, forward roll, policy replay or bootstrap gate.
 
-The primary ranking measure is the AUD capital-adjusted value
+The primary ranking measure is the complete custom CSM
 
 $$
-J_{\mathrm{adj}}(\pi)=J(\pi)-hK_{\mathrm{MLL}}(\pi),
-\qquad h=0.06,
+J(\pi).
+$$
+
+The following risk-penalised value is reported only as a secondary research
+sensitivity:
+
+$$
+J_{\mathrm{FPAR}}(\pi)=J(\pi)-\lambda R_{\mathrm{MLL}}(\pi),
+\qquad \lambda=0.06.
 $$
 
 where $J$ is the complete CSM proxy and $\pi$ is either a fixed cap or a fitted
-annual-management candidate. The 6% factor is a one-year research capital
-hurdle, not a full projected Risk Margin, regulatory cost of capital or APRA
-requirement. The lifetime efficiency diagnostic $J/K_{\mathrm{MLL}}$ is
-reported alongside the primary AUD objective. A candidate with immaterial
-capital has no ratio; the implementation does not manufacture a denominator
-with an epsilon.
+annual-management candidate. The dimensionless 6% factor is a user-selected
+FPAR penalty weight, not a capital charge, cost-of-capital rate, full projected
+Risk Margin or APRA requirement. The lifetime diagnostic
+$J/R_{\mathrm{MLL}}$ is also secondary. A candidate with immaterial FPAR has no
+ratio; the implementation does not manufacture a denominator with an epsilon.
 
-MLL is nonlinear because stand-alone losses contain positive parts, the lapse
-module contains a maximum and MLL contains a correlation norm. The complete
-capital-adjusted objective therefore cannot be inserted directly as an additive
+MLL-FPAR is nonlinear because stand-alone losses contain positive parts, the
+lapse module contains a maximum and MLL-FPAR contains a correlation norm. The
+complete risk-penalised sensitivity therefore cannot be inserted directly as an additive
 one-year Bellman reward. Management LSMC fits a finite, predeclared policy class
 using additive support objectives
 
@@ -216,8 +248,8 @@ The stress directions are mortality, longevity, lapse up, lapse down and an
 equal-weighted basket of all four. This gives 21 Base/Stress objectives,
 including pure Base CSM, plus one conditional-ratio heuristic. Each complete
 fitted 14-value Time-0 payload is then evaluated with the actual nonlinear
-MLL formula. Thus $J_{\mathrm{adj}}$, not a support objective, selects the
-result; CSM/MLL remains supplementary.
+MLL-FPAR formula. Pure Base CSM selects the result; the FPAR-penalised value and
+CSM/MLL-FPAR remain supplementary diagnostics.
 
 To control the regression level error, candidate $j$ is anchored to the direct
 best-fixed projection:
@@ -231,8 +263,8 @@ $$
 
 There is no additional minimum-CSM constraint. Best fixed remains an explicit
 zero-flexibility-value comparator and is replaced only by a strictly higher
-actual capital-adjusted value. Ties are resolved deterministically; no epsilon
-denominator is introduced to manufacture a ratio.
+custom CSM. Ties are resolved deterministically; no epsilon denominator is
+introduced to manufacture a ratio.
 
 ## Same-sample fixed-cap comparator
 
@@ -245,7 +277,7 @@ management comparisons.
 In completed run `20260714T084838.270769Z`, the best fixed cell is the lower
 grid boundary of 0.25%:
 
-| Fixed cap | CSM (AUD) | MLL (AUD) | CSM − 6% MLL (AUD) | CSM / MLL |
+| Fixed cap | Custom CSM (AUD) | MLL-FPAR (AUD) | CSM minus 6% FPAR penalty (AUD) | CSM / MLL-FPAR |
 |---:|---:|---:|---:|---:|
 | 0.25% | 52,151.27 | 25,057.48 | 50,647.82 | 2.08127 |
 | 1% | 43,684.60 | 21,872.82 | 42,372.23 | 1.99721 |
@@ -253,10 +285,10 @@ grid boundary of 0.25%:
 | 12% | -42,096.49 | 7,308.65 | -42,535.01 | -5.75982 |
 
 The fixed-cap result alone confirms that the crediting choice changes both
-profitability and the partial life-risk capital profile. The 0.25% cell also
-maximises the primary capital-adjusted measure on the fixed grid. It does not
-yet value the annual reset right; that requires the Management-LSMC comparison
-below.
+profitability and the stressed future-profit-risk profile. The 0.25% cell
+maximises custom CSM on the fixed grid; it also happens to maximise the
+secondary FPAR-penalised sensitivity. It does not yet value the annual reset
+right; that requires the Management-LSMC comparison below.
 
 ## Time-zero value of annual reset flexibility
 
@@ -269,35 +301,37 @@ conditional-ratio heuristic.
 
 The completed fit stored every candidate. Its earlier ratio-only presentation
 selected `base_stress_mix_alpha_0.50::balanced_four_stress_csm`; that result is
-retained only as a historical objective sensitivity. Applying the current
-$J_{\mathrm{adj}}=\mathrm{CSM}-0.06K_{\mathrm{MLL}}$ ranking to the complete
-stored table selects `base_csm`. This deterministic selection-layer change does
-not require a new projection or regression fit.
+retained only as a historical objective sensitivity. Ranking the complete
+stored table by the current primary custom-CSM objective selects `base_csm`.
+That same candidate also leads the secondary 6%-FPAR-penalised sensitivity.
+This deterministic selection-layer change does not require a new projection or
+regression fit.
 
 The selected candidate's first Time-0 action is 0.25%, the same as best fixed.
 Its additional value comes from the right to make later state-dependent annual
 choices; no future operating schedule is exported or tested.
 
-| Time-0 alternative | CSM (AUD) | MLL (AUD) | CSM − 6% MLL (AUD) | CSM / MLL | MLL / CSM |
+| Time-0 alternative | Custom CSM (AUD) | MLL-FPAR (AUD) | CSM minus 6% FPAR penalty (AUD) | CSM / MLL-FPAR | MLL-FPAR / CSM |
 |---|---:|---:|---:|---:|---:|
 | Best fixed 0.25% | 52,151.27 | 25,057.48 | 50,647.82 | 2.08127 | 48.05% |
 | Annual adjustment right: `base_csm` | 103,840.38 | 45,213.13 | 101,127.59 | 2.29669 | 43.54% |
-| Difference | +51,689.11 | +20,155.65 | **+50,479.77** | **+0.21542** | **-4.51 pp** |
+| Difference | **+51,689.11** | +20,155.65 | +50,479.77 | +0.21542 | -4.51 pp |
 
-The primary Time-0 value of flexibility is therefore AUD 50,479.77 under the
-one-year 6% research capital charge. The supplementary efficiency measure also
-improves: CSM/MLL rises by 0.21542 and MLL/CSM falls by 4.51 percentage points.
-Absolute MLL nevertheless rises by AUD 20,155.65 because CSM rises by AUD
-51,689.11. The result demonstrates higher capital-adjusted value and improved
-partial life-risk efficiency, not lower absolute capital.
+The primary Time-0 value of flexibility is therefore the custom-CSM increase of
+AUD 51,689.11. After applying the secondary 6% FPAR penalty, the corresponding
+sensitivity is AUD 50,479.77. CSM/MLL-FPAR rises by 0.21542 and MLL-FPAR/CSM
+falls by 4.51 percentage points. Absolute MLL-FPAR nevertheless rises by AUD
+20,155.65 because custom CSM rises by AUD 51,689.11. These are profitability
+and stressed-future-profit diagnostics; they do not show higher or lower
+required capital.
 
 This is an in-sample Time-0 estimate by design. It is the maximum within the
 declared fitted policy class, not a global optimum over every possible
 management rule. Exactly one illustrative modelpoint is used, so the 40%
 positive-CSM mass-lapse proxy can materially influence both measures. Regression
-fit, anchoring, path count, stress calibration and the partial scope of MLL are
-model limitations. Sensitivities are required before treating the uplift as a
-robust product-value estimate.
+fit, anchoring, path count, stress calibration and the partial scope of
+MLL-FPAR are model limitations. Sensitivities are required before treating the
+uplift as a robust product-value estimate.
 
 The plot and compact source tables are documented under
 [`results/document_figures`](../results/document_figures/README.md).
@@ -305,8 +339,10 @@ The plot and compact source tables are documented under
 ## Accounting interpretation
 
 Management discretion over future crediting may be relevant to
-fulfilment-cashflow and contractual-service assessments if it is substantive and reflected
-in the applicable accounting policy. This repository only estimates cashflows
-under an assumed management rule. It does not demonstrate IFRS recognition,
-group-level CSM or release patterns. Accounting conclusions require separate
-contract interpretation and governance.
+fulfilment-cashflow and contractual-service assessments if it is substantive
+and reflected in the applicable accounting policy. This repository only
+estimates cashflows under an assumed management rule. Its custom CSM and
+stressed custom-CSM losses are not IFRS 17 CSM balances or movements. It does
+not demonstrate IFRS recognition, group-level CSM or release patterns.
+Accounting conclusions require separate contract interpretation and
+governance.

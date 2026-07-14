@@ -18,8 +18,8 @@ projector.  A backward pass on the account-value inventory grid (Boogert & de
 Jong, 2008; Carmona & Ludkovski, 2010) propagates a conditional value vector
 for the nine base-CSM components, four mortality/longevity/lapse stress CSMs
 and the signed base CSM of the sole modelpoint.  Only after conditional
-aggregation does it form correlated MLL capital, capital-adjusted CSM and the
-reported CSM/MLL ratio.
+aggregation does it form the correlated MLL stressed-CSM future-profit-risk
+proxy (MLL-FPAR), its research penalty and the reported CSM/MLL-FPAR ratio.
 
 The continuation value is fitted by a separate regression per grid node on the
 slim exogenous basis ``{1, ATM one-year call, Reference-Fund level, overnight
@@ -28,17 +28,22 @@ factors plus standardised account value and its square; their targets add the
 one-year cashflow components to the value at each path's realised next account
 value.  The inter-node delta V(A_{k+1}) - V(A_k) is the discrete marginal
 value of account value (the storage shadow price).  Base CSM is the signed
-market-consistent insurer net-value proxy before Risk Margin.  MLL is a partial
-research capital proxy, not total regulatory capital.  Because a ratio, loss
-maxima and a correlation norm are not additive Bellman rewards, management
+market-consistent insurer net-value proxy before Risk Margin.  MLL-FPAR is the
+one-sided loss of that custom profitability measure under illustrative life
+stresses.  It is not APRA/LAGIC capital, an IFRS 17 CSM stress or a Risk
+Adjustment.  Because a ratio, loss maxima and a correlation norm are not
+additive Bellman rewards, management
 LSMC fits a predeclared finite class of additive Base-/Stress-CSM objectives.
+For reporting only, the change in correlated MLL is allocated exactly across
+Mortality, Longevity and binding Lapse by a three-module Shapley calculation
+over all six replacement orders; this allocation is not an LSMC reward.
 Each complete fitted value vector is anchored to the directly projected best
-fixed cap and is ranked on actual aggregate Time-0
-``CSM - lambda * MLL``, with a default ``lambda`` of 6%.  CSM/MLL is reported
-alongside it as the capital-efficiency check.  There is no additional CSM
-constraint.  Best fixed remains the explicit primary-objective comparator, so
-annual flexibility is recognised only for a strictly higher capital-adjusted
-CSM.  The complete Q sample is used for both fitting and today's risk-neutral
+fixed cap and is ranked on aggregate Time-0 CSM.  Best fixed is likewise the
+fixed cap with the highest CSM.  ``CSM - lambda * MLL-FPAR`` (default research
+penalty weight ``lambda=6%``) and CSM/MLL-FPAR are reported only as secondary
+sensitivity diagnostics.  There is no additional CSM constraint.  Annual
+flexibility is recognised only for a strictly higher CSM.  The complete Q
+sample is used for both fitting and today's risk-neutral
 expected-value calculation, as requested: there is no held-out sample, forward
 roll, OOS validation, deployment gate or bootstrap.  Income Election remains
 in the loaded dynamic Behaviour mode, subject to the existing contractual
@@ -69,9 +74,14 @@ withdrawals are therefore driven only by the versioned assumptions under
 coefficient in that Behaviour model; it affects behaviour through the
 projected Account Value, guarantee moneyness and realised performance history.
 
-When explicitly run, the script writes CSV/JSON results, a DEBUG ``run.log``
-and headless Matplotlib diagnostics below ``plots/`` while reporting concise
-progress to the console.  Merely importing it has no side effects.
+When explicitly run, the script writes CSV/JSON results, including reconciled
+best-fixed-versus-flexible CSM and non-additive MLL component tables, a DEBUG
+``run.log`` and headless Matplotlib diagnostics below ``plots/`` while
+reporting concise progress to the console.  Merely importing it has no side
+effects.  ``--candidate-policy-class`` limits an explicitly authorised payload
+recovery to one previously selected additive policy class.  Once a current-
+schema run contains its component ledgers, ``--report-from-run`` regenerates
+the plots without loading market caches, projecting contracts or fitting LSMC.
 """
 
 # Algorithmic change: 2026-07-13 (Europe/Zurich).
@@ -171,7 +181,9 @@ from policy_engine.crediting_capital import (  # noqa: E402
     PairedBootstrapRatioDelta,
     PolicyCSMPathArrays,
     PolicyLevelCSMMLLResult,
+    aggregate_mll_capital,
     calculate_policy_level_csm_mll,
+    mll_correlation_matrix,
     paired_bootstrap_ratio_delta,
     score_lsmc_value_vectors,
 )
@@ -216,7 +228,16 @@ ACTION_CAPS = np.concatenate((
 ))
 MLL_STRESS_IDS = ("mortality", "longevity", "lapse_up", "lapse_down")
 MANAGEMENT_OBJECTIVES = ("csm_to_mll", "csm")
-DEFAULT_MLL_CAPITAL_CHARGE_RATE = 0.06
+DEFAULT_MLL_RISK_PENALTY_WEIGHT = 0.06
+# Backwards-compatible internal/CLI alias.  This coefficient is not a capital
+# charge or cost-of-capital rate; it is a dimensionless research penalty.
+DEFAULT_MLL_CAPITAL_CHARGE_RATE = DEFAULT_MLL_RISK_PENALTY_WEIGHT
+MLL_RISK_MEASURE_NAME = "mll_stressed_csm_future_profit_risk_proxy"
+MLL_RISK_VALUE_BASIS = (
+    "one_sided_loss_in_custom_csm_profitability_proxy_under_illustrative_stress"
+)
+REGULATORY_CAPITAL_STATUS = "not_calculated"
+REGULATORY_CAPITAL_FRAMEWORK = "APRA_LAGIC"
 OTHER_INSURER_FUNDED_BENEFIT_KEYS: tuple[str, ...] = ()
 CONTROL_STATE_FEATURE_NAMES = (
     "zero_rate_5y",
@@ -252,6 +273,41 @@ INSURER_COMPONENT_NAMES = (
     "other_insurer_funded_benefits",
     "expenses",
     "hedge_costs",
+)
+TIME_ZERO_CSM_COMPONENT_METADATA = (
+    ("fees_product", "Product fees", "fee_income", 1.0),
+    ("fees_lip", "LIP fees", "fee_income", 1.0),
+    (
+        "crediting_margin",
+        "Money-market income + retained hedge gain",
+        "other_income",
+        1.0,
+    ),
+    ("mva_retained", "Retained MVA", "other_income", 1.0),
+    ("aps_retained", "Retained APS", "other_income", 1.0),
+    ("guarantee_claims", "Guarantee claims", "claims", -1.0),
+    (
+        "other_insurer_funded_benefits",
+        "Other insurer-funded benefits",
+        "claims",
+        -1.0,
+    ),
+    ("expenses", "Operating expenses", "costs", -1.0),
+    ("hedge_costs", "Option / hedge costs", "costs", -1.0),
+)
+TIME_ZERO_STRESS_CSM_METADATA = (
+    ("mortality_stressed_csm", "Mortality-stressed CSM"),
+    ("longevity_stressed_csm", "Longevity-stressed CSM"),
+    ("lapse_up_stressed_csm", "Lapse-up-stressed CSM"),
+    ("lapse_down_stressed_csm", "Lapse-down-stressed CSM"),
+)
+TIME_ZERO_VALUE_VECTOR_NAMES = (
+    *INSURER_COMPONENT_NAMES,
+    "mortality_stressed_csm",
+    "longevity_stressed_csm",
+    "lapse_up_stressed_csm",
+    "lapse_down_stressed_csm",
+    "sole_model_point_base_csm_recomputed_from_base_components",
 )
 NONNEGATIVE_INSURER_COMPONENT_INDICES = (1, 2, 4, 5, 6, 7, 8, 9)
 FOLLOWER_PRE_CAP_FEATURE_NAMES = (
@@ -1344,13 +1400,48 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-benchmark-cache", action="store_true")
     parser.add_argument(
-        "--mll-capital-materiality-bp", type=float, default=1.0,
+        "--mll-risk-materiality-bp",
+        "--mll-capital-materiality-bp",
+        dest="mll_risk_materiality_bp",
+        type=float,
+        default=1.0,
+        help=(
+            "materiality for the MLL future-profit-risk proxy in basis points "
+            "of representative premium; the old capital-named flag is a "
+            "deprecated compatibility alias"
+        ),
     )
     parser.add_argument("--mass-lapse-fraction", type=float, default=0.40)
     parser.add_argument(
-        "--mll-capital-charge-rate", type=float,
-        default=DEFAULT_MLL_CAPITAL_CHARGE_RATE,
-        help="lambda in the primary Time-0 objective CSM - lambda * MLL",
+        "--mll-risk-penalty-weight",
+        "--mll-capital-charge-rate",
+        dest="mll_risk_penalty_weight",
+        type=float,
+        default=DEFAULT_MLL_RISK_PENALTY_WEIGHT,
+        help=(
+            "dimensionless lambda in the secondary research sensitivity "
+            "CSM - lambda * MLL-FPAR; the old capital-named flag is a "
+            "deprecated compatibility alias"
+        ),
+    )
+    parser.add_argument(
+        "--candidate-policy-class",
+        choices=tuple(name for name, _ in _time_zero_policy_class_weights()),
+        default=None,
+        help=(
+            "fit only this already-selected additive Management-LSMC policy "
+            "class; skips the conditional-ratio heuristic and all other "
+            "candidate fits for targeted payload recovery"
+        ),
+    )
+    parser.add_argument(
+        "--report-from-run",
+        type=Path,
+        default=None,
+        help=(
+            "regenerate Time-0 plots from a completed current-schema run "
+            "without loading market caches, projecting or fitting LSMC"
+        ),
     )
     parser.add_argument(
         "--model-point-log-interval", type=int, default=1,
@@ -1367,7 +1458,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     args.policyholder_behaviour = "dynamic"
-    args.optimisation_objective = "csm_minus_lambda_mll"
+    args.optimisation_objective = "csm"
+    # Preserve the attribute contract used by older callers while ensuring
+    # all new output is labelled as a risk-proxy sensitivity.
+    args.mll_capital_materiality_bp = args.mll_risk_materiality_bp
+    args.mll_capital_charge_rate = args.mll_risk_penalty_weight
+
+    if args.report_from_run is not None and args.candidate_policy_class is not None:
+        parser.error(
+            "--report-from-run and --candidate-policy-class are mutually exclusive"
+        )
 
     if args.n_paths <= 0 or args.seed < 0 or args.heston_substeps <= 0:
         parser.error("--n-paths/substeps must be positive and --seed non-negative")
@@ -1379,15 +1479,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--inventory-nodes must be at least three")
     if not 0.0 <= args.inventory_quantile_clip < 0.5:
         parser.error("--inventory-quantile-clip must be in [0, 0.5)")
-    if not np.isfinite(args.mll_capital_materiality_bp) \
-            or args.mll_capital_materiality_bp < 0.0:
-        parser.error("--mll-capital-materiality-bp must be non-negative")
+    if not np.isfinite(args.mll_risk_materiality_bp) \
+            or args.mll_risk_materiality_bp < 0.0:
+        parser.error("--mll-risk-materiality-bp must be non-negative")
     if not np.isfinite(args.mass_lapse_fraction) \
             or not 0.0 <= args.mass_lapse_fraction <= 1.0:
         parser.error("--mass-lapse-fraction must lie in [0, 1]")
-    if not np.isfinite(args.mll_capital_charge_rate) \
-            or args.mll_capital_charge_rate < 0.0:
-        parser.error("--mll-capital-charge-rate must be non-negative")
+    if not np.isfinite(args.mll_risk_penalty_weight) \
+            or args.mll_risk_penalty_weight < 0.0:
+        parser.error("--mll-risk-penalty-weight must be non-negative")
     if args.model_point_log_interval <= 0 or args.plot_dpi < 72:
         parser.error("logging interval must be positive and plot DPI at least 72")
     if args.portfolio_contract_count is not None and (
@@ -3563,7 +3663,7 @@ def _mll_metrics_from_payload(
     payload: Array,
     objective_spec: ManagementObjectiveSpec,
 ) -> tuple[Array, Array, Array]:
-    """Return base CSM, MLL capital and selectable conditional CSM/MLL.
+    """Return base CSM, MLL-FPAR and selectable conditional CSM/MLL-FPAR.
 
     The payload contains nine additive base-CSM components, four additive
     stressed CSM values and one additive base CSM value per model point.  The
@@ -7753,7 +7853,7 @@ def _management_payload_and_activity_exposure(
     if objective_spec.kind != "csm_to_mll" \
             or objective_spec.model_point_count != 1:
         raise ValueError(
-            "The Time-0 capital-adjusted study requires exactly one modelpoint."
+            "The Time-0 CSM/MLL-FPAR study requires exactly one modelpoint."
         )
     if data.inforce_exposure is None or data.model_point_csm is None:
         raise ValueError("Time-0 LSMC requires exposure and model-point ledgers.")
@@ -7842,9 +7942,9 @@ def _time_zero_policy_class_weights() -> tuple[tuple[str, Array], ...]:
     MLL itself is formed only after Time-0 aggregation and is therefore not an
     additive Bellman reward.  These 21 linear support objectives span explicit
     trade-offs between Base CSM and each stressed CSM (plus a balanced stress
-    basket).  Finished policies are ranked later on actual aggregate
-    ``CSM - lambda * MLL``; the nonlinear CSM/MLL ratio is calculated and
-    reported separately from the same completed payload.
+    basket).  Finished policies are ranked later on aggregate CSM.  The
+    nonlinear MLL-FPAR, risk-penalised CSM sensitivity and CSM/MLL-FPAR ratio
+    are calculated and reported separately from the same completed payload.
     """
     csm_signs = np.array([1.0] * 5 + [-1.0] * 4)
     objectives: list[tuple[str, Array]] = []
@@ -7959,11 +8059,49 @@ def _time_zero_capital_adjusted_csm(
     result: PolicyLevelCSMMLLResult,
     capital_charge_rate: float,
 ) -> float:
-    """Return ``CSM - lambda * MLL`` for one completed Time-0 payload."""
+    """Legacy alias for the secondary risk-penalised CSM sensitivity."""
     rate = float(capital_charge_rate)
     if not np.isfinite(rate) or rate < 0.0:
-        raise ValueError("The MLL capital-charge rate must be non-negative.")
+        raise ValueError("The MLL risk-penalty weight must be non-negative.")
     return float(result.csm - rate * result.mll.capital)
+
+
+def _time_zero_risk_penalized_csm(
+    result: PolicyLevelCSMMLLResult,
+    risk_penalty_weight: float,
+) -> float:
+    """Return the secondary ``CSM - lambda * MLL-FPAR`` sensitivity."""
+    return _time_zero_capital_adjusted_csm(result, risk_penalty_weight)
+
+
+def _select_best_time_zero_csm_candidate(
+    candidates: Sequence[_TimeZeroPolicyCandidate],
+) -> _TimeZeroPolicyCandidate:
+    """Select the highest aggregate CSM, with deterministic risk tie-breaks."""
+    defined = [
+        candidate for candidate in candidates
+        if np.isfinite(candidate.anchored_result.csm)
+    ]
+    if not defined:
+        raise RuntimeError("No fitted Time-0 policy has a finite CSM payload.")
+    maximum_csm = max(candidate.anchored_result.csm for candidate in defined)
+    csm_ties = [
+        candidate for candidate in defined
+        if candidate.anchored_result.csm == maximum_csm
+    ]
+    return max(
+        csm_ties,
+        key=lambda candidate: (
+            -float(candidate.anchored_result.mll.capital),
+            (
+                -np.inf
+                if candidate.anchored_result.csm_to_mll_ratio is None
+                else float(candidate.anchored_result.csm_to_mll_ratio)
+            ),
+            -float(ACTION_CAPS[candidate.estimate.chosen_action]),
+            -candidate.policy_class_index,
+        ),
+    )
 
 
 def _select_best_time_zero_capital_adjusted_candidate(
@@ -7971,7 +8109,7 @@ def _select_best_time_zero_capital_adjusted_candidate(
     *,
     capital_charge_rate: float,
 ) -> _TimeZeroPolicyCandidate:
-    """Select on actual ``CSM - lambda * MLL`` after payload aggregation."""
+    """Legacy research-sensitivity selector; not the current primary rule."""
     defined = [
         candidate for candidate in candidates
         if np.isfinite(candidate.anchored_result.csm)
@@ -8018,16 +8156,17 @@ def _time_zero_management_lsmc(
     fixed_cap_start_payload: Array,
     fixed_cap_start: float,
     capital_charge_rate: float,
+    candidate_policy_class: str | None = None,
 ) -> TimeZeroManagementLSMCResult:
-    """Rank a fixed-anchored policy class on CSM minus lambda times MLL.
+    """Rank a fixed-anchored policy class on aggregate Time-0 CSM.
 
-    Every Bellman chain uses all paths.  The 21 predeclared linear Base/Stress
-    objectives are additive and hence fit-compatible; capital-adjusted CSM and
-    the nonlinear CSM/MLL ratio are calculated only from each complete
-    Time-0 value vector.  A direct fixed-cap projection anchors the LSMC
-    differences, and best fixed remains an explicit primary-objective
-    comparator.  No additional CSM constraint, held-out
-    paths, forward rollout or deployment validation exists.
+    Every Bellman chain uses all paths.  By default the 21 predeclared linear
+    Base/Stress objectives and the conditional-ratio heuristic are fitted.  A
+    named additive policy class may instead be recovered on its own after a
+    completed full-grid run has already established the selection.  A direct
+    fixed-cap projection anchors all LSMC differences, and best fixed remains
+    an explicit primary-objective comparator.  No additional CSM constraint,
+    held-out paths, forward rollout or deployment validation exists.
     """
     payload, exposure, active_years = (
         _management_payload_and_activity_exposure(
@@ -8040,14 +8179,32 @@ def _time_zero_management_lsmc(
     fixed_result = _policy_level_csm_mll_from_payload(
         fixed_anchor, objective_spec
     )
-    fixed_capital_adjusted = _time_zero_capital_adjusted_csm(
+    fixed_risk_penalized = _time_zero_risk_penalized_csm(
         fixed_result, capital_charge_rate
     )
     fixed_action = int(np.argmin(np.abs(ACTION_CAPS - fixed_cap_start)))
     if not np.isclose(ACTION_CAPS[fixed_action], fixed_cap_start):
         raise ValueError("The best fixed cap is outside the management grid.")
 
-    policy_grid = _time_zero_policy_class_weights()
+    complete_policy_grid = tuple(
+        (index, name, weights)
+        for index, (name, weights) in enumerate(
+            _time_zero_policy_class_weights(), start=1
+        )
+    )
+    if candidate_policy_class is None:
+        policy_grid = complete_policy_grid
+        include_conditional_ratio = True
+    else:
+        policy_grid = tuple(
+            item for item in complete_policy_grid
+            if item[1] == candidate_policy_class
+        )
+        if len(policy_grid) != 1:
+            raise ValueError(
+                f"Unknown Time-0 policy class: {candidate_policy_class!r}."
+            )
+        include_conditional_ratio = False
     fixed_chain = _fit_time_zero_chain(
         data=data,
         actions=action_indices,
@@ -8057,7 +8214,7 @@ def _time_zero_management_lsmc(
         ridge=ridge,
         inventory_nodes=inventory_nodes,
         inventory_quantile_clip=inventory_quantile_clip,
-        linear_weights=policy_grid[0][1],
+        linear_weights=complete_policy_grid[0][2],
         forced_action=fixed_action,
     )
     fixed_lsmc_payload = _reconcile_single_model_point_payload(
@@ -8072,14 +8229,25 @@ def _time_zero_management_lsmc(
             fixed_lsmc_payload, objective_spec
         ).csm,
         "anchored_csm": fixed_result.csm,
+        "anchored_mll_future_profit_risk": fixed_result.mll.capital,
         "anchored_mll_capital": fixed_result.mll.capital,
+        "anchored_csm_to_mll_risk_ratio": fixed_result.csm_to_mll_ratio,
         "anchored_csm_to_mll_ratio": fixed_result.csm_to_mll_ratio,
-        "anchored_csm_minus_lambda_mll": fixed_capital_adjusted,
+        "anchored_csm_minus_lambda_mll": fixed_risk_penalized,
+        "anchored_risk_penalized_csm": fixed_risk_penalized,
         "mll_capital_charge_rate": capital_charge_rate,
+        "mll_risk_penalty_weight": capital_charge_rate,
+        "primary_optimisation_objective": "csm",
+        "legacy_capital_named_fields_retained": True,
         "additional_csm_constraint": False,
-        "candidate_status": "fixed_primary_objective_comparator",
+        "candidate_status": "fixed_csm_comparator",
         "uses_all_paths": True,
         "oos": False,
+        "value_vector_units": "unscaled_representative_portfolio",
+        **{
+            f"anchored_unscaled_{name}": float(value)
+            for name, value in zip(TIME_ZERO_VALUE_VECTOR_NAMES, fixed_anchor)
+        },
     }]
     all_candidates: list[_TimeZeroPolicyCandidate] = []
 
@@ -8128,27 +8296,44 @@ def _time_zero_management_lsmc(
                 raw_payload, objective_spec
             ).csm,
             "anchored_csm": result.csm,
+            "anchored_mll_future_profit_risk": result.mll.capital,
             "anchored_mll_capital": result.mll.capital,
+            "anchored_csm_to_mll_risk_ratio": result.csm_to_mll_ratio,
             "anchored_csm_to_mll_ratio": result.csm_to_mll_ratio,
             "anchored_csm_minus_lambda_mll": (
-                _time_zero_capital_adjusted_csm(
+                _time_zero_risk_penalized_csm(
+                    result, capital_charge_rate
+                )
+            ),
+            "anchored_risk_penalized_csm": (
+                _time_zero_risk_penalized_csm(
                     result, capital_charge_rate
                 )
             ),
             "mll_capital_charge_rate": capital_charge_rate,
+            "mll_risk_penalty_weight": capital_charge_rate,
+            "primary_optimisation_objective": "csm",
+            "legacy_capital_named_fields_retained": True,
             "additional_csm_constraint": False,
             "candidate_status": status,
             "uses_all_paths": True,
             "oos": False,
+            "value_vector_units": "unscaled_representative_portfolio",
+            **{
+                f"anchored_unscaled_{name}": float(value)
+                for name, value in zip(
+                    TIME_ZERO_VALUE_VECTOR_NAMES, anchored_payload
+                )
+            },
         })
         LOGGER.info(
             "Time-0 policy class | %d/%d | %s | first cap %.2f%% | "
-            "anchored CSM %.2f | MLL %.2f | CSM-lambda*MLL %.2f | "
+            "anchored CSM %.2f | MLL-FPAR %.2f | risk-penalised CSM %.2f | "
             "ratio=%s | %s",
-            policy_class_index, len(policy_grid), policy_class_name,
+            policy_class_index, len(complete_policy_grid), policy_class_name,
             100.0 * float(ACTION_CAPS[estimate.chosen_action]),
             result.csm, result.mll.capital,
-            _time_zero_capital_adjusted_csm(result, capital_charge_rate),
+            _time_zero_risk_penalized_csm(result, capital_charge_rate),
             (
                 "undefined"
                 if result.csm_to_mll_ratio is None
@@ -8157,28 +8342,27 @@ def _time_zero_management_lsmc(
             status,
         )
 
-    rolling = _fit_time_zero_chain(
-        data=data,
-        actions=action_indices,
-        immediate_payload=payload,
-        activity_exposure=exposure,
-        objective_spec=objective_spec,
-        ridge=ridge,
-        inventory_nodes=inventory_nodes,
-        inventory_quantile_clip=inventory_quantile_clip,
-        linear_weights=None,
-    )
-    fitted_chain_count += 1
-    add_candidate(
-        policy_class_name="conditional_ratio_heuristic",
-        policy_class_index=0,
-        estimate=rolling,
-        support_weights=None,
-    )
+    if include_conditional_ratio:
+        rolling = _fit_time_zero_chain(
+            data=data,
+            actions=action_indices,
+            immediate_payload=payload,
+            activity_exposure=exposure,
+            objective_spec=objective_spec,
+            ridge=ridge,
+            inventory_nodes=inventory_nodes,
+            inventory_quantile_clip=inventory_quantile_clip,
+            linear_weights=None,
+        )
+        fitted_chain_count += 1
+        add_candidate(
+            policy_class_name="conditional_ratio_heuristic",
+            policy_class_index=0,
+            estimate=rolling,
+            support_weights=None,
+        )
 
-    for policy_class_index, (policy_class_name, weights) in enumerate(
-        policy_grid, start=1
-    ):
+    for policy_class_index, policy_class_name, weights in policy_grid:
         estimate = _fit_time_zero_chain(
             data=data,
             actions=action_indices,
@@ -8198,17 +8382,9 @@ def _time_zero_management_lsmc(
             support_weights=weights,
         )
 
-    best_adaptive = _select_best_time_zero_capital_adjusted_candidate(
-        all_candidates,
-        capital_charge_rate=capital_charge_rate,
-    )
+    best_adaptive = _select_best_time_zero_csm_candidate(all_candidates)
     best_adaptive_result = best_adaptive.anchored_result
-    adaptive_value = _time_zero_capital_adjusted_csm(
-        best_adaptive_result, capital_charge_rate
-    )
-    adaptive_selected = bool(
-        adaptive_value > fixed_capital_adjusted
-    )
+    adaptive_selected = bool(best_adaptive_result.csm > fixed_result.csm)
     fixed_primary_objective_comparator_binding = not adaptive_selected
     selected_payload = (
         best_adaptive.anchored_payload if adaptive_selected else fixed_anchor
@@ -8222,7 +8398,7 @@ def _time_zero_management_lsmc(
     )
     selected_source = (
         best_adaptive.policy_class_name
-        if adaptive_selected else "best_fixed_primary_objective_comparator"
+        if adaptive_selected else "best_fixed_csm_comparator"
     )
 
     action_rows: list[Mapping[str, object]] = []
@@ -8242,16 +8418,30 @@ def _time_zero_management_lsmc(
             "cap": float(cap),
             "cap_percent": 100.0 * float(cap),
             "anchored_time_zero_csm": action_result.csm,
+            "anchored_time_zero_mll_future_profit_risk": (
+                action_result.mll.capital
+            ),
             "anchored_time_zero_mll_capital": action_result.mll.capital,
+            "anchored_time_zero_csm_to_mll_risk_ratio": (
+                action_result.csm_to_mll_ratio
+            ),
             "anchored_time_zero_csm_to_mll_ratio": (
                 action_result.csm_to_mll_ratio
             ),
             "anchored_time_zero_csm_minus_lambda_mll": (
-                _time_zero_capital_adjusted_csm(
+                _time_zero_risk_penalized_csm(
+                    action_result, capital_charge_rate
+                )
+            ),
+            "anchored_time_zero_risk_penalized_csm": (
+                _time_zero_risk_penalized_csm(
                     action_result, capital_charge_rate
                 )
             ),
             "mll_capital_charge_rate": capital_charge_rate,
+            "mll_risk_penalty_weight": capital_charge_rate,
+            "primary_optimisation_objective": "csm",
+            "legacy_capital_named_fields_retained": True,
             "policy_class_support_value": (
                 None
                 if best_adaptive.support_weights is None
@@ -8317,18 +8507,35 @@ def _time_zero_management_lsmc(
         ),
         "first_time_zero_action_cap": selected_first_cap,
         "anchored_csm": selected_result.csm,
+        "anchored_mll_future_profit_risk": selected_result.mll.capital,
         "anchored_mll_capital": selected_result.mll.capital,
+        "anchored_csm_to_mll_risk_ratio": selected_result.csm_to_mll_ratio,
         "anchored_csm_to_mll_ratio": selected_result.csm_to_mll_ratio,
         "anchored_csm_minus_lambda_mll": (
-            _time_zero_capital_adjusted_csm(
+            _time_zero_risk_penalized_csm(
+                selected_result, capital_charge_rate
+            )
+        ),
+        "anchored_risk_penalized_csm": (
+            _time_zero_risk_penalized_csm(
                 selected_result, capital_charge_rate
             )
         ),
         "mll_capital_charge_rate": capital_charge_rate,
+        "mll_risk_penalty_weight": capital_charge_rate,
+        "primary_optimisation_objective": "csm",
+        "legacy_capital_named_fields_retained": True,
         "additional_csm_constraint": False,
         "candidate_status": "selected",
         "uses_all_paths": True,
         "oos": False,
+        "value_vector_units": "unscaled_representative_portfolio",
+        **{
+            f"anchored_unscaled_{name}": float(value)
+            for name, value in zip(
+                TIME_ZERO_VALUE_VECTOR_NAMES, selected_payload
+            )
+        },
     })
     return TimeZeroManagementLSMCResult(
         first_year_cap=selected_first_cap,
@@ -8342,12 +8549,15 @@ def _time_zero_management_lsmc(
         selected_candidate_source=selected_source,
         estimator=(
             "full_sample_time_zero_fixed_anchored_"
-            "csm_minus_lambda_mll_policy_class_search"
+            "csm_policy_class_search"
+            if candidate_policy_class is None
+            else "full_sample_time_zero_fixed_anchored_targeted_"
+            "policy_class_payload_recovery"
         ),
         fixed_primary_objective_comparator_binding=(
             fixed_primary_objective_comparator_binding
         ),
-        policy_class_grid_complete=True,
+        policy_class_grid_complete=(candidate_policy_class is None),
         global_ratio_optimum_claimed=False,
         best_adaptive_first_year_cap=float(
             ACTION_CAPS[best_adaptive.estimate.chosen_action]
@@ -9163,7 +9373,7 @@ def _csm_mll_evaluation_from_paths(
     )
     if result.csm_to_mll_ratio is None:
         raise RuntimeError(
-            "CSM/MLL is undefined because MLL capital is below materiality."
+            "CSM/MLL-FPAR is undefined because the proxy is below materiality."
         )
     return FrozenCapCSMMLLEvaluation(
         paths=paths,
@@ -9993,7 +10203,7 @@ def _evaluate_fixed_benchmarks(
     if capital_charge_rate is not None:
         rate = float(capital_charge_rate)
         if not np.isfinite(rate) or rate < 0.0:
-            raise ValueError("The fixed-cap capital-charge rate is invalid.")
+            raise ValueError("The fixed-cap FPAR penalty weight is invalid.")
         if not use_csm_to_mll:
             raise ValueError(
                 "Capital-adjusted fixed-cap selection requires MLL payloads."
@@ -13048,7 +13258,7 @@ def _legacy_deployment_main() -> None:
     validation_adaptive_mll: FrozenCapCSMMLLEvaluation | None = None
     validation_fixed_mll: FrozenCapCSMMLLEvaluation | None = None
     if objective_spec.kind == "csm_to_mll":
-        with _logged_stage("Revalue validation policies for MLL capital"):
+        with _logged_stage("Revalue validation policies for MLL-FPAR"):
             validation_fixed_mll = _evaluate_frozen_cap_csm_mll(
                 scenarios=validation_scenarios,
                 cap_matrix=validation_best_fixed_caps,
@@ -13238,7 +13448,7 @@ def _legacy_deployment_main() -> None:
     evaluation_adaptive_mll: FrozenCapCSMMLLEvaluation | None = None
     evaluation_fixed_mll: FrozenCapCSMMLLEvaluation | None = None
     if objective_spec.kind == "csm_to_mll":
-        with _logged_stage("Revalue final policies for MLL capital"):
+        with _logged_stage("Revalue final policies for MLL-FPAR"):
             evaluation_fixed_mll = _evaluate_frozen_cap_csm_mll(
                 scenarios=evaluation_scenarios,
                 cap_matrix=evaluation_best_fixed_caps,
@@ -15037,6 +15247,530 @@ def _time_zero_fixed_output_rows(
     return output
 
 
+def _mll_shapley_delta_allocation(
+    fixed_modules: Array,
+    flexible_modules: Array,
+    *,
+    stresses: CapitalStresses,
+) -> Array:
+    """Allocate the nonlinear MLL change exactly across its three modules.
+
+    The value function is correlated MLL-FPAR. Averaging each module's
+    marginal contribution over all six replacement orders gives the three-
+    player Shapley allocation.  It is order-neutral and sums to flexible MLL
+    minus best-fixed MLL, while allowing individual impacts to be negative.
+    """
+    fixed = np.asarray(fixed_modules, dtype=float)
+    flexible = np.asarray(flexible_modules, dtype=float)
+    if fixed.shape != (3,) or flexible.shape != (3,):
+        raise ValueError("MLL Shapley inputs must contain exactly three modules.")
+    if not np.all(np.isfinite(fixed)) or not np.all(np.isfinite(flexible)):
+        raise ValueError("MLL Shapley inputs must be finite.")
+    if np.any(fixed < 0.0) or np.any(flexible < 0.0):
+        raise ValueError("MLL Shapley module values must be non-negative.")
+
+    def capital(modules: Array) -> float:
+        return aggregate_mll_capital(
+            float(modules[0]),
+            float(modules[1]),
+            float(modules[2]),
+            stresses=stresses,
+        )
+
+    permutations = (
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    )
+    allocation = np.zeros(3, dtype=float)
+    for ordering in permutations:
+        hybrid = np.array(fixed, copy=True)
+        previous = capital(hybrid)
+        for module_index in ordering:
+            hybrid[module_index] = flexible[module_index]
+            current = capital(hybrid)
+            allocation[module_index] += current - previous
+            previous = current
+    allocation /= float(len(permutations))
+
+    expected_delta = capital(flexible) - capital(fixed)
+    allocation_sum = math.fsum(float(value) for value in allocation)
+    tolerance = 1.0e-10 * max(
+        1.0, abs(expected_delta), float(np.sum(np.abs(allocation)))
+    )
+    if abs(allocation_sum - expected_delta) > tolerance:
+        raise RuntimeError("MLL Shapley allocation does not reconcile.")
+    return allocation
+
+
+def _time_zero_flexibility_breakdown_rows(
+    *,
+    fixed_payload: Array,
+    flexible_payload: Array,
+    objective_spec: ManagementObjectiveSpec,
+    portfolio_scale: float,
+    capital_charge_rate: float,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Return auditable CSM and non-additive MLL-FPAR comparison ledgers.
+
+    CSM cashflow rows carry both their raw projected amount and their
+    signed contribution to CSM.  MLL rows deliberately preserve the stress
+    revaluations, lapse maximum and correlated MLL-FPAR as separate stages;
+    the standalone modules must not be read as an additive FPAR waterfall.
+    """
+    scale = float(portfolio_scale)
+    rate = float(capital_charge_rate)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("portfolio_scale must be finite and positive.")
+    if not np.isfinite(rate) or rate < 0.0:
+        raise ValueError("risk penalty weight must be finite and non-negative.")
+
+    fixed = _reconcile_single_model_point_payload(
+        np.asarray(fixed_payload, dtype=float), objective_spec
+    )
+    flexible = _reconcile_single_model_point_payload(
+        np.asarray(flexible_payload, dtype=float), objective_spec
+    )
+    if fixed.shape != (14,) or flexible.shape != (14,):
+        raise ValueError("Time-0 breakdown payloads must each have width 14.")
+    fixed_result = _policy_level_csm_mll_from_payload(fixed, objective_spec)
+    flexible_result = _policy_level_csm_mll_from_payload(
+        flexible, objective_spec
+    )
+    fixed_aud = scale * fixed
+    flexible_aud = scale * flexible
+
+    metadata_names = tuple(
+        name for name, _, _, _ in TIME_ZERO_CSM_COMPONENT_METADATA
+    )
+    if metadata_names != tuple(INSURER_COMPONENT_NAMES):
+        raise RuntimeError(
+            "Time-0 CSM metadata no longer matches the value-vector layout."
+        )
+    csm_rows: list[dict[str, object]] = []
+    for index, (name, label, group, sign) in enumerate(
+        TIME_ZERO_CSM_COMPONENT_METADATA
+    ):
+        fixed_amount = float(fixed_aud[index])
+        flexible_amount = float(flexible_aud[index])
+        fixed_contribution = sign * fixed_amount
+        flexible_contribution = sign * flexible_amount
+        csm_rows.append({
+            "row_type": "component",
+            "component": name,
+            "display_label": label,
+            "csm_group": group,
+            "csm_sign": sign,
+            "best_fixed_amount_aud": fixed_amount,
+            "flexible_amount_aud": flexible_amount,
+            "flexible_minus_best_fixed_amount_aud": (
+                flexible_amount - fixed_amount
+            ),
+            "best_fixed_csm_contribution_aud": fixed_contribution,
+            "flexible_csm_contribution_aud": flexible_contribution,
+            "flexibility_csm_impact_aud": (
+                flexible_contribution - fixed_contribution
+            ),
+            "reconciliation_role": "additive_csm_component",
+            "note": (
+                "Crediting margin equals money-market income plus retained "
+                "hedge gain; under the standard sold cap leg the retained "
+                "hedge gain is zero."
+                if name == "crediting_margin" else ""
+            ),
+        })
+
+    group_labels = {
+        "fee_income": "Fee income",
+        "other_income": "Other income",
+        "claims": "Claims",
+        "costs": "Costs",
+    }
+    for group, label in group_labels.items():
+        members = [row for row in csm_rows if row["csm_group"] == group]
+        fixed_amount = float(sum(
+            float(row["best_fixed_amount_aud"]) for row in members
+        ))
+        flexible_amount = float(sum(
+            float(row["flexible_amount_aud"]) for row in members
+        ))
+        fixed_contribution = float(sum(
+            float(row["best_fixed_csm_contribution_aud"]) for row in members
+        ))
+        flexible_contribution = float(sum(
+            float(row["flexible_csm_contribution_aud"]) for row in members
+        ))
+        csm_rows.append({
+            "row_type": "group_total",
+            "component": group,
+            "display_label": label,
+            "csm_group": group,
+            "csm_sign": 1.0 if group in {"fee_income", "other_income"} else -1.0,
+            "best_fixed_amount_aud": fixed_amount,
+            "flexible_amount_aud": flexible_amount,
+            "flexible_minus_best_fixed_amount_aud": (
+                flexible_amount - fixed_amount
+            ),
+            "best_fixed_csm_contribution_aud": fixed_contribution,
+            "flexible_csm_contribution_aud": flexible_contribution,
+            "flexibility_csm_impact_aud": (
+                flexible_contribution - fixed_contribution
+            ),
+            "reconciliation_role": "subtotals_not_additional_to_components",
+            "note": "Subtotal of the detailed component rows above.",
+        })
+
+    fixed_csm = scale * fixed_result.csm
+    flexible_csm = scale * flexible_result.csm
+    component_fixed = float(sum(
+        float(row["best_fixed_csm_contribution_aud"])
+        for row in csm_rows if row["row_type"] == "component"
+    ))
+    component_flexible = float(sum(
+        float(row["flexible_csm_contribution_aud"])
+        for row in csm_rows if row["row_type"] == "component"
+    ))
+    tolerance = 1.0e-8 * max(
+        1.0, abs(fixed_csm), abs(flexible_csm),
+        abs(component_fixed), abs(component_flexible),
+    )
+    if abs(component_fixed - fixed_csm) > tolerance \
+            or abs(component_flexible - flexible_csm) > tolerance:
+        raise RuntimeError("Time-0 CSM component breakdown does not reconcile.")
+    csm_rows.append({
+        "row_type": "csm_total",
+        "component": "csm",
+        "display_label": "CSM",
+        "csm_group": "total",
+        "csm_sign": 1.0,
+        "best_fixed_amount_aud": fixed_csm,
+        "flexible_amount_aud": flexible_csm,
+        "flexible_minus_best_fixed_amount_aud": flexible_csm - fixed_csm,
+        "best_fixed_csm_contribution_aud": fixed_csm,
+        "flexible_csm_contribution_aud": flexible_csm,
+        "flexibility_csm_impact_aud": flexible_csm - fixed_csm,
+        "reconciliation_role": "sum_of_component_rows",
+        "note": "Fee income + other income - claims - costs.",
+    })
+
+    fixed_binding = fixed_result.mll.binding_lapse_stress
+    flexible_binding = flexible_result.mll.binding_lapse_stress
+    mll_stresses = _capital_stresses_for_mass_lapse(
+        objective_spec.mass_lapse_fraction
+    )
+    correlation_matrix_json = json.dumps(
+        mll_correlation_matrix(mll_stresses), separators=(",", ":")
+    )
+    capital_materiality_aud = scale * objective_spec.capital_materiality
+    mll_rows: list[dict[str, object]] = []
+
+    def add_mll_row(
+        *,
+        row_type: str,
+        component: str,
+        display_label: str,
+        fixed_value: float,
+        flexible_value: float,
+        formula: str,
+        additivity_note: str,
+        fixed_is_binding: bool | None = None,
+        flexible_is_binding: bool | None = None,
+    ) -> None:
+        mll_rows.append({
+            "row_type": row_type,
+            "component": component,
+            "display_label": display_label,
+            "best_fixed_value_aud": float(fixed_value),
+            "flexible_value_aud": float(flexible_value),
+            "flexible_minus_best_fixed_aud": float(
+                flexible_value - fixed_value
+            ),
+            "best_fixed_is_binding_lapse": fixed_is_binding,
+            "flexible_is_binding_lapse": flexible_is_binding,
+            "best_fixed_binding_lapse_stress": fixed_binding,
+            "flexible_binding_lapse_stress": flexible_binding,
+            "mass_lapse_rate": objective_spec.mass_lapse_fraction,
+            "capital_materiality_aud": capital_materiality_aud,
+            "mll_correlation_matrix": correlation_matrix_json,
+            "mll_correlation_source": (
+                "CapitalStresses.corr_life[mortality,longevity,lapse]"
+            ),
+            "mll_framework": fixed_result.mll.framework,
+            "mll_risk_measure_name": MLL_RISK_MEASURE_NAME,
+            "mll_risk_value_basis": MLL_RISK_VALUE_BASIS,
+            "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+            "regulatory_capital_framework": REGULATORY_CAPITAL_FRAMEWORK,
+            "mass_lapse_method": fixed_result.mll.mass_lapse_method,
+            "formula": formula,
+            "additivity_note": additivity_note,
+        })
+
+    add_mll_row(
+        row_type="base_csm",
+        component="base_csm",
+        display_label="Base CSM",
+        fixed_value=fixed_csm,
+        flexible_value=flexible_csm,
+        formula="fee income + other income - claims - costs",
+        additivity_note="Base for each adverse stress loss.",
+    )
+    for offset, (name, label) in enumerate(TIME_ZERO_STRESS_CSM_METADATA):
+        add_mll_row(
+            row_type="stress_csm",
+            component=name,
+            display_label=label,
+            fixed_value=float(fixed_aud[9 + offset]),
+            flexible_value=float(flexible_aud[9 + offset]),
+            formula=(
+                "stressed CSM on each alternative's reported Time-0 "
+                "valuation basis"
+            ),
+            additivity_note=(
+                "Input to max(0, base CSM - stressed CSM); not additive. "
+                "The flexible value is a fixed-anchored fitted-Q estimate."
+            ),
+        )
+
+    fixed_mll = fixed_result.mll
+    flexible_mll = flexible_result.mll
+    loss_rows = (
+        (
+            "mortality_loss", "Mortality loss", "standalone_loss",
+            fixed_mll.mortality_loss, flexible_mll.mortality_loss,
+            "max(0, base CSM - mortality-stressed CSM)",
+        ),
+        (
+            "longevity_loss", "Longevity loss", "standalone_loss",
+            fixed_mll.longevity_loss, flexible_mll.longevity_loss,
+            "max(0, base CSM - longevity-stressed CSM)",
+        ),
+        (
+            "lapse_up_loss", "Lapse-up loss", "lapse_candidate_loss",
+            fixed_mll.lapse_up_loss, flexible_mll.lapse_up_loss,
+            "max(0, base CSM - lapse-up-stressed CSM)",
+        ),
+        (
+            "lapse_down_loss", "Lapse-down loss", "lapse_candidate_loss",
+            fixed_mll.lapse_down_loss, flexible_mll.lapse_down_loss,
+            "max(0, base CSM - lapse-down-stressed CSM)",
+        ),
+        (
+            "mass_lapse_loss", "Mass-lapse proxy", "lapse_candidate_loss",
+            fixed_mll.mass_lapse_loss, flexible_mll.mass_lapse_loss,
+            (
+                f"{100.0 * objective_spec.mass_lapse_fraction:g}% x sum of "
+                "positive model-point CSM"
+            ),
+        ),
+    )
+    for component, label, row_type, fixed_value, flexible_value, formula in loss_rows:
+        lapse_name = component.removesuffix("_loss")
+        add_mll_row(
+            row_type=row_type,
+            component=component,
+            display_label=label,
+            fixed_value=scale * fixed_value,
+            flexible_value=scale * flexible_value,
+            formula=formula,
+            additivity_note=(
+                "Lapse candidate; only the maximum enters the lapse module."
+                if row_type == "lapse_candidate_loss"
+                else "Standalone MLL-FPAR module before correlation aggregation."
+            ),
+            fixed_is_binding=(
+                lapse_name == fixed_binding
+                if row_type == "lapse_candidate_loss" else None
+            ),
+            flexible_is_binding=(
+                lapse_name == flexible_binding
+                if row_type == "lapse_candidate_loss" else None
+            ),
+        )
+    add_mll_row(
+        row_type="binding_lapse_module",
+        component="lapse_loss",
+        display_label="Binding lapse loss",
+        fixed_value=scale * fixed_mll.lapse_loss,
+        flexible_value=scale * flexible_mll.lapse_loss,
+        formula="max(lapse-up loss, lapse-down loss, mass-lapse proxy)",
+        additivity_note=(
+            "Standalone lapse FPAR module before correlation aggregation."
+        ),
+        fixed_is_binding=True,
+        flexible_is_binding=True,
+    )
+    fixed_capital = scale * fixed_mll.capital
+    flexible_capital = scale * flexible_mll.capital
+    fixed_module_values = scale * np.asarray([
+        fixed_mll.mortality_loss,
+        fixed_mll.longevity_loss,
+        fixed_mll.lapse_loss,
+    ])
+    flexible_module_values = scale * np.asarray([
+        flexible_mll.mortality_loss,
+        flexible_mll.longevity_loss,
+        flexible_mll.lapse_loss,
+    ])
+    shapley_impacts = _mll_shapley_delta_allocation(
+        fixed_module_values,
+        flexible_module_values,
+        stresses=mll_stresses,
+    )
+    recomputed_fixed_capital = aggregate_mll_capital(
+        *[float(value) for value in fixed_module_values],
+        stresses=mll_stresses,
+    )
+    recomputed_flexible_capital = aggregate_mll_capital(
+        *[float(value) for value in flexible_module_values],
+        stresses=mll_stresses,
+    )
+    endpoint_tolerance = 1.0e-10 * max(
+        1.0,
+        abs(fixed_capital),
+        abs(flexible_capital),
+        abs(recomputed_fixed_capital),
+        abs(recomputed_flexible_capital),
+    )
+    if abs(recomputed_fixed_capital - fixed_capital) > endpoint_tolerance \
+            or abs(
+                recomputed_flexible_capital - flexible_capital
+            ) > endpoint_tolerance:
+        raise RuntimeError(
+            "MLL Shapley endpoints do not match the reported FPAR values."
+        )
+    shapley_gap = float(
+        math.fsum(float(value) for value in shapley_impacts)
+        - (flexible_capital - fixed_capital)
+    )
+    if abs(shapley_gap) > endpoint_tolerance:
+        raise RuntimeError(
+            "MLL Shapley effects do not reconcile to the displayed endpoints."
+        )
+    add_mll_row(
+        row_type="correlated_capital",
+        component="mll_capital",
+        display_label="Correlated MLL future-profit-risk proxy",
+        fixed_value=fixed_capital,
+        flexible_value=flexible_capital,
+        formula="sqrt([mortality, longevity, lapse] R [mortality, longevity, lapse]')",
+        additivity_note=(
+            "Correlated research norm; standalone modules do not add to FPAR."
+        ),
+    )
+    shapley_metadata = (
+        (
+            "mortality_mll_shapley",
+            "mortality_loss",
+            "Mortality effect on correlated MLL",
+        ),
+        (
+            "longevity_mll_shapley",
+            "longevity_loss",
+            "Longevity effect on correlated MLL",
+        ),
+        (
+            "lapse_mll_shapley",
+            "lapse_loss",
+            "Binding-lapse effect on correlated MLL",
+        ),
+    )
+    for order, (metadata, impact) in enumerate(
+        zip(shapley_metadata, shapley_impacts), start=1
+    ):
+        component, source_component, label = metadata
+        module_index = order - 1
+        add_mll_row(
+            row_type="mll_shapley_attribution",
+            component=component,
+            display_label=label,
+            fixed_value=float(fixed_module_values[module_index]),
+            flexible_value=float(flexible_module_values[module_index]),
+            formula=(
+                "average marginal change in correlated MLL over all six "
+                "module replacement orders"
+            ),
+            additivity_note=(
+                "Additive attribution of the correlated MLL change; not the "
+                "standalone module-value change."
+            ),
+        )
+        mll_rows[-1].update({
+            "source_component": source_component,
+            "correlated_mll_shapley_effect_aud": float(impact),
+            "mll_charge_shapley_effect_aud": float(rate * impact),
+            "capital_adjusted_csm_shapley_effect_aud": float(-rate * impact),
+            "mll_fpar_penalty_shapley_effect_aud": float(rate * impact),
+            "risk_penalized_csm_shapley_effect_aud": float(-rate * impact),
+            "mll_waterfall_order": order,
+            "mll_waterfall_role": "change_component",
+            "mll_waterfall_method": (
+                "exact_three_module_shapley_all_six_orders"
+            ),
+            "mll_waterfall_permutation_count": 6,
+        })
+    add_mll_row(
+        row_type="mll_shapley_reconciliation",
+        component="mll_shapley_total",
+        display_label="Correlated MLL-FPAR Shapley reconciliation",
+        fixed_value=fixed_capital,
+        flexible_value=flexible_capital,
+        formula="best-fixed MLL + sum(three Shapley effects) = flexible MLL",
+        additivity_note="Reconciliation total; do not add as a fourth effect.",
+    )
+    mll_rows[-1].update({
+        "source_component": "mll_capital",
+        "mll_shapley_reconciliation_target_aud": (
+            flexible_capital - fixed_capital
+        ),
+        "mll_shapley_effect_sum_aud": math.fsum(
+            float(value) for value in shapley_impacts
+        ),
+        "mll_shapley_reconciliation_gap_aud": shapley_gap,
+        "mll_waterfall_role": "reconciliation_total",
+        "mll_waterfall_method": (
+            "exact_three_module_shapley_all_six_orders"
+        ),
+        "mll_waterfall_permutation_count": 6,
+    })
+    add_mll_row(
+        row_type="risk_penalty",
+        component="mll_capital_charge",
+        display_label=f"MLL future-profit-risk penalty ({100.0 * rate:g}%)",
+        fixed_value=rate * fixed_capital,
+        flexible_value=rate * flexible_capital,
+        formula="lambda x correlated MLL future-profit-risk proxy",
+        additivity_note=(
+            "Research penalty subtracted only in the secondary sensitivity."
+        ),
+    )
+    fixed_adjusted = fixed_csm - rate * fixed_capital
+    flexible_adjusted = flexible_csm - rate * flexible_capital
+    expected_adjusted_delta = (
+        flexible_csm - fixed_csm
+        - rate * (flexible_capital - fixed_capital)
+    )
+    actual_adjusted_delta = flexible_adjusted - fixed_adjusted
+    if abs(actual_adjusted_delta - expected_adjusted_delta) > tolerance:
+        raise RuntimeError(
+            "Time-0 risk-penalised sensitivity bridge does not reconcile."
+        )
+    add_mll_row(
+        row_type="secondary_sensitivity",
+        component="csm_minus_lambda_mll",
+        display_label="Risk-penalised CSM sensitivity",
+        fixed_value=fixed_adjusted,
+        flexible_value=flexible_adjusted,
+        formula="CSM - lambda x correlated MLL future-profit-risk proxy",
+        additivity_note=(
+            "Secondary research sensitivity; primary Time-0 objective is CSM."
+        ),
+    )
+    return csm_rows, mll_rows
+
+
 def _plot_time_zero_capital_adjusted_flexibility(
     *,
     plotting_backend,
@@ -15057,18 +15791,20 @@ def _plot_time_zero_capital_adjusted_flexibility(
         )
 
     best_cap = float(comparison["best_fixed_cap_percent"])
-    best_ratio = optional_float(comparison["best_fixed_csm_to_mll_ratio"])
-    flexible_ratio = optional_float(comparison["flexible_csm_to_mll_ratio"])
-    capital_charge_rate = float(comparison["mll_capital_charge_rate"])
+    best_ratio = optional_float(comparison["best_fixed_csm_to_mll_risk_ratio"])
+    flexible_ratio = optional_float(
+        comparison["flexible_csm_to_mll_risk_ratio"]
+    )
+    risk_penalty_weight = float(comparison["mll_risk_penalty_weight"])
     fixed_aud = np.asarray([
         float(comparison["best_fixed_csm_aud"]),
-        float(comparison["best_fixed_mll_capital_aud"]),
-        float(comparison["best_fixed_csm_minus_lambda_mll_aud"]),
+        float(comparison["best_fixed_mll_future_profit_risk_aud"]),
+        float(comparison["best_fixed_risk_penalized_csm_aud"]),
     ])
     flexible_aud = np.asarray([
         float(comparison["flexible_csm_aud"]),
-        float(comparison["flexible_mll_capital_aud"]),
-        float(comparison["flexible_csm_minus_lambda_mll_aud"]),
+        float(comparison["flexible_mll_future_profit_risk_aud"]),
+        float(comparison["flexible_risk_penalized_csm_aud"]),
     ])
     best_adjusted = float(fixed_aud[2])
     flexible_adjusted = float(flexible_aud[2])
@@ -15118,7 +15854,11 @@ def _plot_time_zero_capital_adjusted_flexibility(
     )
     aud_axis.set_xticks(
         positions,
-        ("CSM", "MLL", f"CSM - {100.0 * capital_charge_rate:g}% MLL"),
+        (
+            "CSM",
+            "MLL-FPAR\nproxy",
+            f"CSM - {100.0 * risk_penalty_weight:g}%\nFPAR penalty",
+        ),
     )
     aud_axis.set_ylabel("Time-0 value (AUD)")
     aud_axis.yaxis.set_major_formatter(
@@ -15127,7 +15867,7 @@ def _plot_time_zero_capital_adjusted_flexibility(
     aud_axis.set_ylim(
         0.0, 1.31 * float(max(np.max(fixed_aud), np.max(flexible_aud)))
     )
-    aud_axis.set_title("Profitability, capital and capital-adjusted value")
+    aud_axis.set_title("Profitability and secondary risk sensitivity")
     aud_axis.grid(axis="y", alpha=0.22, zorder=1)
     aud_axis.legend(loc="upper left", frameon=False)
 
@@ -15171,14 +15911,14 @@ def _plot_time_zero_capital_adjusted_flexibility(
         ratio_positions,
         (f"Best fixed\n({best_cap:g}%)", "Annual\nmanagement"),
     )
-    ratio_axis.set_ylabel("CSM / MLL")
+    ratio_axis.set_ylabel("CSM / MLL-FPAR")
     finite_ratios = ratio_values[np.isfinite(ratio_values)]
     ratio_upper = (
         1.36 * float(np.max(finite_ratios))
         if finite_ratios.size else 1.0
     )
     ratio_axis.set_ylim(0.0, ratio_upper)
-    ratio_axis.set_title("Capital efficiency")
+    ratio_axis.set_title("Proxy risk efficiency")
     ratio_axis.grid(axis="y", alpha=0.22, zorder=1)
 
     both_improve = bool(
@@ -15188,8 +15928,8 @@ def _plot_time_zero_capital_adjusted_flexibility(
     )
     figure.suptitle(
         (
-            "Optimal annual crediting-rate management improves value and "
-            "efficiency"
+            "Annual crediting-rate flexibility improves CSM and proxy "
+            "risk efficiency"
             if both_improve
             else "Optimal annual crediting-rate management: Time-0 comparison"
         ),
@@ -15199,7 +15939,10 @@ def _plot_time_zero_capital_adjusted_flexibility(
     figure.text(
         0.5,
         0.925,
-        "Direct visualisation of the Section 7 comparison table",
+        (
+            "Primary selection = CSM; FPAR is a stressed-profit sensitivity. "
+            "No APRA/LAGIC capital is calculated."
+        ),
         ha="center",
         fontsize=10,
         color="#555555",
@@ -15209,16 +15952,762 @@ def _plot_time_zero_capital_adjusted_flexibility(
         figure=figure,
         pyplot=pyplot,
         directory=directory,
-        stem="01_time_zero_capital_adjusted_flexibility",
+        stem="01_time_zero_csm_and_future_profit_risk",
         plot_format=plot_format,
         dpi=dpi,
     )
     return paths, str(matplotlib.__version__)
 
 
+def _draw_waterfall_axis(
+    *,
+    axis,
+    ticker,
+    start: float,
+    changes: Array,
+    end: float,
+    labels: Sequence[str],
+    title: str,
+    ylabel: str,
+    positive_colour: str,
+    negative_colour: str,
+) -> None:
+    """Draw an absolute-start, floating-change, absolute-end waterfall."""
+    start_value = float(start)
+    end_value = float(end)
+    impacts = np.asarray(changes, dtype=float)
+    if impacts.ndim != 1 or len(labels) != impacts.size + 2:
+        raise ValueError("Waterfall labels and changes do not align.")
+    if not np.isfinite(start_value) or not np.isfinite(end_value) \
+            or not np.all(np.isfinite(impacts)):
+        raise ValueError("Waterfall values must be finite.")
+    reconciled_end = start_value + math.fsum(
+        float(impact) for impact in impacts
+    )
+    tolerance = 1.0e-8 * max(
+        1.0, abs(start_value), abs(end_value), abs(reconciled_end)
+    )
+    if abs(reconciled_end - end_value) > tolerance:
+        raise RuntimeError("Waterfall changes do not reconcile to the endpoint.")
+
+    positions = np.arange(impacts.size + 2, dtype=float)
+    width = 0.64
+    fixed_colour = "#2F6B9A"
+    flexible_colour = "#D4882A"
+
+    def total_bar(position: float, value: float, colour: str):
+        return axis.bar(
+            position,
+            abs(value),
+            width=width,
+            bottom=min(0.0, value),
+            color=colour,
+            edgecolor="white",
+            linewidth=0.8,
+            zorder=3,
+        )[0]
+
+    start_bar = total_bar(positions[0], start_value, fixed_colour)
+    cumulative = start_value
+    levels = [0.0, start_value]
+    change_bars = []
+    for index, impact in enumerate(impacts, start=1):
+        next_level = cumulative + float(impact)
+        bar = axis.bar(
+            positions[index],
+            abs(float(impact)),
+            width=width,
+            bottom=min(cumulative, next_level),
+            color=(positive_colour if impact >= 0.0 else negative_colour),
+            edgecolor="white",
+            linewidth=0.8,
+            zorder=3,
+        )[0]
+        change_bars.append(bar)
+        axis.plot(
+            [positions[index - 1] + width / 2.0,
+             positions[index] - width / 2.0],
+            [cumulative, cumulative],
+            color="#777777",
+            linewidth=0.9,
+            linestyle="--",
+            zorder=2,
+        )
+        levels.extend((cumulative, next_level))
+        cumulative = next_level
+    end_bar = total_bar(positions[-1], end_value, flexible_colour)
+    axis.plot(
+        [positions[-2] + width / 2.0, positions[-1] - width / 2.0],
+        [cumulative, cumulative],
+        color="#777777",
+        linewidth=0.9,
+        linestyle="--",
+        zorder=2,
+    )
+
+    for bar, value in ((start_bar, start_value), (end_bar, end_value)):
+        anchor = value
+        axis.annotate(
+            f"{value:,.0f}",
+            xy=(bar.get_x() + bar.get_width() / 2.0, anchor),
+            xytext=(0, 5 if value >= 0.0 else -5),
+            textcoords="offset points",
+            ha="center",
+            va="bottom" if value >= 0.0 else "top",
+            fontsize=8.5,
+            fontweight="bold",
+        )
+    running = start_value
+    for bar, impact in zip(change_bars, impacts):
+        next_level = running + float(impact)
+        anchor = max(running, next_level) if impact >= 0.0 else min(
+            running, next_level
+        )
+        axis.annotate(
+            f"{impact:+,.0f}",
+            xy=(bar.get_x() + bar.get_width() / 2.0, anchor),
+            xytext=(0, 4 if impact >= 0.0 else -4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom" if impact >= 0.0 else "top",
+            fontsize=8,
+        )
+        running = next_level
+
+    lower = min(levels + [end_value, 0.0])
+    upper = max(levels + [end_value, 0.0])
+    span = max(upper - lower, 1.0)
+    axis.set_ylim(lower - 0.14 * span, upper + 0.20 * span)
+    axis.axhline(0.0, color="#555555", linewidth=0.9, zorder=1)
+    axis.set_xticks(positions, labels, rotation=25, ha="right")
+    axis.set_ylabel(ylabel)
+    axis.yaxis.set_major_formatter(
+        ticker.FuncFormatter(lambda value, _: f"{value:,.0f}")
+    )
+    axis.grid(axis="y", alpha=0.20, zorder=0)
+    axis.set_title(title, fontweight="bold")
+
+
+def _plot_time_zero_flexibility_breakdown(
+    *,
+    plotting_backend,
+    csm_rows: Sequence[Mapping[str, object]],
+    mll_rows: Sequence[Mapping[str, object]],
+    comparison: Mapping[str, object],
+    directory: Path,
+    plot_format: str,
+    dpi: int,
+) -> list[Path]:
+    """Plot exact CSM and Shapley-allocated MLL component waterfalls."""
+    _, pyplot, ticker = plotting_backend
+    component_rows = [
+        row for row in csm_rows if row["row_type"] == "component"
+    ]
+    if len(component_rows) != len(TIME_ZERO_CSM_COMPONENT_METADATA):
+        raise ValueError("The Time-0 CSM breakdown is incomplete.")
+    mll_by_component = {
+        str(row["component"]): row for row in mll_rows
+    }
+    required_mll = (
+        "mortality_loss",
+        "longevity_loss",
+        "lapse_up_loss",
+        "lapse_down_loss",
+        "mass_lapse_loss",
+        "lapse_loss",
+        "mll_capital",
+        "mll_capital_charge",
+        "csm_minus_lambda_mll",
+        "mortality_mll_shapley",
+        "longevity_mll_shapley",
+        "lapse_mll_shapley",
+        "mll_shapley_total",
+    )
+    missing = set(required_mll).difference(mll_by_component)
+    if missing:
+        raise ValueError(
+            "The Time-0 MLL breakdown is incomplete: "
+            + ", ".join(sorted(missing))
+        )
+
+    figure = pyplot.figure(figsize=(15.8, 10.2))
+    grid = figure.add_gridspec(
+        2,
+        2,
+        width_ratios=(1.0, 1.0),
+        height_ratios=(1.15, 1.0),
+        wspace=0.28,
+        hspace=0.62,
+    )
+    csm_axis = figure.add_subplot(grid[0, :])
+    mll_axis = figure.add_subplot(grid[1, 0])
+    lapse_axis = figure.add_subplot(grid[1, 1])
+
+    csm_impacts = np.asarray([
+        float(row["flexibility_csm_impact_aud"])
+        for row in component_rows
+    ])
+    csm_total = next(
+        row for row in csm_rows if row["row_type"] == "csm_total"
+    )
+    fixed_csm = float(csm_total["best_fixed_amount_aud"])
+    flexible_csm = float(csm_total["flexible_amount_aud"])
+    csm_delta = float(comparison["flexible_minus_best_fixed_csm_aud"])
+    component_delta = float(np.sum(csm_impacts))
+    plot_tolerance = 1.0e-8 * max(
+        1.0, abs(csm_delta), abs(component_delta)
+    )
+    if abs(component_delta - csm_delta) > plot_tolerance:
+        raise RuntimeError(
+            "Plotted CSM impacts do not reconcile to the reported delta."
+        )
+    csm_plot_labels = (
+        "Product fees",
+        "LIP fees",
+        "Money-market /\nhedge income",
+        "MVA",
+        "APS",
+        "Guarantee claims",
+        "Other benefits",
+        "Expenses",
+        "Option / hedge costs",
+    )
+    if len(csm_plot_labels) != len(component_rows):
+        raise RuntimeError("The concise CSM plot labels are incomplete.")
+    _draw_waterfall_axis(
+        axis=csm_axis,
+        ticker=ticker,
+        start=fixed_csm,
+        changes=csm_impacts,
+        end=flexible_csm,
+        labels=(
+            f"Best fixed CSM\n({float(comparison['best_fixed_cap_percent']):g}%)",
+            *csm_plot_labels,
+            "Flexible CSM",
+        ),
+        title=(
+            "CSM component waterfall: best fixed to flexible\n"
+            "Nine signed cashflow effects; subtotals are not double-counted"
+        ),
+        ylabel="CSM (AUD)",
+        positive_colour="#4E9F70",
+        negative_colour="#C75B5B",
+    )
+
+    shapley_rows = sorted(
+        (
+            row for row in mll_rows
+            if row["row_type"] == "mll_shapley_attribution"
+        ),
+        key=lambda row: int(row["mll_waterfall_order"]),
+    )
+    if len(shapley_rows) != 3 or len({
+        row["component"] for row in shapley_rows
+    }) != 3:
+        raise RuntimeError("The MLL Shapley waterfall requires three drivers.")
+    if [int(row["mll_waterfall_order"]) for row in shapley_rows] != [1, 2, 3]:
+        raise RuntimeError(
+            "The MLL Shapley waterfall requires unique orders 1, 2 and 3."
+        )
+    shapley_impacts = np.asarray([
+        float(row["correlated_mll_shapley_effect_aud"])
+        for row in shapley_rows
+    ])
+    fixed_mll = float(mll_by_component["mll_capital"]["best_fixed_value_aud"])
+    flexible_mll = float(
+        mll_by_component["mll_capital"]["flexible_value_aud"]
+    )
+    _draw_waterfall_axis(
+        axis=mll_axis,
+        ticker=ticker,
+        start=fixed_mll,
+        changes=shapley_impacts,
+        end=flexible_mll,
+        labels=(
+            "Best fixed\nMLL-FPAR",
+            "Mortality effect",
+            "Longevity effect",
+            "Lapse effect",
+            "Flexible\nMLL-FPAR",
+        ),
+        title=(
+            "Correlated MLL-FPAR change: exact Shapley allocation\n"
+            "Effects include correlation and diversification"
+        ),
+        ylabel="Correlated MLL-FPAR proxy (AUD)",
+        positive_colour="#C75B5B",
+        negative_colour="#4E9F70",
+    )
+
+    module_components = ("mortality_loss", "longevity_loss", "lapse_loss")
+    module_labels = ("Mortality", "Longevity", "Binding lapse")
+    fixed_modules = np.asarray([
+        float(mll_by_component[name]["best_fixed_value_aud"])
+        for name in module_components
+    ])
+    flexible_modules = np.asarray([
+        float(mll_by_component[name]["flexible_value_aud"])
+        for name in module_components
+    ])
+    module_positions = np.arange(len(module_components), dtype=float)
+    module_width = 0.34
+    fixed_module_bars = lapse_axis.bar(
+        module_positions - module_width / 2.0,
+        fixed_modules,
+        module_width,
+        color="#2F6B9A",
+        label=f"Best fixed ({float(comparison['best_fixed_cap_percent']):g}%)",
+        zorder=3,
+    )
+    flexible_module_bars = lapse_axis.bar(
+        module_positions + module_width / 2.0,
+        flexible_modules,
+        module_width,
+        color="#D4882A",
+        label="Annual flexibility",
+        zorder=3,
+    )
+    for bars, values in (
+        (fixed_module_bars, fixed_modules),
+        (flexible_module_bars, flexible_modules),
+    ):
+        lapse_axis.bar_label(
+            bars,
+            labels=[f"{value:,.0f}" for value in values],
+            padding=3,
+            fontsize=8,
+        )
+    fixed_binding = str(
+        mll_by_component["lapse_loss"]["best_fixed_binding_lapse_stress"]
+    )
+    flexible_binding = str(
+        mll_by_component["lapse_loss"]["flexible_binding_lapse_stress"]
+    )
+    fixed_mortality_signed = float(
+        mll_by_component["base_csm"]["best_fixed_value_aud"]
+        - mll_by_component["mortality_stressed_csm"]["best_fixed_value_aud"]
+    )
+    flexible_mortality_signed = float(
+        mll_by_component["base_csm"]["flexible_value_aud"]
+        - mll_by_component["mortality_stressed_csm"]["flexible_value_aud"]
+    )
+    lapse_axis.set_xticks(module_positions, module_labels)
+    lapse_axis.set_ylabel("Standalone adverse FPAR input (AUD)")
+    lapse_axis.yaxis.set_major_formatter(
+        ticker.FuncFormatter(lambda value, _: f"{value:,.0f}")
+    )
+    lapse_axis.set_ylim(
+        0.0, 1.24 * max(float(np.max(fixed_modules)),
+                        float(np.max(flexible_modules)), 1.0)
+    )
+    lapse_axis.grid(axis="y", alpha=0.20, zorder=0)
+    lapse_axis.legend(loc="best", frameon=False, fontsize=8)
+    lapse_axis.set_title(
+        "Absolute standalone MLL-FPAR inputs\n"
+        f"Mortality signed effects {fixed_mortality_signed:+,.0f} / "
+        f"{flexible_mortality_signed:+,.0f} are favourable and clipped to 0; "
+        f"lapse={fixed_binding}/{flexible_binding}",
+        fontweight="bold",
+        fontsize=9.5,
+    )
+
+    rate = 100.0 * float(comparison["mll_risk_penalty_weight"])
+    mass_lapse_rate = 100.0 * float(comparison["mass_lapse_rate"])
+    model_point_count = int(comparison["model_point_count"])
+
+    figure.suptitle(
+        "CSM and MLL future-profit-risk: flexibility vs best fixed",
+        fontsize=15,
+        fontweight="bold",
+        y=0.985,
+    )
+    figure.text(
+        0.5,
+        0.942,
+        (
+            "Time-0 fixed-anchored fitted-Q comparison under the same complete "
+            "risk-neutral sample"
+        ),
+        ha="center",
+        fontsize=10,
+        color="#555555",
+    )
+    figure.text(
+        0.01,
+        0.012,
+        (
+            "CSM: nine signed cashflow changes reconcile from best fixed to "
+            "flexible. MLL-FPAR: the three Shapley effects average all six "
+            "module-change orders and reconcile to the correlated proxy within "
+            "tolerance.\n"
+            "Standalone adverse FPAR inputs, fixed to flexible: mortality "
+            f"{float(mll_by_component['mortality_loss']['best_fixed_value_aud']):,.0f}"
+            " to "
+            f"{float(mll_by_component['mortality_loss']['flexible_value_aud']):,.0f}; "
+            "longevity "
+            f"{float(mll_by_component['longevity_loss']['best_fixed_value_aud']):,.0f}"
+            " to "
+            f"{float(mll_by_component['longevity_loss']['flexible_value_aud']):,.0f}; "
+            "binding lapse "
+            f"{float(mll_by_component['lapse_loss']['best_fixed_value_aud']):,.0f}"
+            " to "
+            f"{float(mll_by_component['lapse_loss']['flexible_value_aud']):,.0f}.\n"
+            f"Mass lapse is {mass_lapse_rate:g}% of positive CSM across "
+            f"{model_point_count} modelpoint(s), not a stress revaluation.\n"
+            f"Lambda={rate:g}% is only a secondary research penalty. Primary "
+            "selection is CSM. No APRA/LAGIC capital or IFRS 17 CSM is "
+            "calculated. Results are in-sample estimates, not an OOS result "
+            "or deployment schedule."
+        ),
+        fontsize=8,
+        color="#555555",
+    )
+    figure.subplots_adjust(top=0.88, bottom=0.18)
+    return _save_figure(
+        figure=figure,
+        pyplot=pyplot,
+        directory=directory,
+        stem="02_time_zero_csm_mll_fpar_component_waterfalls",
+        plot_format=plot_format,
+        dpi=dpi,
+    )
+
+
+def _typed_csv_value(value: str | None) -> object:
+    """Recover the scalar types needed by report-only plotting."""
+    if value is None or value == "":
+        return None
+    if value == "True":
+        return True
+    if value == "False":
+        return False
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _read_typed_csv_rows(path: Path) -> list[dict[str, object]]:
+    """Read one runner CSV without turning the string ``False`` into truth."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Required report source is missing: {path}")
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = [
+            {key: _typed_csv_value(value) for key, value in row.items()}
+            for row in csv.DictReader(handle)
+        ]
+    if not rows:
+        raise ValueError(f"Required report source is empty: {path}")
+    return rows
+
+
+def _normalise_time_zero_fpar_report_schema(
+    comparison: Mapping[str, object],
+    csm_rows: Sequence[Mapping[str, object]],
+    mll_rows: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+    """Add canonical FPAR fields while retaining legacy capital-named inputs.
+
+    Completed v3.2 runs are immutable provenance sources.  This adapter lets
+    report-only generation consume them without implying that their stressed-
+    CSM loss is APRA capital.  New canonical fields are additive aliases; old
+    fields remain only for backwards-compatible readers.
+    """
+
+    def first(*names: str) -> object:
+        for name in names:
+            if name in comparison and comparison[name] not in (None, ""):
+                return comparison[name]
+        raise KeyError(
+            "Time-0 report is missing all compatible fields: "
+            + ", ".join(names)
+        )
+
+    normalised = dict(comparison)
+    weight = float(first(
+        "mll_risk_penalty_weight", "mll_capital_charge_rate"
+    ))
+    fixed_csm = float(first("best_fixed_csm_aud"))
+    flexible_csm = float(first("flexible_csm_aud"))
+    fixed_risk = float(first(
+        "best_fixed_mll_future_profit_risk_aud",
+        "best_fixed_mll_capital_aud",
+    ))
+    flexible_risk = float(first(
+        "flexible_mll_future_profit_risk_aud",
+        "flexible_mll_capital_aud",
+    ))
+    fixed_ratio = normalised.get(
+        "best_fixed_csm_to_mll_risk_ratio",
+        normalised.get("best_fixed_csm_to_mll_ratio"),
+    )
+    flexible_ratio = normalised.get(
+        "flexible_csm_to_mll_risk_ratio",
+        normalised.get("flexible_csm_to_mll_ratio"),
+    )
+    fixed_penalized = fixed_csm - weight * fixed_risk
+    flexible_penalized = flexible_csm - weight * flexible_risk
+    normalised.update({
+        "primary_optimisation_objective": "csm",
+        "optimisation_objective": "csm",
+        "mll_risk_measure_name": MLL_RISK_MEASURE_NAME,
+        "mll_risk_value_basis": MLL_RISK_VALUE_BASIS,
+        "mll_scope": (
+            "partial_mortality_longevity_lapse_future_profit_risk_proxy"
+        ),
+        "mll_risk_penalty_weight": weight,
+        "best_fixed_mll_future_profit_risk_aud": fixed_risk,
+        "flexible_mll_future_profit_risk_aud": flexible_risk,
+        "flexible_minus_best_fixed_mll_future_profit_risk_aud": (
+            flexible_risk - fixed_risk
+        ),
+        "best_fixed_mll_risk_penalty_aud": weight * fixed_risk,
+        "flexible_mll_risk_penalty_aud": weight * flexible_risk,
+        "flexible_minus_best_fixed_mll_risk_penalty_aud": (
+            weight * (flexible_risk - fixed_risk)
+        ),
+        "best_fixed_risk_penalized_csm_aud": fixed_penalized,
+        "flexible_risk_penalized_csm_aud": flexible_penalized,
+        "flexible_minus_best_fixed_risk_penalized_csm_aud": (
+            flexible_penalized - fixed_penalized
+        ),
+        "best_fixed_csm_to_mll_risk_ratio": fixed_ratio,
+        "flexible_csm_to_mll_risk_ratio": flexible_ratio,
+        "fixed_csm_comparator_binding": bool(normalised.get(
+            "fixed_primary_objective_comparator_binding", False
+        )),
+        "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+        "regulatory_capital_framework": REGULATORY_CAPITAL_FRAMEWORK,
+        "regulatory_capital_aud": None,
+        "apra_insurance_risk_charge_aud": None,
+        "apra_prescribed_capital_amount_aud": None,
+        "apra_prudential_capital_requirement_aud": None,
+        "ifrs17_csm_status": "not_calculated_custom_profitability_proxy_only",
+        "mll_correlation_assumption_status": (
+            "illustrative_research_assumption_not_apra_prescribed"
+        ),
+        "legacy_capital_named_fields_retained": True,
+    })
+
+    canonical_components = {
+        "mll_capital": "mll_future_profit_risk",
+        "mll_capital_charge": "mll_future_profit_risk_penalty",
+        "csm_minus_lambda_mll": "risk_penalized_csm",
+        "mortality_mll_shapley": "mortality_mll_fpar_shapley",
+        "longevity_mll_shapley": "longevity_mll_fpar_shapley",
+        "lapse_mll_shapley": "lapse_mll_fpar_shapley",
+        "mll_shapley_total": "mll_fpar_shapley_total",
+    }
+    canonical_row_types = {
+        "correlated_capital": "correlated_future_profit_risk",
+        "capital_charge": "risk_penalty",
+        "primary_objective": "secondary_sensitivity",
+    }
+    canonical_labels = {
+        "mll_capital": "Correlated MLL future-profit-risk proxy",
+        "mll_capital_charge": (
+            f"MLL future-profit-risk penalty ({100.0 * weight:g}%)"
+        ),
+        "csm_minus_lambda_mll": "Risk-penalised CSM sensitivity",
+        "mortality_mll_shapley": "Mortality effect on correlated MLL-FPAR",
+        "longevity_mll_shapley": "Longevity effect on correlated MLL-FPAR",
+        "lapse_mll_shapley": "Binding-lapse effect on correlated MLL-FPAR",
+        "mll_shapley_total": "Correlated MLL-FPAR Shapley reconciliation",
+    }
+    normalised_csm: list[dict[str, object]] = []
+    for source_row in csm_rows:
+        row = dict(source_row)
+        row.update({
+            "profitability_measure": "custom_csm_proxy",
+            "ifrs17_csm_status": (
+                "not_calculated_custom_profitability_proxy_only"
+            ),
+            "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+        })
+        normalised_csm.append(row)
+
+    normalised_mll: list[dict[str, object]] = []
+    for source_row in mll_rows:
+        row = dict(source_row)
+        component = str(row.get("component", ""))
+        row_type = str(row.get("row_type", ""))
+        row.update({
+            "canonical_component": canonical_components.get(
+                component, component
+            ),
+            "canonical_row_type": canonical_row_types.get(
+                row_type, row_type
+            ),
+            "mll_risk_measure_name": MLL_RISK_MEASURE_NAME,
+            "mll_risk_value_basis": MLL_RISK_VALUE_BASIS,
+            "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+            "regulatory_capital_framework": REGULATORY_CAPITAL_FRAMEWORK,
+            "mll_correlation_assumption_status": (
+                "illustrative_research_assumption_not_apra_prescribed"
+            ),
+        })
+        if component != row["canonical_component"]:
+            row["legacy_component"] = component
+        if row_type != row["canonical_row_type"]:
+            row["legacy_row_type"] = row_type
+        if "capital_materiality_aud" in row:
+            row["mll_risk_materiality_aud"] = row[
+                "capital_materiality_aud"
+            ]
+        if component in canonical_labels:
+            row["display_label"] = canonical_labels[component]
+        if row.get("row_type") in {
+            "standalone_loss", "lapse_candidate_loss",
+            "binding_lapse_module", "correlated_capital",
+        }:
+            row["best_fixed_future_profit_risk_aud"] = row.get(
+                "best_fixed_value_aud"
+            )
+            row["flexible_future_profit_risk_aud"] = row.get(
+                "flexible_value_aud"
+            )
+        normalised_mll.append(row)
+    return normalised, normalised_csm, normalised_mll
+
+
+def _run_time_zero_report_only(args: argparse.Namespace) -> None:
+    """Regenerate current-schema plots without market or LSMC work."""
+    source = args.report_from_run.expanduser().resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"Report source run does not exist: {source}")
+    source_files = {
+        "comparison": source / "time_zero_flexibility_comparison.csv",
+        "csm_components": source / "time_zero_csm_component_comparison.csv",
+        "mll_components": source / "time_zero_mll_component_comparison.csv",
+        "summary": source / "optimization_summary.json",
+        "manifest": source / "run_manifest.json",
+    }
+    comparison_rows = _read_typed_csv_rows(source_files["comparison"])
+    if len(comparison_rows) != 1:
+        raise ValueError(
+            "The report source must contain exactly one comparison row."
+        )
+    comparison = comparison_rows[0]
+    csm_rows = _read_typed_csv_rows(source_files["csm_components"])
+    mll_rows = _read_typed_csv_rows(source_files["mll_components"])
+    comparison, csm_rows, mll_rows = _normalise_time_zero_fpar_report_schema(
+        comparison, csm_rows, mll_rows
+    )
+    for key in ("summary", "manifest"):
+        if not source_files[key].is_file():
+            raise FileNotFoundError(
+                f"Required report source is missing: {source_files[key]}"
+            )
+    with source_files["summary"].open("r", encoding="utf-8") as handle:
+        source_summary = json.load(handle)
+    if not isinstance(source_summary, dict) or not source_summary.get("run_id"):
+        raise ValueError("The report source summary has no valid run_id.")
+
+    created = datetime.now(timezone.utc)
+    report_id = created.strftime("%Y%m%dT%H%M%S.%fZ")
+    output = args.output.expanduser().resolve() / f"report_{report_id}"
+    output.mkdir(parents=True, exist_ok=False)
+    log_path = _configure_logging(output, args.log_level)
+    LOGGER.info("Report-only generation started | source=%s", source)
+    plotting_backend = _load_plotting_backend()
+    plot_directory = output / "plots"
+    plot_directory.mkdir(parents=True, exist_ok=False)
+    plot_paths, matplotlib_version = (
+        _plot_time_zero_capital_adjusted_flexibility(
+            plotting_backend=plotting_backend,
+            fixed_rows=(),
+            comparison=comparison,
+            directory=plot_directory,
+            plot_format=args.plot_format,
+            dpi=args.plot_dpi,
+        )
+    )
+    plot_paths.extend(_plot_time_zero_flexibility_breakdown(
+        plotting_backend=plotting_backend,
+        csm_rows=csm_rows,
+        mll_rows=mll_rows,
+        comparison=comparison,
+        directory=plot_directory,
+        plot_format=args.plot_format,
+        dpi=args.plot_dpi,
+    ))
+    report_manifest = {
+        "schema": "crediting-flexibility-time0-future-profit-risk-report-only-2.0",
+        "report_id": report_id,
+        "created_utc": created.isoformat(),
+        "script": str(Path(__file__).resolve()),
+        "script_sha256": hashlib.sha256(
+            Path(__file__).resolve().read_bytes()
+        ).hexdigest(),
+        "source_run": str(source),
+        "source_run_id": source_summary["run_id"],
+        "market_cache_loaded": False,
+        "projection_run": False,
+        "management_lsmc_fit": False,
+        "primary_optimisation_objective": "csm",
+        "mll_risk_measure_name": MLL_RISK_MEASURE_NAME,
+        "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+        "regulatory_capital_framework": REGULATORY_CAPITAL_FRAMEWORK,
+        "regulatory_capital_aud": None,
+        "matplotlib_version": matplotlib_version,
+        "plot_files": [
+            str(path.relative_to(output)) for path in plot_paths
+        ],
+        "plot_sha256": {
+            str(path.relative_to(output)): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in plot_paths
+        },
+        "source_sha256": {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in source_files.items()
+        },
+    }
+    _write_csv(
+        output / "time_zero_flexibility_comparison.csv", [comparison]
+    )
+    _write_csv(
+        output / "time_zero_csm_component_comparison.csv", csm_rows
+    )
+    _write_csv(
+        output / "time_zero_mll_future_profit_risk_component_comparison.csv",
+        mll_rows,
+    )
+    generated_data = (
+        "time_zero_flexibility_comparison.csv",
+        "time_zero_csm_component_comparison.csv",
+        "time_zero_mll_future_profit_risk_component_comparison.csv",
+    )
+    report_manifest["data_files"] = list(generated_data)
+    report_manifest["data_sha256"] = {
+        name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+        for name in generated_data
+    }
+    with (output / "report_manifest.json").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        json.dump(
+            report_manifest,
+            handle,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        handle.write("\n")
+    LOGGER.info(
+        "REPORT COMPLETE | %d plot files | no market/projection/LSMC | "
+        "log=%s | directory=%s",
+        len(plot_paths), log_path, output,
+    )
+
+
 def main() -> None:
     """Run the same-sample Time-0 management-flexibility valuation."""
     args = parse_args()
+    if args.report_from_run is not None:
+        _run_time_zero_report_only(args)
+        return
     started = time.perf_counter()
     created = datetime.now(timezone.utc)
     run_id = created.strftime("%Y%m%dT%H%M%S.%fZ")
@@ -15239,8 +16728,13 @@ def main() -> None:
         "created_utc": created.isoformat(),
         "valuation_basis": "risk_neutral_time_zero_current_curve",
         "estimator": "full_sample_management_lsmc",
-        "optimisation_objective": "csm_minus_lambda_mll",
+        "optimisation_objective": "csm",
+        "mll_risk_penalty_weight": args.mll_risk_penalty_weight,
         "mll_capital_charge_rate": args.mll_capital_charge_rate,
+        "mll_risk_measure_name": MLL_RISK_MEASURE_NAME,
+        "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+        "regulatory_capital_framework": REGULATORY_CAPITAL_FRAMEWORK,
+        "regulatory_capital_aud": None,
         "oos_used": False,
         "forward_roll_used": False,
         "deployment_strategy_output": False,
@@ -15325,8 +16819,8 @@ def main() -> None:
     )
     LOGGER.info(
         "Inputs | modelpoint=%s | horizon=%.2f years | dynamic customer "
-        "behaviour=%s | customer LSMC=False | management objective="
-        "CSM-%.4g*MLL",
+        "behaviour=%s | customer LSMC=False | primary objective=CSM | "
+        "secondary MLL-FPAR penalty weight=%.4g",
         model_point.model_point_id, horizon_years, behaviour.regime,
         args.mll_capital_charge_rate,
     )
@@ -15485,19 +16979,30 @@ def main() -> None:
         row["time_zero_mll_capital_aud"] = row[
             "fixed_cap_selection_sample_mll_capital_aud"
         ]
+        row["time_zero_mll_future_profit_risk_aud"] = row[
+            "time_zero_mll_capital_aud"
+        ]
         row["time_zero_csm_to_mll_ratio"] = row[
             "fixed_cap_selection_sample_csm_to_mll_ratio"
         ]
         row["mll_capital_charge_rate"] = args.mll_capital_charge_rate
+        row["mll_risk_penalty_weight"] = args.mll_risk_penalty_weight
+        row["primary_optimisation_objective"] = "csm"
+        row["mll_risk_measure_name"] = MLL_RISK_MEASURE_NAME
+        row["regulatory_capital_status"] = REGULATORY_CAPITAL_STATUS
         row["time_zero_csm_minus_lambda_mll_aud"] = (
             float(row["time_zero_csm_aud"])
             - args.mll_capital_charge_rate
             * float(row["time_zero_mll_capital_aud"])
         )
+        row["time_zero_risk_penalized_csm_aud"] = row[
+            "time_zero_csm_minus_lambda_mll_aud"
+        ]
     best_fixed = max(
         fixed_rows,
         key=lambda row: (
-            float(row["time_zero_csm_minus_lambda_mll_aud"]),
+            float(row["time_zero_csm_aud"]),
+            -float(row["time_zero_mll_future_profit_risk_aud"]),
             (
                 -np.inf
                 if row["time_zero_csm_to_mll_ratio"] is None
@@ -15523,6 +17028,7 @@ def main() -> None:
     )
     for row in fixed_rows:
         row["is_best_fixed_cap_primary_objective"] = row is best_fixed
+        row["is_best_fixed_cap_csm"] = row is best_fixed
         row["is_best_fixed_cap_admissible_grid"] = row is best_fixed
         row["time_zero_csm_minus_lambda_mll_difference_vs_best_fixed_aud"] = (
             float(row["time_zero_csm_minus_lambda_mll_aud"])
@@ -15546,6 +17052,7 @@ def main() -> None:
             fixed_cap_start_payload=fixed_start_payload,
             fixed_cap_start=float(best_fixed["cap"]),
             capital_charge_rate=args.mll_capital_charge_rate,
+            candidate_policy_class=args.candidate_policy_class,
         )
     flexible_result = flexible.csm_mll
     fixed_ratio = (
@@ -15581,6 +17088,7 @@ def main() -> None:
         None if ratio_delta is None else ratio_delta * fixed_mll
     )
     payload_scaled = portfolio_scale * np.asarray(flexible.selected_payload)
+    fixed_payload_scaled = portfolio_scale * np.asarray(fixed_start_payload)
     comparison = {
         "valuation_basis": "risk_neutral_time_zero_current_curve",
         "common_q_scenario_fingerprint": scenarios.content_fingerprint,
@@ -15590,13 +17098,17 @@ def main() -> None:
         "model_point_id": model_point.model_point_id,
         "customer_behaviour": "dynamic_statistical_no_customer_lsmc",
         "management_estimator": flexible.estimator,
+        "candidate_policy_class_filter": args.candidate_policy_class,
+        "targeted_payload_recovery": (
+            args.candidate_policy_class is not None
+        ),
         "selected_management_candidate_source": (
             flexible.selected_candidate_source
         ),
         "policy_class_grid_complete": flexible.policy_class_grid_complete,
         "global_ratio_optimum_claimed": flexible.global_ratio_optimum_claimed,
         "global_primary_objective_optimum_claimed": False,
-        "optimisation_objective": "csm_minus_lambda_mll",
+        "optimisation_objective": "csm",
         "mll_capital_charge_rate": args.mll_capital_charge_rate,
         "fixed_primary_objective_comparator_binding": (
             flexible.fixed_primary_objective_comparator_binding
@@ -15656,11 +17168,29 @@ def main() -> None:
         "best_fixed_mortality_loss_aud": float(best_fixed[
             "fixed_cap_selection_sample_mortality_loss_aud"
         ]),
+        "best_fixed_mortality_stressed_csm_aud": float(best_fixed[
+            "fixed_cap_selection_sample_mortality_stressed_csm_aud"
+        ]),
         "best_fixed_longevity_loss_aud": float(best_fixed[
             "fixed_cap_selection_sample_longevity_loss_aud"
         ]),
+        "best_fixed_longevity_stressed_csm_aud": float(best_fixed[
+            "fixed_cap_selection_sample_longevity_stressed_csm_aud"
+        ]),
         "best_fixed_lapse_loss_aud": float(best_fixed[
             "fixed_cap_selection_sample_lapse_loss_aud"
+        ]),
+        "best_fixed_lapse_up_stressed_csm_aud": float(best_fixed[
+            "fixed_cap_selection_sample_lapse_up_stressed_csm_aud"
+        ]),
+        "best_fixed_lapse_down_stressed_csm_aud": float(best_fixed[
+            "fixed_cap_selection_sample_lapse_down_stressed_csm_aud"
+        ]),
+        "best_fixed_lapse_up_loss_aud": float(best_fixed[
+            "fixed_cap_selection_sample_lapse_up_loss_aud"
+        ]),
+        "best_fixed_lapse_down_loss_aud": float(best_fixed[
+            "fixed_cap_selection_sample_lapse_down_loss_aud"
         ]),
         "best_fixed_mass_lapse_loss_aud": float(best_fixed[
             "fixed_cap_selection_sample_mass_lapse_loss_aud"
@@ -15671,11 +17201,21 @@ def main() -> None:
         "flexible_mortality_loss_aud": (
             portfolio_scale * flexible_result.mll.mortality_loss
         ),
+        "flexible_mortality_stressed_csm_aud": float(payload_scaled[9]),
         "flexible_longevity_loss_aud": (
             portfolio_scale * flexible_result.mll.longevity_loss
         ),
+        "flexible_longevity_stressed_csm_aud": float(payload_scaled[10]),
         "flexible_lapse_loss_aud": (
             portfolio_scale * flexible_result.mll.lapse_loss
+        ),
+        "flexible_lapse_up_stressed_csm_aud": float(payload_scaled[11]),
+        "flexible_lapse_down_stressed_csm_aud": float(payload_scaled[12]),
+        "flexible_lapse_up_loss_aud": (
+            portfolio_scale * flexible_result.mll.lapse_up_loss
+        ),
+        "flexible_lapse_down_loss_aud": (
+            portfolio_scale * flexible_result.mll.lapse_down_loss
         ),
         "flexible_mass_lapse_loss_aud": (
             portfolio_scale * flexible_result.mll.mass_lapse_loss
@@ -15685,19 +17225,30 @@ def main() -> None:
         ),
         "fitted_bellman_chain_count": flexible.fitted_chain_count,
         "mll_scope": "partial mortality_longevity_lapse_research_capital",
+        "mass_lapse_rate": objective_spec.mass_lapse_fraction,
+        "mll_capital_materiality_aud": (
+            portfolio_scale * objective_spec.capital_materiality
+        ),
+        "mll_correlation_matrix": json.dumps(
+            mll_correlation_matrix(_capital_stresses_for_mass_lapse(
+                objective_spec.mass_lapse_fraction
+            )),
+            separators=(",", ":"),
+        ),
     }
-    component_names = tuple(INSURER_COMPONENT_NAMES)
     value_vector = {
-        "layout": [
-            *component_names,
-            "mortality_stressed_csm",
-            "longevity_stressed_csm",
-            "lapse_up_stressed_csm",
-            "lapse_down_stressed_csm",
-            "sole_model_point_base_csm_recomputed_from_base_components",
-        ],
+        "layout": list(TIME_ZERO_VALUE_VECTOR_NAMES),
+        "best_fixed_unscaled_time_zero_values": fixed_start_payload.tolist(),
+        "best_fixed_scaled_time_zero_values_aud": (
+            fixed_payload_scaled.tolist()
+        ),
         "unscaled_time_zero_values": flexible.selected_payload.tolist(),
         "scaled_time_zero_values_aud": payload_scaled.tolist(),
+        "portfolio_scale": portfolio_scale,
+        "candidate_policy_class_filter": args.candidate_policy_class,
+        "targeted_payload_recovery": (
+            args.candidate_policy_class is not None
+        ),
         "best_fitted_candidate_unscaled_time_zero_values": (
             flexible.best_adaptive_payload.tolist()
         ),
@@ -15715,6 +17266,85 @@ def main() -> None:
             flexible_csm - payload_scaled[-1]
         ),
     }
+    csm_breakdown_rows, mll_breakdown_rows = (
+        _time_zero_flexibility_breakdown_rows(
+            fixed_payload=fixed_start_payload,
+            flexible_payload=flexible.selected_payload,
+            objective_spec=objective_spec,
+            portfolio_scale=portfolio_scale,
+            capital_charge_rate=args.mll_capital_charge_rate,
+        )
+    )
+    breakdown_csm = next(
+        row for row in csm_breakdown_rows if row["row_type"] == "csm_total"
+    )
+    breakdown_mll = next(
+        row for row in mll_breakdown_rows
+        if row["component"] == "mll_capital"
+    )
+    mll_breakdown_by_component = {
+        str(row["component"]): row for row in mll_breakdown_rows
+    }
+    shapley_total = mll_breakdown_by_component["mll_shapley_total"]
+    comparison.update({
+        "mll_delta_attribution_method": (
+            "exact_three_module_shapley_all_six_orders"
+        ),
+        "mortality_correlated_mll_shapley_effect_aud": float(
+            mll_breakdown_by_component["mortality_mll_shapley"][
+                "correlated_mll_shapley_effect_aud"
+            ]
+        ),
+        "longevity_correlated_mll_shapley_effect_aud": float(
+            mll_breakdown_by_component["longevity_mll_shapley"][
+                "correlated_mll_shapley_effect_aud"
+            ]
+        ),
+        "lapse_correlated_mll_shapley_effect_aud": float(
+            mll_breakdown_by_component["lapse_mll_shapley"][
+                "correlated_mll_shapley_effect_aud"
+            ]
+        ),
+        "mll_shapley_reconciliation_gap_aud": float(
+            shapley_total["mll_shapley_reconciliation_gap_aud"]
+        ),
+    })
+    comparison, csm_breakdown_rows, mll_breakdown_rows = (
+        _normalise_time_zero_fpar_report_schema(
+            comparison, csm_breakdown_rows, mll_breakdown_rows
+        )
+    )
+    mll_breakdown_by_component = {
+        str(row["component"]): row for row in mll_breakdown_rows
+    }
+    breakdown_csm = next(
+        row for row in csm_breakdown_rows if row["row_type"] == "csm_total"
+    )
+    breakdown_mll = mll_breakdown_by_component["mll_capital"]
+    for label, observed, expected in (
+        (
+            "best-fixed CSM", breakdown_csm["best_fixed_amount_aud"],
+            fixed_csm,
+        ),
+        (
+            "flexible CSM", breakdown_csm["flexible_amount_aud"],
+            flexible_csm,
+        ),
+        (
+            "best-fixed MLL", breakdown_mll["best_fixed_value_aud"],
+            fixed_mll,
+        ),
+        (
+            "flexible MLL", breakdown_mll["flexible_value_aud"],
+            flexible_mll,
+        ),
+    ):
+        if not np.isclose(
+            float(observed), float(expected), rtol=1.0e-8, atol=1.0e-8
+        ):
+            raise RuntimeError(
+                f"Time-0 breakdown {label} does not match the comparison."
+            )
 
     plot_directory = output / "plots"
     plot_directory.mkdir(parents=True, exist_ok=False)
@@ -15729,6 +17359,15 @@ def main() -> None:
                 dpi=args.plot_dpi,
             )
         )
+        plot_paths.extend(_plot_time_zero_flexibility_breakdown(
+            plotting_backend=plotting_backend,
+            csm_rows=csm_breakdown_rows,
+            mll_rows=mll_breakdown_rows,
+            comparison=comparison,
+            directory=plot_directory,
+            plot_format=args.plot_format,
+            dpi=args.plot_dpi,
+        ))
     elapsed = time.perf_counter() - started
     summary = {
         "status": "completed",
@@ -15744,18 +17383,53 @@ def main() -> None:
             "Today's risk-neutral fitted-Q value of the contractual right to "
             "reset the annual crediting cap; not a deployment strategy."
         ),
+        "breakdown": {
+            "csm_breakdown_rows": len(csm_breakdown_rows),
+            "csm_detail_component_rows": sum(
+                row["row_type"] == "component"
+                for row in csm_breakdown_rows
+            ),
+            "csm_group_total_rows": sum(
+                row["row_type"] == "group_total"
+                for row in csm_breakdown_rows
+            ),
+            "mll_analysis_rows": len(mll_breakdown_rows),
+            "csm_components_reconciled_within_tolerance": True,
+            "mll_modules_additive": False,
+            "mll_delta_attribution_reported": True,
+            "mll_delta_attribution_method": (
+                "exact_three_module_shapley_all_six_orders"
+            ),
+            "waterfall_graphics_reported": True,
+            "primary_objective": "csm",
+            "secondary_sensitivity_bridge": (
+                "delta_CSM-lambda_times_delta_MLL_FPAR"
+            ),
+        },
         "limitations": [
-            "MLL covers mortality, longevity and lapse only; it is not total "
-            "regulatory capital.",
+            "MLL-FPAR is a stressed custom-CSM future-profit-risk proxy. It "
+            "is not APRA/LAGIC capital, an IFRS 17 CSM stress or a Risk "
+            "Adjustment.",
+            "No APRA Insurance Risk Charge, Prescribed Capital Amount or "
+            "Prudential Capital Requirement is calculated because fund-level "
+            "adjusted policy liabilities, assets, tax/reinsurance and the "
+            "remaining capital modules are outside this product study.",
             "The estimator uses the complete Q sample in-sample as requested; "
             "there is no OOS performance claim or bootstrap interval.",
-            "The reported value maximises CSM minus lambda times MLL only "
-            "within the predeclared 21-member fitted Base/Stress policy class "
-            "plus one conditional-ratio heuristic; no global optimum over all "
-            "management rules is claimed.",
+            (
+                "This targeted payload-recovery run evaluates only the "
+                f"previously selected {args.candidate_policy_class!r} policy "
+                "class against best fixed; the parent full-grid run established "
+                "the candidate selection."
+                if args.candidate_policy_class is not None
+                else "The reported value maximises CSM "
+                "only within the predeclared 21-member fitted Base/Stress "
+                "policy class plus one conditional-ratio heuristic; no global "
+                "optimum over all management rules is claimed."
+            ),
             "Every fitted payload difference is anchored to the direct best-"
-            "fixed projection. There is no additional CSM constraint; best "
-            "fixed is the explicit primary-objective comparator for the "
+            "fixed projection. There is no additional CSM constraint; the "
+            "highest-CSM fixed cap is the explicit comparator for the "
             "flexibility right.",
             "Exactly one illustrative modelpoint is used; mass lapse therefore "
             "equals the configured fraction of positive total base CSM.",
@@ -15763,7 +17437,7 @@ def main() -> None:
     }
     surface = scenarios.hedge_price_surface
     manifest = {
-        "schema": "crediting-flexibility-time0-capital-adjusted-3.0",
+        "schema": "crediting-flexibility-time0-csm-future-profit-risk-4.0",
         "run_id": run_id,
         "script": str(script_path),
         "script_sha256": script_sha256,
@@ -15799,9 +17473,24 @@ def main() -> None:
             "measure": Measure.RISK_NEUTRAL.value,
             "discounting": "pathwise_to_time_zero_from_current_curve",
             "management_lsmc": flexible.estimator,
+            "full_policy_class_grid": [
+                name for name, _ in _time_zero_policy_class_weights()
+            ],
             "policy_class_grid": [
                 name for name, _ in _time_zero_policy_class_weights()
             ],
+            "evaluated_policy_classes": (
+                [args.candidate_policy_class]
+                if args.candidate_policy_class is not None
+                else [
+                    "conditional_ratio_heuristic",
+                    *(name for name, _ in _time_zero_policy_class_weights()),
+                ]
+            ),
+            "candidate_policy_class_filter": args.candidate_policy_class,
+            "targeted_payload_recovery": (
+                args.candidate_policy_class is not None
+            ),
             "policy_class_grid_complete": (
                 flexible.policy_class_grid_complete
             ),
@@ -15810,9 +17499,47 @@ def main() -> None:
             ),
             "fixed_anchor_control_variate": True,
             "additional_csm_constraint": False,
-            "primary_objective": "csm_minus_lambda_mll",
+            "primary_objective": "csm",
+            "secondary_sensitivity": "csm_minus_lambda_mll_fpar",
+            "mll_risk_penalty_weight": args.mll_risk_penalty_weight,
             "mll_capital_charge_rate": args.mll_capital_charge_rate,
+            "mass_lapse_rate": objective_spec.mass_lapse_fraction,
+            "mll_risk_materiality_bp": args.mll_risk_materiality_bp,
+            "mll_capital_materiality_bp": args.mll_capital_materiality_bp,
+            "mll_capital_materiality_aud": (
+                portfolio_scale * objective_spec.capital_materiality
+            ),
+            "mll_correlation_matrix": mll_correlation_matrix(
+                _capital_stresses_for_mass_lapse(
+                    objective_spec.mass_lapse_fraction
+                )
+            ),
+            "mll_correlation_source": (
+                "CapitalStresses.corr_life[mortality,longevity,lapse]"
+            ),
+            "mll_framework": MLL_FRAMEWORK,
+            "mll_risk_measure_name": MLL_RISK_MEASURE_NAME,
+            "mll_risk_value_basis": MLL_RISK_VALUE_BASIS,
+            "mll_correlation_assumption_status": (
+                "illustrative_research_assumption_not_apra_prescribed"
+            ),
+            "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+            "regulatory_capital_framework": REGULATORY_CAPITAL_FRAMEWORK,
+            "regulatory_capital_aud": None,
+            "apra_insurance_risk_charge_aud": None,
+            "apra_prescribed_capital_amount_aud": None,
+            "apra_prudential_capital_requirement_aud": None,
             "csm_to_mll_reported": True,
+            "csm_component_breakdown_reported": True,
+            "mll_nonadditive_module_breakdown_reported": True,
+            "mll_delta_attribution_reported": True,
+            "mll_delta_attribution_method": (
+                "exact_three_module_shapley_all_six_orders"
+            ),
+            "mll_delta_attribution_drivers": [
+                "mortality", "longevity", "binding_lapse"
+            ],
+            "component_waterfall_graphics_reported": True,
             "fixed_primary_objective_comparator": True,
             "fixed_primary_objective_comparator_binding": (
                 flexible.fixed_primary_objective_comparator_binding
@@ -15826,12 +17553,19 @@ def main() -> None:
             "exploration": exploration_metadata,
             "fixed_cap_metadata": {
                 "time_zero_path_count": scenarios.n_paths,
-                "objective": "csm_minus_lambda_mll",
+                "objective": "csm",
+                "secondary_sensitivity": "csm_minus_lambda_mll_fpar",
+                "mll_risk_penalty_weight": args.mll_risk_penalty_weight,
                 "mll_capital_charge_rate": args.mll_capital_charge_rate,
                 "best_fixed_csm_aud": fixed_csm,
                 "best_fixed_mll_capital_aud": fixed_mll,
+                "best_fixed_mll_future_profit_risk_aud": fixed_mll,
                 "best_fixed_csm_to_mll_ratio": fixed_ratio,
+                "best_fixed_csm_to_mll_risk_ratio": fixed_ratio,
                 "best_fixed_csm_minus_lambda_mll_aud": (
+                    fixed_capital_adjusted
+                ),
+                "best_fixed_risk_penalized_csm_aud": (
                     fixed_capital_adjusted
                 ),
                 "market_scenario_fingerprint": (
@@ -15870,6 +17604,18 @@ def main() -> None:
             list(flexible.iteration_rows),
         ),
         (output / "time_zero_flexibility_comparison.csv", [comparison]),
+        (
+            output / "time_zero_csm_component_comparison.csv",
+            csm_breakdown_rows,
+        ),
+        (
+            output / "time_zero_mll_component_comparison.csv",
+            mll_breakdown_rows,
+        ),
+        (
+            output / "time_zero_mll_future_profit_risk_component_comparison.csv",
+            mll_breakdown_rows,
+        ),
     )
     with _logged_stage("Write Time-0 CSV and JSON results"):
         for path, rows in csv_outputs:
@@ -15891,12 +17637,15 @@ def main() -> None:
                 handle.write("\n")
     LOGGER.info(
         "RUN COMPLETE | %.1fs | one modelpoint | same-sample Time-0 Q | "
-        "CSM-lambda*MLL %.2f vs fixed %.2f | delta %+.2f | "
-        "CSM/MLL %s vs fixed %s | no OOS",
+        "primary CSM %.2f vs fixed %.2f | delta %+.2f | "
+        "secondary risk-penalised CSM %.2f vs %.2f | CSM/MLL-FPAR %s "
+        "vs fixed %s | no APRA capital | no OOS",
         elapsed,
+        flexible_csm,
+        fixed_csm,
+        flexible_csm - fixed_csm,
         flexible_capital_adjusted,
         fixed_capital_adjusted,
-        capital_adjusted_delta,
         "undefined" if flexible_ratio is None else f"{flexible_ratio:.6g}",
         "undefined" if fixed_ratio is None else f"{fixed_ratio:.6g}",
     )

@@ -1,0 +1,47 @@
+{
+  "schema": "crediting-flexibility-time0-future-profit-risk-report-only-2.0",
+  "report_id": "20260714T163854.089093Z",
+  "created_utc": "2026-07-14T16:38:54.089093+00:00",
+  "script": "C:\\Users\\user\\Documents\\GMLB Structuring\\code\\portfolio_simulations\\optimize_crediting_rate_dynamic_behaviour_alt.py",
+  "script_sha256": "c4f05ba62083ce5434e34c105157cc1fe69e36ae6b02c2e7870ba2a364a08be7",
+  "source_run": "C:\\Users\\user\\Documents\\GMLB Structuring\\results\\crediting_rate_optimisation\\time0_csm_mll_one_modelpoint_capital_adjusted_4200_targeted\\20260714T151746.544341Z",
+  "source_run_id": "20260714T151746.544341Z",
+  "market_cache_loaded": false,
+  "projection_run": false,
+  "management_lsmc_fit": false,
+  "primary_optimisation_objective": "csm",
+  "mll_risk_measure_name": "mll_stressed_csm_future_profit_risk_proxy",
+  "regulatory_capital_status": "not_calculated",
+  "regulatory_capital_framework": "APRA_LAGIC",
+  "regulatory_capital_aud": null,
+  "matplotlib_version": "3.9.4",
+  "plot_files": [
+    "plots\\01_time_zero_csm_and_future_profit_risk.png",
+    "plots\\01_time_zero_csm_and_future_profit_risk.svg",
+    "plots\\02_time_zero_csm_mll_fpar_component_waterfalls.png",
+    "plots\\02_time_zero_csm_mll_fpar_component_waterfalls.svg"
+  ],
+  "plot_sha256": {
+    "plots\\01_time_zero_csm_and_future_profit_risk.png": "5cfd48b1a7957d8c096d87feec3970c2c6f185556f9b903a2704376e0d25d601",
+    "plots\\01_time_zero_csm_and_future_profit_risk.svg": "7927374e68e8c6844df4c3e0c7cdce6e4269fdca4981ef4ed209046adec22e95",
+    "plots\\02_time_zero_csm_mll_fpar_component_waterfalls.png": "de53d4e8b0a974dcdb4a0ff40e1ed98f3644f52cd1416c47f83e4d163c61f033",
+    "plots\\02_time_zero_csm_mll_fpar_component_waterfalls.svg": "1178ebc5c26bbf1a402cee8c3df56d0511b5461a68cbbb3e13e079d005af2c70"
+  },
+  "source_sha256": {
+    "comparison": "596b5889a0e0191097c0b326e689b70d79f603deef3683a412ff88b5c5cbfdbf",
+    "csm_components": "b037457a193b2fc88c5d6c87d4773a481232c99e23a8c1c243fc4cc61b70f190",
+    "mll_components": "5e25aee6db8a61334e117dc2ce0320fe703e520bca08b5bfe8e489ff938c2453",
+    "summary": "4ead05f165313836a16945e4938278e0d288c9dca4155aa85908ecab6e048707",
+    "manifest": "564601c0c2365fdb4efc468fb996a341d50c0f03d2ebe555be7d63fe5574e085"
+  },
+  "data_files": [
+    "time_zero_flexibility_comparison.csv",
+    "time_zero_csm_component_comparison.csv",
+    "time_zero_mll_future_profit_risk_component_comparison.csv"
+  ],
+  "data_sha256": {
+    "time_zero_flexibility_comparison.csv": "9448fe7d92f91d28abce7da872a346b687075ace2e5d87e2a7e718b6b55b9fcb",
+    "time_zero_csm_component_comparison.csv": "70301e067161079f523ebee4c54e890fe0e5d044e3938b419c972f241d0ac96b",
+    "time_zero_mll_future_profit_risk_component_comparison.csv": "2186a93cd158e51ed5b5e89684c2b2d3418de85fdf157a59c89d9cb844214825"
+  }
+}

@@ -1,4 +1,4 @@
-"""Contracts for the Dynamic-only crediting-cap capital orchestrator."""
+"""Contracts for the Dynamic-only crediting-cap MLL FPAR orchestrator."""
 
 from pathlib import Path
 
@@ -7,12 +7,15 @@ import pytest
 from portfolio_simulations import run_crediting_rate_capital_analysis as runner
 
 
-def test_defaults_are_dynamic_only_and_capital_adjusted() -> None:
+def test_defaults_are_dynamic_only_and_custom_csm_primary() -> None:
     args = runner.parse_args([])
 
     assert args.cap_grid == (0.0025, 0.01, 0.06, 0.12)
     assert args.baseline_cap == pytest.approx(0.06)
-    assert args.objective == "capital_adjusted_csm"
+    assert args.objective == runner.PRIMARY_OBJECTIVE
+    assert args.fpar_penalty_weight == pytest.approx(0.06)
+    assert args.fpar_materiality_bp == pytest.approx(1.0)
+    # Programmatic aliases remain available during the migration.
     assert args.capital_hurdle_rate == pytest.approx(0.06)
     assert args.mass_lapse_fraction == pytest.approx(0.40)
     assert runner.STRESS_IDS == (
@@ -21,6 +24,23 @@ def test_defaults_are_dynamic_only_and_capital_adjusted() -> None:
         "longevity",
         "lapse_up",
         "lapse_down",
+    )
+
+
+def test_legacy_capital_cli_names_normalise_to_fpar() -> None:
+    args = runner.parse_args([
+        "--objective", "capital_adjusted_csm",
+        "--capital-hurdle-rate", "0.08",
+        "--capital-materiality-bp", "2.5",
+    ])
+
+    assert args.objective == runner.FPAR_OBJECTIVE
+    assert args.fpar_penalty_weight == pytest.approx(0.08)
+    assert args.capital_hurdle_rate == pytest.approx(0.08)
+    assert args.fpar_materiality_bp == pytest.approx(2.5)
+    assert args.capital_materiality_bp == pytest.approx(2.5)
+    assert runner.parse_args(["--objective", "csm"]).objective == (
+        runner.PRIMARY_OBJECTIVE
     )
 
 
@@ -102,7 +122,7 @@ def _scenario(cap: float, stress: str, csm: float) -> dict[str, object]:
     }
 
 
-def test_capital_adjusted_selection_can_reject_higher_csm_with_more_capital() -> None:
+def test_fpar_penalty_can_reject_higher_csm_with_more_future_profit_risk() -> None:
     scenarios = []
     values = {
         0.01: {
@@ -125,30 +145,114 @@ def test_capital_adjusted_selection_can_reject_higher_csm_with_more_capital() ->
             _scenario(cap, stress, csm) for stress, csm in stresses.items()
         )
 
-    rows = runner._build_capital_rows(
+    rows = runner._build_fpar_rows(
         scenarios,
         positive_base_value={0.01: 100.0, 0.06: 300.0},
         baseline_cap=0.06,
-        capital_hurdle_rate=0.10,
-        capital_materiality_bp=1.0,
+        fpar_penalty_weight=0.10,
+        fpar_materiality_bp=1.0,
         mass_lapse_fraction=0.40,
-        objective="capital_adjusted_csm",
+        objective=runner.FPAR_OBJECTIVE,
     )
 
     selected = next(row for row in rows if row["is_selected_cap"])
     assert selected["crediting_cap_rate"] == pytest.approx(0.01)
     assert selected["base_csm_aud"] < 105.0
-    assert selected["mll_life_capital_proxy_aud"] < next(
-        row["mll_life_capital_proxy_aud"]
+    assert selected["mll_future_profit_at_risk_aud"] < next(
+        row["mll_future_profit_at_risk_aud"]
         for row in rows
         if row["crediting_cap_rate"] == pytest.approx(0.06)
     )
     assert selected["mass_lapse_proxy_is_binding"] is True
     assert (
-        selected["mll_life_capital_proxy_aud"]
-        > selected["mll_permanent_lapse_only_capital_proxy_aud"]
+        selected["mll_future_profit_at_risk_aud"]
+        > selected["mll_permanent_lapse_only_future_profit_at_risk_aud"]
     )
-    assert selected["capital_adjusted_value_vs_baseline_aud"] > 0.0
+    assert selected["fpar_penalised_value_vs_baseline_aud"] > 0.0
+    assert selected["regulatory_capital_status"] == "not_calculated"
+    assert selected["regulatory_capital_calculated"] is False
+    assert selected["required_capital_calculated"] is False
+    assert selected["apra_prescribed_capital_amount_calculated"] is False
+    # Historic result fields remain exact aliases, not a second calculation.
+    assert selected["mll_life_capital_proxy_aud"] == pytest.approx(
+        selected["mll_future_profit_at_risk_aud"]
+    )
+    assert selected["capital_adjusted_csm_aud"] == pytest.approx(
+        selected["fpar_penalised_csm_aud"]
+    )
+
+
+def test_custom_csm_primary_default_is_separate_from_fpar_sensitivity() -> None:
+    scenarios = []
+    values = {
+        0.01: {
+            "base": 100.0,
+            "mortality": 105.0,
+            "longevity": 90.0,
+            "lapse_up": 95.0,
+            "lapse_down": 100.0,
+        },
+        0.06: {
+            "base": 105.0,
+            "mortality": 110.0,
+            "longevity": 95.0,
+            "lapse_up": 105.0,
+            "lapse_down": 105.0,
+        },
+    }
+    for cap, stresses in values.items():
+        scenarios.extend(
+            _scenario(cap, stress, csm) for stress, csm in stresses.items()
+        )
+
+    rows = runner._build_fpar_rows(
+        scenarios,
+        positive_base_value={0.01: 100.0, 0.06: 300.0},
+        baseline_cap=0.06,
+        fpar_penalty_weight=0.10,
+        fpar_materiality_bp=1.0,
+        mass_lapse_fraction=0.40,
+        objective=runner.PRIMARY_OBJECTIVE,
+    )
+
+    selected = next(row for row in rows if row["is_selected_cap"])
+    fpar_sensitivity = next(
+        row for row in rows
+        if row["is_secondary_fpar_penalised_selected_cap"]
+    )
+    assert selected["crediting_cap_rate"] == pytest.approx(0.06)
+    assert selected["is_primary_csm_selected_cap"] is True
+    assert selected["primary_optimisation_objective"] == "custom_csm"
+    assert selected["selection_objective_role"] == "primary"
+    assert fpar_sensitivity["crediting_cap_rate"] == pytest.approx(0.01)
+    assert selected["risk_scope"] == (
+        "mortality_longevity_lapse_future_profit_at_risk"
+    )
+
+
+def test_legacy_build_helper_and_objective_remain_compatible() -> None:
+    scenarios = [
+        _scenario(0.06, "base", 100.0),
+        _scenario(0.06, "mortality", 105.0),
+        _scenario(0.06, "longevity", 90.0),
+        _scenario(0.06, "lapse_up", 95.0),
+        _scenario(0.06, "lapse_down", 100.0),
+    ]
+
+    rows = runner._build_capital_rows(
+        scenarios,
+        positive_base_value={0.06: 100.0},
+        baseline_cap=0.06,
+        capital_hurdle_rate=0.06,
+        capital_materiality_bp=1.0,
+        mass_lapse_fraction=0.40,
+        objective="capital_adjusted_csm",
+    )
+
+    assert rows[0]["selection_objective"] == runner.FPAR_OBJECTIVE
+    assert rows[0]["mll_life_capital_proxy_aud"] == pytest.approx(
+        rows[0]["mll_future_profit_at_risk_aud"]
+    )
 
 
 def test_positive_model_point_value_does_not_net_onerous_cells() -> None:

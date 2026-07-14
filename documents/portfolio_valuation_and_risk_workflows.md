@@ -3,8 +3,9 @@
 ## Purpose
 
 The portfolio workflows connect portable inputs, exact market scenarios, the
-monthly product projector, policyholder behaviour, CSM components and
-shock-and-revalue analysis. The central design rule is separation of duties:
+monthly product projector, policyholder behaviour, custom-CSM profitability
+components and shock-and-revalue analysis. The central design rule is
+separation of duties:
 
 ```text
 versioned inputs
@@ -160,7 +161,7 @@ optimal action set. The customer value is
 $\mathbb E_0^Q[\sum_tP(0,t)CF_t]$, using deterministic discount factors from
 today's Australian zero curve. The fit is conditional on survival and includes
 normal income, Full Surrender and the post-fee account-value closeout at the
-finite horizon; actual mortality is restored only for the actuarial/CSM
+finite horizon; actual mortality is restored only for the actuarial/custom-CSM
 rollout.
 
 Whole-path folds are internal continuation-value estimators. Fit and rollout
@@ -185,12 +186,13 @@ Optional `--stress-analysis` expands the grid to requested one-factor stresses.
 For market stresses, the full stressed Q scenario and hedge caches are prepared
 and read. For mortality, longevity or expense stresses, the base market cache
 is reused and the non-market assumption is changed in the projection. Permanent
-lapse stresses are available only in the separate Dynamic-only capital workflow
-below, not in this Dynamic-plus-LSMC orchestrator.
+lapse stresses are available only in the separate Dynamic-only MLL-FPAR
+workflow below, not in this Dynamic-plus-LSMC orchestrator.
 
 The workflow reports, among other items:
 
-- CSM proxy and its Fee Income, Other Income, Claims and Costs legs;
+- custom-CSM profitability proxy and its Fee Income, Other Income, Claims and
+  Costs legs;
 - guarantee claims, option cost and money-market backing income;
 - election timing, phase exposure and voluntary-action diagnostics;
 - Dynamic-versus-direct-LSMC differences and time-zero customer optionality;
@@ -199,38 +201,61 @@ The workflow reports, among other items:
 
 Its retained outputs are expected present values and model-point scalars, not a
 pathwise shareholder-loss distribution. Therefore the workflow does **not**
-produce VaR, TVaR/CTE, APRA LAGIC capital or a complete IFRS 17 Risk Adjustment.
-Calling model-point dispersion a tail-loss distribution is incorrect.
+produce VaR, TVaR/CTE, APRA LAGIC capital, an APRA prescribed capital amount or
+a complete IFRS 17 Risk Adjustment. Its custom CSM is also not an IFRS 17 CSM
+balance or movement. Calling model-point dispersion a tail-loss distribution
+is incorrect.
 
 When behaviour is refitted under stress, the result includes behavioural
 adaptation to the stressed environment. It is not the sensitivity of one frozen
 behaviour policy. The run manifest records the interpretation.
 
-## Dynamic-only capital-adjusted fixed-cap analysis
+## Dynamic-only MLL future-profit-at-risk analysis
 
 [`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py)
-is the dedicated route when Policyholder LSMC must not run. It hard-gates every
-valuation child to `run_portfolio_valuation.py`, Dynamic election and Dynamic
-post-Income behaviour, and exact required market and hedge caches. For every
-fixed cap it runs common-random-number revaluations for base, mortality,
-longevity, permanent lapse-up and permanent lapse-down assumptions.
+is the implementation behind the canonical
+`crediting-future-profit-risk-analysis` command. It is the dedicated route when
+Policyholder LSMC must not run. It hard-gates every valuation child to
+`run_portfolio_valuation.py`, Dynamic election and Dynamic post-Income
+behaviour, and exact required market and hedge caches. For every fixed cap it
+runs common-random-number revaluations for base, mortality, longevity,
+permanent lapse-up and permanent lapse-down assumptions.
 
-The resulting mortality/longevity/lapse capital is a partial research proxy,
-not APRA LAGIC capital or a complete Solvency II SCR. Mortality and longevity
-losses use permanent 15% and -20% mortality-rate shocks. The lapse module takes
-the largest adverse permanent 50% up/down shock and a separately disclosed 40%
-mass-lapse proxy on positive model-point CSM; the three modules are then
-aggregated with the documented life-risk correlation matrix. The primary
-selection measure is the capital-adjusted CSM, denoted
+The resulting **MLL future profit at risk (MLL-FPAR)** is the positive loss of
+the repository's custom CSM under those stresses. It is a partial research
+measure, not APRA LAGIC capital or a complete Solvency II SCR. Mortality and
+longevity losses use permanent 15% and -20% mortality-rate shocks. The lapse
+module takes the largest adverse permanent 50% up/down shock and a separately
+disclosed 40% mass-lapse proxy on positive model-point custom CSM; the three
+modules are then aggregated with the documented life-risk correlation matrix.
 
-$\mathrm{CSM}_{\mathrm{adj}}=\mathrm{CSM}-hK_{\mathrm{MLL}}$.
+The command reports the secondary research sensitivity
+
+$\mathrm{CSM}_{\mathrm{FPAR}}=\mathrm{CSM}-\lambda R_{\mathrm{MLL}}$,
+
+with a default dimensionless penalty weight of $\lambda=6\%$. This weight is
+not a capital charge, cost-of-capital rate or Risk Margin. The default and
+primary fixed-design ranking is custom CSM. Ranking by this penalised value or
+by CSM/MLL-FPAR requires the explicit `--objective fpar_penalised_csm` or
+`--objective csm_to_fpar` choice. The historic `crediting-capital-analysis`
+command, capital-named options and output fields remain compatibility aliases
+only.
 
 This evaluates a fixed product-design choice. It does not establish that an
 annually adaptive discretionary cap rule has value. Outputs include the full
-stress revaluation table, capital table, run manifest and three diagnostic
-figures under `results/runs/crediting_rate_capital_analysis/`.
+stress revaluation table, FPAR table, run manifest and diagnostic figures under
+the historically named `results/runs/crediting_rate_capital_analysis/`
+directory.
 
-## Time-zero capital-adjusted value of annual cap flexibility
+This is not an APRA calculation. [APRA LPS 115](https://www.apra.gov.au/standards/lps-115)
+bases the Insurance Risk Charge on the capital-base effect of stressed adjusted
+policy liabilities, [APRA LPS 112](https://www.apra.gov.au/standards/lps-112)
+defines the adjusted-policy-liability/capital-base boundary, and
+[APRA LPS 110](https://www.apra.gov.au/standards/lps-110) specifies the broader
+prescribed-capital and Prudential Capital Requirement framework. The repository
+does not calculate those quantities, nor does it calculate an IFRS 17 CSM.
+
+## Time-zero value of annual cap flexibility
 
 [`optimize_crediting_rate_dynamic_behaviour_alt.py`](../code/portfolio_simulations/optimize_crediting_rate_dynamic_behaviour_alt.py)
 is the strict reader for the current annual-flexibility question. It uses
@@ -240,25 +265,27 @@ does not invoke Customer LSMC.
 The fixed caps, Management-LSMC regressions and finished-candidate ranking use
 one complete exact Q sample. Cashflows are discounted to Time 0 with the current
 curve. There is no path reservation, OOS seed, forward roll, deployment gate or
-strategy replay. The primary final score is
-$\mathrm{CSM}-0.06\,\mathrm{MLL}$; CSM/MLL is a secondary reported efficiency
-measure and does not select the policy. Twenty-one additive Base/Stress
-objectives plus one conditional-ratio heuristic generate the finite fitted
-policy class, while a forced best-fixed chain supplies the regression anchor.
-Best fixed is the explicit comparator under the same 6% score and there is no
-additional CSM constraint.
+strategy replay. The primary final score is custom CSM. The quantities
+$\mathrm{CSM}-0.06\,\mathrm{MLL\mbox{-}FPAR}$ and CSM/MLL-FPAR are secondary
+research sensitivities and do not select the policy. Twenty-one additive
+Base/Stress objectives plus one conditional-ratio heuristic generate the
+finite fitted policy class, while a forced best-fixed chain supplies the
+regression anchor. Best fixed is the explicit comparator under custom CSM and
+there is no additional CSM constraint.
 
 For the documented one-modelpoint run with 4,200 Q paths and market seed 2026,
-the selector chooses `base_csm`: CSM AUD 103,840.3807, MLL AUD 45,213.1339,
-capital-adjusted CSM AUD 101,127.5926 and secondary CSM/MLL 2.2966862. The best
-fixed comparator is 0.25%, with CSM AUD 52,151.2701, MLL AUD 25,057.4801,
-capital-adjusted CSM AUD 50,647.8213 and CSM/MLL 2.0812656. Both use the current
-curve and the same complete sample.
+the custom-CSM selector chooses `base_csm`: custom CSM AUD 103,840.3807,
+MLL-FPAR AUD 45,213.1339, secondary 6%-FPAR-penalised CSM AUD 101,127.5926 and
+CSM/MLL-FPAR 2.2966862. The best fixed comparator is 0.25%, with custom CSM AUD
+52,151.2701, MLL-FPAR AUD 25,057.4801, secondary penalised CSM AUD 50,647.8213
+and CSM/MLL-FPAR 2.0812656. Both use the current curve and the same complete
+sample. The primary flexibility uplift is AUD 51,689.1106 in custom CSM; the
+secondary 6%-penalised sensitivity is AUD 50,479.7713.
 
 The output is a present-value estimate of the contractual annual reset right,
 not an operating policy. It includes the fixed grid, policy-class candidates,
-primary capital-adjusted and secondary ratio metrics, Time-0 action-cell and
-regression diagnostics, comparison table, manifest and plot. The current
+primary custom-CSM and secondary MLL-FPAR metrics, Time-0 action-cell and
+regression diagnostics, comparison table, manifest and plots. The current
 one-modelpoint result and limitations are documented in
 [`crediting_rate_profitability_and_capital.md`](crediting_rate_profitability_and_capital.md).
 
@@ -277,16 +304,16 @@ Every documented run should retain:
 - sample semantics and whether any OOS validation/evaluation was used;
 - the fitted candidate label and, only where the workflow deploys a policy, the
   deployed-policy label;
-- aggregation basis and CSM reconciliation;
+- aggregation basis and custom-CSM reconciliation;
 - runtime status and logs.
 
 `results/document_figures/` is reserved for a small set of reviewed figures
 promoted from completed runs. A promoted figure should have a nearby documented
 provenance link to its completed run manifest and must not be copied from a
 smoke, interrupted, rejected or source-mismatched run. The current curated
-Dynamic Time-0 study preserves the completed fit manifest and documents the
-final $\lambda=6\%$ capital-adjusted re-ranking separately; it is not labelled
-as a deployment run.
+Dynamic Time-0 study preserves the completed fit manifest, uses custom CSM as
+the primary selector and documents the $\lambda=6\%$ MLL-FPAR penalty
+separately as a secondary sensitivity; it is not labelled as a deployment run.
 The current base-only customer-LSMC diagnostic uses one model point (`ALT4-01`),
 20,000 common paths, market seed 12026 and Caps 0.25%, 0.5%, 1%, 2%, 4%, 6%, 8%
 and 12%. Every displayed cell directly deploys a structurally valid V11 rule;
@@ -318,12 +345,16 @@ Add the standard market/longevity shock set explicitly:
 portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --crediting-rates 0.25% 0.5% 1% 2% 4% 6% 8% 12% --market-cache-root AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths --hedge-cache-root AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices --stress-analysis --stress-scenarios interest_up interest_down longevity --require-market-cache --require-hedge-cache
 ```
 
-Run the Dynamic-only mortality/longevity/lapse capital comparison without
+Run the Dynamic-only mortality/longevity/lapse MLL-FPAR comparison without
 triggering Policyholder LSMC:
 
 ```powershell
-crediting-capital-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --cap-grid 0.0025,0.01,0.06,0.12 --baseline-cap 0.06
+crediting-future-profit-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --cap-grid 0.0025,0.01,0.06,0.12 --baseline-cap 0.06
 ```
+
+`crediting-capital-analysis` remains an equivalent legacy command name. Its
+name does not change the output classification: the result is MLL-FPAR, not
+regulatory capital.
 
 Run either cap-management family through its prepare-then-read console command:
 
@@ -355,14 +386,15 @@ Before interpreting or promoting a result, confirm that:
 
 1. the run completed and its source hash matches the code being described;
 2. every Q and `mc_conditional` hedge input came from an exact validated cache;
-3. the four CSM legs reconcile to the reported signed objective;
+3. the four custom-CSM legs reconcile to the reported signed objective;
 4. the portfolio aggregation reconciliation is within tolerance;
 5. the Dynamic and customer-LSMC comparison uses the recorded common sample;
 6. direct V11 deployment, structural validity and the absence of external
    policy selection or fixed-rule substitution are recorded;
 7. the Dynamic Management-LSMC output records one modelpoint, one complete
-   Time-0 Q sample, primary $\mathrm{CSM}-0.06\,\mathrm{MLL}$ selection,
-   secondary CSM/MLL reporting and no OOS, forward roll or deployment output;
+   Time-0 Q sample, primary custom-CSM selection, secondary
+   $\mathrm{CSM}-0.06\,\mathrm{MLL\mbox{-}FPAR}$ and CSM/MLL-FPAR reporting,
+   and no OOS, forward roll or deployment output;
 8. Monte Carlo uncertainty and the proxy/non-regulatory boundaries are stated;
 9. any promoted chart carries the run and cache provenance needed to reproduce
    it.

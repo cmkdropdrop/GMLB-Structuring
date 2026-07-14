@@ -1,4 +1,4 @@
-"""Dynamic-only crediting-cap profitability and life-capital analysis.
+"""Dynamic-only crediting-cap profitability and future-profit risk analysis.
 
 This orchestrator studies fixed crediting caps under the repository's
 statistical Dynamic Policyholder Behaviour model.  It never fits or applies a
@@ -9,8 +9,13 @@ strict cache-reading ``run_portfolio_valuation.py`` entry point.
 Only ``precompute_q_market_and_hedge_cache.py`` is allowed to prepare missing
 Q-market and conditional-MC hedge-price caches.  Non-market stresses reuse the
 same exact market and hedge cache as the base case.  The resulting
-Mortality/Longevity/Lapse (MLL) amount is a research life-risk capital proxy,
-not APRA capital, a complete Solvency Capital Requirement or IFRS 17 CSM.
+Mortality/Longevity/Lapse (MLL) amount is a custom-CSM future-profit-at-risk
+(FPAR) research measure. It is not required or regulatory capital, APRA
+prescribed capital, a Solvency Capital Requirement, or an IFRS 17 CSM.
+
+The historic ``crediting-capital-analysis`` entry point, command-line options,
+helper name and output columns containing ``capital`` remain readable aliases.
+New integrations should use the FPAR names exposed by this module.
 """
 
 from __future__ import annotations
@@ -57,6 +62,16 @@ from portfolio_simulations._mc_analysis_inputs import (  # noqa: E402
 
 ENGINE_VERSION = "3.0.0"
 STRESS_IDS = ("base", "mortality", "longevity", "lapse_up", "lapse_down")
+PRIMARY_OBJECTIVE = "custom_csm"
+FPAR_OBJECTIVE = "fpar_penalised_csm"
+FPAR_RATIO_OBJECTIVE = "csm_to_fpar"
+LEGACY_OBJECTIVE_ALIASES: Mapping[str, str] = {
+    "csm": PRIMARY_OBJECTIVE,
+    "capital_adjusted_csm": FPAR_OBJECTIVE,
+    "csm_to_capital": FPAR_RATIO_OBJECTIVE,
+}
+REGULATORY_CAPITAL_STATUS = "not_calculated"
+FPAR_CLASSIFICATION = "internal_research_custom_csm_future_profit_at_risk_proxy"
 DEFAULT_CAP_GRID = (0.0025, 0.01, 0.06, 0.12)
 DEFAULT_BASELINE_CAP = 0.06
 DEFAULT_OUTPUT_ROOT = run_output_directory("crediting_rate_capital_analysis")
@@ -181,24 +196,41 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--objective",
-        choices=("capital_adjusted_csm", "csm_to_capital"),
-        default="capital_adjusted_csm",
+        choices=(
+            PRIMARY_OBJECTIVE,
+            FPAR_OBJECTIVE,
+            FPAR_RATIO_OBJECTIVE,
+            *LEGACY_OBJECTIVE_ALIASES,
+        ),
+        default=PRIMARY_OBJECTIVE,
         help=(
-            "deployment ranking; capital_adjusted_csm is the robust default, "
-            "while csm_to_capital is a secondary lifetime efficiency ratio"
+            "selection ranking; custom_csm is the primary default. "
+            "fpar_penalised_csm and csm_to_fpar are explicit secondary "
+            "research sensitivities. The old csm, capital_adjusted_csm and "
+            "csm_to_capital spellings are aliases"
         ),
     )
     parser.add_argument(
+        "--fpar-penalty-weight",
         "--capital-hurdle-rate",
+        dest="fpar_penalty_weight",
         type=float,
         default=0.06,
-        help="one-year capital charge applied to the MLL proxy (default: 6%%)",
+        help=(
+            "research penalty weight applied to MLL FPAR (default: 6%%); "
+            "--capital-hurdle-rate is a legacy alias"
+        ),
     )
     parser.add_argument(
+        "--fpar-materiality-bp",
         "--capital-materiality-bp",
+        dest="fpar_materiality_bp",
         type=float,
         default=1.0,
-        help="minimum MLL capital for reporting a CSM/capital ratio, in bp of premium",
+        help=(
+            "minimum MLL FPAR for reporting a CSM/FPAR ratio, in bp of "
+            "premium; --capital-materiality-bp is a legacy alias"
+        ),
     )
     parser.add_argument(
         "--mass-lapse-fraction",
@@ -216,6 +248,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     args.cap_grid = tuple(float(value) for value in args.cap_grid)
+    args.objective = LEGACY_OBJECTIVE_ALIASES.get(args.objective, args.objective)
+    # Attribute aliases keep programmatic users of the historic parser working.
+    args.capital_hurdle_rate = args.fpar_penalty_weight
+    args.capital_materiality_bp = args.fpar_materiality_bp
     if args.n_paths <= 0 or args.heston_substeps <= 0:
         parser.error("--n-paths and --heston-substeps must be positive")
     if min(args.seed, args.take_up_seed, args.mortality_seed) < 0:
@@ -228,15 +264,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ):
         parser.error("--baseline-cap must occur exactly in --cap-grid")
     if (
-        not math.isfinite(args.capital_hurdle_rate)
-        or args.capital_hurdle_rate < 0.0
+        not math.isfinite(args.fpar_penalty_weight)
+        or args.fpar_penalty_weight < 0.0
     ):
-        parser.error("--capital-hurdle-rate must be finite and non-negative")
+        parser.error("--fpar-penalty-weight must be finite and non-negative")
     if (
-        not math.isfinite(args.capital_materiality_bp)
-        or args.capital_materiality_bp < 0.0
+        not math.isfinite(args.fpar_materiality_bp)
+        or args.fpar_materiality_bp < 0.0
     ):
-        parser.error("--capital-materiality-bp must be finite and non-negative")
+        parser.error("--fpar-materiality-bp must be finite and non-negative")
     if (
         not math.isfinite(args.mass_lapse_fraction)
         or not 0.0 <= args.mass_lapse_fraction <= 1.0
@@ -362,7 +398,7 @@ def _assert_dynamic_only_command(command: Sequence[str]) -> None:
     tokens = tuple(str(token).lower() for token in command)
     joined = " ".join(tokens)
     if Path(command[1]).resolve() != DYNAMIC_READER.resolve():
-        raise ValueError("Capital analysis may only call the Dynamic reader.")
+        raise ValueError("FPAR analysis may only call the Dynamic reader.")
     forbidden = (
         "run_portfolio_valuation_lsmc.py",
         "optimize_crediting_rate_lsmc.py",
@@ -478,17 +514,17 @@ def _validate_dynamic_output(
     if not isinstance(method, Mapping) or not isinstance(settings, Mapping):
         raise ValueError(f"Incomplete Dynamic manifest in {job.output}.")
     if _as_bool(summary.get("lsmc_used")) or _as_bool(method.get("lsmc_used")):
-        raise ValueError("Policyholder LSMC was used; capital run is invalid.")
+        raise ValueError("Policyholder LSMC was used; FPAR run is invalid.")
     if settings.get("income_election_mode") != "dynamic" or settings.get(
         "post_income_behaviour"
     ) != "dynamic":
-        raise ValueError("Capital run did not retain complete Dynamic Behaviour.")
+        raise ValueError("FPAR run did not retain complete Dynamic Behaviour.")
     if not _as_bool(settings.get("require_market_cache")):
-        raise ValueError("Capital run did not enforce the market cache.")
+        raise ValueError("FPAR run did not enforce the market cache.")
     if hedge_pricing_method == "mc_conditional" and not _as_bool(
         settings.get("require_hedge_cache")
     ):
-        raise ValueError("Conditional-MC capital run did not enforce hedge cache.")
+        raise ValueError("Conditional-MC FPAR run did not enforce hedge cache.")
     if not isinstance(stress, Mapping):
         raise ValueError(f"Dynamic manifest has no stress definition in {job.output}.")
     if stress.get("stress_id") != job.stress_id:
@@ -599,23 +635,30 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def _build_capital_rows(
+def _build_fpar_rows(
     scenario_rows: Sequence[Mapping[str, object]],
     positive_base_value: Mapping[float, float],
     *,
     baseline_cap: float,
-    capital_hurdle_rate: float,
-    capital_materiality_bp: float,
+    fpar_penalty_weight: float,
+    fpar_materiality_bp: float,
     mass_lapse_fraction: float,
     objective: str,
 ) -> list[dict[str, object]]:
+    objective = LEGACY_OBJECTIVE_ALIASES.get(objective, objective)
+    if objective not in {
+        PRIMARY_OBJECTIVE,
+        FPAR_OBJECTIVE,
+        FPAR_RATIO_OBJECTIVE,
+    }:
+        raise ValueError(f"Unsupported selection objective: {objective!r}")
     # Imported here so the pure calculation module remains independently
     # testable and this orchestrator remains cheap to import for CLI help.
     from policy_engine.crediting_capital import (  # noqa: PLC0415
         MASS_LAPSE_METHOD,
         adverse_csm_loss,
-        aggregate_mll_capital,
-        evaluate_capital_adjusted_csm,
+        aggregate_mll_capital as aggregate_mll_fpar,
+        evaluate_capital_adjusted_csm as evaluate_fpar_penalised_csm,
         model_point_mass_lapse_proxy,
     )
 
@@ -670,22 +713,22 @@ def _build_capital_rows(
             key=lapse_by_name.__getitem__,
         )
         lapse_capital = lapse_by_name[binding_lapse_stress]
-        mll_permanent_lapse_only = aggregate_mll_capital(
+        mll_permanent_lapse_only = aggregate_mll_fpar(
             mortality_capital,
             longevity_capital,
             permanent_lapse_capital,
         )
-        mll_life_capital = aggregate_mll_capital(
+        mll_life_fpar = aggregate_mll_fpar(
             mortality_capital,
             longevity_capital,
             lapse_capital,
         )
         premium = float(by_stress["base"]["premium_aud"])
-        materiality = premium * capital_materiality_bp / 10_000.0
-        metrics = evaluate_capital_adjusted_csm(
+        materiality = premium * fpar_materiality_bp / 10_000.0
+        metrics = evaluate_fpar_penalised_csm(
             base_csm,
-            mll_life_capital,
-            capital_hurdle=capital_hurdle_rate,
+            mll_life_fpar,
+            capital_hurdle=fpar_penalty_weight,
             capital_materiality=materiality,
         )
         row = {
@@ -709,6 +752,38 @@ def _build_capital_rows(
             "longevity_signed_csm_loss_aud": longevity_signed,
             "lapse_up_signed_csm_loss_aud": lapse_up_signed,
             "lapse_down_signed_csm_loss_aud": lapse_down_signed,
+            "mortality_future_profit_at_risk_aud": mortality_capital,
+            "longevity_future_profit_at_risk_aud": longevity_capital,
+            "lapse_up_future_profit_at_risk_aud": lapse_up_capital,
+            "lapse_down_future_profit_at_risk_aud": lapse_down_capital,
+            "mass_lapse_future_profit_at_risk_proxy_aud": mass_lapse_capital,
+            "permanent_lapse_future_profit_at_risk_aud": permanent_lapse_capital,
+            "lapse_future_profit_at_risk_aud": lapse_capital,
+            "mll_permanent_lapse_only_future_profit_at_risk_aud": (
+                mll_permanent_lapse_only
+            ),
+            "mll_future_profit_at_risk_aud": mll_life_fpar,
+            "mass_lapse_incremental_mll_future_profit_at_risk_aud": (
+                mll_life_fpar - mll_permanent_lapse_only
+            ),
+            "fpar_penalty_weight": fpar_penalty_weight,
+            "fpar_penalty_aud": metrics.capital_charge,
+            "fpar_penalised_csm_aud": metrics.capital_adjusted_csm,
+            "csm_to_fpar_ratio": metrics.csm_to_capital,
+            "fpar_penalised_csm_to_fpar_ratio": (
+                None
+                if metrics.csm_to_capital is None
+                else metrics.capital_adjusted_csm / metrics.capital
+            ),
+            "fpar_ratio_materiality_aud": metrics.capital_materiality,
+            "risk_scope": "mortality_longevity_lapse_future_profit_at_risk",
+            "risk_measure_classification": FPAR_CLASSIFICATION,
+            "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+            "regulatory_capital_calculated": False,
+            "required_capital_calculated": False,
+            "apra_prescribed_capital_amount_calculated": False,
+            # Legacy field aliases. These are numerically identical to FPAR
+            # and must never be interpreted as required/regulatory capital.
             "mortality_capital_aud": mortality_capital,
             "longevity_capital_aud": longevity_capital,
             "lapse_up_capital_aud": lapse_up_capital,
@@ -726,11 +801,11 @@ def _build_capital_rows(
             "mll_permanent_lapse_only_capital_proxy_aud": (
                 mll_permanent_lapse_only
             ),
-            "mll_life_capital_proxy_aud": mll_life_capital,
+            "mll_life_capital_proxy_aud": mll_life_fpar,
             "mass_lapse_incremental_mll_capital_aud": (
-                mll_life_capital - mll_permanent_lapse_only
+                mll_life_fpar - mll_permanent_lapse_only
             ),
-            "capital_hurdle_rate": capital_hurdle_rate,
+            "capital_hurdle_rate": fpar_penalty_weight,
             "one_year_capital_charge_aud": metrics.capital_charge,
             "capital_adjusted_csm_aud": metrics.capital_adjusted_csm,
             "csm_to_capital_ratio": metrics.csm_to_capital,
@@ -758,43 +833,122 @@ def _build_capital_rows(
         }
         rows.append(row)
 
-    eligible = [
+    ratio_eligible = [
         row for row in rows
-        if objective == "capital_adjusted_csm"
-        or row["csm_to_capital_ratio"] is not None
+        if row["csm_to_fpar_ratio"] is not None
     ]
-    if not eligible:
-        raise ValueError("No cap has material capital for ratio-based selection.")
-    objective_field = (
-        "capital_adjusted_csm_aud"
-        if objective == "capital_adjusted_csm"
-        else "csm_to_capital_ratio"
+    if objective == FPAR_RATIO_OBJECTIVE and not ratio_eligible:
+        raise ValueError("No cap has material FPAR for ratio-based selection.")
+    primary_selected = max(
+        rows,
+        key=lambda row: (
+            float(row["base_csm_aud"]),
+            -float(row["crediting_cap_rate"]),
+        ),
     )
-    selected = max(
-        eligible,
-        key=lambda row: (float(row[objective_field]), -float(row["crediting_cap_rate"])),
+    fpar_penalised_selected = max(
+        rows,
+        key=lambda row: (
+            float(row["fpar_penalised_csm_aud"]),
+            -float(row["crediting_cap_rate"]),
+        ),
     )
+    ratio_selected = (
+        None
+        if not ratio_eligible
+        else max(
+            ratio_eligible,
+            key=lambda row: (
+                float(row["csm_to_fpar_ratio"]),
+                -float(row["crediting_cap_rate"]),
+            ),
+        )
+    )
+    objective_fields = {
+        PRIMARY_OBJECTIVE: "base_csm_aud",
+        FPAR_OBJECTIVE: "fpar_penalised_csm_aud",
+        FPAR_RATIO_OBJECTIVE: "csm_to_fpar_ratio",
+    }
+    selected_by_objective = {
+        PRIMARY_OBJECTIVE: primary_selected,
+        FPAR_OBJECTIVE: fpar_penalised_selected,
+        FPAR_RATIO_OBJECTIVE: ratio_selected,
+    }
+    objective_field = objective_fields[objective]
+    selected = selected_by_objective[objective]
+    if selected is None:
+        raise ValueError("No cap is eligible for the requested selection objective.")
     baseline = next(row for row in rows if row["is_contractual_baseline_cap"])
     for row in rows:
+        row["primary_optimisation_objective"] = PRIMARY_OBJECTIVE
+        row["primary_optimisation_objective_value"] = row["base_csm_aud"]
+        row["is_primary_csm_selected_cap"] = row is primary_selected
+        row["secondary_research_sensitivities"] = (
+            f"{FPAR_OBJECTIVE},{FPAR_RATIO_OBJECTIVE}"
+        )
+        row["is_secondary_fpar_penalised_selected_cap"] = (
+            row is fpar_penalised_selected
+        )
+        row["is_secondary_csm_to_fpar_selected_cap"] = (
+            row is ratio_selected
+        )
         row["selection_objective"] = objective
         row["selection_objective_value"] = row[objective_field]
+        row["selection_objective_role"] = (
+            "primary"
+            if objective == PRIMARY_OBJECTIVE
+            else "secondary_research_sensitivity"
+        )
         row["is_selected_cap"] = row is selected
         row["csm_uplift_vs_baseline_aud"] = (
             float(row["base_csm_aud"]) - float(baseline["base_csm_aud"])
         )
-        row["capital_release_vs_baseline_aud"] = (
-            float(baseline["mll_life_capital_proxy_aud"])
-            - float(row["mll_life_capital_proxy_aud"])
+        row["fpar_reduction_vs_baseline_aud"] = (
+            float(baseline["mll_future_profit_at_risk_aud"])
+            - float(row["mll_future_profit_at_risk_aud"])
         )
-        row["capital_adjusted_value_vs_baseline_aud"] = (
-            float(row["capital_adjusted_csm_aud"])
-            - float(baseline["capital_adjusted_csm_aud"])
+        row["fpar_penalised_value_vs_baseline_aud"] = (
+            float(row["fpar_penalised_csm_aud"])
+            - float(baseline["fpar_penalised_csm_aud"])
         )
+        # Legacy result aliases.
+        row["capital_release_vs_baseline_aud"] = row[
+            "fpar_reduction_vs_baseline_aud"
+        ]
+        row["capital_adjusted_value_vs_baseline_aud"] = row[
+            "fpar_penalised_value_vs_baseline_aud"
+        ]
     return rows
 
 
-def _create_plots(
-    capital_rows: Sequence[Mapping[str, object]],
+def _build_capital_rows(
+    scenario_rows: Sequence[Mapping[str, object]],
+    positive_base_value: Mapping[float, float],
+    *,
+    baseline_cap: float,
+    capital_hurdle_rate: float,
+    capital_materiality_bp: float,
+    mass_lapse_fraction: float,
+    objective: str,
+) -> list[dict[str, object]]:
+    """Legacy alias for :func:`_build_fpar_rows`.
+
+    The parameter names are retained so existing callers continue to run;
+    returned rows include both canonical FPAR fields and historic aliases.
+    """
+    return _build_fpar_rows(
+        scenario_rows,
+        positive_base_value,
+        baseline_cap=baseline_cap,
+        fpar_penalty_weight=capital_hurdle_rate,
+        fpar_materiality_bp=capital_materiality_bp,
+        mass_lapse_fraction=mass_lapse_fraction,
+        objective=objective,
+    )
+
+
+def _create_fpar_plots(
+    fpar_rows: Sequence[Mapping[str, object]],
     output: Path,
     *,
     baseline_cap: float,
@@ -805,61 +959,69 @@ def _create_plots(
 
     output.mkdir(parents=True, exist_ok=True)
     caps = np.asarray([float(row["crediting_cap_rate_percent"])
-                       for row in capital_rows])
-    csm = np.asarray([float(row["base_csm_aud"]) for row in capital_rows])
-    capital = np.asarray([float(row["mll_life_capital_proxy_aud"])
-                          for row in capital_rows])
-    adjusted = np.asarray([float(row["capital_adjusted_csm_aud"])
-                           for row in capital_rows])
+                       for row in fpar_rows])
+    csm = np.asarray([float(row["base_csm_aud"]) for row in fpar_rows])
+    fpar = np.asarray([float(row["mll_future_profit_at_risk_aud"])
+                       for row in fpar_rows])
+    adjusted = np.asarray([float(row["fpar_penalised_csm_aud"])
+                           for row in fpar_rows])
     baseline_percent = 100.0 * baseline_cap
     paths: dict[str, str] = {}
 
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), constrained_layout=True)
     axes[0].plot(caps, csm / 1_000.0, marker="o", label="CSM proxy")
-    axes[0].plot(caps, capital / 1_000.0, marker="s", label="MLL capital proxy")
+    axes[0].plot(caps, fpar / 1_000.0, marker="s", label="MLL FPAR proxy")
     axes[0].axhline(0.0, color="#777777", linewidth=0.8)
     axes[0].axvline(baseline_percent, color="#666666", linestyle="--", linewidth=1)
     axes[0].set(xlabel="Crediting cap (%)", ylabel="AUD thousand",
-                title="Profit and life-risk capital")
+                title="Profit and future-profit risk")
     axes[0].legend(frameon=False)
     axes[0].grid(alpha=0.2)
     axes[1].plot(caps, adjusted / 1_000.0, marker="o", color="#6f4aa8")
     axes[1].axhline(0.0, color="#777777", linewidth=0.8)
     axes[1].axvline(baseline_percent, color="#666666", linestyle="--", linewidth=1)
     axes[1].set(xlabel="Crediting cap (%)", ylabel="AUD thousand",
-                title="Capital-adjusted CSM (one-year charge)")
+                title="CSM after research FPAR penalty")
     axes[1].grid(alpha=0.2)
-    path = output / "01_csm_and_mll_capital_by_crediting_cap.png"
+    path = output / "01_csm_and_mll_fpar_by_crediting_cap.png"
     fig.savefig(path, dpi=180)
+    legacy_path = output / "01_csm_and_mll_capital_by_crediting_cap.png"
+    fig.savefig(legacy_path, dpi=180)
     plt.close(fig)
-    paths["csm_and_capital"] = str(path.resolve())
+    paths["csm_and_fpar"] = str(path.resolve())
+    paths["csm_and_capital_legacy_alias"] = str(legacy_path.resolve())
+    paths["csm_and_capital"] = str(legacy_path.resolve())
 
     fig, ax = plt.subplots(figsize=(8.5, 4.8), constrained_layout=True)
     for field, label, marker in (
-        ("mortality_capital_aud", "Mortality", "o"),
-        ("longevity_capital_aud", "Longevity", "s"),
-        ("lapse_capital_aud", "Lapse (binding)", "^"),
-        ("mll_life_capital_proxy_aud", "Aggregated MLL", "D"),
+        ("mortality_future_profit_at_risk_aud", "Mortality", "o"),
+        ("longevity_future_profit_at_risk_aud", "Longevity", "s"),
+        ("lapse_future_profit_at_risk_aud", "Lapse (binding)", "^"),
+        ("mll_future_profit_at_risk_aud", "Aggregated MLL FPAR", "D"),
     ):
-        ax.plot(caps, [float(row[field]) / 1_000.0 for row in capital_rows],
+        ax.plot(caps, [float(row[field]) / 1_000.0 for row in fpar_rows],
                 marker=marker, label=label)
     ax.axvline(baseline_percent, color="#666666", linestyle="--", linewidth=1)
-    ax.set(xlabel="Crediting cap (%)", ylabel="Capital proxy (AUD thousand)",
-           title="Mortality, longevity and lapse capital by cap")
+    ax.set(xlabel="Crediting cap (%)", ylabel="FPAR proxy (AUD thousand)",
+           title="Mortality, longevity and lapse future-profit risk by cap")
     ax.legend(frameon=False, ncol=2)
     ax.grid(alpha=0.2)
-    path = output / "02_mll_capital_modules_by_crediting_cap.png"
+    path = output / "02_mll_fpar_modules_by_crediting_cap.png"
     fig.savefig(path, dpi=180)
+    legacy_path = output / "02_mll_capital_modules_by_crediting_cap.png"
+    fig.savefig(legacy_path, dpi=180)
     plt.close(fig)
-    paths["capital_modules"] = str(path.resolve())
+    paths["fpar_modules"] = str(path.resolve())
+    paths["capital_modules_legacy_alias"] = str(legacy_path.resolve())
+    paths["capital_modules"] = str(legacy_path.resolve())
 
     fig, ax = plt.subplots(figsize=(8.5, 4.8), constrained_layout=True)
     ordinary = np.asarray([float(row["ordinary_income_lapse_event_mass"])
-                           for row in capital_rows])
+                           for row in fpar_rows])
     performance = np.asarray([float(row["performance_income_lapse_event_mass"])
-                              for row in capital_rows])
+                              for row in fpar_rows])
     total = np.asarray([float(row["total_income_lapse_event_mass"])
-                        for row in capital_rows])
+                        for row in fpar_rows])
     ax.plot(caps, 100.0 * ordinary, marker="o", label="Ordinary")
     ax.plot(caps, 100.0 * performance, marker="s", label="Performance-sensitive")
     ax.plot(caps, 100.0 * total, marker="D", linewidth=2, label="Total")
@@ -876,6 +1038,20 @@ def _create_plots(
     return paths
 
 
+def _create_plots(
+    capital_rows: Sequence[Mapping[str, object]],
+    output: Path,
+    *,
+    baseline_cap: float,
+) -> dict[str, str]:
+    """Legacy alias for :func:`_create_fpar_plots`."""
+    return _create_fpar_plots(
+        capital_rows,
+        output,
+        baseline_cap=baseline_cap,
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     output = (
@@ -888,7 +1064,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     horizon_years = _projection_horizon_years(args.model_points)
 
     print(
-        "DYNAMIC-ONLY CAPITAL ANALYSIS | "
+        "DYNAMIC-ONLY MLL FUTURE-PROFIT RISK ANALYSIS | "
         f"caps={len(args.cap_grid)} | stresses={len(STRESS_IDS)} | "
         "Policyholder LSMC blocked",
         flush=True,
@@ -916,26 +1092,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scenario_rows, positive_base_value = _collect_scenario_rows(
         jobs, hedge_pricing_method=args.hedge_pricing_method
     )
-    capital_rows = _build_capital_rows(
+    fpar_rows = _build_fpar_rows(
         scenario_rows,
         positive_base_value,
         baseline_cap=args.baseline_cap,
-        capital_hurdle_rate=args.capital_hurdle_rate,
-        capital_materiality_bp=args.capital_materiality_bp,
+        fpar_penalty_weight=args.fpar_penalty_weight,
+        fpar_materiality_bp=args.fpar_materiality_bp,
         mass_lapse_fraction=args.mass_lapse_fraction,
         objective=args.objective,
     )
     scenario_csv = output / "dynamic_stress_revaluations_by_crediting_cap.csv"
-    capital_csv = output / "crediting_capital_results.csv"
+    fpar_csv = output / "crediting_future_profit_risk_results.csv"
+    legacy_capital_csv = output / "crediting_capital_results.csv"
     _write_csv(scenario_csv, scenario_rows)
-    _write_csv(capital_csv, capital_rows)
-    plot_paths = {} if args.no_plots else _create_plots(
-        capital_rows, output / "plots", baseline_cap=args.baseline_cap
+    _write_csv(fpar_csv, fpar_rows)
+    _write_csv(legacy_capital_csv, fpar_rows)
+    plot_paths = {} if args.no_plots else _create_fpar_plots(
+        fpar_rows, output / "plots", baseline_cap=args.baseline_cap
     )
 
-    selected = next(row for row in capital_rows if row["is_selected_cap"])
+    selected = next(row for row in fpar_rows if row["is_selected_cap"])
+    primary_selected = next(
+        row for row in fpar_rows if row["is_primary_csm_selected_cap"]
+    )
+    fpar_sensitivity_selected = next(
+        row for row in fpar_rows
+        if row["is_secondary_fpar_penalised_selected_cap"]
+    )
+    ratio_sensitivity_selected = next(
+        (
+            row for row in fpar_rows
+            if row["is_secondary_csm_to_fpar_selected_cap"]
+        ),
+        None,
+    )
     baseline = next(
-        row for row in capital_rows if row["is_contractual_baseline_cap"]
+        row for row in fpar_rows if row["is_contractual_baseline_cap"]
     )
     completed = datetime.now(timezone.utc)
     manifest = {
@@ -943,6 +1135,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "started_at_utc": started.isoformat(),
         "runtime_seconds": (completed - started).total_seconds(),
         "engine_version": ENGINE_VERSION,
+        "primary_optimisation_objective": PRIMARY_OBJECTIVE,
+        "secondary_research_sensitivities": {
+            "role": "diagnostic_not_primary_optimisation_objective",
+            FPAR_OBJECTIVE: {
+                "selected_cap": fpar_sensitivity_selected[
+                    "crediting_cap_rate"
+                ],
+                "selected_cap_percent": fpar_sensitivity_selected[
+                    "crediting_cap_rate_percent"
+                ],
+                "objective_value": fpar_sensitivity_selected[
+                    "fpar_penalised_csm_aud"
+                ],
+                "fpar_penalty_weight": args.fpar_penalty_weight,
+            },
+            FPAR_RATIO_OBJECTIVE: {
+                "available": ratio_sensitivity_selected is not None,
+                "selected_cap": (
+                    None
+                    if ratio_sensitivity_selected is None
+                    else ratio_sensitivity_selected["crediting_cap_rate"]
+                ),
+                "selected_cap_percent": (
+                    None
+                    if ratio_sensitivity_selected is None
+                    else ratio_sensitivity_selected[
+                        "crediting_cap_rate_percent"
+                    ]
+                ),
+                "objective_value": (
+                    None
+                    if ratio_sensitivity_selected is None
+                    else ratio_sensitivity_selected["csm_to_fpar_ratio"]
+                ),
+            },
+        },
+        "regulatory_capital": {
+            "status": REGULATORY_CAPITAL_STATUS,
+            "calculated": False,
+            "required_capital_calculated": False,
+            "apra_prescribed_capital_amount_calculated": False,
+        },
+        "ifrs17_csm": {
+            "status": "not_calculated",
+            "custom_profitability_measure_only": True,
+        },
         "method": {
             "policyholder_behaviour": "dynamic_statistical",
             "policyholder_lsmc_used": False,
@@ -953,11 +1191,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "hedge_cache_required": args.hedge_pricing_method == "mc_conditional",
             "cache_writer": str(CACHE_PRECOMPUTE_RUNNER.resolve()),
             "valuation_reader": str(DYNAMIC_READER.resolve()),
-            "capital_scope": "mortality_longevity_lapse_research_proxy",
+            "risk_measure": "mll_future_profit_at_risk",
+            "risk_scope": (
+                "mortality_longevity_lapse_future_profit_at_risk_"
+                "research_sensitivity"
+            ),
+            "risk_measure_classification": FPAR_CLASSIFICATION,
+            "risk_measure_basis": "adverse_reduction_in_custom_csm",
+            "regulatory_capital_status": REGULATORY_CAPITAL_STATUS,
+            "regulatory_capital_calculated": False,
+            "required_capital_calculated": False,
+            "apra_prescribed_capital_amount_calculated": False,
+            "capital_scope": (
+                "legacy_alias_for_mll_future_profit_at_risk_"
+                "not_regulatory_capital"
+            ),
             "not_total_scr": True,
             "not_apra_capital": True,
             "mass_lapse_method": selected["mass_lapse_method"],
-            "capital_adjustment": "one_year_hurdle_charge_not_full_risk_margin",
+            "fpar_adjustment": "research_penalty_weight_not_cost_of_capital",
+            "capital_adjustment": "legacy_name_for_fpar_research_penalty",
+            "primary_optimisation_objective": PRIMARY_OBJECTIVE,
+            "secondary_sensitivity_role": (
+                "fpar_metrics_are_research_diagnostics_unless_explicitly_"
+                "selected"
+            ),
         },
         "settings": {
             "cap_grid": list(args.cap_grid),
@@ -970,7 +1228,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "heston_substeps": args.heston_substeps,
             "horizon_years": horizon_years,
             "hedge_pricing_method": args.hedge_pricing_method,
+            "primary_optimisation_objective": PRIMARY_OBJECTIVE,
+            "selection_objective": args.objective,
+            "selection_objective_role": selected["selection_objective_role"],
             "objective": args.objective,
+            "fpar_penalty_weight": args.fpar_penalty_weight,
+            "fpar_materiality_bp": args.fpar_materiality_bp,
+            # Legacy setting aliases.
             "capital_hurdle_rate": args.capital_hurdle_rate,
             "capital_materiality_bp": args.capital_materiality_bp,
             "mass_lapse_fraction": args.mass_lapse_fraction,
@@ -982,7 +1246,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "selected_cap_percent": selected["crediting_cap_rate_percent"],
             "selection_objective": args.objective,
             "selection_objective_value": selected["selection_objective_value"],
+            "selection_objective_role": selected["selection_objective_role"],
+            "primary_optimisation_objective": PRIMARY_OBJECTIVE,
+            "primary_selected_cap": primary_selected["crediting_cap_rate"],
+            "primary_selected_cap_percent": primary_selected[
+                "crediting_cap_rate_percent"
+            ],
+            "primary_custom_csm_aud": primary_selected["base_csm_aud"],
+            "selection_matches_primary": selected is primary_selected,
             "contractual_baseline_cap": args.baseline_cap,
+            "fpar_penalised_value_vs_baseline_aud": selected[
+                "fpar_penalised_value_vs_baseline_aud"
+            ],
+            "fpar_reduction_vs_baseline_aud": selected[
+                "fpar_reduction_vs_baseline_aud"
+            ],
+            "baseline_fpar_penalised_csm_aud": baseline[
+                "fpar_penalised_csm_aud"
+            ],
+            # Legacy selection aliases.
             "capital_adjusted_value_vs_baseline_aud": selected[
                 "capital_adjusted_value_vs_baseline_aud"
             ],
@@ -997,9 +1279,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ],
         },
         "limitations": [
-            "The MLL amount is a partial research life-risk capital proxy, not APRA capital or total SCR.",
+            "MLL FPAR is a partial research measure of stressed custom-CSM loss, not required or regulatory capital.",
+            "APRA prescribed capital, the full PCA/PCR, and an IFRS 17 CSM are not calculated.",
             "Mass lapse is a model-point positive-value proxy, not an immediate-surrender revaluation.",
-            "The capital charge is one year at the selected hurdle rate, not a full projected risk margin.",
+            "The FPAR weight is a research penalty, not a cost-of-capital rate or projected risk margin.",
             "Dynamic Behaviour and Gompertz-Makeham mortality are illustrative, uncalibrated proxies.",
             "The selected cap is the best point on the supplied discrete grid, not a continuous global optimum.",
             "The analysis values fixed cap designs; it does not establish value for an annual adaptive cap policy.",
@@ -1015,7 +1298,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
         "outputs": {
             "dynamic_stress_revaluations_csv": str(scenario_csv.resolve()),
-            "crediting_capital_results_csv": str(capital_csv.resolve()),
+            "crediting_future_profit_risk_results_csv": str(fpar_csv.resolve()),
+            "crediting_capital_results_csv": str(legacy_capital_csv.resolve()),
             "plots": plot_paths,
         },
     }
@@ -1027,8 +1311,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         "RUN COMPLETE | "
         f"selected cap={float(selected['crediting_cap_rate_percent']):.4g}% | "
-        f"capital-adjusted value vs {100.0 * args.baseline_cap:.4g}%="
-        f"{float(selected['capital_adjusted_value_vs_baseline_aud']):,.2f} AUD | "
+        f"objective={args.objective} ({selected['selection_objective_role']}) | "
+        f"value={float(selected['selection_objective_value']):,.6g} | "
         f"output={output}",
         flush=True,
     )

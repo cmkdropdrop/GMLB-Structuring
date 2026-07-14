@@ -4,73 +4,73 @@ Only small figures reviewed against a completed run manifest belong here.
 Large run directories and Q caches remain generated local artefacts under
 `results/runs/` and `results/cache/`.
 
-## Current Time-0 capital-adjusted flexibility study
+## Current Time-0 CSM and MLL-FPAR flexibility study
 
-`time0_crediting_flexibility_csm_mll.png` and `.svg` document completed run
-`20260714T084838.270769Z`. It uses exactly one modelpoint (`ALT4-01`), 4,200
-common Heston-Hull-White Q paths with market seed 2026, the current Australian
-curve and exact path-congruent market and hedge caches. Customers follow the
-statistical Dynamic behaviour model. Customer LSMC was not fitted or called.
+The aggregate `time0_crediting_flexibility_csm_fpar` figure and the component
+`time0_crediting_flexibility_csm_fpar_component_waterfalls` figure document the
+`base_csm` alternative selected by completed full-grid run
+`20260714T084838.270769Z`. Detailed payload recovery run
+`20260714T151746.544341Z` used the same 4,200 cached Heston-Hull-White Q paths,
+market seed 2026, current Australian curve and path-congruent market and hedge
+caches. Only the fixed anchor and already selected `base_csm` chain were fitted;
+the full 23-chain search was not repeated.
 
-This is today's risk-neutral valuation of the annual cap-reset right, not a
-deployment study. The complete Q sample is shared by the Management-LSMC fit,
-the finished-candidate ranking and every fixed-cap comparator. There is no OOS
-sample, different validation seed, forward roll, strategy replay or bootstrap
-gate. Exactly one modelpoint is used throughout.
+The corrected primary objective is CSM. The best fixed cap remains 0.25% with
+CSM AUD 52,151.27; `base_csm` has CSM AUD 103,840.38, an uplift of AUD
+51,689.11. The displayed MLL values are now explicitly MLL stressed-CSM
+future-profit-at-risk proxies: AUD 25,057.48 fixed and AUD 45,213.13 flexible.
+The 6%-penalised CSM sensitivity is AUD 50,647.82 and AUD 101,127.59,
+respectively; it is secondary and does not select the policy.
 
-The completed fit stored all 22 candidate payloads before its original final
-screen. The documented selection now maximises the stable, additive-capital
-criterion `CSM - lambda * MLL` with `lambda = 6%`; CSM/MLL is reported as the
-second success criterion. This post-fit ranking needs neither a new projection
-nor a regression refit. Its exact inputs and result are recorded in
-`capital_adjusted_reranking_audit.csv`; the earlier pure-ratio audit remains a
-secondary diagnostic only.
+The CSM waterfall attributes the uplift to all nine signed ledger components.
+The largest favourable effects are money-market/hedge income (AUD 50,917.84)
+and lower guarantee claims (AUD 33,763.91); the main offset is higher option and
+hedge costs (AUD 39,444.33). The correlated MLL-FPAR waterfall uses an exact
+three-module Shapley allocation: mortality AUD 0, longevity AUD 347.38 and
+binding lapse AUD 19,808.27. The adjacent absolute-input panel shows mortality
+0, longevity AUD 9,614.37/10,275.19 and binding lapse AUD
+20,860.51/41,536.15. Mortality is zero because its signed CSM stress effect is
+favourable and clipped before aggregation, not because of correlation. Mass
+lapse binds at both endpoints.
 
-The best fixed cap is 0.25%, with CSM AUD 52,151.27, MLL AUD 25,057.48,
-CSM/MLL 2.08127 and capital-adjusted CSM AUD 50,647.82. The selected fitted
-class is `base_csm`. Its Time-0 values are CSM AUD 103,840.38, MLL AUD
-45,213.13, CSM/MLL 2.29669 and capital-adjusted CSM AUD 101,127.59. Thus the
-ratio rises by 0.21542 and the primary criterion by AUD 50,479.77. Absolute MLL
-rises, but more slowly than CSM: MLL/CSM falls from 48.05% to 43.54%.
+This is a Time-0 in-sample profitability valuation, not a deployment study or
+global optimum. `regulatory_capital_status` is `not_calculated`: MLL-FPAR is not
+an APRA Insurance Risk Charge, Prescribed Capital Amount, Prudential Capital
+Requirement, IFRS 17 CSM or Risk Adjustment. The correlation matrix and 6%
+penalty are illustrative research assumptions, not APRA requirements.
 
-This is the maximum only within the predeclared 21 Base/Stress fitted policies
-plus one conditional-ratio heuristic, not a global management optimum. It is
-in-sample by design. MLL covers mortality, longevity and lapse only and is not
-total regulatory capital. The 6% lambda is the existing one-year cost-of-
-capital rate and remains an explicit modelling choice.
-
-The plot was regenerated after the completed valuation as one direct
-visualisation of the Section 7 table. It compares best fixed and annual
-management for CSM, MLL, `CSM - 6% * MLL` and CSM/MLL; no full fixed-cap curve
-or separate risk-module graphic is included. This changed neither stored paths
-nor fitted payloads. The original run manifest and numerical outputs are
-preserved under
-`source_data/time0_crediting_flexibility_20260714T084838.270769Z/`.
+Report-only run `20260714T163854.089093Z` generated the reviewed PNG/SVG files
+and canonical CSVs in 2.1 seconds. Its manifest confirms
+`market_cache_loaded=false`, `projection_run=false` and
+`management_lsmc_fit=false`. The immutable report bundle is under
+`source_data/time0_crediting_flexibility_fpar_report_20260714T163854.089093Z/`;
+the original valuation source remains under
+`source_data/time0_crediting_flexibility_20260714T151746.544341Z/`.
 
 Promoted files and SHA-256 digests are:
 
-- `time0_crediting_flexibility_csm_mll.png`:
-  `ee894e010d2e92188157e9aa7b408b99e3eb3d34396a8c590c67f289d0596c7f`;
-- `time0_crediting_flexibility_csm_mll.svg`:
-  `7dab8e240185393a3ba58a27582f3137e7978e87961dd2befaf6572ed751e0df`;
-- `fixed_cap_time_zero_results.csv`:
-  `552261bf5a741e0c9daa937f17818b28adeb6dfa9a8edd5dca40c2aacd3d9eb4`;
-- `time_zero_capital_adjusted_flexibility_comparison.csv`:
-  `8e68741c5b98a0ee23f02d02250411b135ccb903452367b3aa657b56cfee6009`;
-- `management_lsmc_policy_class_candidates.csv`:
-  `353527b05dfb2c89f542a902f40830737dfdbe449451a1d8a645bfbef333b015`;
-- `capital_adjusted_reranking_audit.csv`:
-  `fbd4debb3fe8c4c7016205e2f248e85aac5553fce5fb1377985e068611f0cb5a`.
-
-The adjacent record
-`time0_crediting_flexibility_20260714T084838.270769Z.provenance.json` contains
-the full input, cache, method and curation metadata.
+- `time0_crediting_flexibility_csm_fpar.png`:
+  `5cfd48b1a7957d8c096d87feec3970c2c6f185556f9b903a2704376e0d25d601`;
+- `time0_crediting_flexibility_csm_fpar.svg`:
+  `7927374e68e8c6844df4c3e0c7cdce6e4269fdca4981ef4ed209046adec22e95`;
+- `time0_crediting_flexibility_csm_fpar_component_waterfalls.png`:
+  `de53d4e8b0a974dcdb4a0ff40e1ed98f3644f52cd1416c47f83e4d163c61f033`;
+- `time0_crediting_flexibility_csm_fpar_component_waterfalls.svg`:
+  `1178ebc5c26bbf1a402cee8c3df56d0511b5461a68cbbb3e13e079d005af2c70`;
+- canonical `time_zero_flexibility_comparison.csv`:
+  `9448fe7d92f91d28abce7da872a346b687075ace2e5d87e2a7e718b6b55b9fcb`;
+- canonical `time_zero_csm_component_comparison.csv`:
+  `70301e067161079f523ebee4c54e890fe0e5d044e3938b419c972f241d0ac96b`;
+- canonical `time_zero_mll_future_profit_risk_component_comparison.csv`:
+  `2186a93cd158e51ed5b5e89684c2b2d3418de85fdf157a59c89d9cb844214825`;
+- `report_manifest.json`:
+  `f9e579d90bce7dbd757eecce06c39a3d7e3286bf73c1f2131ae07db33396502c`.
 
 ## Historical dynamic-behaviour OOS cap study
 
 This earlier four-modelpoint study is retained for historical comparison. It is
 superseded for README Section 7 and is not an input to the current one-modelpoint
-same-sample Time-0 capital-adjusted valuation.
+same-sample Time-0 CSM/MLL-FPAR valuation.
 
 The three `dynamic_*.png` figures are byte-for-byte copies from completed run
 `20260713T233802.157326Z`. This is a four-model-point proxy study, not the full
@@ -134,11 +134,11 @@ are in `source_data/customer_lsmc_crediting_cap_grid/`.
 When a figure is replaced, update its SHA-256 digest and all numerical claims
 in the adjacent provenance file.
 
-## Historical fixed-cap Dynamic-only MLL capital study
+## Historical fixed-cap Dynamic-only MLL-FPAR study
 
 This earlier four-modelpoint fixed-cap screen is retained as background. Its
 CSM-minus-6%-of-MLL ranking is superseded for the current annual-flexibility
-question by the one-modelpoint Time-0 CSM/MLL study above.
+question by the one-modelpoint Time-0 CSM/MLL-FPAR study above.
 
 The three `capital_*.png` figures are byte-for-byte copies from completed run
 `20260714T054131.308036Z`. The run used the four-model-point proxy, 1,000 common
@@ -147,16 +147,17 @@ For each of 0.25%, 1%, 6% and 12%, it ran base, mortality +15%, longevity -20%,
 lapse-up +50% and lapse-down -50% revaluations. Every child manifest records
 `lsmc_used=false`; no Policyholder LSMC runner was called.
 
-The reported MLL amount combines adverse mortality, longevity and the largest
-of lapse-up, lapse-down and a 40% model-point positive-CSM mass-lapse proxy. It
-is a partial research life-risk capital proxy, not APRA capital or total SCR.
-Mass lapse is not a surrender revaluation. The primary objective is CSM less a
-one-year 6% charge on this proxy, not a full Risk Margin.
+The legacy report called its stressed-CSM amount “MLL capital”. Canonically it
+is an MLL-FPAR research proxy combining adverse mortality, longevity and the
+largest of lapse-up, lapse-down and a 40% model-point positive-CSM mass-lapse
+proxy. It is not APRA capital or total SCR. Mass lapse is not a surrender
+revaluation. The 6% deduction is a research penalty, not a capital charge or
+full Risk Margin.
 
 The 0.25% cap was selected on the four-point grid. Its CSM was AUD 57,630.46,
-MLL capital AUD 28,398.52 and capital-adjusted CSM AUD 55,926.55. Relative to
-the contractual 6% cap it added AUD 64,327.01 of CSM, required AUD 17,626.04
-more MLL capital and added AUD 63,269.45 after the one-year capital charge.
+MLL-FPAR AUD 28,398.52 and risk-penalised CSM AUD 55,926.55. Relative to
+the contractual 6% cap it added AUD 64,327.01 of CSM, had AUD 17,626.04
+more MLL-FPAR and added AUD 63,269.45 after the 6% research penalty.
 This is a fixed-design comparison and does not establish positive value from
 annual adaptive discretion.
 

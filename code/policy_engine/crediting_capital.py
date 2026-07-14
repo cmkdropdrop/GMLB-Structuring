@@ -1,17 +1,26 @@
-"""Pure crediting-cap capital arithmetic for research comparisons.
+"""Pure MLL future-profit-at-risk arithmetic for research comparisons.
 
-The functions in this module consume signed CSM proxy values produced by
-separate base and stress revaluations.  They do not build market scenarios,
-price hedges, read or write caches, or trigger any valuation runner.  This
-keeps the arithmetic usable by a strict cache-reading orchestrator without
-creating a second route for risk-neutral path generation.
+The functions in this module consume the repository's signed *custom CSM*
+values produced by separate base and stress revaluations.  That custom CSM is
+the present value of insurer income less claims and costs.  On the frozen
+cashflow basis used by the caller, ``base custom CSM - stressed custom CSM`` is
+therefore an insurer future-profit/value loss proxy (and, where only the
+non-unit BEL changes, its algebraic counterpart is an increase in that BEL).
+It is not a change in recognised IFRS 17 CSM.
 
-Only mortality, longevity and lapse (``MLL``) risk are aggregated.  The result
-is a deliberately partial life-risk research proxy.  It is not total SCR,
-APRA/LAGIC capital, Solvency II regulatory capital, an IFRS 17 Risk Adjustment
-or recognised IFRS 17 CSM.  In particular, market, expense, catastrophe,
-operational, concentration, tax-absorption and diversification effects outside
-the MLL submatrix are absent.
+The functions do not build market scenarios, price hedges, read or write
+caches, or trigger any valuation runner.  This keeps the arithmetic usable by
+a strict cache-reading orchestrator without creating a second route for
+risk-neutral path generation.
+
+Only mortality, longevity and lapse (``MLL``) losses are aggregated.  The
+result is a deliberately partial MLL future-profit-at-risk (``MLL-FPAR``)
+research proxy.  It is not APRA/LAGIC required capital, total SCR, Solvency II
+regulatory capital, an IFRS 17 Risk Adjustment, or recognised IFRS 17 CSM.  In
+particular, adjusted policy liabilities/RFBEL, termination-value floors and the
+complete insurer balance sheet are not calculated; market, expense,
+catastrophe, operational, concentration, tax-absorption and diversification
+effects outside the MLL submatrix are also absent.
 
 The mass-lapse amount is also a proxy rather than a shock revaluation.  It is
 calculated model point by model point as the configured mass-lapse fraction of
@@ -33,7 +42,21 @@ from numpy.typing import ArrayLike, NDArray
 from .capital import CapitalStresses
 
 
-MLL_FRAMEWORK = "MLL_LIFE_RISK_RESEARCH_PROXY_NOT_REGULATORY_CAPITAL"
+MLL_FUTURE_PROFIT_RISK_FRAMEWORK = (
+    "MLL_FUTURE_PROFIT_AT_RISK_RESEARCH_PROXY_NOT_REGULATORY_CAPITAL"
+)
+MLL_VALUE_BASIS = (
+    "ONE_SIDED_LOSS_IN_REPOSITORY_CUSTOM_CSM_AS_INSURER_"
+    "FUTURE_PROFIT_VALUE_PROXY"
+)
+REGULATORY_CAPITAL_CALCULATED = False
+APRA_LAGIC_CAPITAL_CALCULATED = False
+IFRS17_CSM_CALCULATED = False
+
+# Backwards-compatible public name.  New code should use the explicit
+# ``MLL_FUTURE_PROFIT_RISK_FRAMEWORK`` name.
+MLL_FRAMEWORK = MLL_FUTURE_PROFIT_RISK_FRAMEWORK
+MLL_LEGACY_FRAMEWORK = "MLL_LIFE_RISK_RESEARCH_PROXY_NOT_REGULATORY_CAPITAL"
 MASS_LAPSE_METHOD = "positive_model_point_csm_proxy_not_revaluation"
 MLL_LABELS = ("mortality", "longevity", "lapse")
 LAPSE_STRESS_ORDER = ("lapse_up", "lapse_down", "mass_lapse")
@@ -88,17 +111,32 @@ def _resolve_stresses(stresses: Optional[CapitalStresses]) -> CapitalStresses:
     return stresses
 
 
-def adverse_csm_loss(base_csm: Real, stressed_csm: Real) -> float:
-    """Return the one-sided loss in signed CSM under one stress.
+def adverse_future_profit_loss(
+    base_custom_csm: Real,
+    stressed_custom_csm: Real,
+) -> float:
+    """Return the one-sided insurer future-profit/value loss under one stress.
 
-    A stress that increases signed CSM is favourable and therefore contributes
-    zero capital.  Signed CSM is intentionally not clipped at zero before the
-    comparison: a stress can make an already onerous portfolio more onerous.
+    The inputs are repository-specific custom CSM values, not recognised
+    IFRS 17 CSM balances.  A stress that increases custom CSM is favourable and
+    therefore contributes zero to MLL-FPAR.  Custom CSM is intentionally not
+    clipped at zero before the comparison: a stress can make an already
+    onerous portfolio more onerous.
     """
 
-    base = _finite_float(base_csm, "base_csm")
-    stressed = _finite_float(stressed_csm, "stressed_csm")
+    base = _finite_float(base_custom_csm, "base_custom_csm")
+    stressed = _finite_float(stressed_custom_csm, "stressed_custom_csm")
     return max(0.0, base - stressed)
+
+
+def adverse_csm_loss(base_csm: Real, stressed_csm: Real) -> float:
+    """Legacy alias for :func:`adverse_future_profit_loss`.
+
+    ``csm`` here means the repository's custom profitability measure, not an
+    IFRS 17 CSM balance and not regulatory capital.
+    """
+
+    return adverse_future_profit_loss(base_csm, stressed_csm)
 
 
 def model_point_mass_lapse_proxy(
@@ -181,14 +219,18 @@ def mll_correlation_matrix(
     return matrix
 
 
-def aggregate_mll_capital(
+def aggregate_mll_future_profit_risk(
     mortality_loss: Real,
     longevity_loss: Real,
     lapse_loss: Real,
     *,
     stresses: Optional[CapitalStresses] = None,
 ) -> float:
-    """Aggregate non-negative MLL stand-alone losses by correlation."""
+    """Aggregate non-negative MLL future-profit losses by correlation.
+
+    The correlation matrix is a research aggregation convention.  This result
+    is not an APRA/LAGIC capital requirement or a complete regulatory module.
+    """
 
     vector = (
         _nonnegative_float(mortality_loss, "mortality_loss"),
@@ -210,9 +252,32 @@ def aggregate_mll_capital(
     return math.sqrt(max(0.0, quadratic))
 
 
+def aggregate_mll_capital(
+    mortality_loss: Real,
+    longevity_loss: Real,
+    lapse_loss: Real,
+    *,
+    stresses: Optional[CapitalStresses] = None,
+) -> float:
+    """Legacy alias for :func:`aggregate_mll_future_profit_risk`."""
+
+    return aggregate_mll_future_profit_risk(
+        mortality_loss,
+        longevity_loss,
+        lapse_loss,
+        stresses=stresses,
+    )
+
+
 @dataclass(frozen=True)
 class MLLCapitalResult:
-    """Standalone losses and correlated MLL capital for one cap policy."""
+    """Standalone losses and correlated MLL-FPAR for one cap policy.
+
+    The ``capital`` attribute is retained only for compatibility.  New code
+    should use :attr:`future_profit_risk`.  The explicit status fields prevent
+    this research proxy from being reported as APRA/LAGIC or other regulatory
+    capital.
+    """
 
     mortality_loss: float
     longevity_loss: float
@@ -224,6 +289,19 @@ class MLLCapitalResult:
     capital: float
     mass_lapse_rate: float
     framework: str = field(default=MLL_FRAMEWORK, init=False)
+    risk_measure_basis: str = field(default=MLL_VALUE_BASIS, init=False)
+    regulatory_capital_calculated: bool = field(
+        default=REGULATORY_CAPITAL_CALCULATED,
+        init=False,
+    )
+    apra_lagic_capital_calculated: bool = field(
+        default=APRA_LAGIC_CAPITAL_CALCULATED,
+        init=False,
+    )
+    ifrs17_csm_calculated: bool = field(
+        default=IFRS17_CSM_CALCULATED,
+        init=False,
+    )
     mass_lapse_method: str = field(default=MASS_LAPSE_METHOD, init=False)
     mass_lapse_is_revaluation: bool = field(default=False, init=False)
 
@@ -263,8 +341,28 @@ class MLLCapitalResult:
         ):
             raise ValueError("binding_lapse_stress does not identify a maximum.")
 
+    @property
+    def future_profit_risk(self) -> float:
+        """Correlated MLL future-profit-at-risk research proxy.
 
-def calculate_mll_capital(
+        This is the canonical name for the numeric value stored in the legacy
+        ``capital`` field.
+        """
+
+        return self.capital
+
+    @property
+    def value_basis(self) -> str:
+        """Descriptive alias for :attr:`risk_measure_basis`."""
+
+        return self.risk_measure_basis
+
+
+# Canonical result name; ``MLLCapitalResult`` remains import-compatible.
+MLLFutureProfitRiskResult = MLLCapitalResult
+
+
+def calculate_mll_future_profit_risk(
     *,
     base_csm: Real,
     mortality_stressed_csm: Real,
@@ -274,19 +372,22 @@ def calculate_mll_capital(
     model_point_csms: Sequence[Real],
     model_point_weights: Sequence[Real],
     stresses: Optional[CapitalStresses] = None,
-) -> MLLCapitalResult:
-    """Calculate the complete MLL arithmetic from supplied revaluation CSMs.
+) -> MLLFutureProfitRiskResult:
+    """Calculate MLL-FPAR from supplied custom-CSM stress revaluations.
 
     The caller remains responsible for producing cache-valid, path-congruent
     base and stress valuations under one frozen management rule.  No stress is
-    simulated or inferred by this function.
+    simulated or inferred by this function.  A stressed reduction in the
+    repository's custom CSM is treated as an insurer future-profit/value loss;
+    it is not a movement in recognised IFRS 17 CSM and does not calculate
+    APRA/LAGIC policy liabilities or required capital.
     """
 
     resolved = _resolve_stresses(stresses)
-    mortality = adverse_csm_loss(base_csm, mortality_stressed_csm)
-    longevity = adverse_csm_loss(base_csm, longevity_stressed_csm)
-    lapse_up = adverse_csm_loss(base_csm, lapse_up_stressed_csm)
-    lapse_down = adverse_csm_loss(base_csm, lapse_down_stressed_csm)
+    mortality = adverse_future_profit_loss(base_csm, mortality_stressed_csm)
+    longevity = adverse_future_profit_loss(base_csm, longevity_stressed_csm)
+    lapse_up = adverse_future_profit_loss(base_csm, lapse_up_stressed_csm)
+    lapse_down = adverse_future_profit_loss(base_csm, lapse_down_stressed_csm)
     mass_lapse = model_point_mass_lapse_proxy(
         model_point_csms,
         model_point_weights,
@@ -300,7 +401,7 @@ def calculate_mll_capital(
     # ``max`` is stable, so LAPSE_STRESS_ORDER is the deterministic tie-break.
     binding = max(LAPSE_STRESS_ORDER, key=lapse_by_name.__getitem__)
     lapse = lapse_by_name[binding]
-    capital = aggregate_mll_capital(
+    future_profit_risk = aggregate_mll_future_profit_risk(
         mortality, longevity, lapse, stresses=resolved
     )
     return MLLCapitalResult(
@@ -311,14 +412,45 @@ def calculate_mll_capital(
         mass_lapse_loss=mass_lapse,
         lapse_loss=lapse,
         binding_lapse_stress=binding,
-        capital=capital,
+        capital=future_profit_risk,
         mass_lapse_rate=resolved.lapse_mass,
+    )
+
+
+def calculate_mll_capital(
+    *,
+    base_csm: Real,
+    mortality_stressed_csm: Real,
+    longevity_stressed_csm: Real,
+    lapse_up_stressed_csm: Real,
+    lapse_down_stressed_csm: Real,
+    model_point_csms: Sequence[Real],
+    model_point_weights: Sequence[Real],
+    stresses: Optional[CapitalStresses] = None,
+) -> MLLCapitalResult:
+    """Legacy alias for :func:`calculate_mll_future_profit_risk`."""
+
+    return calculate_mll_future_profit_risk(
+        base_csm=base_csm,
+        mortality_stressed_csm=mortality_stressed_csm,
+        longevity_stressed_csm=longevity_stressed_csm,
+        lapse_up_stressed_csm=lapse_up_stressed_csm,
+        lapse_down_stressed_csm=lapse_down_stressed_csm,
+        model_point_csms=model_point_csms,
+        model_point_weights=model_point_weights,
+        stresses=stresses,
     )
 
 
 @dataclass(frozen=True)
 class CapitalAdjustedCSMResult:
-    """Signed CSM, capital charge and optional capital-efficiency ratio."""
+    """Custom CSM with an optional MLL-FPAR research penalty.
+
+    The capital-named fields are retained for backwards compatibility.  Their
+    canonical properties below deliberately say ``risk`` or ``penalty``: the
+    weight is a dimensionless research preference, not a regulatory capital
+    charge or cost-of-capital calibration.
+    """
 
     csm: float
     capital: float
@@ -328,6 +460,19 @@ class CapitalAdjustedCSMResult:
     capital_adjusted_csm: float
     csm_to_capital: Optional[float]
     framework: str = field(default=MLL_FRAMEWORK, init=False)
+    risk_measure_basis: str = field(default=MLL_VALUE_BASIS, init=False)
+    regulatory_capital_calculated: bool = field(
+        default=REGULATORY_CAPITAL_CALCULATED,
+        init=False,
+    )
+    apra_lagic_capital_calculated: bool = field(
+        default=APRA_LAGIC_CAPITAL_CALCULATED,
+        init=False,
+    )
+    ifrs17_csm_calculated: bool = field(
+        default=IFRS17_CSM_CALCULATED,
+        init=False,
+    )
 
     def __post_init__(self) -> None:
         csm = _finite_float(self.csm, "csm")
@@ -362,6 +507,89 @@ class CapitalAdjustedCSMResult:
             ):
                 raise ValueError("csm_to_capital is inconsistent.")
 
+    @property
+    def future_profit_risk(self) -> float:
+        """MLL future-profit-at-risk proxy (legacy field: ``capital``)."""
+
+        return self.capital
+
+    @property
+    def value_basis(self) -> str:
+        """Descriptive alias for :attr:`risk_measure_basis`."""
+
+        return self.risk_measure_basis
+
+    @property
+    def risk_penalty_weight(self) -> float:
+        """Dimensionless research weight (legacy: ``capital_hurdle``)."""
+
+        return self.capital_hurdle
+
+    @property
+    def risk_materiality(self) -> float:
+        """MLL-FPAR materiality threshold."""
+
+        return self.capital_materiality
+
+    @property
+    def risk_penalty(self) -> float:
+        """Research penalty ``weight * MLL-FPAR``."""
+
+        return self.capital_charge
+
+    @property
+    def risk_penalized_csm(self) -> float:
+        """Custom CSM less the research MLL-FPAR penalty."""
+
+        return self.capital_adjusted_csm
+
+    @property
+    def csm_to_mll_risk_ratio(self) -> Optional[float]:
+        """Custom-CSM-to-MLL-FPAR ratio, if the denominator is material."""
+
+        return self.csm_to_capital
+
+
+# Canonical result name; the legacy class name remains stable for callers.
+RiskPenalizedCSMResult = CapitalAdjustedCSMResult
+
+
+def evaluate_risk_penalized_csm(
+    csm: Real,
+    future_profit_risk: Real,
+    *,
+    risk_penalty_weight: Real,
+    risk_materiality: Real = 1.0e-9,
+) -> RiskPenalizedCSMResult:
+    """Evaluate ``custom CSM - weight * MLL-FPAR`` and its optional ratio.
+
+    This is a research sensitivity, not an APRA/LAGIC capital charge, cost of
+    capital or annualised RAROC.  The ratio is ``None`` when MLL-FPAR is at or
+    below the caller's materiality threshold; no epsilon denominator is used.
+    """
+
+    signed_csm = _finite_float(csm, "csm")
+    risk = _nonnegative_float(future_profit_risk, "future_profit_risk")
+    weight = _nonnegative_float(risk_penalty_weight, "risk_penalty_weight")
+    materiality = _nonnegative_float(
+        risk_materiality, "risk_materiality"
+    )
+    penalty = weight * risk
+    ratio = (
+        None
+        if risk <= materiality
+        else signed_csm / risk
+    )
+    return CapitalAdjustedCSMResult(
+        csm=signed_csm,
+        capital=risk,
+        capital_hurdle=weight,
+        capital_materiality=materiality,
+        capital_charge=penalty,
+        capital_adjusted_csm=signed_csm - penalty,
+        csm_to_capital=ratio,
+    )
+
 
 def evaluate_capital_adjusted_csm(
     csm: Real,
@@ -370,34 +598,13 @@ def evaluate_capital_adjusted_csm(
     capital_hurdle: Real,
     capital_materiality: Real = 1.0e-9,
 ) -> CapitalAdjustedCSMResult:
-    """Evaluate ``CSM - hurdle * capital`` and the optional raw CSM ratio.
+    """Legacy alias for :func:`evaluate_risk_penalized_csm`."""
 
-    The AUD capital-adjusted CSM is the robust comparison objective.  The
-    optional ``CSM / capital`` ratio is a secondary lifetime value-to-capital
-    diagnostic, not annualised RAROC.  It is ``None`` when capital is at or
-    below the caller's materiality threshold; no epsilon denominator is used.
-    """
-
-    signed_csm = _finite_float(csm, "csm")
-    required_capital = _nonnegative_float(capital, "capital")
-    hurdle = _nonnegative_float(capital_hurdle, "capital_hurdle")
-    materiality = _nonnegative_float(
-        capital_materiality, "capital_materiality"
-    )
-    charge = hurdle * required_capital
-    ratio = (
-        None
-        if required_capital <= materiality
-        else signed_csm / required_capital
-    )
-    return CapitalAdjustedCSMResult(
-        csm=signed_csm,
-        capital=required_capital,
-        capital_hurdle=hurdle,
-        capital_materiality=materiality,
-        capital_charge=charge,
-        capital_adjusted_csm=signed_csm - charge,
-        csm_to_capital=ratio,
+    return evaluate_risk_penalized_csm(
+        csm,
+        capital,
+        risk_penalty_weight=capital_hurdle,
+        risk_materiality=capital_materiality,
     )
 
 
@@ -419,13 +626,32 @@ def _require_same_metric_basis(
 
 @dataclass(frozen=True)
 class CapitalMetricComparison:
-    """Candidate-minus-comparator changes on one common metric basis."""
+    """Candidate-minus-comparator changes on one common research basis."""
 
     csm_delta: float
     capital_delta: float
     capital_charge_delta: float
     capital_adjusted_csm_delta: float
     csm_to_capital_delta: Optional[float]
+
+    @property
+    def future_profit_risk_delta(self) -> float:
+        return self.capital_delta
+
+    @property
+    def risk_penalty_delta(self) -> float:
+        return self.capital_charge_delta
+
+    @property
+    def risk_penalized_csm_delta(self) -> float:
+        return self.capital_adjusted_csm_delta
+
+    @property
+    def csm_to_mll_risk_ratio_delta(self) -> Optional[float]:
+        return self.csm_to_capital_delta
+
+
+RiskMetricComparison = CapitalMetricComparison
 
 
 def compare_capital_metrics(
@@ -455,6 +681,11 @@ def compare_capital_metrics(
     )
 
 
+# Canonical comparison name; legacy field aliases remain available on the
+# returned immutable result.
+compare_risk_metrics = compare_capital_metrics
+
+
 @dataclass(frozen=True)
 class FlexibilityDelta:
     """Adaptive result relative to the best supplied fixed-cap result."""
@@ -468,12 +699,18 @@ class FlexibilityDelta:
     def capital_adjusted_csm_delta(self) -> float:
         return self.comparison.capital_adjusted_csm_delta
 
+    @property
+    def risk_penalized_csm_delta(self) -> float:
+        """Canonical alias for the MLL-FPAR-penalised CSM change."""
+
+        return self.comparison.risk_penalized_csm_delta
+
 
 def calculate_flexibility_delta(
     adaptive: CapitalAdjustedCSMResult,
     fixed_candidates: Sequence[CapitalAdjustedCSMResult],
 ) -> FlexibilityDelta:
-    """Compare adaptive value with the best fixed capital-adjusted CSM.
+    """Compare adaptive value with the best fixed risk-penalised custom CSM.
 
     The first fixed candidate wins an exact tie, making selection stable and
     reproducible.  Sample separation is an orchestrator responsibility: final
@@ -512,7 +749,7 @@ def calculate_flexibility_delta(
 
 @dataclass(frozen=True)
 class PolicyLevelCSMMLLResult:
-    """Complete policy-level CSM/MLL ratio on one aggregation basis.
+    """Policy-level custom-CSM/MLL-FPAR ratio on one aggregation basis.
 
     The supplied CSM values are already policy-level expectation values.  In
     particular, this class performs no path averaging.  ``mll`` retains the
@@ -551,13 +788,39 @@ class PolicyLevelCSMMLLResult:
 
     @property
     def mll_capital(self) -> float:
+        """Legacy alias for :attr:`future_profit_risk`."""
+
         return self.mll.capital
 
     @property
     def csm_to_capital(self) -> Optional[float]:
-        """Compatibility alias for the explicitly MLL-only ratio."""
+        """Legacy alias for :attr:`csm_to_mll_risk_ratio`."""
 
         return self.csm_to_mll_ratio
+
+    @property
+    def future_profit_risk(self) -> float:
+        """Correlated MLL future-profit-at-risk research proxy."""
+
+        return self.mll.future_profit_risk
+
+    @property
+    def csm_to_mll_risk_ratio(self) -> Optional[float]:
+        """Custom-CSM-to-MLL-FPAR ratio, if the denominator is material."""
+
+        return self.csm_to_mll_ratio
+
+    @property
+    def regulatory_capital_calculated(self) -> bool:
+        return self.mll.regulatory_capital_calculated
+
+    @property
+    def apra_lagic_capital_calculated(self) -> bool:
+        return self.mll.apra_lagic_capital_calculated
+
+    @property
+    def ifrs17_csm_calculated(self) -> bool:
+        return self.mll.ifrs17_csm_calculated
 
 
 def calculate_policy_level_csm_mll(
@@ -572,7 +835,7 @@ def calculate_policy_level_csm_mll(
     capital_materiality: Real = 1.0e-9,
     stresses: Optional[CapitalStresses] = None,
 ) -> PolicyLevelCSMMLLResult:
-    """Calculate signed CSM, MLL capital and their policy-level ratio.
+    """Calculate custom CSM, MLL-FPAR and their policy-level ratio.
 
     ``model_point_csms`` are signed base CSM values.  Their positive part is
     taken *per model point* inside the mass-lapse proxy, before the supplied
@@ -584,7 +847,7 @@ def calculate_policy_level_csm_mll(
     materiality = _nonnegative_float(
         capital_materiality, "capital_materiality"
     )
-    mll = calculate_mll_capital(
+    mll = calculate_mll_future_profit_risk(
         base_csm=csm,
         mortality_stressed_csm=mortality_stressed_csm,
         longevity_stressed_csm=longevity_stressed_csm,
@@ -715,7 +978,7 @@ def _score_output(
 
 @dataclass(frozen=True)
 class LSMCCSMMLLScore:
-    """CSM/MLL outputs for one or many management-LSMC value vectors.
+    """Custom-CSM/MLL-FPAR outputs for management-LSMC value vectors.
 
     Array inputs preserve every leading dimension.  For an array result,
     non-material ratio cells are represented by ``NaN`` because NumPy arrays
@@ -734,9 +997,39 @@ class LSMCCSMMLLScore:
 
     @property
     def score(self) -> Optional[float] | NDArray[np.float64]:
-        """The declared CSM/MLL score used for policy-level comparison."""
+        """The custom-CSM/MLL-FPAR score used for policy comparison."""
+
+        return self.csm_to_mll_risk_ratio
+
+    @property
+    def future_profit_risk(self) -> float | NDArray[np.float64]:
+        """Canonical alias for the legacy ``mll_capital`` field."""
+
+        return self.mll_capital
+
+    @property
+    def csm_to_mll_risk_ratio(
+        self,
+    ) -> Optional[float] | NDArray[np.float64]:
+        """Custom-CSM-to-MLL-FPAR ratio."""
 
         return self.csm_to_mll_ratio
+
+    @property
+    def risk_materiality(self) -> float:
+        return self.capital_materiality
+
+    @property
+    def regulatory_capital_calculated(self) -> bool:
+        return REGULATORY_CAPITAL_CALCULATED
+
+    @property
+    def apra_lagic_capital_calculated(self) -> bool:
+        return APRA_LAGIC_CAPITAL_CALCULATED
+
+    @property
+    def ifrs17_csm_calculated(self) -> bool:
+        return IFRS17_CSM_CALCULATED
 
 
 def score_lsmc_value_vectors(
@@ -981,7 +1274,7 @@ def _bootstrap_ratio_values(
     if np.any(capital <= capital_materiality):
         raise ValueError(
             "CSM/MLL ratio is undefined in at least one bootstrap resample "
-            "because MLL capital is at or below materiality."
+            "because MLL-FPAR is at or below materiality."
         )
     ratio = base / capital
     if not np.all(np.isfinite(ratio)):
@@ -1045,7 +1338,7 @@ def paired_bootstrap_ratio_delta(
     and projector draws; shape equality alone cannot prove provenance.
 
     The returned interval is the ordinary two-sided percentile interval.  No
-    resample with immaterial MLL capital is silently dropped, since doing so
+    resample with immaterial MLL-FPAR is silently dropped, since doing so
     would condition and bias a ratio estimator.
     """
 
@@ -1138,32 +1431,48 @@ def paired_bootstrap_ratio_delta(
 
 # Descriptive alias for callers that prefer the complete metric name.
 paired_bootstrap_csm_to_mll_delta = paired_bootstrap_ratio_delta
+paired_bootstrap_csm_to_mll_risk_delta = paired_bootstrap_ratio_delta
 
 
 __all__ = [
+    "APRA_LAGIC_CAPITAL_CALCULATED",
     "CapitalAdjustedCSMResult",
     "CapitalMetricComparison",
     "FlexibilityDelta",
+    "IFRS17_CSM_CALCULATED",
     "LSMC_BASE_COMPONENT_NAMES",
     "LSMC_FIXED_VALUE_COUNT",
     "LSMC_STRESS_CSM_NAMES",
     "LSMCCSMMLLScore",
     "MASS_LAPSE_METHOD",
     "MLLCapitalResult",
+    "MLLFutureProfitRiskResult",
     "MLL_FRAMEWORK",
+    "MLL_FUTURE_PROFIT_RISK_FRAMEWORK",
+    "MLL_LEGACY_FRAMEWORK",
+    "MLL_VALUE_BASIS",
     "PairedBootstrapRatioDelta",
     "PolicyCSMPathArrays",
     "PolicyLevelCSMMLLResult",
+    "REGULATORY_CAPITAL_CALCULATED",
+    "RiskMetricComparison",
+    "RiskPenalizedCSMResult",
     "adverse_csm_loss",
+    "adverse_future_profit_loss",
     "aggregate_mll_capital",
+    "aggregate_mll_future_profit_risk",
     "calculate_flexibility_delta",
     "calculate_mll_capital",
+    "calculate_mll_future_profit_risk",
     "calculate_policy_level_csm_mll",
     "compare_capital_metrics",
+    "compare_risk_metrics",
     "evaluate_capital_adjusted_csm",
+    "evaluate_risk_penalized_csm",
     "mll_correlation_matrix",
     "model_point_mass_lapse_proxy",
     "paired_bootstrap_csm_to_mll_delta",
+    "paired_bootstrap_csm_to_mll_risk_delta",
     "paired_bootstrap_ratio_delta",
     "score_lsmc_value_vectors",
 ]

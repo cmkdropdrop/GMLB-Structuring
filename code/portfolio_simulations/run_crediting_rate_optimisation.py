@@ -95,7 +95,7 @@ def _precompute_commands(
     model_points = load_policyholder_model_points(args.model_points)
     if mode == "dynamic" and len(model_points.model_points) != 1:
         raise ValueError(
-            "The Dynamic Time-0 capital-adjusted workflow requires exactly one "
+            "The Dynamic Time-0 future-profit-risk workflow requires exactly one "
             f"modelpoint before cache preparation; loaded "
             f"{len(model_points.model_points)} from {args.model_points}."
         )

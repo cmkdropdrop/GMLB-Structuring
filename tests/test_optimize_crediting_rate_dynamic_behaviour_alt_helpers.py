@@ -8,9 +8,11 @@ import numpy as np
 import pytest
 
 from policy_engine import ProjectionConfig
+from policy_engine.capital import CapitalStresses
 from policy_engine.crediting_capital import (
     PairedBootstrapRatioDelta,
     PolicyCSMPathArrays,
+    aggregate_mll_capital,
     score_lsmc_value_vectors,
 )
 from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import (
@@ -33,9 +35,13 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _masked_lower_cap_argmax,
     _mll_metrics_from_payload,
     _management_payload_and_activity_exposure,
+    _mll_shapley_delta_allocation,
+    _normalise_time_zero_fpar_report_schema,
     _objective_from_payload,
     _time_zero_policy_class_weights,
+    _time_zero_flexibility_breakdown_rows,
     _time_zero_fixed_output_rows,
+    _typed_csv_value,
     parse_args,
     _pathwise_outer_fold_ids,
     _policy_action_values,
@@ -44,6 +50,7 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _screened_policy_component_values,
     _screened_policy_actions,
     _select_best_fixed_label,
+    _select_best_time_zero_csm_candidate,
     _select_best_time_zero_capital_adjusted_candidate,
     _time_zero_capital_adjusted_csm,
     _shell_neutral_argv_display,
@@ -634,11 +641,14 @@ def test_validation_gate_accepts_significant_uplift_and_rejects_fallback_cases()
         assert not _adaptive_policy_passes_validation(**arguments)
 
 
-def test_capital_adjusted_parser_uses_one_full_sample_and_one_model_point_default():
+def test_time_zero_parser_uses_csm_primary_and_fpar_penalty_defaults():
     args = parse_args(["--n-paths", "882", "--seed", "17"])
 
-    assert args.optimisation_objective == "csm_minus_lambda_mll"
+    assert args.optimisation_objective == "csm"
+    assert args.mll_risk_penalty_weight == pytest.approx(0.06)
     assert args.mll_capital_charge_rate == pytest.approx(0.06)
+    assert args.mll_risk_materiality_bp == pytest.approx(1.0)
+    assert args.mll_capital_materiality_bp == pytest.approx(1.0)
     assert args.n_paths == 882
     assert args.seed == 17
     assert args.model_points.name == "model_points_policyholders_1_point_proxy.csv"
@@ -649,6 +659,51 @@ def test_capital_adjusted_parser_uses_one_full_sample_and_one_model_point_defaul
         assert not hasattr(args, removed)
     with pytest.raises(SystemExit):
         parse_args(["--fixed-selection-seed", "18"])
+
+
+def test_time_zero_parser_keeps_deprecated_capital_named_cli_aliases():
+    canonical = parse_args([
+        "--n-paths", "882",
+        "--mll-risk-penalty-weight", "0.04",
+        "--mll-risk-materiality-bp", "2.5",
+    ])
+    legacy = parse_args([
+        "--n-paths", "882",
+        "--mll-capital-charge-rate", "0.04",
+        "--mll-capital-materiality-bp", "2.5",
+    ])
+
+    assert canonical.mll_risk_penalty_weight == pytest.approx(0.04)
+    assert legacy.mll_risk_penalty_weight == pytest.approx(0.04)
+    assert canonical.mll_risk_materiality_bp == pytest.approx(2.5)
+    assert legacy.mll_risk_materiality_bp == pytest.approx(2.5)
+
+
+def test_targeted_recovery_and_report_only_cli_are_explicit_and_exclusive():
+    targeted = parse_args([
+        "--n-paths", "882", "--candidate-policy-class", "base_csm",
+    ])
+    report_only = parse_args([
+        "--report-from-run", "completed-run",
+    ])
+
+    assert targeted.candidate_policy_class == "base_csm"
+    assert targeted.report_from_run is None
+    assert report_only.report_from_run.name == "completed-run"
+    assert report_only.candidate_policy_class is None
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--candidate-policy-class", "base_csm",
+            "--report-from-run", "completed-run",
+        ])
+
+
+def test_report_only_csv_scalar_parser_preserves_boolean_meaning():
+    assert _typed_csv_value("False") is False
+    assert _typed_csv_value("True") is True
+    assert _typed_csv_value("") is None
+    assert _typed_csv_value("12.5") == pytest.approx(12.5)
+    assert _typed_csv_value("mass_lapse") == "mass_lapse"
 
 
 def test_time_zero_policy_class_grid_is_predeclared_and_additive():
@@ -689,6 +744,125 @@ def test_time_zero_fixed_output_removes_legacy_sample_role_names():
         "time_zero_csm_aud": 12.0,
         "time_zero_mll_capital_aud": 5.0,
     }]
+
+
+def test_time_zero_flexibility_breakdowns_reconcile_csm_and_preserve_mll_stages():
+    spec = ManagementObjectiveSpec(
+        kind="csm_to_mll",
+        model_point_count=1,
+        capital_materiality=0.01,
+        mass_lapse_fraction=0.40,
+    )
+    fixed = np.array([
+        100.0, 20.0, 30.0, 4.0, 2.0,
+        10.0, 5.0, 8.0, 3.0,
+        120.0, 125.0, 110.0, 128.0,
+        999.0,
+    ])
+    flexible = np.array([
+        110.0, 25.0, 45.0, 4.0, 1.0,
+        8.0, 4.0, 9.0, 5.0,
+        140.0, 150.0, 130.0, 155.0,
+        -999.0,
+    ])
+
+    csm_rows, mll_rows = _time_zero_flexibility_breakdown_rows(
+        fixed_payload=fixed,
+        flexible_payload=flexible,
+        objective_spec=spec,
+        portfolio_scale=2.0,
+        capital_charge_rate=0.06,
+    )
+
+    components = [row for row in csm_rows if row["row_type"] == "component"]
+    total = next(row for row in csm_rows if row["row_type"] == "csm_total")
+    assert len(components) == 9
+    assert sum(
+        row["best_fixed_csm_contribution_aud"] for row in components
+    ) == pytest.approx(total["best_fixed_csm_contribution_aud"])
+    assert sum(
+        row["flexible_csm_contribution_aud"] for row in components
+    ) == pytest.approx(total["flexible_csm_contribution_aud"])
+    assert sum(
+        row["flexibility_csm_impact_aud"] for row in components
+    ) == pytest.approx(total["flexibility_csm_impact_aud"])
+    assert total["best_fixed_amount_aud"] == pytest.approx(260.0)
+    assert total["flexible_amount_aud"] == pytest.approx(318.0)
+
+    mll = {row["component"]: row for row in mll_rows}
+    assert mll["mortality_stressed_csm"]["best_fixed_value_aud"] \
+        == pytest.approx(240.0)
+    assert mll["mass_lapse_loss"]["best_fixed_value_aud"] \
+        == pytest.approx(104.0)
+    assert mll["mass_lapse_loss"]["mass_lapse_rate"] \
+        == pytest.approx(0.40)
+    assert mll["mass_lapse_loss"]["capital_materiality_aud"] \
+        == pytest.approx(0.02)
+    assert np.asarray(json.loads(
+        mll["mll_capital"]["mll_correlation_matrix"]
+    )).shape == (3, 3)
+    assert mll["mass_lapse_loss"]["best_fixed_is_binding_lapse"] is True
+    assert mll["lapse_up_loss"]["best_fixed_is_binding_lapse"] is False
+    assert mll["lapse_loss"]["best_fixed_binding_lapse_stress"] \
+        == "mass_lapse"
+    assert "do not add" in mll["mll_capital"]["additivity_note"]
+    assert mll["csm_minus_lambda_mll"][
+        "flexible_minus_best_fixed_aud"
+    ] == pytest.approx(
+        total["flexibility_csm_impact_aud"]
+        - mll["mll_capital_charge"]["flexible_minus_best_fixed_aud"]
+    )
+    shapley_rows = sorted(
+        (
+            row for row in mll_rows
+            if row["row_type"] == "mll_shapley_attribution"
+        ),
+        key=lambda row: row["mll_waterfall_order"],
+    )
+    assert [row["mll_waterfall_order"] for row in shapley_rows] == [1, 2, 3]
+    assert len({row["component"] for row in shapley_rows}) == 3
+    shapley_sum = sum(
+        row["correlated_mll_shapley_effect_aud"] for row in shapley_rows
+    )
+    assert mll["mll_capital"]["best_fixed_value_aud"] + shapley_sum \
+        == pytest.approx(mll["mll_capital"]["flexible_value_aud"])
+    assert mll["mll_shapley_total"][
+        "mll_shapley_reconciliation_gap_aud"
+    ] == pytest.approx(0.0, abs=1.0e-10)
+    assert mll["csm_minus_lambda_mll"][
+        "flexible_minus_best_fixed_aud"
+    ] == pytest.approx(
+        sum(row["flexibility_csm_impact_aud"] for row in components)
+        - 0.06 * shapley_sum
+    )
+
+
+def test_mll_shapley_allocation_is_signed_exact_and_homogeneous():
+    stresses = CapitalStresses()
+    fixed = np.array([10.0, 20.0, 30.0])
+    mortality_only = np.array([15.0, 20.0, 30.0])
+
+    unchanged = _mll_shapley_delta_allocation(
+        fixed, fixed, stresses=stresses
+    )
+    allocation = _mll_shapley_delta_allocation(
+        fixed, mortality_only, stresses=stresses
+    )
+    expected_delta = aggregate_mll_capital(
+        *mortality_only, stresses=stresses
+    ) - aggregate_mll_capital(*fixed, stresses=stresses)
+
+    np.testing.assert_allclose(unchanged, np.zeros(3), atol=1.0e-12)
+    assert allocation[0] == pytest.approx(expected_delta)
+    np.testing.assert_allclose(allocation[1:], np.zeros(2), atol=1.0e-12)
+    np.testing.assert_allclose(
+        _mll_shapley_delta_allocation(
+            2.0 * fixed, 2.0 * mortality_only, stresses=stresses
+        ),
+        2.0 * allocation,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
 
 
 def test_single_model_point_payload_is_recomputed_after_clipping():
@@ -876,6 +1050,36 @@ def test_time_zero_final_selection_maximises_capital_adjusted_csm():
     assert selected is higher_adjusted_lower_ratio
 
 
+def test_time_zero_primary_selection_maximises_csm_not_fpar_penalised_score():
+    higher_csm_higher_risk = SimpleNamespace(
+        anchored_result=SimpleNamespace(
+            csm=120.0,
+            mll=SimpleNamespace(capital=300.0),
+            csm_to_mll_ratio=0.4,
+        ),
+        estimate=SimpleNamespace(chosen_action=0),
+        policy_class_index=1,
+    )
+    lower_csm_lower_risk = SimpleNamespace(
+        anchored_result=SimpleNamespace(
+            csm=110.0,
+            mll=SimpleNamespace(capital=0.0),
+            csm_to_mll_ratio=None,
+        ),
+        estimate=SimpleNamespace(chosen_action=1),
+        policy_class_index=2,
+    )
+
+    assert _time_zero_capital_adjusted_csm(
+        higher_csm_higher_risk.anchored_result, 0.06
+    ) < _time_zero_capital_adjusted_csm(
+        lower_csm_lower_risk.anchored_result, 0.06
+    )
+    assert _select_best_time_zero_csm_candidate((
+        higher_csm_higher_risk, lower_csm_lower_risk
+    )) is higher_csm_higher_risk
+
+
 def test_capital_adjusted_selection_allows_undefined_secondary_ratio():
     zero_mll = SimpleNamespace(
         anchored_result=SimpleNamespace(
@@ -901,6 +1105,50 @@ def test_capital_adjusted_selection_allows_undefined_secondary_ratio():
     )
 
     assert selected is zero_mll
+
+
+def test_legacy_report_schema_is_normalised_to_fpar_and_no_apra_capital():
+    comparison = {
+        "best_fixed_csm_aud": 100.0,
+        "flexible_csm_aud": 130.0,
+        "best_fixed_mll_capital_aud": 20.0,
+        "flexible_mll_capital_aud": 30.0,
+        "best_fixed_csm_to_mll_ratio": 5.0,
+        "flexible_csm_to_mll_ratio": 130.0 / 30.0,
+        "mll_capital_charge_rate": 0.06,
+        "fixed_primary_objective_comparator_binding": False,
+    }
+    csm_rows = [{"component": "csm", "row_type": "csm_total"}]
+    mll_rows = [{
+        "component": "mll_capital",
+        "row_type": "correlated_capital",
+        "display_label": "Correlated MLL capital",
+        "best_fixed_value_aud": 20.0,
+        "flexible_value_aud": 30.0,
+    }]
+
+    normalised, normalised_csm, normalised_mll = (
+        _normalise_time_zero_fpar_report_schema(
+            comparison, csm_rows, mll_rows
+        )
+    )
+
+    assert normalised["primary_optimisation_objective"] == "csm"
+    assert normalised["best_fixed_mll_future_profit_risk_aud"] \
+        == pytest.approx(20.0)
+    assert normalised["flexible_risk_penalized_csm_aud"] \
+        == pytest.approx(128.2)
+    assert normalised["regulatory_capital_status"] == "not_calculated"
+    assert normalised["regulatory_capital_aud"] is None
+    assert normalised["apra_insurance_risk_charge_aud"] is None
+    assert normalised_csm[0]["regulatory_capital_status"] == "not_calculated"
+    assert normalised_mll[0]["canonical_component"] \
+        == "mll_future_profit_risk"
+    assert normalised_mll[0]["canonical_row_type"] \
+        == "correlated_future_profit_risk"
+    assert normalised_mll[0]["legacy_component"] == "mll_capital"
+    assert normalised_mll[0]["legacy_row_type"] == "correlated_capital"
+    assert "future-profit-risk" in normalised_mll[0]["display_label"]
 
 
 def test_ratio_is_formed_after_value_vector_aggregation():
