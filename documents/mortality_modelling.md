@@ -109,7 +109,7 @@ The default annual improvement is 1.25% through age 90, tapers linearly to zero
 at age 110, and is zero thereafter:
 
 $$
-i(x)=0.0125\times\operatorname{clip}\left(\frac{110-x}{110-90},0,1\right).
+i(x)=0.0125\times\mathrm{clip}\left(\frac{110-x}{110-90},0,1\right).
 $$
 
 <p align="center">
@@ -123,7 +123,7 @@ Before the terminal-age override, the annual probability is calculated
 schematically as
 
 $$
-q(x,y,d)=\operatorname{clip}\left(
+q(x,y,d)=\mathrm{clip}\left(
 q_x^{\mathrm{base}}
 [1-i(x)]^{\max(y-2022,0)}\times s
 +a\times\mathbf{1}_{0\le d<1},
@@ -297,10 +297,10 @@ present value denoted by PV,
 
 $$
 \mathrm{CSM}
-=PV(\text{Fee Income})
-+PV(\text{Other Income})
--PV(\text{Claims})
--PV(\text{Costs}).
+=\mathrm{PV}_{\mathrm{fees}}
++\mathrm{PV}_{\mathrm{other}}
+-\mathrm{PV}_{\mathrm{claims}}
+-\mathrm{PV}_{\mathrm{costs}}.
 $$
 
 Mortality changes several terms at once:

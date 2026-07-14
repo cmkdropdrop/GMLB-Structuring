@@ -87,7 +87,7 @@ The combined monthly fund return is
 
 $$
 R_m^{\mathrm{fund}}
-= 0.30R_m^{\text{global equity}}+0.70R_m^{\text{5y government bond}}.
+= 0.30R_m^{\mathrm{global}}+0.70R_m^{\mathrm{bond}}.
 $$
 
 Equity and bond returns are combined first; only then is the annual floor/cap
@@ -129,8 +129,8 @@ The standard profitability objective is the signed new-business CSM proxy
 
 $$
 \mathrm{CSM}^{\mathrm{proxy}}
-=\operatorname{PV}(\text{Fee Income})+\operatorname{PV}(\text{Other Income})
--\operatorname{PV}(\text{Claims})-\operatorname{PV}(\text{Costs}).
+=\mathrm{PV}_{\mathrm{fees}}+\mathrm{PV}_{\mathrm{other}}
+-\mathrm{PV}_{\mathrm{claims}}-\mathrm{PV}_{\mathrm{costs}}.
 $$
 
 | Leg | Main modelled components |
@@ -349,7 +349,7 @@ Adjustment.
 The primary ranking is no longer mean CSM alone. It uses the robust AUD measure
 
 $$
-\mathrm{CSM}^{\text{capital-adjusted}}(C)
+\mathrm{CSM}^{\mathrm{capital-adjusted}}(C)
 =\mathrm{CSM}^{\mathrm{proxy}}(C)-0.06\times K_{\mathrm{MLL}}(C),
 $$
 

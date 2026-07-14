@@ -25,6 +25,7 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _constant_first_year_policy,
     _csm_mll_evaluation_from_paths,
     _direct_transition_target,
+    _decision_year_activity_exposure,
     _fit_direct_q_chain,
     _grid_continuation_lookup,
     _lower_cap_argmax,
@@ -171,6 +172,29 @@ def test_activity_exposure_clips_only_numerical_negative_noise():
         _validated_activity_exposure(
             np.array([[1.0, -1.0e-6]]),
             expected_shape=(1, 2),
+            label="test",
+        )
+
+
+def test_decision_year_activity_exposure_drops_only_terminal_boundary():
+    boundary_values = np.array([
+        [1.0, 0.8, 0.4, 0.1],
+        [1.0, 0.7, 0.2, 0.0],
+    ])
+
+    aligned = _decision_year_activity_exposure(
+        boundary_values,
+        n_paths=2,
+        n_years=3,
+        label="test",
+    )
+
+    np.testing.assert_array_equal(aligned, boundary_values[:, :3])
+    with np.testing.assert_raises_regex(ValueError, "has shape"):
+        _decision_year_activity_exposure(
+            np.ones((2, 5)),
+            n_paths=2,
+            n_years=3,
             label="test",
         )
 

@@ -7302,6 +7302,32 @@ def _validated_activity_exposure(
     return exposure
 
 
+def _decision_year_activity_exposure(
+    values: Array,
+    *,
+    n_paths: int,
+    n_years: int,
+    label: str,
+) -> Array:
+    """Align boundary exposure to the annual management-decision grid.
+
+    Production projections record exposure at every cap boundary, including
+    the terminal boundary, and therefore have ``n_years + 1`` columns.  The
+    additive cashflow ledger and the management actions have ``n_years``
+    columns.  The terminal exposure has no following action or cashflow and is
+    deliberately excluded.  Synthetic tests may already supply the aligned
+    ``n_years`` representation.
+    """
+    exposure = np.asarray(values, dtype=float)
+    if exposure.shape == (n_paths, n_years + 1):
+        exposure = exposure[:, :n_years]
+    return _validated_activity_exposure(
+        exposure,
+        expected_shape=(n_paths, n_years),
+        label=label,
+    )
+
+
 def _fit_direct_q_chain(
     *,
     data: PortfolioPathData,
@@ -7353,13 +7379,14 @@ def _fit_direct_q_chain(
     feature_names = tuple(data.state_feature_names)
     inventory_index = _inventory_feature_index(feature_names)
     account_value = raw_states[:, :, inventory_index]
-    exposure = _validated_activity_exposure(
+    exposure = _decision_year_activity_exposure(
         (
         np.asarray(data.inforce_exposure, dtype=float)
         if activity_exposure is None
         else np.asarray(activity_exposure, dtype=float)
         ),
-        expected_shape=(n_paths, n_years),
+        n_paths=n_paths,
+        n_years=n_years,
         label="Direct-Q",
     )
     if immediate_components is None:
@@ -7723,9 +7750,10 @@ def _management_payload_and_activity_exposure(
             "The sole model-point CSM does not reconcile path/year to base CSM."
         )
 
-    exposure = _validated_activity_exposure(
+    exposure = _decision_year_activity_exposure(
         np.asarray(data.inforce_exposure, dtype=float),
-        expected_shape=(n_paths, n_years),
+        n_paths=n_paths,
+        n_years=n_years,
         label="Base",
     )
     stress_components: list[Array] = []
@@ -7733,9 +7761,10 @@ def _management_payload_and_activity_exposure(
         stressed = stressed_data[stress_id]
         if stressed.inforce_exposure is None:
             raise ValueError(f"Stress {stress_id!r} lacks in-force exposure.")
-        stressed_exposure = _validated_activity_exposure(
+        stressed_exposure = _decision_year_activity_exposure(
             np.asarray(stressed.inforce_exposure, dtype=float),
-            expected_shape=(n_paths, n_years),
+            n_paths=n_paths,
+            n_years=n_years,
             label=f"Stress projection {stress_id!r}",
         )
         exposure = np.maximum(exposure, stressed_exposure)
@@ -7983,15 +8012,14 @@ def _time_zero_management_lsmc(
             result = _policy_level_csm_mll_from_payload(
                 estimate.selected_payload, objective_spec
             )
-            if result.csm_to_mll_ratio is None:
-                raise RuntimeError("A Time-0 LSMC candidate has immaterial MLL.")
             gap = float(weights @ (estimate.selected_payload - current))
             payload_change = float(
                 np.linalg.norm(estimate.selected_payload - current)
                 / max(1.0, np.linalg.norm(current))
             )
             ratio_change = (
-                float("inf") if previous_ratio is None
+                None if result.csm_to_mll_ratio is None
+                else float("inf") if previous_ratio is None
                 else abs(float(result.csm_to_mll_ratio) - previous_ratio)
             )
             iteration_rows.append({
@@ -8004,9 +8032,24 @@ def _time_zero_management_lsmc(
                 "linear_support_gap": gap,
                 "relative_payload_change": payload_change,
                 "absolute_ratio_change": ratio_change,
+                "admissible_ratio_candidate": (
+                    result.csm_to_mll_ratio is not None
+                ),
+                "candidate_status": (
+                    "admissible"
+                    if result.csm_to_mll_ratio is not None
+                    else "discarded_immaterial_mll"
+                ),
                 "uses_all_paths": True,
                 "oos": False,
             })
+            # A zero-capital fitted candidate has no defined CSM/MLL under the
+            # central MLL convention.  It must neither abort the study nor be
+            # treated as an infinite objective.  Record it, exclude it from
+            # ranking and stop this scalarisation start because no next ratio
+            # subgradient exists at that value vector.
+            if result.csm_to_mll_ratio is None:
+                break
             candidates.append((start_name, iteration, estimate, result))
             if payload_change <= convergence_tolerance or (
                 previous_ratio is not None
@@ -8309,9 +8352,10 @@ def _backward_induction(
             or advantage_screen_multiplier < 0.0:
         raise ValueError("advantage_screen_multiplier must be finite and non-negative.")
     raw_states = np.asarray(data.raw_states, dtype=float)
-    exposure = _validated_activity_exposure(
+    exposure = _decision_year_activity_exposure(
         np.asarray(data.inforce_exposure, dtype=float),
-        expected_shape=(n_paths, n_years),
+        n_paths=n_paths,
+        n_years=n_years,
         label="Base",
     )
     if objective_spec.kind == "csm_to_mll":
@@ -8325,9 +8369,10 @@ def _backward_induction(
                 raise ValueError(
                     f"Stress projection {stress_id!r} lacks in-force exposure."
                 )
-            stressed_values = _validated_activity_exposure(
+            stressed_values = _decision_year_activity_exposure(
                 np.asarray(stressed_exposure, dtype=float),
-                expected_shape=(n_paths, n_years),
+                n_paths=n_paths,
+                n_years=n_years,
                 label=f"Stress projection {stress_id!r}",
             )
             exposure = np.maximum(exposure, stressed_values)
