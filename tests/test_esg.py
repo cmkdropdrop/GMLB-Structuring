@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from policy_engine.curves import YieldCurve
-from policy_engine.esg import (ESGConfig, Measure, simulate)
+from policy_engine.esg import (ESGConfig, HestonParams, Measure, simulate)
+from policy_engine.market_assumptions import load_market_assumptions
+from policy_engine.repository_paths import MARKET_DATA_DIRECTORY
 from policy_engine.product import Index
 
 
@@ -70,3 +72,37 @@ def test_heston_effective_vol(config):
     sig = scen.effective_bs_vol(Index.AUS_EQUITY, 0, 1.0)
     hp = config.heston[Index.AUS_EQUITY]
     assert np.all(sig > 0.5 * np.sqrt(hp.theta)) and np.all(sig < 2.0 * np.sqrt(hp.theta))
+
+
+def test_zero_vol_of_variance_requires_stationary_initial_variance():
+    with pytest.raises(
+        ValueError,
+        match="xi=0 fixed-volatility boundary requires v0=theta>0",
+    ):
+        HestonParams(v0=0.02, theta=0.03, kappa=1.8, xi=0.0)
+
+
+def test_constant_equity_volatility_sensitivity_keeps_variance_constant():
+    assumptions = load_market_assumptions(
+        model_parameters_path=(
+            MARKET_DATA_DIRECTORY
+            / "model_parameters_constant_equity_vol_low_rate_vol_sensitivity.csv"
+        )
+    )
+    scenarios = simulate(
+        "heston_hull_white",
+        assumptions.esg,
+        horizon_years=2.0,
+        n_paths=37,
+        seed=41,
+        substeps=4,
+    )
+
+    assert assumptions.esg.hull_white.sigma_r == pytest.approx(0.004)
+    assert scenarios.variance is not None
+    for index in Index:
+        expected = assumptions.esg.heston[index].theta
+        assert np.array_equal(
+            scenarios.variance[index],
+            np.full_like(scenarios.variance[index], expected),
+        )

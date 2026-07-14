@@ -6,6 +6,7 @@ import pytest
 
 from policy_engine import (
     DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
+    load_market_assumptions,
     load_policyholder_model_points,
 )
 from portfolio_simulations.run_portfolio_risk_analysis import (
@@ -15,6 +16,13 @@ from portfolio_simulations.run_portfolio_risk_analysis import (
 
 EXPECTED_DEFAULT_FILENAME = "model_points_policyholders_4_point_proxy.csv"
 FULL_GRID_FILENAME = "model_points_policyholders.csv"
+SENSITIVITY_MODEL_POINTS_FILENAME = (
+    "model_points_policyholders_4_point_"
+    "constant_equity_vol_low_rate_vol_sensitivity.csv"
+)
+SENSITIVITY_MODEL_PARAMETERS_FILENAME = (
+    "model_parameters_constant_equity_vol_low_rate_vol_sensitivity.csv"
+)
 
 
 def test_all_default_entry_points_use_four_point_proxy():
@@ -34,3 +42,30 @@ def test_default_proxy_and_explicit_full_grid_remain_available():
         == pytest.approx(1.0, abs=1e-12)
     assert sum(point.contract_weight for point in full.model_points) \
         == pytest.approx(1.0, abs=1e-12)
+
+
+def test_four_point_sensitivity_matches_explicit_market_parameter_set():
+    root = Path(__file__).resolve().parents[1]
+    assumptions = load_market_assumptions(
+        model_parameters_path=(
+            root
+            / "input_data"
+            / "market_data"
+            / SENSITIVITY_MODEL_PARAMETERS_FILENAME
+        )
+    )
+    model_points = load_policyholder_model_points(
+        root
+        / "input_data"
+        / "model_points_policyholders"
+        / SENSITIVITY_MODEL_POINTS_FILENAME,
+        expected_market_parameter_set_id=assumptions.parameter_set_id,
+        expected_yield_curve_id=assumptions.curve_id,
+    )
+
+    assert assumptions.parameter_set_id == (
+        "constant_equity_vol_low_rate_vol_sensitivity_2026-06-30"
+    )
+    assert model_points.market_parameter_set_id == assumptions.parameter_set_id
+    assert model_points.yield_curve_id == assumptions.curve_id
+    assert len(model_points.model_points) == 4

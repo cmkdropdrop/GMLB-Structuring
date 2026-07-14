@@ -434,6 +434,37 @@ def test_default_commands_require_dynamic_functions_and_lsmc():
     }) == 5
 
 
+def test_alternate_model_parameters_propagate_to_all_cache_and_valuation_calls(
+    tmp_path,
+):
+    alternate_parameters = (
+        risk_runner.DEFAULT_MARKET_DATA_DIRECTORY
+        / "model_parameters_constant_equity_vol_low_rate_vol_sensitivity.csv"
+    ).resolve()
+    args = parse_args([
+        "--model-parameters",
+        str(alternate_parameters),
+    ])
+
+    dynamic = _dynamic_command(args, 0.06, tmp_path / "dynamic")
+    lsmc = _lsmc_command(args, 0.06, tmp_path / "lsmc")
+    precompute_jobs = _cache_precompute_jobs(
+        args,
+        (_scenario_job(1, "base", 0.06),),
+        horizon_years=53.0,
+        output=tmp_path,
+    )
+
+    for command in (
+        dynamic,
+        lsmc,
+        *(list(job.command) for job in precompute_jobs),
+    ):
+        assert command[command.index("--model-parameters") + 1] == str(
+            alternate_parameters
+        )
+
+
 def test_moment_matched_risk_run_still_requires_market_but_not_hedge_cache():
     args = parse_args(["--hedge-pricing-method", "moment_matched_bs"])
     dynamic = _dynamic_command(args, 0.06, Path("dynamic"))

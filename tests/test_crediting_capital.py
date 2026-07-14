@@ -3,19 +3,24 @@
 from dataclasses import replace
 import math
 
+import numpy as np
 import pytest
 
 from policy_engine.capital import CapitalStresses
 from policy_engine.crediting_capital import (
     MLL_FRAMEWORK,
+    PolicyCSMPathArrays,
     adverse_csm_loss,
     aggregate_mll_capital,
     calculate_flexibility_delta,
     calculate_mll_capital,
+    calculate_policy_level_csm_mll,
     compare_capital_metrics,
     evaluate_capital_adjusted_csm,
     mll_correlation_matrix,
     model_point_mass_lapse_proxy,
+    paired_bootstrap_ratio_delta,
+    score_lsmc_value_vectors,
 )
 
 
@@ -233,3 +238,169 @@ def test_flexibility_fixed_tie_break_and_portfolio_scaling_are_stable():
         10.0 * adaptive.capital_adjusted_csm
     )
     assert scaled.csm_to_capital == pytest.approx(adaptive.csm_to_capital)
+
+
+def test_policy_level_ratio_can_reject_higher_csm_with_worse_mll():
+    higher_csm = calculate_policy_level_csm_mll(
+        base_csm=120.0,
+        mortality_stressed_csm=60.0,
+        longevity_stressed_csm=60.0,
+        lapse_up_stressed_csm=60.0,
+        lapse_down_stressed_csm=60.0,
+        model_point_csms=[1.0],
+        model_point_weights=[1.0],
+    )
+    lower_csm = calculate_policy_level_csm_mll(
+        base_csm=100.0,
+        mortality_stressed_csm=90.0,
+        longevity_stressed_csm=90.0,
+        lapse_up_stressed_csm=90.0,
+        lapse_down_stressed_csm=90.0,
+        model_point_csms=[1.0],
+        model_point_weights=[1.0],
+    )
+    assert higher_csm.csm > lower_csm.csm
+    assert higher_csm.mll_capital > lower_csm.mll_capital
+    assert higher_csm.csm_to_mll_ratio < lower_csm.csm_to_mll_ratio
+
+
+def test_policy_level_ratio_is_none_at_materiality_and_mass_lapse_has_no_netting():
+    immaterial = calculate_policy_level_csm_mll(
+        base_csm=100.0,
+        mortality_stressed_csm=100.0,
+        longevity_stressed_csm=100.0,
+        lapse_up_stressed_csm=100.0,
+        lapse_down_stressed_csm=100.0,
+        model_point_csms=[-20.0],
+        model_point_weights=[1.0],
+        capital_materiality=0.0,
+    )
+    assert immaterial.mll_capital == 0.0
+    assert immaterial.csm_to_mll_ratio is None
+
+    mass_lapse = calculate_policy_level_csm_mll(
+        base_csm=20.0,
+        mortality_stressed_csm=20.0,
+        longevity_stressed_csm=20.0,
+        lapse_up_stressed_csm=20.0,
+        lapse_down_stressed_csm=20.0,
+        model_point_csms=[100.0, -80.0],
+        model_point_weights=[1.0, 1.0],
+    )
+    assert mass_lapse.mll.mass_lapse_loss == pytest.approx(40.0)
+    assert mass_lapse.mll_capital == pytest.approx(40.0)
+    assert mass_lapse.mll.mass_lapse_loss != pytest.approx(
+        0.40 * (100.0 - 80.0)
+    )
+
+
+def test_lsmc_value_score_preserves_leading_dimensions_and_scaling():
+    # Base CSM = (80 + 20 + 10 + 5 + 5) - (10 + 3 + 4 + 3) = 100.
+    vector = np.asarray([
+        80.0, 20.0, 10.0, 5.0, 5.0,
+        10.0, 3.0, 4.0, 3.0,
+        80.0, 85.0, 70.0, 75.0,
+        60.0, -10.0,
+    ])
+    values = np.stack((vector, 10.0 * vector)).reshape(1, 2, -1)
+    score = score_lsmc_value_vectors(
+        values,
+        model_point_weights=[0.5, 2.0],
+    )
+    assert np.asarray(score.csm).shape == (1, 2)
+    assert np.asarray(score.mll_capital).shape == (1, 2)
+    assert np.asarray(score.csm_to_mll_ratio).shape == (1, 2)
+    assert score.csm[0, 0] == pytest.approx(100.0)
+    assert score.csm[0, 1] == pytest.approx(1_000.0)
+    assert score.mll_capital[0, 1] == pytest.approx(
+        10.0 * score.mll_capital[0, 0]
+    )
+    assert score.csm_to_mll_ratio[0, 1] == pytest.approx(
+        score.csm_to_mll_ratio[0, 0]
+    )
+
+    scalar_immaterial = score_lsmc_value_vectors(
+        [100.0, 0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0,
+         100.0, 100.0, 100.0, 100.0,
+         -1.0],
+        capital_materiality=0.0,
+    )
+    assert scalar_immaterial.mll_capital == 0.0
+    assert scalar_immaterial.csm_to_mll_ratio is None
+
+
+def test_lsmc_value_score_rejects_nonfinite_and_bad_shapes():
+    with pytest.raises(ValueError, match="at least one model-point"):
+        score_lsmc_value_vectors(np.zeros(13))
+    invalid = np.zeros(14)
+    invalid[-1] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        score_lsmc_value_vectors(invalid)
+    with pytest.raises(ValueError, match="one value per model-point"):
+        score_lsmc_value_vectors(np.zeros(15), model_point_weights=[1.0])
+
+
+def _constant_policy_paths(
+    *, base: float, loss: float, n_paths: int = 24
+) -> PolicyCSMPathArrays:
+    common_noise = np.linspace(-1.0, 1.0, n_paths)
+    base_paths = base + common_noise
+    stressed = base - loss + common_noise
+    return PolicyCSMPathArrays(
+        base_csm_paths=base_paths,
+        mortality_stressed_csm_paths=stressed,
+        longevity_stressed_csm_paths=stressed,
+        lapse_up_stressed_csm_paths=stressed,
+        lapse_down_stressed_csm_paths=stressed,
+        model_point_base_csm_paths=np.ones((n_paths, 1)),
+    )
+
+
+def test_paired_bootstrap_identical_policies_have_exact_zero_delta():
+    policy = _constant_policy_paths(base=100.0, loss=20.0)
+    result = paired_bootstrap_ratio_delta(
+        policy,
+        policy,
+        n_resamples=250,
+        seed=1234,
+    )
+    assert result.estimate == pytest.approx(0.0)
+    assert result.standard_error == pytest.approx(0.0)
+    assert result.ci_lower == pytest.approx(0.0)
+    assert result.ci_upper == pytest.approx(0.0)
+    assert result.positive_gate_passed is False
+    assert result.negative_gate_passed is False
+
+
+def test_paired_bootstrap_has_clear_positive_and_negative_ratio_gates():
+    efficient = _constant_policy_paths(base=120.0, loss=10.0)
+    inefficient = _constant_policy_paths(base=100.0, loss=20.0)
+    positive = paired_bootstrap_ratio_delta(
+        efficient,
+        inefficient,
+        n_resamples=400,
+        seed=2026,
+    )
+    repeated = paired_bootstrap_ratio_delta(
+        efficient,
+        inefficient,
+        n_resamples=400,
+        seed=2026,
+    )
+    assert positive == repeated
+    assert positive.estimate > 0.0
+    assert positive.ci_lower > 0.0
+    assert positive.positive_gate_passed is True
+    assert positive.negative_gate_passed is False
+
+    negative = paired_bootstrap_ratio_delta(
+        inefficient,
+        efficient,
+        n_resamples=400,
+        seed=2026,
+    )
+    assert negative.estimate < 0.0
+    assert negative.ci_upper < 0.0
+    assert negative.positive_gate_passed is False
+    assert negative.negative_gate_passed is True

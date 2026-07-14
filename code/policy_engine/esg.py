@@ -78,8 +78,15 @@ class HestonParams:
         values = np.asarray([self.v0, self.theta, self.kappa, self.xi, self.rho_sv])
         if not np.all(np.isfinite(values)):
             raise ValueError("Heston parameters must be finite.")
-        if self.v0 < 0.0 or self.theta <= 0.0 or self.kappa <= 0.0 or self.xi <= 0.0:
-            raise ValueError("Heston variances must be non-negative and kappa/xi positive.")
+        if self.v0 < 0.0 or self.theta <= 0.0 or self.kappa <= 0.0 or self.xi < 0.0:
+            raise ValueError(
+                "Heston variances and xi must be non-negative, with positive "
+                "theta and kappa."
+            )
+        if self.xi == 0.0 and self.v0 != self.theta:
+            raise ValueError(
+                "The xi=0 fixed-volatility boundary requires v0=theta>0."
+            )
         if not -1.0 <= self.rho_sv <= 1.0:
             raise ValueError("Heston rho_sv must be in [-1, 1].")
 

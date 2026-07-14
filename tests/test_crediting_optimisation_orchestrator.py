@@ -14,22 +14,24 @@ def _option(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 
 
-def test_dynamic_orchestrator_derives_both_exact_cache_samples():
+def test_dynamic_orchestrator_derives_four_exact_role_cache_samples():
     commands, reader = runner._precompute_commands(
         "dynamic",
         (
             "--n-paths", "882",
-            "--benchmark-paths", "30",
             "--seed", "7",
+            "--fixed-selection-seed", "8",
+            "--validation-seed", "9",
+            "--evaluation-seed", "10",
             "--hedge-pricing-method", "mc_conditional",
         ),
     )
 
-    assert len(commands) == 2
+    assert len(commands) == 4
     assert [int(_option(command, "--n-paths")) for command in commands] \
-        == [882, 90]
+        == [882, 882, 882, 882]
     assert [int(_option(command, "--seed")) for command in commands] \
-        == [7, 8]
+        == [7, 8, 9, 10]
     assert all(float(_option(command, "--horizon-years")) == 58.0
                for command in commands)
     cap_grid = tuple(float(value) for value in _option(
@@ -40,6 +42,9 @@ def test_dynamic_orchestrator_derives_both_exact_cache_samples():
     assert len(cap_grid) == 21
     assert "--require-market-cache" in reader
     assert "--require-hedge-cache" in reader
+    assert Path(reader[1]).name \
+        == "optimize_crediting_rate_dynamic_behaviour_alt.py"
+    assert "lsmc" not in " ".join(reader).lower()
 
 
 def test_proxy_pricing_prepares_market_cache_only():

@@ -56,9 +56,12 @@ def _reader_module(mode: str):
 
 def _required_samples(mode: str, args) -> tuple[tuple[int, int], ...]:
     if mode == "dynamic":
+        path_count = int(args.n_paths)
         return (
-            (int(args.n_paths), int(args.seed)),
-            (3 * int(args.benchmark_paths), int(args.seed) + 1),
+            (path_count, int(args.seed)),
+            (path_count, int(args.fixed_selection_seed)),
+            (path_count, int(args.validation_seed)),
+            (path_count, int(args.evaluation_seed)),
         )
     return (
         (int(args.n_paths), int(args.seed)),

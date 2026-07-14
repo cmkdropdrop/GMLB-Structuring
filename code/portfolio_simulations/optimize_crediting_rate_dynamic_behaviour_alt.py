@@ -131,6 +131,7 @@ from policy_engine import (  # noqa: E402
     DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY,
     DEFAULT_MODEL_PARAMETERS_PATH,
     DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
+    ESGConfig,
     ExpenseAssumptions,
     FeeSpec,
     HedgeCapLegMode,
@@ -156,12 +157,25 @@ from policy_engine import (  # noqa: E402
     load_policyholder_model_points,
 )
 from policy_engine.behavior import BehaviourModel  # noqa: E402
+from policy_engine.capital import CapitalStresses  # noqa: E402
+from policy_engine.crediting_capital import (  # noqa: E402
+    MLL_FRAMEWORK,
+    PairedBootstrapRatioDelta,
+    PolicyCSMPathArrays,
+    PolicyLevelCSMMLLResult,
+    calculate_policy_level_csm_mll,
+    paired_bootstrap_ratio_delta,
+)
 from policy_engine.model_points import (  # noqa: E402
     PolicyholderModelPoint,
     PolicyholderModelPointSet,
 )
 from policy_engine.mortality import MAX_AGE as MORTALITY_TERMINAL_AGE  # noqa: E402
 from policy_engine.product import Phase, PolicySpec  # noqa: E402
+from policy_engine.portfolio_stresses import (  # noqa: E402
+    apply_portfolio_behaviour_stress,
+    apply_portfolio_input_stress,
+)
 from policy_engine.optimal_behaviour_lsmc import (  # noqa: E402
     FEATURE_NAMES as POLICYHOLDER_FEATURE_NAMES,
     OptimalBehaviourLSMCSettings,
@@ -186,6 +200,8 @@ IntArray = NDArray[np.int64]
 STEPS_PER_YEAR = 12
 
 ACTION_CAPS = np.concatenate((np.array([0.0025]), np.arange(0.01, 0.201, 0.01)))
+MLL_STRESS_IDS = ("mortality", "longevity", "lapse_up", "lapse_down")
+MANAGEMENT_OBJECTIVES = ("csm_to_mll", "csm")
 OTHER_INSURER_FUNDED_BENEFIT_KEYS: tuple[str, ...] = ()
 CONTROL_STATE_FEATURE_NAMES = (
     "zero_rate_5y",
@@ -389,6 +405,8 @@ class PortfolioPathData:
     policyholder_benefits_by_signature: dict[
         tuple[object, ...], Array
     ] = field(default_factory=dict)
+    model_point_csm: Array | None = None
+    model_point_ids: tuple[str, ...] = ()
 
     @property
     def new_business_csm_proxy(self) -> Array:
@@ -458,7 +476,42 @@ class _StackelbergPrimitiveCollector:
             raise RuntimeError(
                 f"Duplicate surrender action-value context for year {year}."
             )
-        self.action_value_contexts[year] = context
+            self.action_value_contexts[year] = context
+
+
+@dataclass(frozen=True)
+class ManagementObjectiveSpec:
+    """Layout and safeguards for the management-LSMC action score."""
+
+    kind: str = "csm"
+    model_point_count: int = 0
+    capital_materiality: float = 0.0
+    mass_lapse_fraction: float = 0.40
+
+    def __post_init__(self) -> None:
+        if self.kind not in MANAGEMENT_OBJECTIVES:
+            raise ValueError(f"Unsupported management objective {self.kind!r}.")
+        if self.model_point_count < 0:
+            raise ValueError("model_point_count must be non-negative.")
+        if self.kind == "csm_to_mll" and self.model_point_count <= 0:
+            raise ValueError("CSM/MLL requires modelpoint-wise base CSM values.")
+        if not np.isfinite(self.capital_materiality) \
+                or self.capital_materiality < 0.0:
+            raise ValueError("capital_materiality must be finite and non-negative.")
+        if not np.isfinite(self.mass_lapse_fraction) or not (
+            0.0 <= self.mass_lapse_fraction <= 1.0
+        ):
+            raise ValueError("mass_lapse_fraction must lie in [0, 1].")
+
+    @property
+    def payload_width(self) -> int:
+        if self.kind == "csm":
+            return len(INSURER_COMPONENT_NAMES)
+        return (
+            len(INSURER_COMPONENT_NAMES)
+            + len(MLL_STRESS_IDS)
+            + self.model_point_count
+        )
 
 
 @dataclass(frozen=True)
@@ -479,6 +532,9 @@ class RegressionPolicyYear:
     # older coupled-policy helpers source-compatible without silently changing
     # their established full-state basis.
     compact_q_basis: bool = False
+    objective_spec: ManagementObjectiveSpec = field(
+        default_factory=ManagementObjectiveSpec
+    )
 
 
 @dataclass
@@ -508,6 +564,10 @@ class BackwardResult:
         default_factory=list
     )
     follower_fit_set: object | None = None
+    management_objective: str = "csm"
+    management_objective_value: float | None = None
+    mll_capital_proxy: float | None = None
+    csm_to_mll_ratio: float | None = None
 
 
 def _policy_signature(policy: PolicySpec) -> tuple[object, ...]:
@@ -952,11 +1012,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--benchmark-paths", type=int, default=None,
         help=(
-            "paths in each independent fixed-cap selection, adaptive-policy "
-            "validation and final evaluation sample; defaults to 10%% of "
-            "--n-paths.  This is the dominant runtime lever (fixed-cap "
-            "benchmarks and the causal rollouts scale ~linearly with it); pass "
-            "an explicit value to override the 10%% rule"
+            "deprecated compatibility alias for the paths in each independent "
+            "fixed-cap selection, adaptive-policy validation and final "
+            "evaluation sample; it must equal --n-paths"
         ),
     )
     parser.add_argument(
@@ -966,7 +1024,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "are projected separately to preserve common Behaviour draws"
         ),
     )
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--seed", type=int, default=2026,
+        help="training market seed",
+    )
+    parser.add_argument(
+        "--fixed-selection-seed", type=int, default=None,
+        help="independent fixed-cap-selection market seed (default: seed + 1)",
+    )
+    parser.add_argument(
+        "--validation-seed", type=int, default=None,
+        help="independent adaptive-validation market seed (default: seed + 2)",
+    )
+    parser.add_argument(
+        "--evaluation-seed", type=int, default=None,
+        help="independent final-evaluation market seed (default: seed + 3)",
+    )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
         "--market-cache-root", type=Path, default=DEFAULT_MARKET_CACHE_ROOT,
@@ -1067,6 +1140,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "subdirectory"
         ),
     )
+    parser.add_argument(
+        "--optimisation-objective",
+        choices=MANAGEMENT_OBJECTIVES,
+        default="csm_to_mll",
+        help=(
+            "management-LSMC action score; csm_to_mll is the default and "
+            "propagates a vector of base/stressed conditional values"
+        ),
+    )
+    parser.add_argument(
+        "--mll-capital-materiality-bp", type=float, default=1.0,
+        help=(
+            "MLL denominator materiality in basis points of representative "
+            "premium; ratios at or below it are not selectable"
+        ),
+    )
+    parser.add_argument(
+        "--mass-lapse-fraction", type=float, default=0.40,
+        help="mass-lapse proxy applied modelpoint-wise to positive CSM",
+    )
+    parser.add_argument(
+        "--ratio-bootstrap-replicates", type=int, default=1_000,
+        help="paired OOS bootstrap replicates for the CSM/MLL deployment gate",
+    )
+    parser.add_argument(
+        "--ratio-bootstrap-seed", type=int, default=602_027,
+        help="seed for the paired OOS CSM/MLL bootstrap",
+    )
     args = parser.parse_args(argv)
     # Kept as an internal provenance field so shared reporting helpers can use
     # one stable schema.  It is intentionally not user-configurable here.
@@ -1075,25 +1176,56 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.n_paths <= 0:
         parser.error("--n-paths must be positive")
     if args.benchmark_paths is None:
-        # Default: the benchmark (fixed-cap selection, adaptive validation and
-        # final evaluation) paths are 10% of the capital-market training paths.
-        args.benchmark_paths = max(30, int(round(0.1 * args.n_paths)))
-    if args.benchmark_paths <= 0:
-        parser.error("--benchmark-paths must be positive")
+        args.benchmark_paths = args.n_paths
+    if args.benchmark_paths != args.n_paths:
+        parser.error(
+            "--benchmark-paths is deprecated and must equal --n-paths; "
+            "every OOS market sample now uses the full training path count"
+        )
     if args.benchmark_batch_size <= 0:
         parser.error("--benchmark-batch-size must be positive")
     if args.model_point_log_interval <= 0:
         parser.error("--model-point-log-interval must be positive")
     if args.plot_dpi < 72:
         parser.error("--plot-dpi must be at least 72")
-    if args.seed < 0 or args.heston_substeps <= 0:
-        parser.error("seed must be non-negative and Heston substeps positive")
+    if args.fixed_selection_seed is None:
+        args.fixed_selection_seed = args.seed + 1
+    if args.validation_seed is None:
+        args.validation_seed = args.seed + 2
+    if args.evaluation_seed is None:
+        args.evaluation_seed = args.seed + 3
+    market_seeds = (
+        args.seed,
+        args.fixed_selection_seed,
+        args.validation_seed,
+        args.evaluation_seed,
+    )
+    if any(seed < 0 for seed in market_seeds) or args.heston_substeps <= 0:
+        parser.error("market seeds must be non-negative and Heston substeps positive")
+    if len(set(market_seeds)) != len(market_seeds):
+        parser.error(
+            "training, fixed-selection, validation and evaluation market seeds "
+            "must be pairwise distinct"
+        )
     if args.cross_fit_folds < 2:
         parser.error("--cross-fit-folds must be at least two")
     if not np.isfinite(args.ridge) or args.ridge < 0.0:
         parser.error("--ridge must be finite and non-negative (0 = OLS)")
     if not 0.0 <= args.persistent_exploration_fraction < 1.0:
         parser.error("--persistent-exploration-fraction must be in [0, 1)")
+    if (
+        not np.isfinite(args.mll_capital_materiality_bp)
+        or args.mll_capital_materiality_bp < 0.0
+    ):
+        parser.error("--mll-capital-materiality-bp must be finite and non-negative")
+    if not np.isfinite(args.mass_lapse_fraction) or not (
+        0.0 <= args.mass_lapse_fraction <= 1.0
+    ):
+        parser.error("--mass-lapse-fraction must lie in [0, 1]")
+    if args.ratio_bootstrap_replicates < 100:
+        parser.error("--ratio-bootstrap-replicates must be at least 100")
+    if args.ratio_bootstrap_seed < 0:
+        parser.error("--ratio-bootstrap-seed must be non-negative")
     if args.inventory_nodes < 3:
         parser.error("--inventory-nodes must be at least three")
     if not 0.0 <= args.inventory_quantile_clip < 0.5:
@@ -1832,6 +1964,7 @@ def _aggregate_portfolio_paths(
     collect_stackelberg_primitives: bool = False,
     collect_policyholder_by_signature: bool = False,
     collect_pre_action_states: bool = False,
+    collect_model_point_csm: bool = False,
 ) -> PortfolioPathData:
     """Project all model points under one pathwise cap schedule.
 
@@ -1873,6 +2006,10 @@ def _aggregate_portfolio_paths(
     partial_withdrawals = np.zeros_like(guarantee_claims)
     terminal_closeout = np.zeros_like(guarantee_claims)
     lapse_events = np.zeros_like(guarantee_claims)
+    model_point_csm = (
+        np.zeros((point_count, scenarios.n_paths, n_years), dtype=float)
+        if collect_model_point_csm else None
+    )
     signature_control_paths: dict[
         tuple[object, ...], SignatureControlPaths
     ] = {}
@@ -2106,6 +2243,21 @@ def _aggregate_portfolio_paths(
                     np.ones_like(discount),
                     n_years,
                 )
+                if model_point_csm is not None:
+                    point_other_benefits = np.zeros_like(guarantee_claims)
+                    for key in OTHER_INSURER_FUNDED_BENEFIT_KEYS:
+                        point_other_benefits += annual_control_cashflow(key)
+                    model_point_csm[point_number - 1] += branch_weight * (
+                        annual_control_cashflow("fees_product")
+                        + annual_control_cashflow("fees_lip")
+                        + annual_crediting_margin
+                        + annual_control_cashflow("mva_retained")
+                        + annual_control_cashflow("aps_retained")
+                        - annual_control_cashflow("guarantee_claims")
+                        - point_other_benefits
+                        - annual_control_cashflow("expenses")
+                        - annual_control_cashflow("hedge_costs")
+                    )
 
                 signature = _policy_signature(policy)
                 if collect_policyholder_by_signature:
@@ -2643,6 +2795,10 @@ def _aggregate_portfolio_paths(
         representative_initial_premium=representative_premium,
         signature_control_paths=signature_control_paths,
         policyholder_benefits_by_signature=policyholder_benefits_by_signature,
+        model_point_csm=model_point_csm,
+        model_point_ids=tuple(
+            str(point.model_point_id) for point in model_points.model_points
+        ),
     )
 
 
@@ -3232,6 +3388,81 @@ def _csm_from_component_values(components: Array) -> Array:
     )
 
 
+def _mll_metrics_from_payload(
+    payload: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> tuple[Array, Array, Array]:
+    """Return base CSM, MLL capital and selectable conditional CSM/MLL.
+
+    The payload contains nine additive base-CSM components, four additive
+    stressed CSM values and one additive base CSM value per model point.  The
+    nonlinear loss maxima, correlation square root and ratio are deliberately
+    applied only after those conditional value vectors have been formed.  A
+    pathwise or annual mean of ratios is never used.
+    """
+    values = np.asarray(payload, dtype=float)
+    if objective_spec.kind != "csm_to_mll":
+        raise ValueError("MLL metrics require the csm_to_mll objective.")
+    if values.shape[-1] != objective_spec.payload_width:
+        raise ValueError("CSM/MLL value-vector payload has an invalid width.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("CSM/MLL value-vector payload must be finite.")
+    base_components = values[..., :len(INSURER_COMPONENT_NAMES)]
+    base_csm = _csm_from_component_values(base_components)
+    stress_start = len(INSURER_COMPONENT_NAMES)
+    stress_values = values[
+        ..., stress_start:stress_start + len(MLL_STRESS_IDS)
+    ]
+    model_point_values = values[
+        ..., stress_start + len(MLL_STRESS_IDS):
+    ]
+    mortality = np.maximum(base_csm - stress_values[..., 0], 0.0)
+    longevity = np.maximum(base_csm - stress_values[..., 1], 0.0)
+    lapse_up = np.maximum(base_csm - stress_values[..., 2], 0.0)
+    lapse_down = np.maximum(base_csm - stress_values[..., 3], 0.0)
+    mass_lapse = objective_spec.mass_lapse_fraction * np.sum(
+        np.maximum(model_point_values, 0.0), axis=-1
+    )
+    lapse = np.maximum(np.maximum(lapse_up, lapse_down), mass_lapse)
+    quadratic = (
+        mortality ** 2
+        + longevity ** 2
+        + lapse ** 2
+        - 0.5 * mortality * longevity
+        + 0.5 * longevity * lapse
+    )
+    capital = np.sqrt(np.maximum(quadratic, 0.0))
+    selectable = capital > objective_spec.capital_materiality
+    # A finite sentinel keeps regression/plot artefacts JSON-safe while making
+    # an undefined ratio strictly dominated by every defined finite ratio.
+    ratio = np.full_like(base_csm, -1.0e100, dtype=float)
+    np.divide(base_csm, capital, out=ratio, where=selectable)
+    return base_csm, capital, ratio
+
+
+def _objective_from_payload(
+    payload: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> Array:
+    values = np.asarray(payload, dtype=float)
+    if values.shape[-1] != objective_spec.payload_width:
+        raise ValueError("Management value-vector payload has an invalid width.")
+    if objective_spec.kind == "csm":
+        return _csm_from_component_values(values)
+    return _mll_metrics_from_payload(values, objective_spec)[2]
+
+
+def _with_management_objective(
+    payload: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> Array:
+    values = np.asarray(payload, dtype=float)
+    return np.concatenate(
+        (_objective_from_payload(values, objective_spec)[..., None], values),
+        axis=-1,
+    )
+
+
 def _with_derived_csm(components: Array) -> Array:
     values = np.asarray(components, dtype=float)
     return np.concatenate(
@@ -3246,6 +3477,22 @@ def _component_regression_coefficients(component_beta: Array) -> Array:
     return np.concatenate(
         (_csm_from_component_values(beta)[..., None], beta), axis=-1
     )
+
+
+def _management_regression_coefficients(
+    payload_beta: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> Array:
+    beta = np.asarray(payload_beta, dtype=float)
+    if beta.shape[-1] != objective_spec.payload_width:
+        raise ValueError("Management payload coefficients have an invalid width.")
+    # CSM is the exact linear first-output coefficient.  In ratio mode it is a
+    # placeholder only: every evaluator recomputes the nonlinear objective from
+    # the predicted conditional payload after clipping.
+    base_beta = _csm_from_component_values(
+        beta[..., :len(INSURER_COMPONENT_NAMES)]
+    )
+    return np.concatenate((base_beta[..., None], beta), axis=-1)
 
 
 def _component_prediction_bounds(targets: Array) -> tuple[Array, Array]:
@@ -3288,6 +3535,69 @@ def _clip_component_predictions(
     clipped_fraction = float(np.mean(np.abs(bounded[..., 1:] - before) > 0.0))
     bounded[..., 0] = _csm_from_component_values(bounded[..., 1:])
     return bounded, clipped_fraction
+
+
+def _management_prediction_bounds(
+    payload_targets: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> tuple[Array, Array]:
+    targets = np.asarray(payload_targets, dtype=float)
+    if targets.ndim != 2 or targets.shape[1] != objective_spec.payload_width:
+        raise ValueError("Management prediction targets have an invalid shape.")
+    if objective_spec.kind == "csm":
+        return _component_prediction_bounds(
+            _with_derived_csm(targets)
+        )
+    base_lower, base_upper = _component_prediction_bounds(
+        _with_derived_csm(targets[:, :len(INSURER_COMPONENT_NAMES)])
+    )
+    extra = targets[:, len(INSURER_COMPONENT_NAMES):]
+    spread = np.std(extra, axis=0, ddof=0)
+    padding = 1.0e-10 * np.maximum(1.0, np.max(np.abs(extra), axis=0))
+    extra_lower = np.min(extra, axis=0) - 5.0 * spread - padding
+    extra_upper = np.max(extra, axis=0) + 5.0 * spread + padding
+    objective_values = _objective_from_payload(targets, objective_spec)
+    finite_objective = objective_values[objective_values > -1.0e99]
+    if finite_objective.size:
+        objective_spread = float(np.std(finite_objective, ddof=0))
+        objective_lower = float(np.min(finite_objective) - 5.0 * objective_spread)
+        objective_upper = float(np.max(finite_objective) + 5.0 * objective_spread)
+    else:
+        objective_lower = -1.0e100
+        objective_upper = -1.0e100
+    lower = np.concatenate((
+        np.array([objective_lower]), base_lower[1:], extra_lower
+    ))
+    upper = np.concatenate((
+        np.array([objective_upper]), base_upper[1:], extra_upper
+    ))
+    return lower, upper
+
+
+def _clip_management_predictions(
+    values: Array,
+    lower: Array,
+    upper: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> tuple[Array, float]:
+    predicted = np.asarray(values, dtype=float)
+    expected = objective_spec.payload_width + 1
+    if predicted.shape[-1] != expected:
+        raise ValueError("Management predictions have an invalid output width.")
+    lower_values = np.asarray(lower, dtype=float)
+    upper_values = np.asarray(upper, dtype=float)
+    if lower_values.shape != (expected,) or upper_values.shape != (expected,):
+        raise ValueError("Management prediction bounds are shape-inconsistent.")
+    bounded = predicted.copy()
+    before = bounded[..., 1:].copy()
+    bounded[..., 1:] = np.minimum(
+        np.maximum(bounded[..., 1:], lower_values[1:]), upper_values[1:]
+    )
+    fraction = float(np.mean(np.abs(bounded[..., 1:] - before) > 0.0))
+    bounded[..., 0] = _objective_from_payload(
+        bounded[..., 1:], objective_spec
+    )
+    return bounded, fraction
 
 
 @dataclass
@@ -3826,18 +4136,14 @@ def _policy_action_values(
             raise ValueError("Fitted value bounds are shape-inconsistent.")
         values = np.minimum(np.maximum(values, lower[None, :, :]),
                             upper[None, :, :])
-        if values.shape[2] == 10:
-            values[:, :, 0] = (
-                values[:, :, 1]
-                + values[:, :, 2]
-                + values[:, :, 3]
-                + values[:, :, 4]
-                + values[:, :, 5]
-                - values[:, :, 6]
-                - values[:, :, 7]
-                - values[:, :, 8]
-                - values[:, :, 9]
+        if policy.objective_spec.kind == "csm_to_mll" or values.shape[2] == 10:
+            values[:, :, 0] = _objective_from_payload(
+                values[:, :, 1:], policy.objective_spec
             )
+    elif policy.objective_spec.kind == "csm_to_mll":
+        values[:, :, 0] = _objective_from_payload(
+            values[:, :, 1:], policy.objective_spec
+        )
     if not np.all(np.isfinite(values)):
         raise RuntimeError("Fitted cap-policy values contain non-finite entries.")
     return values
@@ -3898,9 +4204,15 @@ def _screened_policy_actions(
     )
     if standard_errors.shape != (n_actions,):
         raise ValueError("Fitted action standard errors are inconsistent.")
-    uncertainty = advantage_screen_multiplier * np.hypot(
-        standard_errors[best], standard_errors[fallback_action]
-    )
+    if policy.objective_spec.kind == "csm_to_mll":
+        # CSM-unit regression errors cannot be compared with a dimensionless
+        # ratio advantage.  Ratio deployment is gated later by the independent
+        # paired OOS bootstrap, so only fit/support masks apply locally.
+        uncertainty = np.zeros(n_rows)
+    else:
+        uncertainty = advantage_screen_multiplier * np.hypot(
+            standard_errors[best], standard_errors[fallback_action]
+        )
     candidate = best != fallback_action
     passes = candidate & np.isfinite(advantage) & np.isfinite(uncertainty) \
         & (advantage > uncertainty)
@@ -4025,6 +4337,7 @@ def _rollout_cap_policy_with_projected_states(
     surrender_policy_factory: Optional[Callable[[PolicySpec], object]],
     advantage_screen_multiplier: float = 1.96,
     collect_policyholder_by_signature: bool = False,
+    collect_model_point_csm: bool = False,
 ) -> tuple[Array, PortfolioPathData, dict[str, object]]:
     """Roll out the rich-state policy causally, one frozen prefix at a time.
 
@@ -4135,6 +4448,7 @@ def _rollout_cap_policy_with_projected_states(
         model_point_log_interval=model_point_log_interval,
         surrender_policy_factory=surrender_policy_factory,
         collect_policyholder_by_signature=collect_policyholder_by_signature,
+        collect_model_point_csm=collect_model_point_csm,
     )
     # Audit the central causal invariant against the final full-horizon
     # projection.  This catches horizon-dependent projector RNG or state
@@ -6531,9 +6845,12 @@ class _GridYearValue:
 
     factor_mean: Array
     factor_scale: Array
-    node_coefficients: Array  # (n_nodes, 4, 9) component value functions
-    node_lower_bounds: Array  # (n_nodes, 10), including derived CSM
-    node_upper_bounds: Array  # (n_nodes, 10), including derived CSM
+    node_coefficients: Array
+    node_lower_bounds: Array
+    node_upper_bounds: Array
+    objective_spec: ManagementObjectiveSpec = field(
+        default_factory=ManagementObjectiveSpec
+    )
 
 
 def _clip_component_tensor_by_cell(
@@ -6561,12 +6878,40 @@ def _clip_component_tensor_by_cell(
     return bounded, fractions
 
 
+def _clip_management_tensor_by_cell(
+    payload: Array,
+    lower_bounds: Array,
+    upper_bounds: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> tuple[Array, Array]:
+    values = np.asarray(payload, dtype=float)
+    lower = np.asarray(lower_bounds, dtype=float)
+    upper = np.asarray(upper_bounds, dtype=float)
+    if values.ndim != 3 or values.shape[2] != objective_spec.payload_width:
+        raise ValueError("Management tensor has an invalid payload width.")
+    expected_bounds = (values.shape[1], objective_spec.payload_width + 1)
+    if lower.shape != expected_bounds or upper.shape != expected_bounds:
+        raise ValueError("Management cell bounds are shape-inconsistent.")
+    bounded = np.empty_like(values)
+    fractions = np.zeros(values.shape[1])
+    for cell in range(values.shape[1]):
+        with_objective, fractions[cell] = _clip_management_predictions(
+            _with_management_objective(values[:, cell, :], objective_spec),
+            lower[cell],
+            upper[cell],
+            objective_spec,
+        )
+        bounded[:, cell, :] = with_objective[:, 1:]
+    return bounded, fractions
+
+
 def _fit_grid_continuation(
     continuation_design: Array,
     node_targets: Array,
     factor_mean: Array,
     factor_scale: Array,
     ridge: float,
+    objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
 ) -> _GridYearValue:
     """Regress each node value on ``[1, C_atm, S, r]``.
 
@@ -6584,14 +6929,14 @@ def _fit_grid_continuation(
     n_nodes = node_targets.shape[1]
     n_components = node_targets.shape[2]
     coefficients = np.zeros((n_nodes, design.shape[1], n_components), dtype=float)
-    lower_bounds = np.zeros((n_nodes, 10))
-    upper_bounds = np.zeros((n_nodes, 10))
+    lower_bounds = np.zeros((n_nodes, objective_spec.payload_width + 1))
+    upper_bounds = np.zeros_like(lower_bounds)
     for node in range(n_nodes):
         coefficients[node] = _ridge_fit_multioutput(
             design, node_targets[:, node, :], ridge
         )
-        lower_bounds[node], upper_bounds[node] = _component_prediction_bounds(
-            _with_derived_csm(node_targets[:, node, :])
+        lower_bounds[node], upper_bounds[node] = _management_prediction_bounds(
+            node_targets[:, node, :], objective_spec
         )
     return _GridYearValue(
         np.asarray(factor_mean, dtype=float).copy(),
@@ -6599,6 +6944,7 @@ def _fit_grid_continuation(
         coefficients,
         lower_bounds,
         upper_bounds,
+        objective_spec,
     )
 
 
@@ -6616,8 +6962,11 @@ def _evaluate_grid_continuation(
     )
     # (n_paths, 4) x (n_nodes, 4, 9) -> (n_paths, n_nodes, 9)
     predicted = np.einsum("pb,kbo->pko", design, value.node_coefficients)
-    bounded, _ = _clip_component_tensor_by_cell(
-        predicted, value.node_lower_bounds, value.node_upper_bounds
+    bounded, _ = _clip_management_tensor_by_cell(
+        predicted,
+        value.node_lower_bounds,
+        value.node_upper_bounds,
+        value.objective_spec,
     )
     return bounded
 
@@ -6679,8 +7028,8 @@ def _direct_transition_target(
     realised one-year component reward before the current Q regression.
     """
     immediate = np.asarray(immediate_components, dtype=float)
-    if immediate.ndim != 2 or immediate.shape[1] != len(INSURER_COMPONENT_NAMES):
-        raise ValueError("Direct Q reward must have shape (paths, 9).")
+    if immediate.ndim != 2 or immediate.shape[1] < len(INSURER_COMPONENT_NAMES):
+        raise ValueError("Direct Q reward must be a path-by-payload matrix.")
     supplied = (
         next_node_values is not None,
         inventory_grid is not None,
@@ -6737,6 +7086,7 @@ def _fit_direct_q_chain(
     advantage_screen_multiplier: float = 0.0,
     minimum_training_count: int | None = None,
     immediate_components: Array | None = None,
+    objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
 ) -> _DirectQChain:
     """Fit a full direct-Q recursion without touching excluded paths in fits."""
     if data.raw_states is None or data.inforce_exposure is None:
@@ -6768,7 +7118,9 @@ def _fit_direct_q_chain(
         immediate = _portfolio_continue_component_tensor(data)[:, :, 1:]
     else:
         immediate = np.asarray(immediate_components, dtype=float)
-        if immediate.shape != (n_paths, n_years, 9):
+        if immediate.shape != (
+            n_paths, n_years, objective_spec.payload_width
+        ):
             raise ValueError("Supplied direct-Q component tensor is invalid.")
     active_years = [
         year for year in range(n_years)
@@ -6836,9 +7188,13 @@ def _fit_direct_q_chain(
                 inventory_grid=None,
                 realised_next_inventory=None,
             )
-        coefficients = np.zeros((len(ACTION_CAPS), q_design.shape[1], 9))
-        lower_bounds = np.zeros((len(ACTION_CAPS), 10))
-        upper_bounds = np.zeros((len(ACTION_CAPS), 10))
+        coefficients = np.zeros((
+            len(ACTION_CAPS), q_design.shape[1], objective_spec.payload_width
+        ))
+        lower_bounds = np.zeros((
+            len(ACTION_CAPS), objective_spec.payload_width + 1
+        ))
+        upper_bounds = np.zeros_like(lower_bounds)
         counts = np.zeros(len(ACTION_CAPS), dtype=np.int64)
         conditions = np.zeros(len(ACTION_CAPS))
         deployable = np.ones(len(ACTION_CAPS), dtype=bool)
@@ -6869,8 +7225,8 @@ def _fit_direct_q_chain(
                 design_selected, target[selected], ridge
             )
             lower_bounds[action], upper_bounds[action] = (
-                _component_prediction_bounds(
-                    _with_derived_csm(target[selected])
+                _management_prediction_bounds(
+                    target[selected], objective_spec
                 )
             )
         if forced_deployable_masks is not None and year in forced_deployable_masks:
@@ -6907,7 +7263,9 @@ def _fit_direct_q_chain(
                     or np.any(action_standard_errors < 0.0):
                 raise ValueError("Frozen direct-Q action uncertainties are invalid.")
 
-        component_coefficients = _component_regression_coefficients(coefficients)
+        component_coefficients = _management_regression_coefficients(
+            coefficients, objective_spec
+        )
         policy = RegressionPolicyYear(
             year=year,
             raw_mean=q_mean,
@@ -6920,6 +7278,7 @@ def _fit_direct_q_chain(
             numerically_stable=bool(np.all(deployable) and not any(reasons)),
             action_deployable_mask=deployable,
             compact_q_basis=True,
+            objective_spec=objective_spec,
         )
         policies[year] = policy
 
@@ -6927,7 +7286,9 @@ def _fit_direct_q_chain(
         # inventory node.  There is no second deployment projection and hence
         # no separate argmax that can disagree with the Bellman argmax.
         current_grid = grids[year]
-        node_value_target = np.zeros((n_paths, current_grid.size, 9))
+        node_value_target = np.zeros((
+            n_paths, current_grid.size, objective_spec.payload_width
+        ))
         maximum_forced_node_clip = np.zeros(len(ACTION_CAPS))
         for node, level in enumerate(current_grid):
             forced_state = raw_year.copy()
@@ -6936,8 +7297,11 @@ def _fit_direct_q_chain(
                 forced_state, feature_names, q_mean, q_scale
             )
             raw_components = np.einsum("pb,abo->pao", design_node, coefficients)
-            bounded_components, cell_clip = _clip_component_tensor_by_cell(
-                raw_components, lower_bounds, upper_bounds
+            bounded_components, cell_clip = _clip_management_tensor_by_cell(
+                raw_components,
+                lower_bounds,
+                upper_bounds,
+                objective_spec,
             )
             maximum_forced_node_clip = np.maximum(
                 maximum_forced_node_clip, cell_clip
@@ -6952,8 +7316,12 @@ def _fit_direct_q_chain(
                 )
                 node_value_target[:, node, :] = selected_components
             else:
-                node_csm = _csm_from_component_values(bounded_components)
-                best = _masked_lower_cap_argmax(node_csm, deployable, axis=1)
+                node_objective = _objective_from_payload(
+                    bounded_components, objective_spec
+                )
+                best = _masked_lower_cap_argmax(
+                    node_objective, deployable, axis=1
+                )
                 node_value_target[:, node, :] = np.take_along_axis(
                     bounded_components, best[:, None, None], axis=1
                 )[:, 0, :]
@@ -6963,6 +7331,7 @@ def _fit_direct_q_chain(
             continuation_mean,
             continuation_scale,
             ridge,
+            objective_spec,
         )
         # Reliability is assessed only where the policy can actually be at the
         # start of this year.  Forced inventory nodes are needed to interpolate
@@ -6971,8 +7340,11 @@ def _fit_direct_q_chain(
         reachable_raw = np.einsum(
             "pb,abo->pao", q_design[reachable], coefficients
         )
-        _, reachable_clip = _clip_component_tensor_by_cell(
-            reachable_raw, lower_bounds, upper_bounds
+        _, reachable_clip = _clip_management_tensor_by_cell(
+            reachable_raw,
+            lower_bounds,
+            upper_bounds,
+            objective_spec,
         )
         action_counts[year] = counts
         condition_numbers[year] = conditions
@@ -7001,6 +7373,7 @@ def _direct_q_target_for_chain(
     year: int,
     path_mask: NDArray[np.bool_],
     immediate_components: Array | None = None,
+    objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
 ) -> Array:
     """Rebuild held-out targets from a chain that never fitted those paths."""
     if data.raw_states is None:
@@ -7013,7 +7386,9 @@ def _direct_q_target_for_chain(
         all_immediate = _portfolio_continue_component_tensor(data)[:, :, 1:]
     else:
         all_immediate = np.asarray(immediate_components, dtype=float)
-        if all_immediate.shape != (n_paths, n_years, 9):
+        if all_immediate.shape != (
+            n_paths, n_years, objective_spec.payload_width
+        ):
             raise ValueError("Supplied direct-Q component tensor is invalid.")
     immediate = all_immediate[rows, year, :]
     if (year + 1) not in chain.grid_values:
@@ -7045,6 +7420,7 @@ class _OuterFoldDirectQEvaluation:
 
     prediction: Array
     target: Array
+    target_payload: Array
     deployable: Mapping[int, NDArray[np.bool_]]
     maximum_reachable_clip: Mapping[int, Array]
     maximum_forced_node_clip: Mapping[int, Array]
@@ -7068,6 +7444,7 @@ def _evaluate_outer_fold_direct_q_chains(
     forced_action_standard_errors: Mapping[int, Array] | None = None,
     fallback_action: int | None = None,
     advantage_screen_multiplier: float = 0.0,
+    objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
 ) -> _OuterFoldDirectQEvaluation:
     """Evaluate complete held-out paths under one identical future policy."""
     if data.raw_states is None:
@@ -7077,6 +7454,9 @@ def _evaluate_outer_fold_direct_q_chains(
     feature_names = tuple(data.state_feature_names)
     prediction = np.full((n_paths, n_years), np.nan)
     target = np.full((n_paths, n_years), np.nan)
+    target_payload = np.full(
+        (n_paths, n_years, objective_spec.payload_width), np.nan
+    )
     deployable = {
         year: np.ones(len(ACTION_CAPS), dtype=bool) for year in active_years
     }
@@ -7086,7 +7466,9 @@ def _evaluate_outer_fold_direct_q_chains(
     maximum_forced_node_clip = {
         year: np.zeros(len(ACTION_CAPS)) for year in active_years
     }
-    first_target_sum = np.zeros((len(ACTION_CAPS), 10))
+    first_target_sum = np.zeros((
+        len(ACTION_CAPS), objective_spec.payload_width + 1
+    ))
     first_target_count = np.zeros(len(ACTION_CAPS), dtype=np.int64)
 
     for fold in range(folds):
@@ -7108,6 +7490,7 @@ def _evaluate_outer_fold_direct_q_chains(
             advantage_screen_multiplier=advantage_screen_multiplier,
             minimum_training_count=minimum_training_count,
             immediate_components=immediate_components,
+            objective_spec=objective_spec,
         )
         for year in active_years:
             policy = chain.policies[year]
@@ -7123,9 +7506,13 @@ def _evaluate_outer_fold_direct_q_chains(
                 year=year,
                 path_mask=held_out,
                 immediate_components=immediate_components,
+                objective_spec=objective_spec,
             )
-            target_with_csm = _with_derived_csm(target_components)
+            target_with_csm = _with_management_objective(
+                target_components, objective_spec
+            )
             target[held_out, year] = target_with_csm[:, 0]
+            target_payload[held_out, year, :] = target_components
             deployable[year] &= np.asarray(
                 policy.action_deployable_mask, dtype=bool
             )
@@ -7148,11 +7535,13 @@ def _evaluate_outer_fold_direct_q_chains(
         del chain
 
     if not np.all(np.isfinite(prediction[:, active_years])) \
-            or not np.all(np.isfinite(target[:, active_years])):
+            or not np.all(np.isfinite(target[:, active_years])) \
+            or not np.all(np.isfinite(target_payload[:, active_years, :])):
         raise RuntimeError("Outer-fold direct-Q diagnostics are incomplete.")
     return _OuterFoldDirectQEvaluation(
         prediction=prediction,
         target=target,
+        target_payload=target_payload,
         deployable=MappingProxyType(deployable),
         maximum_reachable_clip=MappingProxyType(maximum_reachable_clip),
         maximum_forced_node_clip=MappingProxyType(maximum_forced_node_clip),
@@ -7176,6 +7565,8 @@ def _backward_induction(
     inventory_quantile_clip: float = 0.005,
     fallback_cap: float = float(ACTION_CAPS[0]),
     advantage_screen_multiplier: float = 1.96,
+    stressed_data: Mapping[str, PortfolioPathData] | None = None,
+    objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
 ) -> BackwardResult:
     """Fit the insurer policy with honest pathwise outer-fold direct Q.
 
@@ -7221,7 +7612,41 @@ def _backward_induction(
         30, 3 * SLIM_DIRECT_Q_BASIS_DIMENSION
     )
     fold_ids = _pathwise_outer_fold_ids(actions, folds, seed)
-    immediate_components = _portfolio_continue_component_tensor(data)[:, :, 1:]
+    base_components = _portfolio_continue_component_tensor(data)[:, :, 1:]
+    if objective_spec.kind == "csm":
+        immediate_components = base_components
+    else:
+        if stressed_data is None or set(stressed_data) != set(MLL_STRESS_IDS):
+            raise ValueError(
+                "CSM/MLL backward induction requires all four stress projections."
+            )
+        if data.model_point_csm is None:
+            raise ValueError(
+                "CSM/MLL backward induction requires modelpoint-wise base CSM."
+            )
+        model_point_csm = np.asarray(data.model_point_csm, dtype=float)
+        expected_model_point_shape = (
+            objective_spec.model_point_count, n_paths, n_years
+        )
+        if model_point_csm.shape != expected_model_point_shape:
+            raise ValueError("Modelpoint-wise base CSM has an invalid shape.")
+        stress_components = []
+        for stress_id in MLL_STRESS_IDS:
+            values = np.asarray(
+                stressed_data[stress_id].new_business_csm_proxy, dtype=float
+            )
+            if values.shape != (n_paths, n_years):
+                raise ValueError(
+                    f"Stress projection {stress_id!r} has an invalid shape."
+                )
+            stress_components.append(values[..., None])
+        immediate_components = np.concatenate((
+            base_components,
+            *stress_components,
+            np.moveaxis(model_point_csm, 0, -1),
+        ), axis=2)
+        if immediate_components.shape[2] != objective_spec.payload_width:
+            raise RuntimeError("Constructed CSM/MLL payload width is inconsistent.")
 
     LOGGER.info(
         "Direct-Q outer-fold gate recursion | %d folds | %d years | %d paths | "
@@ -7240,6 +7665,7 @@ def _backward_induction(
         inventory_quantile_clip=inventory_quantile_clip,
         minimum_training_count=minimum_training_count,
         immediate_components=immediate_components,
+        objective_spec=objective_spec,
     )
 
     gate_oof_r_squared: dict[int, Array] = {}
@@ -7262,7 +7688,11 @@ def _backward_induction(
             )
             mse = float(np.mean(residual ** 2))
             rmse[action] = math.sqrt(mse)
-            standard_error[action] = rmse[action] / math.sqrt(count)
+            standard_error[action] = (
+                0.0
+                if objective_spec.kind == "csm_to_mll"
+                else rmse[action] / math.sqrt(count)
+            )
             variance = float(np.var(gate_evaluation.target[selected, year]))
             if variance > 1.0e-20:
                 r_squared[action] = 1.0 - mse / variance
@@ -7271,6 +7701,7 @@ def _backward_induction(
             if (
                 year != 0
                 and action != 0
+                and objective_spec.kind == "csm"
                 and (
                     not np.isfinite(r_squared[action])
                     or r_squared[action] < MINIMUM_ACTION_OOF_R_SQUARED
@@ -7322,6 +7753,7 @@ def _backward_induction(
         forced_action_standard_errors=screen_standard_error,
         fallback_action=fallback_action,
         advantage_screen_multiplier=advantage_screen_multiplier,
+        objective_spec=objective_spec,
     )
     oof_prediction = policy_evaluation.prediction
     oof_target = policy_evaluation.target
@@ -7356,8 +7788,10 @@ def _backward_induction(
     # for the actual first decision and keep every otherwise-supported action.
     for action in range(len(ACTION_CAPS)):
         selected = actions[:, 0] == action
-        screen_standard_error[0][action] = _standard_error(
-            oof_target[selected, 0]
+        screen_standard_error[0][action] = (
+            0.0
+            if objective_spec.kind == "csm_to_mll"
+            else _standard_error(oof_target[selected, 0])
         )
 
     # The deployable chain is now fitted once on all paths, using the action
@@ -7377,10 +7811,14 @@ def _backward_induction(
         advantage_screen_multiplier=advantage_screen_multiplier,
         minimum_training_count=minimum_training_count,
         immediate_components=immediate_components,
+        objective_spec=objective_spec,
     )
     if np.any(first_target_count <= 0):
         raise RuntimeError("First-year outer-fold action coverage is incomplete.")
     first_action_targets = first_target_sum / first_target_count[:, None]
+    first_action_targets[:, 0] = _objective_from_payload(
+        first_action_targets[:, 1:], objective_spec
+    )
     policy_years: list[RegressionPolicyYear] = []
     for year in active_years:
         original = full_chain.policies[year]
@@ -7423,11 +7861,14 @@ def _backward_induction(
     first_cap = float(ACTION_CAPS[chosen_action])
     if first_target_count[chosen_action] == 0:
         raise RuntimeError("Chosen first cap has no outer-fold direct target.")
-    first_outputs = (
-        first_target_sum[chosen_action] / first_target_count[chosen_action]
-    )
+    first_outputs = first_action_targets[chosen_action]
     selected_first = actions[:, 0] == chosen_action
-    first_se = _standard_error(oof_target[selected_first, 0])
+    first_selected_base_csm = _csm_from_component_values(
+        policy_evaluation.target_payload[
+            selected_first, 0, :len(INSURER_COMPONENT_NAMES)
+        ]
+    )
+    first_se = _standard_error(first_selected_base_csm)
 
     first_year_action_rows: list[dict[str, object]] = []
     regression_rows: list[dict[str, object]] = []
@@ -7452,7 +7893,7 @@ def _backward_induction(
             reasons = list(full_chain.action_mask_reasons[year][action])
             if not final_masks[year][action] and "outer_oof_validation_fallback" not in reasons:
                 reasons.append("outer_oof_validation_fallback")
-            if year != 0 and action != 0 and (
+            if objective_spec.kind == "csm" and year != 0 and action != 0 and (
                 not np.isfinite(gate_oof_r_squared[year][action])
                 or gate_oof_r_squared[year][action]
                 < MINIMUM_ACTION_OOF_R_SQUARED
@@ -7542,18 +7983,42 @@ def _backward_induction(
     for action, cap in enumerate(ACTION_CAPS):
         if first_target_count[action] == 0:
             raise RuntimeError("First-year outer-fold action coverage is incomplete.")
-        target_value = first_target_sum[action] / first_target_count[action]
+        target_value = first_action_targets[action]
+        target_payload = target_value[1:]
+        target_csm = float(_csm_from_component_values(
+            target_payload[:len(INSURER_COMPONENT_NAMES)][None, :]
+        )[0])
+        if objective_spec.kind == "csm_to_mll":
+            _, target_mll, target_ratio = _mll_metrics_from_payload(
+                target_payload[None, :], objective_spec
+            )
+            target_mll_value: float | None = float(target_mll[0])
+            target_ratio_value: float | None = (
+                None if target_ratio[0] <= -1.0e99 else float(target_ratio[0])
+            )
+        else:
+            target_mll_value = None
+            target_ratio_value = None
         selected = actions[:, 0] == action
+        action_base_csm_paths = _csm_from_component_values(
+            policy_evaluation.target_payload[
+                selected, 0, :len(INSURER_COMPONENT_NAMES)
+            ]
+        )
         first_year_action_rows.append({
             "cap": float(cap),
             "cap_percent": 100.0 * float(cap),
             "selection_estimated_q_new_business_csm_proxy": float(
-                target_value[0]
+                target_csm
             ),
             "selection_standard_error_new_business_csm_proxy": float(
                 screen_standard_error[0][action]
             ),
-            "holdout_estimated_q_new_business_csm_proxy": float(target_value[0]),
+            "selection_management_objective": objective_spec.kind,
+            "selection_management_objective_value": float(target_value[0]),
+            "selection_mll_capital_proxy": target_mll_value,
+            "selection_csm_to_mll_ratio": target_ratio_value,
+            "holdout_estimated_q_new_business_csm_proxy": target_csm,
             "holdout_estimated_q_fees_product": float(target_value[1]),
             "holdout_estimated_q_fees_lip": float(target_value[2]),
             "holdout_estimated_q_crediting_margin": float(target_value[3]),
@@ -7566,7 +8031,7 @@ def _backward_induction(
             "holdout_estimated_q_expenses": float(target_value[8]),
             "holdout_estimated_q_hedge_costs": float(target_value[9]),
             "holdout_standard_error_new_business_csm_proxy": float(
-                _standard_error(oof_target[selected, 0])
+                _standard_error(action_base_csm_paths)
             ),
             # Compatibility aliases: both counts now describe the complete set
             # of paths evaluated OOS exactly once, not a privileged fold zero.
@@ -7593,10 +8058,22 @@ def _backward_induction(
                 numerical_reasons.add(
                     f"policy_year_{year + 1}::cap_{ACTION_CAPS[action]:.6f}_{reason}"
                 )
-    component_csm = _csm_from_component_values(first_outputs[1:][None, :])[0]
+    base_payload = first_outputs[1:1 + len(INSURER_COMPONENT_NAMES)]
+    component_csm = _csm_from_component_values(base_payload[None, :])[0]
+    if objective_spec.kind == "csm_to_mll":
+        _, selected_mll, selected_ratio = _mll_metrics_from_payload(
+            first_outputs[1:][None, :], objective_spec
+        )
+        selected_mll_value: float | None = float(selected_mll[0])
+        selected_ratio_value: float | None = (
+            None if selected_ratio[0] <= -1.0e99 else float(selected_ratio[0])
+        )
+    else:
+        selected_mll_value = None
+        selected_ratio_value = None
     return BackwardResult(
         first_year_cap=first_cap,
-        pv_new_business_csm_proxy=float(first_outputs[0]),
+        pv_new_business_csm_proxy=float(component_csm),
         pv_fees_product=float(first_outputs[1]),
         pv_fees_lip=float(first_outputs[2]),
         pv_crediting_margin=float(first_outputs[3]),
@@ -7617,7 +8094,7 @@ def _backward_induction(
             key=lambda row: (int(row["policy_year"]), float(row["cap"])),
         ),
         policy_years=policy_years,
-        reconciliation_gap=float(first_outputs[0] - component_csm),
+        reconciliation_gap=0.0,
         economically_active_policy_years=tuple(year + 1 for year in active_years),
         inactive_market_tail_year_count=n_years - len(active_years),
         numerically_stable=(
@@ -7625,6 +8102,10 @@ def _backward_induction(
             and all(np.all(mask) for mask in final_masks.values())
         ),
         numerical_fallback_reasons=tuple(sorted(numerical_reasons)),
+        management_objective=objective_spec.kind,
+        management_objective_value=float(first_outputs[0]),
+        mll_capital_proxy=selected_mll_value,
+        csm_to_mll_ratio=selected_ratio_value,
     )
 
 
@@ -7646,6 +8127,179 @@ def _benchmark_cases() -> list[tuple[str, float, str]]:
         )
         for cap in ACTION_CAPS
     ]
+
+
+@dataclass(frozen=True)
+class FrozenCapCSMMLLEvaluation:
+    """Pathwise and expected CSM/MLL for one frozen cap matrix.
+
+    Mortality, longevity and permanent lapse stresses reuse the identical Q
+    paths, hedge-price surface, projector seeds and realised management caps.
+    The management rule is therefore frozen before stress revaluation; it is
+    neither refitted nor allowed to exploit the stress label.
+    """
+
+    paths: PolicyCSMPathArrays
+    result: PolicyLevelCSMMLLResult
+    model_point_ids: tuple[str, ...]
+
+
+def _evaluate_frozen_cap_csm_mll(
+    *,
+    scenarios: ScenarioSet,
+    cap_matrix: Array,
+    base_projected: PortfolioPathData,
+    base_esg: ESGConfig,
+    product: IndexLinkedLifetimeIncomeProduct,
+    model_points: PolicyholderModelPointSet,
+    behaviour: BehaviourModel,
+    mortality: MortalityTable,
+    expenses: ExpenseAssumptions,
+    projection_config: ProjectionConfig,
+    objective_spec: ManagementObjectiveSpec,
+    progress_label: str,
+    model_point_log_interval: int,
+) -> FrozenCapCSMMLLEvaluation:
+    """Revalue one already-frozen cap schedule for the MLL research proxy."""
+    if objective_spec.kind != "csm_to_mll":
+        raise ValueError("Frozen-cap MLL evaluation requires csm_to_mll.")
+    caps = np.asarray(cap_matrix, dtype=float)
+    if caps.shape != base_projected.new_business_csm_proxy.shape:
+        raise ValueError("Frozen MLL cap matrix and base projection do not align.")
+    if caps.shape[0] != scenarios.n_paths:
+        raise ValueError("Frozen MLL cap matrix and ScenarioSet do not align.")
+    if base_projected.model_point_csm is None:
+        raise ValueError(
+            "Frozen MLL evaluation requires modelpoint-wise base CSM paths."
+        )
+    model_point_values = np.asarray(base_projected.model_point_csm, dtype=float)
+    expected_model_point_shape = (
+        objective_spec.model_point_count,
+        scenarios.n_paths,
+        caps.shape[1],
+    )
+    if model_point_values.shape != expected_model_point_shape:
+        raise ValueError("Frozen MLL modelpoint CSM paths have an invalid shape.")
+
+    stress_paths: dict[str, Array] = {}
+    for stress_id in MLL_STRESS_IDS:
+        _, stressed_mortality, stressed_expenses = apply_portfolio_input_stress(
+            stress_id, base_esg, mortality, expenses
+        )
+        stressed_behaviour = apply_portfolio_behaviour_stress(
+            stress_id, behaviour
+        )
+        stressed = _aggregate_portfolio_paths(
+            scenarios=scenarios,
+            cap_matrix=caps,
+            product=product,
+            model_points=model_points,
+            behaviour=stressed_behaviour,
+            mortality=stressed_mortality,
+            expenses=stressed_expenses,
+            projection_config=projection_config,
+            collect_states=False,
+            progress_label=f"{progress_label} | {stress_id}",
+            model_point_log_interval=model_point_log_interval,
+            surrender_policy_factory=None,
+            collect_stackelberg_primitives=False,
+        )
+        stress_paths[stress_id] = np.sum(
+            stressed.new_business_csm_proxy, axis=1
+        )
+
+    path_values = PolicyCSMPathArrays(
+        base_csm_paths=np.sum(
+            base_projected.new_business_csm_proxy, axis=1
+        ),
+        mortality_stressed_csm_paths=stress_paths["mortality"],
+        longevity_stressed_csm_paths=stress_paths["longevity"],
+        lapse_up_stressed_csm_paths=stress_paths["lapse_up"],
+        lapse_down_stressed_csm_paths=stress_paths["lapse_down"],
+        model_point_base_csm_paths=np.sum(model_point_values, axis=2).T,
+    )
+    stresses = replace(
+        CapitalStresses(), lapse_mass=objective_spec.mass_lapse_fraction
+    )
+    result = calculate_policy_level_csm_mll(
+        base_csm=float(np.mean(path_values.base_csm_paths)),
+        mortality_stressed_csm=float(np.mean(
+            path_values.mortality_stressed_csm_paths
+        )),
+        longevity_stressed_csm=float(np.mean(
+            path_values.longevity_stressed_csm_paths
+        )),
+        lapse_up_stressed_csm=float(np.mean(
+            path_values.lapse_up_stressed_csm_paths
+        )),
+        lapse_down_stressed_csm=float(np.mean(
+            path_values.lapse_down_stressed_csm_paths
+        )),
+        model_point_csms=np.mean(
+            np.asarray(path_values.model_point_base_csm_paths, dtype=float),
+            axis=0,
+        ),
+        model_point_weights=np.ones(objective_spec.model_point_count),
+        capital_materiality=objective_spec.capital_materiality,
+        stresses=stresses,
+    )
+    if result.csm_to_mll_ratio is None:
+        raise RuntimeError(
+            "CSM/MLL is undefined because MLL capital is below materiality."
+        )
+    return FrozenCapCSMMLLEvaluation(
+        paths=path_values,
+        result=result,
+        model_point_ids=tuple(base_projected.model_point_ids),
+    )
+
+
+def _add_csm_mll_fields(
+    row: dict[str, object],
+    evaluation: FrozenCapCSMMLLEvaluation,
+    *,
+    portfolio_scale: float,
+    prefix: str = "",
+) -> None:
+    """Attach scaled capital components and the scale-invariant ratio."""
+    result = evaluation.result
+    stem = f"{prefix}_" if prefix else ""
+    row.update({
+        f"{stem}csm_aud": portfolio_scale * result.csm,
+        f"{stem}mortality_stressed_csm_aud": portfolio_scale * float(
+            np.mean(evaluation.paths.mortality_stressed_csm_paths)
+        ),
+        f"{stem}longevity_stressed_csm_aud": portfolio_scale * float(
+            np.mean(evaluation.paths.longevity_stressed_csm_paths)
+        ),
+        f"{stem}lapse_up_stressed_csm_aud": portfolio_scale * float(
+            np.mean(evaluation.paths.lapse_up_stressed_csm_paths)
+        ),
+        f"{stem}lapse_down_stressed_csm_aud": portfolio_scale * float(
+            np.mean(evaluation.paths.lapse_down_stressed_csm_paths)
+        ),
+        f"{stem}mll_capital_aud": portfolio_scale * result.mll.capital,
+        f"{stem}csm_to_mll_ratio": result.csm_to_mll_ratio,
+        f"{stem}mortality_loss_aud": (
+            portfolio_scale * result.mll.mortality_loss
+        ),
+        f"{stem}longevity_loss_aud": (
+            portfolio_scale * result.mll.longevity_loss
+        ),
+        f"{stem}lapse_loss_aud": portfolio_scale * result.mll.lapse_loss,
+        f"{stem}lapse_up_loss_aud": (
+            portfolio_scale * result.mll.lapse_up_loss
+        ),
+        f"{stem}lapse_down_loss_aud": (
+            portfolio_scale * result.mll.lapse_down_loss
+        ),
+        f"{stem}mass_lapse_loss_aud": (
+            portfolio_scale * result.mll.mass_lapse_loss
+        ),
+        f"{stem}binding_lapse_stress": result.mll.binding_lapse_stress,
+        f"{stem}mll_framework": result.mll.framework,
+        f"{stem}mass_lapse_method": result.mll.mass_lapse_method,
+    })
 
 
 def _summed_csm_components(
@@ -7979,6 +8633,8 @@ def _evaluate_fixed_benchmarks(
     model_point_log_interval: int,
     cache_dir: Optional[Path] = None,
     projection_fingerprint: str = "",
+    base_esg: ESGConfig | None = None,
+    objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
 ) -> tuple[
     list[dict[str, object]],
     dict[str, Array],
@@ -7988,6 +8644,17 @@ def _evaluate_fixed_benchmarks(
 ]:
     """Select fixed cap on one sample and report it on an independent sample."""
     cases = _benchmark_cases()
+    use_csm_to_mll = objective_spec.kind == "csm_to_mll"
+    if use_csm_to_mll and base_esg is None:
+        raise ValueError("CSM/MLL fixed-cap selection requires the base ESG inputs.")
+    if use_csm_to_mll and cache_dir is not None:
+        # The legacy derived benchmark cache contains only base CSM paths.  It
+        # cannot be used for a capital-aware selection without hiding missing
+        # stress and modelpoint information.
+        LOGGER.info(
+            "Legacy fixed-cap projection cache disabled for CSM/MLL selection."
+        )
+        cache_dir = None
     if selection_scenarios.n_paths <= 0 or evaluation_scenarios.n_paths <= 0:
         raise ValueError("Fixed-cap sample roles must both contain paths.")
     for role, scenarios, config in (
@@ -8002,6 +8669,7 @@ def _evaluate_fixed_benchmarks(
     evaluation_path_values: dict[str, Array] = {}
     selection_path_values: dict[str, Array] = {}
     evaluation_component_paths: dict[str, dict[str, Array]] = {}
+    selection_mll_evaluations: dict[str, FrozenCapCSMMLLEvaluation] = {}
     # Dynamic Take-up and pathwise Joint-Life mortality use seeded projector
     # draws.  Project cases separately so every cap sees the same draws; simply
     # stacking repeated market paths would generate different Behaviour draws
@@ -8068,6 +8736,7 @@ def _evaluate_fixed_benchmarks(
                 f"Fixed-cap selection {case_number}/{len(cases)}"
             ),
             model_point_log_interval=model_point_log_interval,
+            collect_model_point_csm=use_csm_to_mll,
         )
         evaluation_projected = _aggregate_portfolio_paths(
             scenarios=evaluation_scenarios,
@@ -8089,6 +8758,28 @@ def _evaluate_fixed_benchmarks(
         selection_path_values[label] = np.sum(
             selection_projected.new_business_csm_proxy, axis=1
         )
+        if use_csm_to_mll:
+            if base_esg is None:  # narrowed above; keeps static checkers honest
+                raise RuntimeError("Base ESG inputs disappeared unexpectedly.")
+            selection_mll_evaluations[label] = _evaluate_frozen_cap_csm_mll(
+                scenarios=selection_scenarios,
+                cap_matrix=np.full(
+                    (selection_scenarios.n_paths, n_years), cap, dtype=float
+                ),
+                base_projected=selection_projected,
+                base_esg=base_esg,
+                product=product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=expenses,
+                projection_config=selection_projection_config,
+                objective_spec=objective_spec,
+                progress_label=(
+                    f"Fixed-cap selection MLL {case_number}/{len(cases)}"
+                ),
+                model_point_log_interval=model_point_log_interval,
+            )
         evaluation_path_values[label] = np.sum(
             evaluation_projected.new_business_csm_proxy, axis=1
         )
@@ -8118,10 +8809,16 @@ def _evaluate_fixed_benchmarks(
         if label.startswith("fixed_cap_")
         and np.any(np.isclose(cap, ACTION_CAPS))
     ]
-    best_label = max(
-        fixed_labels,
-        key=lambda label: float(np.mean(selection_path_values[label])),
-    )
+    if use_csm_to_mll:
+        best_label = fixed_labels[int(_lower_cap_argmax(np.asarray([
+            float(selection_mll_evaluations[label].result.csm_to_mll_ratio)
+            for label in fixed_labels
+        ])))]
+    else:
+        best_label = max(
+            fixed_labels,
+            key=lambda label: float(np.mean(selection_path_values[label])),
+        )
     best_paths = evaluation_path_values[best_label]
     selection_means = {
         label: portfolio_scale * float(np.mean(selection_path_values[label]))
@@ -8151,6 +8848,13 @@ def _evaluate_fixed_benchmarks(
         row["fixed_cap_selection_sample_csm_aud"] = (
             selection_means.get(label)
         )
+        if use_csm_to_mll:
+            _add_csm_mll_fields(
+                row,
+                selection_mll_evaluations[label],
+                portfolio_scale=portfolio_scale,
+                prefix="fixed_cap_selection_sample",
+            )
         row["n_fixed_cap_selection_paths"] = selection_scenarios.n_paths
         row["n_final_evaluation_paths"] = evaluation_scenarios.n_paths
         row["sample_role"] = "final_evaluation"
@@ -8181,6 +8885,18 @@ def _evaluate_fixed_benchmarks(
         "selection_path_count": selection_scenarios.n_paths,
         "evaluation_path_count": evaluation_scenarios.n_paths,
         "best_fixed_selection_csm_aud": selection_means[best_label],
+        "fixed_cap_selection_objective": objective_spec.kind,
+        "best_fixed_selection_mll_capital_aud": (
+            None
+            if not use_csm_to_mll
+            else portfolio_scale
+            * selection_mll_evaluations[best_label].result.mll.capital
+        ),
+        "best_fixed_selection_csm_to_mll_ratio": (
+            None
+            if not use_csm_to_mll
+            else selection_mll_evaluations[best_label].result.csm_to_mll_ratio
+        ),
         "selection_market_scenario_fingerprint": (
             selection_scenarios.content_fingerprint
         ),
@@ -8740,6 +9456,24 @@ def _adaptive_policy_passes_validation(
         and causal_rollout_valid
         and csm_delta_aud
         > confidence_multiplier * paired_standard_error_aud
+    )
+
+
+def _adaptive_policy_passes_ratio_validation(
+    *,
+    masked_candidate_executable: bool,
+    policyholder_validation_passed: bool,
+    causal_rollout_valid: bool,
+    bootstrap: PairedBootstrapRatioDelta,
+) -> bool:
+    """Deploy only when the paired CSM/MLL interval is wholly positive."""
+    if not isinstance(bootstrap, PairedBootstrapRatioDelta):
+        raise TypeError("bootstrap must be a PairedBootstrapRatioDelta result.")
+    return bool(
+        masked_candidate_executable
+        and policyholder_validation_passed
+        and causal_rollout_valid
+        and bootstrap.positive_gate_passed
     )
 
 
@@ -10329,24 +11063,28 @@ def main() -> None:
             command.append("--market-only")
         return _shell_neutral_argv_display(command)
 
-    # Fail before the expensive exploratory projection if either independent
-    # sample lacks its exact market/hedge artefacts.  Both are opened read-only;
-    # only precompute_q_market_and_hedge_cache.py may create them.
-    benchmark_cache_path_count = 3 * args.benchmark_paths
+    # Fail before the expensive exploratory projection if any independent
+    # full-size sample lacks its exact market/hedge artefacts.  Every role has
+    # the same path count and its own market seed/cache identity; no parent
+    # ScenarioSet is sliced or reserved for OOS validation.
+    market_sample_specs = {
+        "training": (args.n_paths, args.seed),
+        "fixed_cap_selection": (args.n_paths, args.fixed_selection_seed),
+        "validation": (args.n_paths, args.validation_seed),
+        "evaluation": (args.n_paths, args.evaluation_seed),
+    }
     cache_errors: list[tuple[str, Exception]] = []
-    try:
-        with _logged_stage("Load training Q Heston-Hull-White cache"):
-            training_scenarios = cached_q_scenarios(args.n_paths, args.seed)
-    except (ScenarioCacheNotFoundError, HedgePriceCacheNotFoundError) as exc:
-        cache_errors.append(("training", exc))
-    try:
-        with _logged_stage("Load benchmark Q Heston-Hull-White cache"):
-            benchmark_scenarios = cached_q_scenarios(
-                benchmark_cache_path_count,
-                args.seed + 1,
-            )
-    except (ScenarioCacheNotFoundError, HedgePriceCacheNotFoundError) as exc:
-        cache_errors.append(("benchmark/validation/evaluation", exc))
+    scenarios_by_role: dict[str, ScenarioSet] = {}
+    for role, (path_count, market_seed) in market_sample_specs.items():
+        try:
+            with _logged_stage(
+                f"Load {role.replace('_', ' ')} Q Heston-Hull-White cache"
+            ):
+                scenarios_by_role[role] = cached_q_scenarios(
+                    path_count, market_seed
+                )
+        except (ScenarioCacheNotFoundError, HedgePriceCacheNotFoundError) as exc:
+            cache_errors.append((role, exc))
     if cache_errors:
         original_errors = "\n".join(
             f"{role}: {error}" for role, error in cache_errors
@@ -10358,25 +11096,29 @@ def main() -> None:
             "the authorised precompute runner, then repeat the optimisation. "
             "The following JSON arrays are exact process argv values and can "
             "be passed directly to any cross-platform process runner.\n"
-            f"Training cache:\n{cache_precompute_command(args.n_paths, args.seed)}\n"
-            "Benchmark/validation/evaluation cache:\n"
-            f"{cache_precompute_command(benchmark_cache_path_count, args.seed + 1)}\n"
+            "Required role caches:\n"
+            + "\n".join(
+                f"{role}: {cache_precompute_command(path_count, market_seed)}"
+                for role, (path_count, market_seed) in market_sample_specs.items()
+            )
+            + "\n"
             f"Original cache errors:\n{original_errors}"
         )
         LOGGER.error(message)
         raise RuntimeError(message) from cache_errors[0][1]
-    LOGGER.debug(
-        "Training scenarios | fingerprint=%s | paths=%d | steps=%d",
-        training_scenarios.content_fingerprint,
-        training_scenarios.n_paths,
-        training_scenarios.n_steps,
-    )
-    LOGGER.debug(
-        "Benchmark scenarios | fingerprint=%s | paths=%d | steps=%d",
-        benchmark_scenarios.content_fingerprint,
-        benchmark_scenarios.n_paths,
-        benchmark_scenarios.n_steps,
-    )
+    training_scenarios = scenarios_by_role["training"]
+    fixed_selection_scenarios = scenarios_by_role["fixed_cap_selection"]
+    validation_scenarios = scenarios_by_role["validation"]
+    evaluation_scenarios = scenarios_by_role["evaluation"]
+    for role, scenarios in scenarios_by_role.items():
+        LOGGER.debug(
+            "%s scenarios | seed=%d | fingerprint=%s | paths=%d | steps=%d",
+            role,
+            market_sample_specs[role][1],
+            scenarios.content_fingerprint,
+            scenarios.n_paths,
+            scenarios.n_steps,
+        )
     with _logged_stage("Generate exploratory cap controls"):
         action_indices, exploratory_caps, exploration_metadata = (
             _exploration_schedule(
@@ -10406,7 +11148,41 @@ def main() -> None:
             model_point_log_interval=args.model_point_log_interval,
             surrender_policy_factory=None,
             collect_stackelberg_primitives=False,
+            collect_model_point_csm=(
+                args.optimisation_objective == "csm_to_mll"
+            ),
         )
+    training_stress_data: dict[str, PortfolioPathData] = {}
+    if args.optimisation_objective == "csm_to_mll":
+        for stress_id in MLL_STRESS_IDS:
+            _, stressed_mortality, stressed_expenses = (
+                apply_portfolio_input_stress(
+                    stress_id, market.esg, mortality, costs.expenses
+                )
+            )
+            stressed_behaviour = apply_portfolio_behaviour_stress(
+                stress_id, behaviour
+            )
+            with _logged_stage(
+                f"Project control-randomisation {stress_id} portfolio"
+            ):
+                training_stress_data[stress_id] = _aggregate_portfolio_paths(
+                    scenarios=training_scenarios,
+                    cap_matrix=exploratory_caps,
+                    product=costs.product,
+                    model_points=model_points,
+                    behaviour=stressed_behaviour,
+                    mortality=stressed_mortality,
+                    expenses=stressed_expenses,
+                    projection_config=training_projection_config,
+                    collect_states=False,
+                    progress_label=(
+                        f"Control-randomisation {stress_id} projection"
+                    ),
+                    model_point_log_interval=args.model_point_log_interval,
+                    surrender_policy_factory=None,
+                    collect_stackelberg_primitives=False,
+                )
     with _logged_stage("Merge adapted market history and rich portfolio states"):
         training_control_inputs = _control_state_inputs(
             training_scenarios, costs.product, n_years
@@ -10450,22 +11226,9 @@ def main() -> None:
             "the full lifetime horizon | maximum absolute=%.6g",
             training_closeout_max_abs,
         )
-    # Fixed-cap selection, adaptive validation and final evaluation own
-    # disjoint market blocks and disjoint projector-RNG namespaces.  Policies
-    # compared within one role intentionally retain common random numbers.
-    fixed_selection_scenarios = _slice_scenarios(
-        benchmark_scenarios, 0, args.benchmark_paths
-    )
-    evaluation_scenarios = _slice_scenarios(
-        benchmark_scenarios,
-        args.benchmark_paths,
-        2 * args.benchmark_paths,
-    )
-    validation_scenarios = _slice_scenarios(
-        benchmark_scenarios,
-        2 * args.benchmark_paths,
-        3 * args.benchmark_paths,
-    )
+    # Every role owns a complete independently seeded market sample and a
+    # disjoint projector-RNG namespace.  Policies compared within one role
+    # intentionally retain common random numbers.
     market_sample_fingerprints = {
         "training": training_scenarios.content_fingerprint,
         "fixed_cap_selection": fixed_selection_scenarios.content_fingerprint,
@@ -10504,8 +11267,13 @@ def main() -> None:
         ),
         "market_cache_root": str(args.market_cache_root),
         "hedge_cache_root": str(args.hedge_cache_root),
-        "training": q_cache_metadata(training_scenarios),
-        "benchmark_full_sample": q_cache_metadata(benchmark_scenarios),
+        **{
+            role: {
+                **q_cache_metadata(scenarios),
+                "market_seed": market_sample_specs[role][1],
+            }
+            for role, scenarios in scenarios_by_role.items()
+        },
     }
     LOGGER.info(
         "Disjoint samples | training=%s | fixed selection=%s | "
@@ -10528,6 +11296,19 @@ def main() -> None:
     }
     if len(set(full_stochastic_sample_fingerprints.values())) != 4:
         raise RuntimeError("Full stochastic sample namespaces must be distinct.")
+
+    objective_spec = ManagementObjectiveSpec(
+        kind=args.optimisation_objective,
+        model_point_count=(
+            len(model_points.model_points)
+            if args.optimisation_objective == "csm_to_mll" else 0
+        ),
+        capital_materiality=(
+            training_data.representative_initial_premium
+            * args.mll_capital_materiality_bp / 10_000.0
+        ),
+        mass_lapse_fraction=args.mass_lapse_fraction,
+    )
 
     with _logged_stage("Evaluate existing dynamic-Behaviour fixed-cap benchmarks"):
         dynamic_results = _evaluate_fixed_benchmarks(
@@ -10553,6 +11334,8 @@ def main() -> None:
                 ),
                 equity_weight=equity_allocation.equity_weight,
             ),
+            base_esg=market.esg,
+            objective_spec=objective_spec,
         )
 
     fixed_policyholder_exercise_rows: list[dict[str, object]] = []
@@ -10587,7 +11370,11 @@ def main() -> None:
         and 1.0 <= float(row["cap_percent"]) <= 20.0
     ]
     requested_grid_values = np.asarray([
-        float(row["fixed_cap_selection_sample_csm_aud"])
+        float(row[
+            "fixed_cap_selection_sample_csm_to_mll_ratio"
+            if objective_spec.kind == "csm_to_mll"
+            else "fixed_cap_selection_sample_csm_aud"
+        ])
         for row in fixed_1_to_20_rows
     ])
     best_fixed_1_to_20_row = fixed_1_to_20_rows[
@@ -10615,6 +11402,11 @@ def main() -> None:
             inventory_quantile_clip=args.inventory_quantile_clip,
             fallback_cap=best_fixed_cap,
             advantage_screen_multiplier=1.96,
+            stressed_data=(
+                training_stress_data
+                if args.optimisation_objective == "csm_to_mll" else None
+            ),
+            objective_spec=objective_spec,
         )
     LOGGER.info(
         "Backward diagnostic | first-year cap=%.2f%% | frozen-screened OOF "
@@ -10696,6 +11488,7 @@ def main() -> None:
             collect_states=False,
             progress_label="Paired validation fixed-cap fallback",
             model_point_log_interval=args.model_point_log_interval,
+            collect_model_point_csm=(objective_spec.kind == "csm_to_mll"),
         )
         validation_best_fixed_paths = np.sum(
             validation_best_fixed_projected.new_business_csm_proxy,
@@ -10729,6 +11522,7 @@ def main() -> None:
             model_point_log_interval=args.model_point_log_interval,
             surrender_policy_factory=None,
             collect_policyholder_by_signature=False,
+            collect_model_point_csm=(objective_spec.kind == "csm_to_mll"),
         )
         validation_row, _ = _projected_policy_benchmark_row(
             label="adaptive_policy_validation",
@@ -10741,26 +11535,121 @@ def main() -> None:
             portfolio_scale=portfolio_scale,
         )
 
+    validation_ratio_bootstrap: PairedBootstrapRatioDelta | None = None
+    validation_adaptive_mll: FrozenCapCSMMLLEvaluation | None = None
+    validation_fixed_mll: FrozenCapCSMMLLEvaluation | None = None
+    if objective_spec.kind == "csm_to_mll":
+        with _logged_stage("Revalue validation policies for MLL capital"):
+            validation_fixed_mll = _evaluate_frozen_cap_csm_mll(
+                scenarios=validation_scenarios,
+                cap_matrix=validation_best_fixed_caps,
+                base_projected=validation_best_fixed_projected,
+                base_esg=market.esg,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=validation_projection_config,
+                objective_spec=objective_spec,
+                progress_label="Validation fixed-cap MLL",
+                model_point_log_interval=args.model_point_log_interval,
+            )
+            validation_adaptive_mll = _evaluate_frozen_cap_csm_mll(
+                scenarios=validation_scenarios,
+                cap_matrix=validation_cap_matrix,
+                base_projected=validation_projected,
+                base_esg=market.esg,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=validation_projection_config,
+                objective_spec=objective_spec,
+                progress_label="Validation adaptive-policy MLL",
+                model_point_log_interval=args.model_point_log_interval,
+            )
+            validation_ratio_bootstrap = paired_bootstrap_ratio_delta(
+                validation_adaptive_mll.paths,
+                validation_fixed_mll.paths,
+                model_point_weights=np.ones(objective_spec.model_point_count),
+                capital_materiality=objective_spec.capital_materiality,
+                stresses=replace(
+                    CapitalStresses(),
+                    lapse_mass=objective_spec.mass_lapse_fraction,
+                ),
+                n_resamples=args.ratio_bootstrap_replicates,
+                confidence_level=0.95,
+                seed=args.ratio_bootstrap_seed,
+            )
+            _add_csm_mll_fields(
+                validation_row,
+                validation_adaptive_mll,
+                portfolio_scale=portfolio_scale,
+            )
+            _add_csm_mll_fields(
+                validation_row,
+                validation_fixed_mll,
+                portfolio_scale=portfolio_scale,
+                prefix="comparator",
+            )
+            validation_row.update({
+                "csm_to_mll_ratio_difference_vs_best_fixed": (
+                    validation_ratio_bootstrap.estimate
+                ),
+                "paired_bootstrap_standard_error_csm_to_mll_difference": (
+                    validation_ratio_bootstrap.standard_error
+                ),
+                "paired_bootstrap_csm_to_mll_interval_95pct_lower": (
+                    validation_ratio_bootstrap.ci_lower
+                ),
+                "paired_bootstrap_csm_to_mll_interval_95pct_upper": (
+                    validation_ratio_bootstrap.ci_upper
+                ),
+            })
+
     validation_delta = float(validation_row[
         "new_business_csm_difference_vs_best_fixed_admissible_aud"
     ])
     validation_delta_se = float(validation_row[
         "paired_standard_error_new_business_csm_difference_vs_best_fixed_aud"
     ])
-    validation_adaptive_policy_selected = _adaptive_policy_passes_validation(
-        masked_candidate_executable=True,
-        policyholder_validation_passed=True,
-        causal_rollout_valid=bool(validation_rollout_metadata["converged"]),
-        csm_delta_aud=validation_delta,
-        paired_standard_error_aud=validation_delta_se,
-    )
+    if objective_spec.kind == "csm_to_mll":
+        if validation_ratio_bootstrap is None:
+            raise RuntimeError("Validation CSM/MLL bootstrap was not calculated.")
+        validation_adaptive_policy_selected = (
+            _adaptive_policy_passes_ratio_validation(
+                masked_candidate_executable=True,
+                policyholder_validation_passed=True,
+                causal_rollout_valid=bool(
+                    validation_rollout_metadata["converged"]
+                ),
+                bootstrap=validation_ratio_bootstrap,
+            )
+        )
+    else:
+        validation_adaptive_policy_selected = _adaptive_policy_passes_validation(
+            masked_candidate_executable=True,
+            policyholder_validation_passed=True,
+            causal_rollout_valid=bool(validation_rollout_metadata["converged"]),
+            csm_delta_aud=validation_delta,
+            paired_standard_error_aud=validation_delta_se,
+        )
     adaptive_policy_selected = validation_adaptive_policy_selected
     LOGGER.info(
-        "Adaptive-policy validation | delta vs fixed fallback=%.2f | paired "
-        "SE=%.2f | causal rollout valid=%s | all raw fits stable=%s | "
+        "Adaptive-policy validation | CSM delta=%.2f | paired CSM SE=%.2f | "
+        "CSM/MLL delta=%s | causal rollout valid=%s | all raw fits stable=%s | "
         "selected=%s",
         validation_delta,
         validation_delta_se,
+        (
+            "not used"
+            if validation_ratio_bootstrap is None
+            else f"{validation_ratio_bootstrap.estimate:.6g} "
+            f"[{validation_ratio_bootstrap.ci_lower:.6g}, "
+            f"{validation_ratio_bootstrap.ci_upper:.6g}]"
+        ),
         validation_rollout_metadata["converged"],
         backward.numerically_stable,
         validation_adaptive_policy_selected,
@@ -10795,6 +11684,7 @@ def main() -> None:
             projection_config=evaluation_projection_config,
             model_point_log_interval=args.model_point_log_interval,
             surrender_policy_factory=None,
+            collect_model_point_csm=(objective_spec.kind == "csm_to_mll"),
         )
         if not evaluation_rollout_metadata["converged"]:
             raise RuntimeError(
@@ -10803,6 +11693,87 @@ def main() -> None:
             )
 
     evaluation_best_fixed_paths = benchmark_path_values[best_fixed_label]
+    evaluation_best_fixed_caps = np.full(
+        (evaluation_scenarios.n_paths, n_years), best_fixed_cap, dtype=float
+    )
+    with _logged_stage("Reproduce final fixed-cap comparator"):
+        evaluation_best_fixed_projected = _aggregate_portfolio_paths(
+            scenarios=evaluation_scenarios,
+            cap_matrix=evaluation_best_fixed_caps,
+            product=costs.product,
+            model_points=model_points,
+            behaviour=behaviour,
+            mortality=mortality,
+            expenses=costs.expenses,
+            projection_config=evaluation_projection_config,
+            collect_states=True,
+            progress_label="Final fixed-cap comparator",
+            model_point_log_interval=args.model_point_log_interval,
+            surrender_policy_factory=None,
+            collect_model_point_csm=(objective_spec.kind == "csm_to_mll"),
+        )
+        reproduced_fixed_paths = np.sum(
+            evaluation_best_fixed_projected.new_business_csm_proxy, axis=1
+        )
+        if not np.allclose(
+            reproduced_fixed_paths,
+            evaluation_best_fixed_paths,
+            rtol=1.0e-12,
+            atol=1.0e-8,
+        ):
+            raise RuntimeError(
+                "Final fixed-cap comparator does not reproduce the CRN "
+                "fixed-cap benchmark."
+            )
+
+    evaluation_ratio_bootstrap: PairedBootstrapRatioDelta | None = None
+    evaluation_adaptive_mll: FrozenCapCSMMLLEvaluation | None = None
+    evaluation_fixed_mll: FrozenCapCSMMLLEvaluation | None = None
+    if objective_spec.kind == "csm_to_mll":
+        with _logged_stage("Revalue final policies for MLL capital"):
+            evaluation_fixed_mll = _evaluate_frozen_cap_csm_mll(
+                scenarios=evaluation_scenarios,
+                cap_matrix=evaluation_best_fixed_caps,
+                base_projected=evaluation_best_fixed_projected,
+                base_esg=market.esg,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=evaluation_projection_config,
+                objective_spec=objective_spec,
+                progress_label="Final fixed-cap MLL",
+                model_point_log_interval=args.model_point_log_interval,
+            )
+            evaluation_adaptive_mll = _evaluate_frozen_cap_csm_mll(
+                scenarios=evaluation_scenarios,
+                cap_matrix=adaptive_candidate_cap_matrix,
+                base_projected=adaptive_candidate_projected,
+                base_esg=market.esg,
+                product=costs.product,
+                model_points=model_points,
+                behaviour=behaviour,
+                mortality=mortality,
+                expenses=costs.expenses,
+                projection_config=evaluation_projection_config,
+                objective_spec=objective_spec,
+                progress_label="Final adaptive-policy MLL",
+                model_point_log_interval=args.model_point_log_interval,
+            )
+            evaluation_ratio_bootstrap = paired_bootstrap_ratio_delta(
+                evaluation_adaptive_mll.paths,
+                evaluation_fixed_mll.paths,
+                model_point_weights=np.ones(objective_spec.model_point_count),
+                capital_materiality=objective_spec.capital_materiality,
+                stresses=replace(
+                    CapitalStresses(),
+                    lapse_mass=objective_spec.mass_lapse_fraction,
+                ),
+                n_resamples=args.ratio_bootstrap_replicates,
+                confidence_level=0.95,
+                seed=args.ratio_bootstrap_seed + 1,
+            )
     with _logged_stage("Report paired adaptive-candidate flexibility value"):
         flexible_row, flexible_csm_paths = _projected_policy_benchmark_row(
             label="flexible_dynamic_behaviour_policy",
@@ -10815,6 +11786,34 @@ def main() -> None:
             portfolio_scale=portfolio_scale,
             comparison_paths=evaluation_best_fixed_paths,
         )
+        if evaluation_adaptive_mll is not None:
+            if evaluation_fixed_mll is None or evaluation_ratio_bootstrap is None:
+                raise RuntimeError("Final CSM/MLL comparison is incomplete.")
+            _add_csm_mll_fields(
+                flexible_row,
+                evaluation_adaptive_mll,
+                portfolio_scale=portfolio_scale,
+            )
+            _add_csm_mll_fields(
+                flexible_row,
+                evaluation_fixed_mll,
+                portfolio_scale=portfolio_scale,
+                prefix="comparator",
+            )
+            flexible_row.update({
+                "csm_to_mll_ratio_difference_vs_best_fixed": (
+                    evaluation_ratio_bootstrap.estimate
+                ),
+                "paired_bootstrap_standard_error_csm_to_mll_difference": (
+                    evaluation_ratio_bootstrap.standard_error
+                ),
+                "paired_bootstrap_csm_to_mll_interval_95pct_lower": (
+                    evaluation_ratio_bootstrap.ci_lower
+                ),
+                "paired_bootstrap_csm_to_mll_interval_95pct_upper": (
+                    evaluation_ratio_bootstrap.ci_upper
+                ),
+            })
     flexible_row.update({
         "policy_role": "adaptive_research_candidate",
         "sample_role": "final_evaluation",
@@ -10836,6 +11835,21 @@ def main() -> None:
         "evaluation_rollout_fallback_used": evaluation_rollout_fallback_used,
         "validation_csm_difference_vs_fixed_aud": validation_delta,
         "validation_paired_standard_error_aud": validation_delta_se,
+        "validation_csm_to_mll_ratio_difference_vs_fixed": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.estimate
+        ),
+        "validation_paired_bootstrap_csm_to_mll_interval_95pct_lower": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.ci_lower
+        ),
+        "validation_paired_bootstrap_csm_to_mll_interval_95pct_upper": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.ci_upper
+        ),
     })
 
     if adaptive_policy_selected:
@@ -10846,39 +11860,9 @@ def main() -> None:
             "validation_approved_adaptive_candidate"
         )
     else:
-        with _logged_stage("Project validated fixed-cap deployment fallback"):
-            deployed_cap_matrix = np.full(
-                (evaluation_scenarios.n_paths, n_years),
-                best_fixed_cap,
-                dtype=float,
-            )
-            deployed_projected = _aggregate_portfolio_paths(
-                scenarios=evaluation_scenarios,
-                cap_matrix=deployed_cap_matrix,
-                product=costs.product,
-                model_points=model_points,
-                behaviour=behaviour,
-                mortality=mortality,
-                expenses=costs.expenses,
-                projection_config=evaluation_projection_config,
-                collect_states=True,
-                progress_label="Deployed fixed-cap fallback",
-                model_point_log_interval=args.model_point_log_interval,
-                surrender_policy_factory=None,
-            )
-            reproduced_fixed_paths = np.sum(
-                deployed_projected.new_business_csm_proxy, axis=1
-            )
-            if not np.allclose(
-                reproduced_fixed_paths,
-                evaluation_best_fixed_paths,
-                rtol=1.0e-12,
-                atol=1.0e-8,
-            ):
-                raise RuntimeError(
-                    "Final fixed-cap deployment does not reproduce the CRN "
-                    "fixed-cap evaluation benchmark."
-                )
+        with _logged_stage("Use validated fixed-cap deployment fallback"):
+            deployed_cap_matrix = evaluation_best_fixed_caps
+            deployed_projected = evaluation_best_fixed_projected
             deployed_rollout_metadata = {
                 "converged": True,
                 "causal_prefix_projection_count": 0,
@@ -10900,6 +11884,28 @@ def main() -> None:
             portfolio_scale=portfolio_scale,
             comparison_paths=evaluation_best_fixed_paths,
         )
+        deployed_mll = (
+            evaluation_adaptive_mll
+            if adaptive_policy_selected else evaluation_fixed_mll
+        )
+        if deployed_mll is not None:
+            if evaluation_fixed_mll is None:
+                raise RuntimeError("Final fixed-cap MLL comparator is missing.")
+            _add_csm_mll_fields(
+                deployed_row,
+                deployed_mll,
+                portfolio_scale=portfolio_scale,
+            )
+            _add_csm_mll_fields(
+                deployed_row,
+                evaluation_fixed_mll,
+                portfolio_scale=portfolio_scale,
+                prefix="comparator",
+            )
+            deployed_row["csm_to_mll_ratio_difference_vs_best_fixed"] = (
+                float(deployed_mll.result.csm_to_mll_ratio)
+                - float(evaluation_fixed_mll.result.csm_to_mll_ratio)
+            )
     deployed_row.update({
         "policy_role": "validated_deployed_policy",
         "sample_role": "final_evaluation",
@@ -10926,7 +11932,29 @@ def main() -> None:
         "evaluation_rollout_fallback_used": evaluation_rollout_fallback_used,
         "validation_csm_difference_vs_fixed_aud": validation_delta,
         "validation_paired_standard_error_aud": validation_delta_se,
+        "validation_csm_to_mll_ratio_difference_vs_fixed": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.estimate
+        ),
+        "validation_paired_bootstrap_csm_to_mll_interval_95pct_lower": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.ci_lower
+        ),
+        "validation_paired_bootstrap_csm_to_mll_interval_95pct_upper": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.ci_upper
+        ),
     })
+    if evaluation_fixed_mll is not None:
+        _add_csm_mll_fields(
+            best_fixed_row,
+            evaluation_fixed_mll,
+            portfolio_scale=portfolio_scale,
+        )
+        best_fixed_row["policy_role"] = "best_fixed_csm_to_mll_comparator"
     benchmark_rows.extend((flexible_row, deployed_row))
 
     candidate_first_year_caps = np.unique(adaptive_candidate_cap_matrix[:, 0])
@@ -11916,16 +12944,18 @@ def main() -> None:
         "evaluation_scenario_fingerprint": (
             market_sample_fingerprints["evaluation"]
         ),
-        "benchmark_parent_scenario_fingerprint": (
-            benchmark_scenarios.content_fingerprint
-        ),
+        "benchmark_parent_scenario_fingerprint": None,
+        "benchmark_parent_slicing_used": False,
         "market_scenario_samples_are_pairwise_distinct": True,
         "full_stochastic_samples_are_pairwise_distinct": True,
         "projection_random_seeds_by_sample": (
             projection_random_seeds_by_sample
         ),
         "market_training_seed": args.seed,
-        "market_benchmark_parent_seed": args.seed + 1,
+        "market_fixed_cap_selection_seed": args.fixed_selection_seed,
+        "market_validation_seed": args.validation_seed,
+        "market_evaluation_seed": args.evaluation_seed,
+        "market_benchmark_parent_seed": None,
         "heston_substeps": args.heston_substeps,
         "exploration": exploration_metadata,
         "objective_scope": {
