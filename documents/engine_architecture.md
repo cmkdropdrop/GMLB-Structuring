@@ -102,6 +102,20 @@ as insurance claims. The projector records, among other items:
 The CSM proxy is reconstructed from the insurer legs and reconciled in every
 material reporting workflow.
 
+## Customer-behaviour LSMC boundary
+
+The risk workflow compares the dynamic-function and directly fitted LSMC V11
+policies on one common exact Q sample for each predeclared cap. There is no
+separate customer-LSMC validation or evaluation sample. The customer fit is a
+mortality-free, swing-style problem that maximises the Q-expectation of income,
+full-surrender and finite terminal-closeout cashflows discounted with today's
+Australian zero curve. Internal complete-path folds estimate continuation
+values; they are not an OOS policy test.
+
+Actual mortality and pathwise market discounting return only in the
+actuarial/CSM rollout. The customer-LSMC workflow requires one model point, so
+its output is a method/design sensitivity rather than portfolio evidence.
+
 ## Reproducibility
 
 Run manifests bind numerical outputs to input hashes, model version, scenario

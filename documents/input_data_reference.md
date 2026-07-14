@@ -14,7 +14,7 @@ retain file hashes for run provenance.
 | `cost_assumptions/` | `cost_assumptions.csv` | Customer charges, insurer expenses, option markup and hedge-reference fee |
 | `dynamic_behaviour/` | `dynamic_behaviour_baselines.csv`, `dynamic_behaviour_coefficients.csv` | Statistical take-up, lapse and withdrawal proxy |
 | `equity_allocation/` | `equity_allocation.csv` | Product-level reference-fund equity weight |
-| `mc_analysis/` | `portfolio_analysis.csv` | Evaluation, training and validation path counts and seeds |
+| `mc_analysis/` | `portfolio_analysis.csv` | Named Monte Carlo path counts and seed namespaces used by the different workflows |
 | `model_points_policyholders/` | full, four-point and one-point CSVs | Representative insured-person portfolios |
 
 ## Market data
@@ -59,7 +59,9 @@ behaviour modelling practice, but they are not Australian experience rates.
 
 ## Monte Carlo samples
 
-`portfolio_analysis.csv` predeclares disjoint random-number namespaces:
+`portfolio_analysis.csv` retains disjoint random-number namespaces for workflows
+that require separate policy selection and evaluation, in particular adaptive
+insurer cap optimisation:
 
 - final evaluation;
 - up to three LSMC training samples;
@@ -69,17 +71,25 @@ Market, take-up and mortality seeds remain separate. Changing a market seed or
 path count requires a distinct Q-market cache; changing non-market mortality or
 expense assumptions does not.
 
+The customer-behaviour LSMC is intentionally different. It uses only the
+primary LSMC training row as one common exact Q sample for continuation-value
+fitting, direct V11 rollout and the paired Dynamic comparison. Legacy
+validation/evaluation arguments remain parseable for compatibility but are
+normalised to that primary sample; they do not create an OOS gate. Customer-LSMC
+runs also require exactly one model point.
+
 ## Model-point sets
 
 | File | Intended use |
 |---|---|
 | `model_points_policyholders.csv` | Full 48-point illustrative portfolio for evidence runs |
 | `model_points_policyholders_4_point_proxy.csv` | Small portfolio for development and medium runs |
-| `model_points_policyholders_1_point_proxy.csv` | Fast smoke and orchestration checks only |
+| `model_points_policyholders_1_point_proxy.csv` | Required representative contract for customer-LSMC runs and fast orchestration checks |
 
-The one-point proxy must not be described as portfolio evidence. A model point
-represents an insured person; `contract_weight` and `premium_volume_weight`
-control aggregation.
+The one-point proxy must not be described as portfolio evidence, even when many
+market paths are used. It supports method and product-design sensitivity only.
+A model point represents an insured person; `contract_weight` and
+`premium_volume_weight` control aggregation.
 
 ## Clone-and-run guarantee
 

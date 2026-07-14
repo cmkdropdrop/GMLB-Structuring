@@ -1125,7 +1125,9 @@ def _cross_fitted_regression(
     # estimator on a coarser information set rather than a behavioural
     # Continue/fixed-policy fallback.
     sparse_constant_advantage = bool(
-        advantage_target and selected.size == 0
+        advantage_target
+        and selected.size == 0
+        and not enforce_unique_path_minimum
     )
     total_observation_floor = (
         max(2 * settings.n_folds, settings.observations_per_coefficient)
@@ -6543,6 +6545,11 @@ def fit_optimal_behaviour_policy(
             axis=1,
         )
 
+    # Fixed-START/Continue paths are a transparent reference for the customer
+    # optionality uplift. They are not candidate deployment policies. Do not
+    # roll the fitted surrender rule through fixed START dates that are outside
+    # the cross-fitted V11 state distribution: doing so can manufacture sparse
+    # far-tail coverage requirements which the deployed V11 never reaches.
     fixed_candidates: list[tuple[float, int, str, Array]] = []
     for anchor_step in fixed_election_steps:
         continue_projection, _ = _project_fixed_election_branch(
@@ -6559,22 +6566,6 @@ def fit_optimal_behaviour_policy(
         fixed_candidates.append((
             float(np.mean(continue_paths)), anchor_step, "continue", continue_paths
         ))
-        if not income_fit.fallback_used:
-            lapse_projection, _ = _project_fixed_election_branch(
-                start_step=anchor_step,
-                product=product,
-                policy=policy,
-                scenarios=training_scenarios,
-                behaviour=behaviour,
-                mortality=training_mortality,
-                expenses=expenses,
-                config=config,
-                surrender_policy=income_fit.cross_fitted_policy,
-            )
-            lapse_paths = path_values(lapse_projection)
-            fixed_candidates.append((
-                float(np.mean(lapse_paths)), anchor_step, "annual_lapse", lapse_paths
-            ))
     best_fixed_value, best_fixed_step, best_fixed_mode, best_fixed_paths = max(
         fixed_candidates, key=lambda item: item[0]
     )

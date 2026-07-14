@@ -33,6 +33,7 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _mll_metrics_from_payload,
     _management_payload_and_activity_exposure,
     _objective_from_payload,
+    _time_zero_policy_class_weights,
     parse_args,
     _pathwise_outer_fold_ids,
     _policy_action_values,
@@ -645,6 +646,27 @@ def test_ratio_parser_uses_one_full_sample_and_one_model_point_default():
         parse_args(["--fixed-selection-seed", "18"])
 
 
+def test_time_zero_policy_class_grid_is_predeclared_and_additive():
+    grid = _time_zero_policy_class_weights()
+
+    assert len(grid) == 21
+    assert len({name for name, _ in grid}) == 21
+    assert grid[0][0] == "base_csm"
+    np.testing.assert_array_equal(
+        grid[0][1],
+        np.array([1.0] * 5 + [-1.0] * 4 + [0.0] * 5),
+    )
+    longevity_half = dict(grid)[
+        "base_stress_mix_alpha_0.50::longevity_stressed_csm"
+    ]
+    np.testing.assert_array_equal(
+        longevity_half[:9],
+        0.5 * np.array([1.0] * 5 + [-1.0] * 4),
+    )
+    assert longevity_half[10] == 0.5
+    assert np.count_nonzero(longevity_half[9:]) == 1
+
+
 def test_single_model_point_payload_is_recomputed_after_clipping():
     spec = ManagementObjectiveSpec(
         kind="csm_to_mll",
@@ -724,11 +746,29 @@ def test_full_sample_time_zero_chain_never_calls_outer_fold(monkeypatch):
         inventory_quantile_clip=0.0,
         linear_weights=None,
     )
+    fixed_anchor = _fit_time_zero_chain(
+        data=data,
+        actions=actions,
+        immediate_payload=payload,
+        activity_exposure=exposure,
+        objective_spec=spec,
+        ridge=1.0e-6,
+        inventory_nodes=5,
+        inventory_quantile_clip=0.0,
+        linear_weights=_time_zero_policy_class_weights()[0][1],
+        forced_action=0,
+    )
 
     assert active == (0, 1)
     assert payload.shape[-1] == 14
     assert estimate.first_year_action_payloads.shape == (len(ACTION_CAPS), 14)
     assert np.all(np.isfinite(estimate.first_year_action_scores))
+    assert fixed_anchor.chosen_action == 0
+    assert all(
+        policy.action_deployable_mask.tolist()
+        == [True] + [False] * (len(ACTION_CAPS) - 1)
+        for policy in fixed_anchor.chain.policies.values()
+    )
 
 
 def test_optimizer_mll_score_matches_central_vector_arithmetic():

@@ -99,25 +99,34 @@ runner must not be used or described as an APRA capital calculation.
 ### `run_portfolio_valuation_lsmc.py`
 
 This is the read-only portfolio valuation with the combined policyholder LSMC.
-It fits annual Growth `WAIT`/`START_INCOME_NOW` and annual Income
-`CONTINUE`/`FULL_WITHDRAWAL_NOW` decisions. Partial withdrawal is not part of
-the current optimal action set.
+It fits annual Growth `WAIT`/`START_NORMAL_INCOME` and annual Income normal
+Scheduled Income plus `CONTINUE`/`FULL_SURRENDER` decisions. The implementation
+retains the internal transition labels `START_INCOME_NOW` and
+`FULL_WITHDRAWAL_NOW`. Partial withdrawal is not part of the current optimal
+action set. It requires exactly one model point.
 
-The runner has separate training, validation and final evaluation paths/seeds,
-whole-path cross-fitting, ridge/exercise-buffer controls and optional multiple
-training seeds. It writes regression/action diagnostics and records whether the
-candidate or a valid fallback was actually deployed. A paired Dynamic benchmark
-is produced by default unless explicitly disabled.
+The customer objective is the Q-expectation of income, surrender and finite
+terminal-closeout cashflows discounted by today's Australian zero curve. The
+fit contains no mortality or death benefit; configured mortality is restored
+for actuarial and CSM rollout. Whole-path cross-fitting estimates continuation
+values inside one exact Q sample. The V11 rule is deployed directly on that
+same sample: there is no separate validation/evaluation sample, OOS gate, RMSE
+exercise buffer or fixed-policy fallback. Legacy sample flags remain parseable
+but are normalised to `--n-train` and the active training seeds.
 
-Use this runner directly when one fixed cap and detailed LSMC validation are the
-subject. Use the risk orchestrator for a multi-cap comparison with automatic
+The runner writes regression/action diagnostics, same-sample comparisons and
+explicit `oos_validation_used=false` / `oos_evaluation_used=false` manifest
+fields. A paired Dynamic benchmark is produced by default unless disabled.
+
+Use this runner directly when one fixed cap and detailed LSMC diagnostics are
+the subject. Use the risk orchestrator for a multi-cap comparison with automatic
 cache preparation.
 
 ### `run_portfolio_risk_analysis.py`
 
 This is the primary portfolio orchestrator. For each cap and optional stress it:
 
-1. resolves exact evaluation, LSMC training and validation specifications;
+1. resolves the single exact training-and-valuation sample;
 2. invokes the authorised precompute runner for missing exact Q/hedge entries;
 3. runs Dynamic and LSMC valuations serially within each cap/stress pair;
 4. schedules independent pairs with bounded worker/BLAS concurrency;
@@ -125,9 +134,10 @@ This is the primary portfolio orchestrator. For each cap and optional stress it:
 6. writes aggregate CSV, manifest, report and optional plots to a new timestamped
    run directory.
 
-The default is a base-only 4%, 6%, 12% and 15% cap comparison on the four-point
-proxy with one worker. The one-point file is reserved for explicit smoke tests,
-while the full 48-point portfolio remains an explicit production-style choice.
+The default is a base-only 4%, 6%, 12% and 15% cap comparison on the one-point
+proxy with one worker. The runner rejects multi-model-point input for the
+customer-LSMC workflow. Such output is an illustrative method/design
+sensitivity, not evidence about the full 48-point portfolio.
 `--stress-analysis` is required to add the selected shock-and-revalue grid.
 
 The outputs are expected values and model-point diagnostics, not a pathwise
@@ -199,8 +209,8 @@ Files beginning with `_` are implementation helpers, not public commands:
 | Question | Start here |
 |---|---|
 | One fixed cap with statistical Dynamic behaviour | `run_portfolio_valuation.py` |
-| One fixed cap with detailed optimal-policyholder validation | `run_portfolio_valuation_lsmc.py` |
-| Dynamic versus deployed LSMC across caps and optional stresses | `portfolio-risk-analysis` |
+| One fixed cap with direct optimal-policyholder diagnostics | `run_portfolio_valuation_lsmc.py` |
+| Dynamic versus direct LSMC V11 across caps and optional stresses | `portfolio-risk-analysis` |
 | Fixed caps under Dynamic mortality/longevity/lapse capital | `crediting-capital-analysis` |
 | Adaptive cap under statistical Dynamic behaviour | `optimise-crediting-dynamic` |
 | LSMC-follower cap research | `optimise-crediting-lsmc` |
@@ -216,12 +226,15 @@ Files beginning with `_` are implementation helpers, not public commands:
 3. For Q valuation, never bypass exact market-cache validation.
 4. For `mc_conditional`, never omit the congruent hedge cache or replace it with
    an implicit Black–Scholes estimate.
-5. Keep training, fixed selection, validation and final evaluation seeds
-   distinct.
-6. Read the deployed-policy fields, not only the candidate/Bellman fields.
+5. For adaptive cap optimisation, keep training, fixed selection, validation
+   and final evaluation seeds distinct; customer LSMC deliberately uses one
+   sample and records that fact.
+6. Read the deployed-policy and sample-semantics fields, not only a fitted
+   candidate/Bellman field.
 7. Check the CSM and portfolio aggregation reconciliations before interpreting
    a result.
-8. Treat one-point and small-path runs as smoke tests, not evidence.
+8. Treat one-point customer-LSMC runs as method/design sensitivities, not
+   portfolio evidence, regardless of path count.
 9. Promote a figure to `results/document_figures/` only from a completed,
    current-source, provenance-backed run.
 

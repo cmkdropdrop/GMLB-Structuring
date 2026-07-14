@@ -12,8 +12,8 @@ Two alternative approaches are supported:
   functions to Income Election, Income Full Withdrawal and the expected amount
   of an Income-phase Excess Withdrawal.
 - **Optimal LSMC behaviour** fits a policy that maximises the Policyholder's
-  discounted value on simulated market paths, within a restricted annual action
-  set and regression basis.
+  expected contractual present value as viewed at time zero, within a
+  restricted annual action set and regression basis.
 
 The approaches are alternatives. Statistical actions must not be layered on top
 of an LSMC rollout. Neither approach is calibrated to company experience, and a
@@ -39,11 +39,11 @@ contractual forced Income Election, not voluntary behaviour.
 
 | Phase | Admissible voluntary decision | Statistical Dynamic | Optimal LSMC |
 |---|---|---|---|
-| Growth | `WAIT` or `START_INCOME_NOW` at an eligible anniversary | Annual conditional probability | Annual value comparison |
+| Growth | `WAIT` or `START_NORMAL_INCOME` at an eligible anniversary | Annual conditional probability | Annual value comparison |
 | Growth | Partial or Full Withdrawal | Prohibited | Prohibited |
 | Income | Continue with Scheduled Income | Residual state after allowed actions | `CONTINUE` action |
 | Income | Excess / Partial Withdrawal | State-dependent expected amount, currently on the annual action frequency | Not in the current action set |
-| Income | Full Withdrawal | Annual hazard converted to coherent monthly probabilities | Annual `CONTINUE` versus `FULL_WITHDRAWAL_NOW` |
+| Income | Full Withdrawal | Annual hazard converted to coherent monthly probabilities | Annual `CONTINUE` versus `FULL_SURRENDER` |
 
 [![Schematic x-y chart of contract state over policy duration, including voluntary Income Election, Excess Withdrawal, Full Withdrawal and the automatic age backstop](assets/policyholder_contract_lifecycle.svg)](assets/policyholder_contract_lifecycle.svg)
 
@@ -66,7 +66,9 @@ Scheduled Income is then paid monthly in arrears; the election month has no
 Income payment. On the current statistical basis, the expected Excess
 Withdrawal is applied at its configured annual boundary before the monthly
 Full-Withdrawal settlement. Under LSMC, the Income Full-Withdrawal decision is an
-anniversary-only action and Partial / Excess Withdrawal is suppressed.
+anniversary-only action and Partial / Excess Withdrawal is suppressed. The
+Scheduled Income instalment already booked at that boundary is common to
+`CONTINUE` and `FULL_SURRENDER`; the surrender settlement follows it.
 
 This order matters: Election uses the post-fee Account Value and information
 from the completed crediting year, while an Income surrender uses the current
@@ -278,30 +280,48 @@ input schema are in
 
 ## Optimal LSMC behaviour
 
-The optimal model selects the admissible action that maximises the
-Policyholder's risk-neutral discounted benefits within the fitted basis. Fit and
-held-out policy validation are **conditional on survival**: their projections
-set mortality decrements to zero and contain no death benefit. This keeps death
-outside the Policyholder's voluntary stopping problem. The frozen deployed rule
-is subsequently evaluated in the actuarial projector with the configured
-mortality basis restored.
+The customer LSMC is a finite-horizon, Swing-style stopping problem. It selects
+the admissible sequence of actions that maximises the expected contractual
+present value as viewed today. For an admissible policy $\pi$, the objective is
 
-On that conditional-survival basis, the objective includes contractual
-Scheduled Income, surrender and terminal-closeout cashflows; the issue premium
-is sunk at subsequent decision dates. Customer tax, advice and non-contractual
-liquidity preferences are outside the objective.
+$$
+V_0(\pi)
+=\mathbb{E}^{Q}_0\!\left[
+\sum_j P(0,t_j)\,\mathrm{CF}^{\mathrm{customer},\pi}_{t_j}
+\right],
+$$
+
+where $P(0,t_j)$ is the deterministic discount factor from today's Australian
+zero curve. Equivalently, the backward steps use the deterministic forward
+discount ratios implied by that same curve. Realised future short rates and the
+pathwise stochastic discount factors stored with the market scenarios do
+**not** enter this customer objective. Those pathwise factors remain relevant
+to insurer cashflows, hedge valuation and CSM.
+
+The fit is **conditional on survival**: mortality decrements are set to zero
+and death benefits are excluded. Customer cashflows in the objective are only
+Scheduled Income, Full Surrender proceeds and the finite-horizon terminal
+closeout. The issue premium is sunk at subsequent decision dates. Customer tax,
+advice and non-contractual liquidity preferences are outside the objective.
+After the V11 action policy has been fitted, it is rolled out on the same exact
+Q-market sample in the actuarial projector with the configured mortality basis
+restored. Mortality can therefore affect actuarial cashflows and CSM without
+being treated as a voluntary customer action.
 
 ### Current action set
 
 | Phase | Decision time | Immediate action | Continuation action |
 |---|---|---|---|
-| Growth | Eligible policy anniversary | `START_INCOME_NOW` | `WAIT` one year |
-| Income | Policy anniversary | `FULL_WITHDRAWAL_NOW` | `CONTINUE` one year |
+| Growth | Eligible policy anniversary | `START_NORMAL_INCOME` | `WAIT` one year |
+| Income | Policy anniversary | `FULL_SURRENDER` | Receive normal Scheduled Income and `CONTINUE` for the coming period |
 
 Partial or Excess Withdrawal is deliberately excluded from the current combined
 annual LSMC action set. LSMC therefore does not optimise the amount of an Excess
 Withdrawal. A voluntary reduction below locked Scheduled Income is not a
-contract action in either behaviour regime.
+contract action in either behaviour regime. Surrender during Growth is also
+excluded because the contract prohibits Growth-phase withdrawals. In the code,
+the two immediate actions are represented as `START_INCOME_NOW` and
+`FULL_WITHDRAWAL_NOW` respectively.
 
 ### Value comparison and backward induction
 
@@ -310,30 +330,33 @@ $C_k(s)$ the value of continuing. The implementation constructs phase-specific
 action-advantage targets and regresses the advantage on state observable at
 $t_k$. In Income, the target is immediate surrender value minus realised
 continuation value. In Growth, `START_INCOME_NOW` comes from a cross-fitted,
-pooled START-value surface and is paired with the `WAIT` target. Exercise
-requires the fitted advantage to exceed an error-based buffer $b_k$,
-equivalently:
+pooled START-value surface and is paired with the `WAIT` target. The selected
+action is the pure fitted expected-PV argmax:
 
 $$
-A_k(s)>C_k(s)+b_k.
+A_k(s)>C_k(s).
 $$
 
-[![Schematic x-y LSMC value comparison showing act-now value, fitted continuation value, an exercise buffer and the resulting decision regions](assets/policyholder_lsmc_decision_boundary.svg)](assets/policyholder_lsmc_decision_boundary.svg)
-
-*The figure is a one-dimensional slice of a multi-dimensional fitted rule. A
-Growth `WAIT` value includes the later optimally modelled Income actions on the
-same path; Election and surrender are therefore fitted as one ordered policy,
-not as independent options.*
+There is no RMSE-scaled exercise buffer. A Growth `WAIT` value includes the
+later optimally modelled Income actions on the same path; Income Election and
+surrender are therefore fitted as one ordered policy, not as independent
+options.
 
 The ordered fit moves backward in two stages:
 
-1. solve the annual Income `FULL_WITHDRAWAL_NOW` minus `CONTINUE` advantages
+1. solve the annual Income `FULL_SURRENDER` minus `CONTINUE` advantages
    from the final admissible Income date backward;
-2. construct `START_INCOME_NOW` as the exact projector state transition followed
-   by the already-solved Income policy, not as an immediate cash payment;
-3. fit the Growth `START_INCOME_NOW` minus `WAIT` advantages backward; and
-4. apply the exercise buffer and contractual gates before carrying the selected
-   value to the preceding date.
+2. construct `START_NORMAL_INCOME` as the exact projector state transition
+   followed by the already-solved Income policy, not as an immediate cash
+   payment;
+3. fit the Growth `START_NORMAL_INCOME` minus `WAIT` advantages backward; and
+4. apply the contractual gates and carry the selected value to the preceding
+   date.
+
+At the finite projection horizon, the terminal payout is the remaining
+post-fee Account Value booked as `terminal_closeout`. It is included in the
+customer objective and is the final value used by the backward induction. The
+LSMC does not append an extra guarantee-income tail beyond that horizon.
 
 The observable state includes:
 
@@ -351,47 +374,30 @@ remain in the schema but do not vary through death on the conditional-survival
 fit basis. See
 [`optimal_behaviour_lsmc.py`](../code/policy_engine/optimal_behaviour_lsmc.py).
 
-### Cross-fitting, validation and deployment
+### Continuation estimation and direct deployment
 
-Whole economic paths, not individual rows, are assigned to cross-fitting folds.
-A held-out fold never contributes to its own fitted value. Training, policy
-validation and final evaluation use distinct economic-path samples and recorded
-fingerprints. Mortality randomness is intentionally absent from the
-conditional-survival fit and validation; configured mortality is used only in
-the final actuarial evaluation.
+Whole economic paths, not individual rows, are assigned to internal
+cross-fitting folds. A fold's continuation targets are estimated only with the
+other complete paths. This is part of the conditional-expectation estimator;
+it is not an independent out-of-sample policy test. There is no separate
+validation or final-evaluation path sample and no OOS acceptance gate.
 
-After fitting, the frozen candidate is compared on independent validation paths
-with the best predeclared valid fixed-behaviour baseline. Define $D_i$ as the
-candidate Policyholder PV minus the baseline Policyholder PV on paired path $i$,
-$s_D$ as the sample standard deviation of those differences, and $n$ as the
-number of paired validation paths. The core non-inferiority diagnostic is
+The directly fitted V11 policy is the deployed customer policy. It is not
+replaced by a fixed-behaviour rule on the basis of a confidence bound or an
+in-sample comparison. Structural controls remain hard requirements: a
+non-finite, incomplete, materially unsupported or otherwise invalid regression
+fit aborts the run instead of silently deploying a behavioural fallback.
 
-$$
-B_{95}=\overline{D}-1.96\frac{s_D}{\sqrt{n}}.
-$$
+The advantage basis is reduced from full to core features when necessary for a
+stable estimator. For a materially sparse far-tail decision boundary, its final
+documented basis may be an intercept-only, cross-fitted constant advantage.
+That remains the expected-advantage argmax on a coarser information set; it is
+not a `CONTINUE` rule or another behavioural fallback.
 
-The gate passes only if $B_{95}$ is no lower than the negative configured
-margin, and all required fit diagnostics pass.
-
-[![Schematic x-y lower-bound plots showing a passing and failing held-out LSMC validation gate and the resulting deployed policy](assets/policyholder_lsmc_validation_gate.svg)](assets/policyholder_lsmc_validation_gate.svg)
-
-*The panels illustrate the rule, not actual validation results. A passing
-candidate is frozen before final evaluation. A failed or incomplete candidate
-cannot be labelled deployed optimal behaviour; the recorded valid fallback is
-frozen instead.*
-
-Reports must keep these labels separate:
-
-- **candidate policy**: fitted LSMC rule presented to validation;
-- **deployed policy**: candidate only if every required gate passes, otherwise
-  the recorded fallback; and
-- **final evaluation**: untouched paths used to value the already frozen
-  deployed policy.
-
-The out-of-sample value of any frozen admissible policy is a lower bound within
-the restricted action frequency, action set, basis and path support. The
-deployed policy can be a fixed fallback rather than the fitted candidate, and
-neither result proves globally optimal behaviour.
+Customer-LSMC runs use exactly one modelpoint. The mortality-free fit and the
+actual-mortality actuarial/CSM rollout share one exact market-path sample and
+its recorded fingerprint. This same-sample convention is intentional and must
+not be reported as OOS validation.
 
 ## Effect on cashflows and CSM
 
@@ -441,6 +447,12 @@ precompute runner is the sole cache writer. These controls affect the economic
 paths on which behaviour is evaluated; they do not turn Dynamic proxy
 probabilities into calibrated real-world forecasts.
 
+For avoidance of doubt, the cached stochastic discount factors are not the
+discount basis of the customer LSMC. Its expected-PV objective uses the
+deterministic $P(0,t)$ schedule from today's Australian curve. The cached
+pathwise factors continue to be used where required by the insurer valuation
+and CSM calculation.
+
 ## Required diagnostics
 
 Publishable behaviour results should include:
@@ -450,14 +462,15 @@ Publishable behaviour results should include:
 - ordinary, performance-sensitive and total Full-Withdrawal mass;
 - Excess-Withdrawal amount and resulting Income reduction;
 - moneyness and performance-gap distributions at decision times;
-- regression rank, condition number, ridge choice, RMSE and held-out metrics;
-- training, validation and evaluation seed identities and path fingerprints;
-- candidate, validation outcome, deployed policy and fallback reason; and
+- regression rank, condition number, ridge choice, cross-fitted RMSE and final
+  basis level, including any constant-advantage tail basis;
+- the single market-sample seed and path fingerprint, the one modelpoint used,
+  and the deterministic time-zero-curve objective basis;
+- direct deployment of V11 and the structural fit-validity outcome; and
 - comparison with deterministic and no-voluntary-action controls.
 
 Zero observed action frequency is not by itself evidence of stability. It can
-reflect economic dominance, insufficient state support, an invalid fit or a
-deployed fallback.
+reflect economic dominance, insufficient state support or an invalid fit.
 
 ## Current limitations
 
@@ -470,5 +483,7 @@ deployed fallback.
 - The combined annual LSMC action set excludes Partial / Excess Withdrawal.
 - LSMC optimises risk-neutral discounted contractual value within its basis; it
   is not a real-world behavioural prediction.
+- The customer LSMC has a finite terminal closeout and does not value an
+  additional guarantee-income tail beyond the projection horizon.
 - Tax, financial advice, liquidity needs and other customer-specific utility
   effects are omitted.

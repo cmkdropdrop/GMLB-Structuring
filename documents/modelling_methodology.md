@@ -113,16 +113,40 @@ and credited performance. Growth withdrawals remain contractually prohibited.
 
 ### Optimal LSMC behaviour
 
-The combined policyholder LSMC treats the contract as an ordered multiple-action
-problem:
+The combined policyholder LSMC treats the contract as an ordered, Swing-like
+two-regime stopping problem:
 
-- Growth: `WAIT` or `START_INCOME_NOW` at annual dates;
-- Income: `CONTINUE` or `FULL_WITHDRAWAL_NOW` at annual dates.
+- Growth: `WAIT` or `START_NORMAL_INCOME` at annual dates;
+- Income: receive normal Scheduled Income and `CONTINUE`, or
+  `FULL_SURRENDER`, at annual dates.
 
-Partial withdrawal is not in the current optimal action set. Fits use complete
-path folds, held-out validation and an independently evaluated deployed policy.
-The approach gives a fitted lower bound within the specified basis/action set;
-it is not proof of a global optimum.
+The customer objective is formed at time zero,
+
+$$
+V_0=\mathbb E_0^Q\!\left[\sum_t P(0,t)\,CF_t^{\mathrm{customer}}\right],
+$$
+
+where every $P(0,t)$ comes from the current Australian zero curve. Realised
+future short-rate discount paths do not enter this customer objective. Customer
+cashflows are normal income, Full-Surrender proceeds and the post-fee account
+value closeout at the finite projection horizon. There is no additional
+guarantee tail after that horizon.
+
+The fit is conditional on survival: mortality and death benefits are zero in
+the backward induction, so Full Surrender is the only voluntary terminating
+action. The configured mortality basis is restored for the subsequent
+actuarial and CSM rollout. Partial Withdrawal is not in the optimal action set.
+At an Income anniversary the regular monthly amount due under the projector's
+event order is common to both alternatives; the decision is whether to continue
+normal income for the coming annual period or surrender the remaining contract.
+
+Complete-path folds estimate conditional continuation values. They are an
+internal regression device, not a separate OOS acceptance test. The fitted V11
+rule is deployed directly on the same exact Q sample, with no validation gate,
+RMSE exercise buffer or fixed-policy substitution. A missing material decision
+surface fails the run. Customer-LSMC runs use exactly one model point to keep
+this full-horizon recursion tractable. The approach maximises the fitted value
+within its state basis and action grid; it is not proof of a global optimum.
 
 See [policyholder_behaviour.md](policyholder_behaviour.md).
 
@@ -161,8 +185,9 @@ volume analyses and are not silently substituted for contract weights.
 
 ## Risk analysis
 
-The risk workflow compares the dynamic-function and deployed LSMC policies on
-the same Q scenarios for predeclared caps. Optional shocks are recomputed under
+The risk workflow compares the dynamic-function and directly fitted LSMC V11
+policies on one common exact Q sample for each predeclared cap. There is no
+separate customer-LSMC validation or evaluation sample. Optional shocks are recomputed under
 exact stress-specific caches for market stresses. Non-market stresses reuse the
 base market cache. Stress outputs from this workflow are shock-and-revalue research
 sensitivities, not regulatory capital or a pathwise VaR/CTE model.
@@ -193,5 +218,7 @@ Material limitations include the proxy mortality and behaviour bases, aggregate
 state compression in insurer optimisation, absence of policyholder tax and
 reinsurance, independent joint-life mortality, the simplified physical rate
 model and the research nature of capital/IFRS measures. Every published chart
-must identify its sample, cache fingerprints, assumptions and whether a fitted
-policy passed validation.
+must identify its sample, cache fingerprints and assumptions. Customer-LSMC
+outputs must record structural validity and direct V11 deployment; adaptive
+crediting-cap policies must separately record whether their own validation gate
+was passed.

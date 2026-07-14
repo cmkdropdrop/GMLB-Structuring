@@ -227,13 +227,23 @@ exception.
 | Expected Single-Life decrement | Death cashflow uses $wq_m$; surviving exposure becomes $w(1-q_m)$ | Standard aggregated Single-Life valuation | None |
 | Pathwise Joint-Life state | Independent uniforms determine Primary and Spouse death on each path | Standard portfolio Joint-Life runs and state-dependent behaviour rollouts | Required |
 | Expected Joint-Life fallback | Uses a conditional last-survivor decrement without separate life-state account cohorts | Direct deterministic calls when pathwise Joint-Life is not forced | None |
-| Optimal-behaviour LSMC fit | Sets mortality to zero and fits conditional on survival | Training and validation of the action policy | Normalised to zero and economically irrelevant because $q_m=0$ |
+| Optimal-behaviour LSMC fit | Sets mortality to zero and fits conditional on survival | Direct fitting of the V11 action policy | Normalised to zero and economically irrelevant because $q_m=0$ |
 
-The fitted LSMC policy is subsequently rolled out under the actual mortality
-basis for actuarial valuation. Mortality therefore affects the final cashflows
-and CSM, but death events and death benefits are deliberately excluded from the
-current conditional-survival LSMC fit. This prevents mortality from being
-mislabelled as an exercise decision.
+The directly fitted V11 policy is subsequently rolled out under the actual
+mortality basis for actuarial valuation. The fit and actuarial/CSM rollout use
+the same exact Q-market-path sample; there is no separate mortality-free
+validation or OOS evaluation sample. Internal complete-path folds are used only
+to estimate LSMC conditional expectations and are not an external policy test.
+New customer-LSMC runs use exactly one modelpoint.
+
+Mortality therefore affects the final actuarial cashflows and CSM, but death
+events and death benefits are deliberately excluded from the current
+conditional-survival LSMC fit. The customer objective contains Scheduled
+Income, Full Surrender proceeds and the finite-horizon terminal closeout only,
+discounted with deterministic $P(0,t)$ factors from today's Australian zero
+curve. Simulated future short rates do not determine the customer discount
+factors. This separation prevents mortality from being mislabelled as an
+exercise decision while retaining actual mortality in the insurer valuation.
 
 Mortality random numbers are separate from market and behaviour random numbers.
 Portfolio comparisons can reuse the same mortality draws across alternatives
@@ -360,6 +370,12 @@ An explicitly shorter horizon or lower configured maximum age is respected.
 Any remaining account value is then reported as `terminal_closeout`; truncation
 is not reclassified as death. At the full default lifetime horizon, the hard
 terminal-age mortality convention removes surviving covered exposure.
+
+The mortality-free customer-LSMC fit is a distinct finite-horizon case. Its
+remaining post-fee Account Value is paid as `terminal_closeout`, included as the
+last customer cashflow in backward induction, and no additional
+guarantee-income tail is appended beyond the configured horizon. The subsequent
+actuarial/CSM rollout restores the configured mortality basis.
 
 Years with no surviving and in-force exposure must not create behaviour fits,
 Income Elections or cap decisions.

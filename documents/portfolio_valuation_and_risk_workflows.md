@@ -29,7 +29,7 @@ inputs are under `input_data/`:
 | `cost_assumptions/` | Customer charges, expenses, option markup and hedge-reference fee |
 | `dynamic_behaviour/` | Versioned statistical behaviour baselines and coefficients |
 | `equity_allocation/` | Product reference-fund equity weight |
-| `mc_analysis/` | Predeclared evaluation, LSMC training and validation samples |
+| `mc_analysis/` | Predeclared Monte Carlo samples; customer LSMC uses the primary training row as its sole fit/valuation sample |
 | `model_points_policyholders/` | Full and proxy representative-insured portfolios |
 
 The Australian curve is the only live market time series. The baseline does not
@@ -91,7 +91,7 @@ is the recommended end-to-end fixed-cap and risk orchestrator. Before any
 reader child starts, it resolves the portfolio horizon and enumerates every
 required combination of:
 
-- sample role, path count and market seed;
+- sample role, path count and market seed (one `training_and_valuation` role for customer LSMC);
 - base or market-stress variant;
 - model settings and Heston substeps;
 - product allocation and requested caps.
@@ -152,23 +152,31 @@ replaces statistical voluntary behaviour with one fitted ordered policy:
 | Phase | Decision frequency | Current actions |
 |---|---|---|
 | Growth | Annual anniversary | Wait; start Income now |
-| Income | Annual anniversary | Continue; full withdrawal now |
+| Income | Annual anniversary | Receive normal Scheduled Income and continue; full surrender |
 
 Partial withdrawal and under-year voluntary actions are excluded from this
-optimal action set. Fits use whole-path folds. Training, held-out validation and
-final evaluation use distinct predeclared sample namespaces. A rejected
-candidate is replaced in the actual final rollout by its recorded fixed
-validation baseline.
+optimal action set. The customer value is
+$\mathbb E_0^Q[\sum_tP(0,t)CF_t]$, using deterministic discount factors from
+today's Australian zero curve. The fit is conditional on survival and includes
+normal income, Full Surrender and the post-fee account-value closeout at the
+finite horizon; actual mortality is restored only for the actuarial/CSM
+rollout.
+
+Whole-path folds are internal continuation-value estimators. Fit and rollout
+use one common exact Q sample, and the learned V11 rule is deployed directly.
+There is no held-out OOS test, validation gate, RMSE exercise buffer or fixed
+policy substitution. A material missing regression surface fails the run. The
+runner requires exactly one model point for these full-horizon customer-LSMC
+calculations.
 
 In addition to the standard valuation outputs, the runner writes policyholder
-action summaries, regression diagnostics, validation manifests and comparison
-tables. Reports must distinguish the fitted candidate from the policy actually
-deployed.
+action summaries, regression diagnostics, same-sample comparison tables and a
+manifest that records direct V11 deployment and `oos_*_used=false`.
 
 ## Fixed-cap and behaviour-risk analysis
 
-The risk orchestrator runs Dynamic and deployed LSMC policies for every
-requested cap on common final-evaluation market scenarios. The base workflow
+The risk orchestrator runs Dynamic and direct LSMC V11 policies for every
+requested cap on one common market sample. The base workflow
 focuses on cap and lapse/behaviour exposure. The default cap grid is 4%, 6%, 12%
 and 15%; only 6% is the contractual base case.
 
@@ -184,7 +192,7 @@ The workflow reports, among other items:
 - CSM proxy and its Fee Income, Other Income, Claims and Costs legs;
 - guarantee claims, option cost and money-market backing income;
 - election timing, phase exposure and voluntary-action diagnostics;
-- Dynamic-versus-deployed-LSMC differences;
+- Dynamic-versus-direct-LSMC differences and time-zero customer optionality;
 - cap secants and one-factor shock-and-revalue changes;
 - model-point contribution and concentration diagnostics.
 
@@ -227,14 +235,14 @@ Generated outputs belong under `results/runs/<workflow>/`. Workflows that may
 be rerun create UTC timestamp subdirectories and do not overwrite completed
 runs. Large generated results and caches are ignored by Git.
 
-Every evidence-quality run should retain:
+Every documented run should retain:
 
 - source/model version and input hashes;
 - market- and hedge-cache keys/fingerprints;
-- path counts, all seed namespaces and horizon;
+- path counts, active seed namespaces and horizon;
 - cap grid, behaviour mode, action set and stress definition;
-- training/validation/evaluation separation;
-- candidate, validation decision and deployed-policy label;
+- sample semantics and whether any OOS validation/evaluation was used;
+- the fitted and deployed policy label;
 - aggregation basis and CSM reconciliation;
 - runtime status and logs.
 
@@ -243,14 +251,14 @@ promoted from completed runs. A promoted figure should have a nearby documented
 provenance link to its completed run manifest and must not be copied from a
 smoke, interrupted, rejected or source-mismatched run. The curated
 Dynamic-behaviour cap study records a completed current-source optimisation run.
-Completed base-only portfolio-risk run `20260714T002637.233689Z` supplies the
-separate four-model-point cap and behaviour comparison. It uses 1,000 evaluation
-paths, 4,000 LSMC training paths, 1,000 LSMC validation paths and one training
-seed per cap. All four V11 candidates were rejected, so every published LSMC
-series is explicitly the validated deployed fallback. The run did not execute a
-market, longevity, expense or mortality stress grid; its exposure ratios are
-development sensitivities rather than regulatory capital. Curated hashes and
-compact source tables are under `results/document_figures/`.
+Completed base-only portfolio-risk run `20260714T082548.845487Z` is the current
+customer-LSMC diagnostic. It uses one model point (`ALT4-01`), 20,000 paths,
+market seed 12026 and Caps 0.25%, 1%, 6% and 12%. Every cell directly deploys a
+structurally valid V11 rule; no OOS test or fixed fallback is used. Time-zero
+customer optionality relative to the best fixed START-plus-CONTINUE reference
+is AUD 0, 0, 3,684.45 and 66,949.93 respectively. Because the run contains one
+example insured person, it is method evidence and a design sensitivity, not
+portfolio evidence or regulatory capital.
 
 ## Quick workflows
 
@@ -260,17 +268,17 @@ Install from the repository root:
 python -m pip install -e ".[test]"
 ```
 
-Run the recommended four-point base cap/behaviour comparison; exact missing
+Run the customer-LSMC base cap/behaviour comparison; exact missing
 caches are prepared first:
 
 ```powershell
-portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv --crediting-rates 4% 6% 12% 15% --require-market-cache --require-hedge-cache
+portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --crediting-rates 0.25% 1% 6% 12% --n-train 20000 --no-stress-analysis --require-market-cache --require-hedge-cache
 ```
 
 Add the standard market/longevity shock set explicitly:
 
 ```powershell
-portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv --crediting-rates 4% 6% 12% 15% --stress-analysis --stress-scenarios interest_up interest_down longevity --require-market-cache --require-hedge-cache
+portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --crediting-rates 0.25% 1% 6% 12% --stress-analysis --stress-scenarios interest_up interest_down longevity --require-market-cache --require-hedge-cache
 ```
 
 Run the Dynamic-only mortality/longevity/lapse capital comparison without
@@ -312,9 +320,11 @@ Before interpreting or promoting a result, confirm that:
 2. every Q and `mc_conditional` hedge input came from an exact validated cache;
 3. the four CSM legs reconcile to the reported signed objective;
 4. the portfolio aggregation reconciliation is within tolerance;
-5. the Dynamic and LSMC comparison uses common final scenarios;
-6. the reported LSMC label is the policy actually deployed after validation;
-7. the final sample was not used for policy or hyperparameter selection;
+5. the Dynamic and customer-LSMC comparison uses the recorded common sample;
+6. direct V11 deployment, structural validity and the absence of OOS/fallback
+   selection are recorded;
+7. any separate adaptive-cap selection workflow preserves its own declared
+   training/validation/final-sample controls;
 8. Monte Carlo uncertainty and the proxy/non-regulatory boundaries are stated;
 9. any promoted chart carries the run and cache provenance needed to reproduce
    it.
