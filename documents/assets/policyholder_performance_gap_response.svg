@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
+  <title id="title">Performance-sensitive Full-Withdrawal hazard after a crediting deadband</title>
+  <desc id="desc">A schematic x-y chart showing zero excess hazard inside a log return-factor deadband, followed by a rising bounded hazard. A valuable guarantee attenuates the response relative to a weak guarantee.</desc>
+  <rect width="760" height="500" fill="#ffffff"/>
+  <text x="380" y="34" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#1f2937">Performance-sensitive Full Withdrawal</text>
+  <text x="380" y="59" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#4b5563">The excess cause starts only after the customer-visible crediting deadband</text>
+
+  <rect x="105" y="85" width="600" height="315" rx="5" fill="#f8fafc" stroke="#d1d5db"/>
+  <rect x="120" y="105" width="125" height="275" fill="#e5e7eb"/>
+  <line x1="120" y1="380" x2="690" y2="380" stroke="#374151" stroke-width="2"/>
+  <line x1="120" y1="105" x2="120" y2="380" stroke="#374151" stroke-width="2"/>
+  <line x1="245" y1="105" x2="245" y2="380" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <line x1="600" y1="105" x2="600" y2="380" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="182" y="130" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" fill="#4b5563">deadband</text>
+
+  <path d="M120 380 H245 C320 293 420 192 600 132 H690" fill="none" stroke="#d55e00" stroke-width="5"/>
+  <path d="M120 380 H245 C330 338 455 270 600 230 H690" fill="none" stroke="#0072b2" stroke-width="5" stroke-dasharray="11 6"/>
+  <text x="500" y="116" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#d55e00">weak guarantee</text>
+  <text x="490" y="205" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#0072b2">valuable guarantee</text>
+
+  <text x="120" y="405" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#374151">0</text>
+  <text x="245" y="405" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#374151">d</text>
+  <text x="600" y="405" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#374151">d + g max</text>
+  <text x="690" y="405" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#374151">larger gap</text>
+  <text x="405" y="446" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" fill="#1f2937">Log return-factor gap Δ = ln[(1 + Rref) / (1 + Rcredited)]</text>
+  <text x="55" y="245" text-anchor="middle" transform="rotate(-90 55 245)" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#1f2937">Performance excess hazard</text>
+  <text x="380" y="485" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-style="italic" fill="#6b7280">Schematic direction only · uncalibrated proxy function · not to scale · other variables held fixed</text>
+</svg>

@@ -1,18 +1,15 @@
 """Run the generic portfolio valuation with combined LSMC behaviour.
 
-The market, product, mortality, cost, model-point and aggregation mechanics are
-the same as in ``run_portfolio_valuation.py``.  An independently trained,
-phase-aware LSMC lower-bound policy maximises the risk-neutral value of
-Policyholder cashflows over annual ``WAIT | START_INCOME_NOW`` decisions in
-Growth and annual ``CONTINUE | FULL_WITHDRAWAL_NOW`` decisions in Income.
-Partial Withdrawals and under-year voluntary actions are excluded.  Validation
-and final evaluation use separate held-out samples.  A rejected candidate is
-replaced in the actual rollout by the best predeclared fixed validation
-baseline.  The first seed remains the predeclared primary policy for the canonical
-V00/V01/V10/V11 outputs.  The model-point ``income_start_year`` remains a
-deterministic benchmark and is also one member of the predeclared training
-anchor library.  A paired dynamic-behaviour benchmark is produced on the same
-final evaluation scenarios by default.
+The phase-aware LSMC policy is treated as a time-zero Swing-option exercise
+rule.  It maximises the risk-neutral present value of Policyholder cashflows
+over annual ``WAIT | START_INCOME_NOW`` decisions in Growth and annual
+``CONTINUE | FULL_WITHDRAWAL_NOW`` decisions in Income.  The fit and every
+reported rollout use the same exact cached Q-market sample; there is no
+validation sample, non-inferiority gate, fixed-policy substitution or held-out
+out-of-sample test.  A structurally invalid learned V11 policy fails the run.
+The policy fit is mortality-free, while actuarial and CSM rollouts retain the
+configured mortality basis.  Partial Withdrawals and under-year voluntary
+actions are excluded.
 """
 
 from __future__ import annotations
@@ -99,6 +96,7 @@ from policy_engine.optimal_behaviour_validation import (  # noqa: E402
 )
 from policy_engine.product import PolicySpec  # noqa: E402
 from policy_engine.repository_paths import (  # noqa: E402
+    DEFAULT_FAST_POLICYHOLDER_MODEL_POINTS_PATH,
     Q_HEDGE_PRICE_CACHE_ROOT as DEFAULT_HEDGE_CACHE_ROOT,
     Q_MARKET_PATH_CACHE_ROOT as DEFAULT_MARKET_CACHE_ROOT,
     run_output_directory,
@@ -133,20 +131,19 @@ AVAILABLE_LSMC_TRAINING_SEED_SETS = 3
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     supplied_argv = list(sys.argv[1:] if argv is None else argv)
     mc_inputs = load_mc_analysis_inputs()
-    evaluation_input = require_mc_samples(
-        mc_inputs, "evaluation", 1
-    )[0]
     training_inputs = require_mc_samples(
         mc_inputs,
         "lsmc_training",
         AVAILABLE_LSMC_TRAINING_SEED_SETS,
     )
-    validation_input = require_mc_samples(
-        mc_inputs, "lsmc_validation", 1
-    )[0]
+    primary_training_input = training_inputs[0]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-points", type=Path,
-                        default=DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH)
+    parser.add_argument(
+        "--model-points",
+        type=Path,
+        default=DEFAULT_FAST_POLICYHOLDER_MODEL_POINTS_PATH,
+        help="Policyholder model points; defaults to the fast one-point proxy.",
+    )
     parser.add_argument("--cost-assumptions", type=Path,
                         default=DEFAULT_COST_ASSUMPTIONS_PATH)
     parser.add_argument("--cost-assumption-set", default=None)
@@ -158,21 +155,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         default=DEFAULT_AUSTRALIAN_ZERO_CURVE_PATH)
     parser.add_argument("--model-parameters", type=Path,
                         default=DEFAULT_MODEL_PARAMETERS_PATH)
-    parser.add_argument("--n-paths", type=int, default=evaluation_input.n_paths,
-                        help="independent out-of-sample evaluation paths")
-    parser.add_argument("--seed", type=int, default=evaluation_input.market_seed,
-                        help="out-of-sample evaluation seed")
+    parser.add_argument(
+        "--n-paths", type=int, default=primary_training_input.n_paths,
+        help="legacy alias; normalised to --n-train",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=primary_training_input.market_seed,
+        help="legacy alias; normalised to --train-seed",
+    )
     parser.add_argument(
         "--take-up-seed",
         type=int,
-        default=evaluation_input.take_up_seed,
-        help="out-of-sample common-random-number seed for Election",
+        default=primary_training_input.take_up_seed,
+        help="legacy alias; normalised to --train-take-up-seed",
     )
     parser.add_argument(
         "--mortality-seed",
         type=int,
-        default=evaluation_input.mortality_seed,
-        help="out-of-sample pathwise Joint-Life mortality seed",
+        default=primary_training_input.mortality_seed,
+        help="legacy alias; normalised to --train-mortality-seed",
     )
     parser.add_argument("--n-train", type=int, default=training_inputs[0].n_paths,
                         help="independent LSMC training paths")
@@ -233,28 +234,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=(1, 3),
         default=None,
         help=(
-            "number of independently fitted training policies; one is the "
-            "fast production baseline and three retains the robustness study"
+            "legacy compatibility flag; the single-sample method always uses 1"
         ),
     )
     parser.add_argument(
         "--n-validation",
         type=int,
-        default=validation_input.n_paths,
-        help="independent paths used only for frozen-policy validation gates",
+        default=primary_training_input.n_paths,
+        help="legacy alias; normalised to --n-train (no validation sample)",
     )
     parser.add_argument(
-        "--validation-seed", type=int, default=validation_input.market_seed
+        "--validation-seed", type=int,
+        default=primary_training_input.market_seed,
     )
     parser.add_argument(
         "--validation-take-up-seed",
         type=int,
-        default=validation_input.take_up_seed,
+        default=primary_training_input.take_up_seed,
     )
     parser.add_argument(
         "--validation-mortality-seed",
         type=int,
-        default=validation_input.mortality_seed,
+        default=primary_training_input.mortality_seed,
     )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
@@ -331,8 +332,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "skip the V00/V01 counterfactual valuation outputs; retain only "
-            "the validated V11 candidate or fixed deployment fallback and "
-            "the internal Election/Continue validation control"
+            "V11 and the descriptive same-sample Election/Continue control"
         ),
     )
     parser.add_argument(
@@ -344,19 +344,39 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.require_market_cache = True
     args.require_hedge_cache = args.hedge_pricing_method == "mc_conditional"
-    legacy_replication_requested = any(
-        token in supplied_argv
-        for token in (
-            "--train-seed-2",
-            "--train-take-up-seed-2",
-            "--train-mortality-seed-2",
-            "--train-seed-3",
-            "--train-take-up-seed-3",
-            "--train-mortality-seed-3",
-        )
+    legacy_sample_options = (
+        "--n-paths",
+        "--seed",
+        "--take-up-seed",
+        "--mortality-seed",
+        "--n-validation",
+        "--validation-seed",
+        "--validation-take-up-seed",
+        "--validation-mortality-seed",
+        "--training-seed-count",
+        "--train-seed-2",
+        "--train-take-up-seed-2",
+        "--train-mortality-seed-2",
+        "--train-seed-3",
+        "--train-take-up-seed-3",
+        "--train-mortality-seed-3",
     )
-    if args.training_seed_count is None:
-        args.training_seed_count = 3 if legacy_replication_requested else 1
+    args.legacy_sample_options_ignored = tuple(
+        option for option in legacy_sample_options if option in supplied_argv
+    )
+    # One sample defines the time-zero Swing-option problem.  Legacy sample
+    # arguments remain parseable so existing orchestrators fail neither
+    # mysteriously nor halfway through a run, but they cannot create an OOS or
+    # validation sample.
+    args.training_seed_count = 1
+    args.n_paths = args.n_train
+    args.seed = args.train_seed
+    args.take_up_seed = args.train_take_up_seed
+    args.mortality_seed = args.train_mortality_seed
+    args.n_validation = args.n_train
+    args.validation_seed = args.train_seed
+    args.validation_take_up_seed = args.train_take_up_seed
+    args.validation_mortality_seed = args.train_mortality_seed
     if args.lsmc_income_action_set is None:
         args.lsmc_income_action_set = "continue_full"
     if args.lsmc_income_action_set != "continue_full":
@@ -365,7 +385,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "admissible for ordered annual optimal behaviour"
         )
 
-    for name in ("n_paths", "n_train", "n_validation", "heston_substeps"):
+    for name in ("n_train", "heston_substeps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.lsmc_folds < 2:
@@ -376,62 +396,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "mc_conditional supports the standard sold-cap call spread only"
         )
     seed_names = (
-        "seed",
-        "take_up_seed",
-        "mortality_seed",
         "train_seed",
         "train_take_up_seed",
         "train_mortality_seed",
-        "train_seed_2",
-        "train_take_up_seed_2",
-        "train_mortality_seed_2",
-        "train_seed_3",
-        "train_take_up_seed_3",
-        "train_mortality_seed_3",
-        "validation_seed",
-        "validation_take_up_seed",
-        "validation_mortality_seed",
     )
     if any(getattr(args, name) < 0 for name in seed_names):
-        parser.error("all seeds must be non-negative")
-    active_market_training_seeds = (
-        args.train_seed, args.train_seed_2, args.train_seed_3
-    )[:args.training_seed_count]
-    active_take_up_training_seeds = (
-        args.train_take_up_seed,
-        args.train_take_up_seed_2,
-        args.train_take_up_seed_3,
-    )[:args.training_seed_count]
-    active_mortality_training_seeds = (
-        args.train_mortality_seed,
-        args.train_mortality_seed_2,
-        args.train_mortality_seed_3,
-    )[:args.training_seed_count]
-    market_seeds = (
-        *active_market_training_seeds, args.validation_seed, args.seed
-    )
-    take_up_seeds = (
-        *active_take_up_training_seeds,
-        args.validation_take_up_seed,
-        args.take_up_seed,
-    )
-    mortality_seeds = (
-        *active_mortality_training_seeds,
-        args.validation_mortality_seed,
-        args.mortality_seed,
-    )
-    if len(set(market_seeds)) != len(market_seeds):
-        parser.error(
-            "all active training, validation and evaluation market seeds must differ"
-        )
-    if len(set(take_up_seeds)) != len(take_up_seeds):
-        parser.error(
-            "all active training, validation and evaluation take-up seeds must differ"
-        )
-    if len(set(mortality_seeds)) != len(mortality_seeds):
-        parser.error(
-            "all active training, validation and evaluation mortality seeds must differ"
-        )
+        parser.error("training seeds must be non-negative")
     if not math.isfinite(args.lsmc_ridge) or args.lsmc_ridge < 0.0:
         parser.error("--lsmc-ridge must be finite and non-negative")
     if (

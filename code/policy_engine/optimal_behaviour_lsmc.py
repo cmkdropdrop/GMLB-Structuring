@@ -1,8 +1,8 @@
 """Phase-aware LSMC behaviour for the generic lifetime-income product.
 
 This module is intentionally separate from the archived legacy implementation
-in :mod:`policy_engine.lsmc`.  Training cashflows and the final out-of-sample
-rollout both use the current monthly projector, including the configured
+in :mod:`policy_engine.lsmc`.  Training cashflows and the direct same-sample
+actuarial rollout both use the current monthly projector, including the configured
 Reference-Fund target allocation, daily fee subledger, monthly income, MVA,
 expenses, hedge costs and crediting margin.  The Policyholder recursion is
 conditional on survival: its training projections contain no mortality
@@ -19,11 +19,15 @@ payment.  Partial Withdrawals and voluntary actions between Anniversaries are
 outside the combined optimal-behaviour model.  The historical monthly action
 helpers remain import-compatible for isolated legacy research only.
 
-Version five adds conditional-survival Policyholder fitting and validation to
-the version-four ordered annual Income-first/Growth-second recursion and its
-pooled fold-pure START value surface.  The compatibility-only monthly helper
-retains its earlier analytic Partial optimiser but is unreachable from the
-primary combined fit.
+Version six treats the customer problem as a time-zero Swing-style expected-PV
+maximisation.  Customer cashflows are discounted with the deterministic
+discount-factor schedule implied by the current Australian zero curve; future
+simulated short-rate realisations never enter the customer objective.  The
+learned rule is deployed directly, without an OOS acceptance gate or a
+statistical lower-bound fallback.  Internal complete-path cross-fitting remains
+part of the continuation-value estimator.  The compatibility-only monthly
+helper retains its earlier analytic Partial optimiser but is unreachable from
+the primary combined fit.
 All regressions use training-fold standardisation, truncated SVD and a
 spectral Ridge solve in the orthogonal score basis.  In particular, this module
 never forms normal equations: doing so squares the design condition number and
@@ -68,6 +72,9 @@ from .projection import (IncomeActionDecision, IncomeActionDecisionContext,
 Array = NDArray[np.float64]
 POLICYHOLDER_LSMC_MORTALITY_BASIS = (
     "conditional_survival_no_mortality_full_surrender_only_v1"
+)
+POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS = (
+    "time_zero_australian_zero_curve_deterministic_v1"
 )
 
 
@@ -154,14 +161,17 @@ class OptimalBehaviourLSMCSettings:
     n_folds: int = 5
     fold_seed: int = 9137
     exercise_tolerance_aud: float = 1.0e-8
-    exercise_buffer_rmse_multiplier: float = 0.25
+    # A positive RMSE buffer would deliberately reject some positive fitted
+    # advantages.  The productive Swing rule instead applies the fitted
+    # expected-PV argmax, subject only to the numerical exercise tolerance.
+    exercise_buffer_rmse_multiplier: float = 0.0
     minimum_inforce_weight: float = 1.0e-10
     relative_svd_cutoff: float = 1.0e-8
     maximum_condition_number: float = 1.0e8
     minimum_regression_observations: int = 100
     observations_per_coefficient: int = 10
     immaterial_exposure_fraction: float = 1.0e-6
-    fallback_to_no_action_if_training_underperforms: bool = True
+    fallback_to_no_action_if_training_underperforms: bool = False
     # Deprecated compatibility control for the isolated monthly-action API.
     # The combined annual optimal-behaviour fit ignores it and never permits
     # or produces a Partial Withdrawal.
@@ -1577,18 +1587,12 @@ def fit_optimal_surrender_policy(
     if not decision_steps:
         raise ValueError("Projection horizon contains no Income decision anniversary.")
 
-    policyholder_cashflow = sum(
-        projection.cashflows[name]
-        for name in (
-            "income_paid",
-            "death_benefits",
-            "surrender_benefits",
-            "partial_withdrawals",
-            "terminal_closeout",
-        )
+    discounted_cashflow = _discounted_policyholder_cashflows(
+        projection, training_scenarios
     )
-    discount = training_scenarios.discount[:, :n_steps + 1]
-    discounted_cashflow = policyholder_cashflow * discount
+    discount = _time_zero_curve_discount_factors(
+        training_scenarios, n_steps + 1
+    )
     no_action_path_value = np.sum(discounted_cashflow, axis=1)
 
     rng = np.random.default_rng(settings.fold_seed)
@@ -3056,11 +3060,35 @@ class OptimalBehaviourPolicyFit:
 
 _POLICYHOLDER_CASHFLOW_KEYS = (
     "income_paid",
-    "death_benefits",
     "surrender_benefits",
-    "partial_withdrawals",
     "terminal_closeout",
 )
+
+
+def _time_zero_curve_discount_factors(
+    scenarios: ScenarioSet,
+    n_columns: Optional[int] = None,
+) -> Array:
+    """Return deterministic ``P(0,t)`` factors from today's zero curve.
+
+    The customer Swing objective is an expectation formed at time zero.  It
+    therefore uses the current curve at every cashflow date and never the
+    realised integral of a simulated future short-rate path.  The market paths
+    and their cache-fingerprinted stochastic discount factors remain untouched
+    for insurer valuation, CSM and hedge pricing.
+    """
+    if not isinstance(scenarios, ScenarioSet):
+        raise TypeError("scenarios must be a ScenarioSet.")
+    columns = len(scenarios.times) if n_columns is None else int(n_columns)
+    if columns <= 0 or columns > len(scenarios.times):
+        raise ValueError("n_columns must select a non-empty scenario prefix.")
+    factors = np.asarray(
+        scenarios.config.curve.df(scenarios.times[:columns]), dtype=float
+    )
+    if factors.shape != (columns,) or not np.all(np.isfinite(factors)) \
+            or np.any(factors <= 0.0):
+        raise ValueError("Today's zero curve produced invalid discount factors.")
+    return np.broadcast_to(factors, (scenarios.n_paths, columns))
 
 
 def _assert_no_optimal_partial_withdrawals(
@@ -3082,12 +3110,22 @@ def _discounted_policyholder_cashflows(
     scenarios: ScenarioSet,
 ) -> Array:
     n_columns = len(projection.times)
+    for excluded in ("death_benefits", "partial_withdrawals"):
+        values = np.asarray(projection.cashflows[excluded], dtype=float)
+        if np.any(np.abs(values) > 1.0e-10):
+            raise RuntimeError(
+                "Time-zero customer LSMC requires zero "
+                f"{excluded.replace('_', ' ')}."
+            )
     cashflows = sum(
         projection.cashflows[name]
         for name in _POLICYHOLDER_CASHFLOW_KEYS
     )
     return np.asarray(
-        cashflows * scenarios.discount[:, :n_columns], dtype=float
+        cashflows * _time_zero_curve_discount_factors(
+            scenarios, n_columns
+        ),
+        dtype=float,
     )
 
 
@@ -3346,6 +3384,9 @@ def _fit_surrender_phase_from_projection(
     discounted_cashflow = _discounted_policyholder_cashflows(
         projection, scenarios
     )
+    objective_discount = _time_zero_curve_discount_factors(
+        scenarios, discounted_cashflow.shape[1]
+    )
     no_action_path_value = np.sum(discounted_cashflow, axis=1)
     n_steps = discounted_cashflow.shape[1] - 1
     decision_steps = sorted(
@@ -3384,7 +3425,7 @@ def _fit_surrender_phase_from_projection(
     for position in range(len(decision_steps) - 1, -1, -1):
         step = decision_steps[position]
         context = contexts[step]
-        scale_0 = scenarios.discount[:, step] * context.inforce_weight
+        scale_0 = objective_discount[:, step] * context.inforce_weight
         eligible = (
             (context.phase == Phase.INCOME.value)
             & context.full_withdrawal_eligible
@@ -3892,6 +3933,9 @@ def _assigned_start_value_training_panel(
             or path_ids.shape != (scenarios.n_paths,):
         raise ValueError("Assigned starts and complete-path IDs must match paths.")
     discounted = _discounted_policyholder_cashflows(projection, scenarios)
+    objective_discount = _time_zero_curve_discount_factors(
+        scenarios, discounted.shape[1]
+    )
     post_election = projection.phase_cashflows[
         "policyholder_benefits_post_election"
     ]
@@ -3902,7 +3946,7 @@ def _assigned_start_value_training_panel(
         context = election_contexts.get(step)
         if context is None:
             continue
-        scale_0 = scenarios.discount[:, step] * context.inforce_weight
+        scale_0 = objective_discount[:, step] * context.inforce_weight
         eligible = (
             (assigned == step)
             & (context.phase == Phase.GROWTH.value)
@@ -3920,7 +3964,7 @@ def _assigned_start_value_training_panel(
         if index.size == 0:
             continue
         current_post_election_0 = (
-            post_election[index, step] * scenarios.discount[index, step]
+            post_election[index, step] * objective_discount[index, step]
         )
         future_0 = np.sum(discounted[index, step + 1:], axis=1)
         target_panels.append(

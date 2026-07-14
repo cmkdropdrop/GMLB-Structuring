@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title description">
+  <title id="title">Expected survival exposure over twelve monthly mortality steps</title>
+  <desc id="description">An x-y chart shows an illustrative cohort starting with expected survival exposure of 1,000 at month zero. With a twelve percent annual conditional death probability, the coherent monthly probability is 1.0596 percent, expected exposure is about 938.1 at month six and exactly 880 at month twelve.</desc>
+  <defs>
+    <style>
+      .heading { font: 700 28px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .sub { font: 400 15px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .label { font: 600 16px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .tick { font: 400 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .value { font: 700 19px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #0f766e; }
+      .formula { font: 600 18px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="620" rx="18" fill="#fffdf7"/>
+  <text x="55" y="52" class="heading">One annual qₓ, twelve coherent monthly steps</text>
+  <text x="55" y="79" class="sub">Teaching example only — qₓ = 12.00% is chosen for visibility and is not a model output</text>
+
+  <rect x="55" y="103" width="1090" height="70" rx="12" fill="#edf4fb" stroke="#9fb9d1"/>
+  <text x="82" y="133" class="label">Monthly conditional probability</text>
+  <text x="335" y="133" class="formula">qₘ = 1 − (1 − 0.12)¹⁄¹² = 1.0596%</text>
+  <text x="82" y="159" class="sub">Control: (1 − qₘ)¹² = 1 − qₓ = 88%. The monthly probabilities are conditional and therefore multiply; qₓ ÷ 12 is not the model rule.</text>
+
+  <!-- plotting area: x = month 0..12, y = expected exposure 0..1000 -->
+  <line x1="145" y1="500" x2="1120" y2="500" stroke="#6f7c88" stroke-width="2"/>
+  <line x1="145" y1="500" x2="145" y2="205" stroke="#6f7c88" stroke-width="2"/>
+  <text x="635" y="558" text-anchor="middle" class="label">Month in policy year</text>
+  <text x="34" y="352" text-anchor="middle" class="label" transform="rotate(-90 34 352)">Expected survival exposure Sₘ</text>
+
+  <g stroke="#d7dde3" stroke-width="1">
+    <line x1="145" y1="500" x2="1120" y2="500"/>
+    <line x1="145" y1="426.25" x2="1120" y2="426.25"/>
+    <line x1="145" y1="352.5" x2="1120" y2="352.5"/>
+    <line x1="145" y1="278.75" x2="1120" y2="278.75"/>
+    <line x1="145" y1="205" x2="1120" y2="205"/>
+  </g>
+  <g class="tick" text-anchor="end">
+    <text x="132" y="505">0</text>
+    <text x="132" y="431">250</text>
+    <text x="132" y="357">500</text>
+    <text x="132" y="284">750</text>
+    <text x="132" y="210">1,000</text>
+  </g>
+
+  <g stroke="#aab4bf" stroke-width="1">
+    <line x1="145" y1="500" x2="145" y2="507"/>
+    <line x1="226.25" y1="500" x2="226.25" y2="507"/>
+    <line x1="307.5" y1="500" x2="307.5" y2="507"/>
+    <line x1="388.75" y1="500" x2="388.75" y2="507"/>
+    <line x1="470" y1="500" x2="470" y2="507"/>
+    <line x1="551.25" y1="500" x2="551.25" y2="507"/>
+    <line x1="632.5" y1="500" x2="632.5" y2="507"/>
+    <line x1="713.75" y1="500" x2="713.75" y2="507"/>
+    <line x1="795" y1="500" x2="795" y2="507"/>
+    <line x1="876.25" y1="500" x2="876.25" y2="507"/>
+    <line x1="957.5" y1="500" x2="957.5" y2="507"/>
+    <line x1="1038.75" y1="500" x2="1038.75" y2="507"/>
+    <line x1="1120" y1="500" x2="1120" y2="507"/>
+  </g>
+  <g class="tick" text-anchor="middle">
+    <text x="145" y="526">0</text><text x="226.25" y="526">1</text><text x="307.5" y="526">2</text>
+    <text x="388.75" y="526">3</text><text x="470" y="526">4</text><text x="551.25" y="526">5</text>
+    <text x="632.5" y="526">6</text><text x="713.75" y="526">7</text><text x="795" y="526">8</text>
+    <text x="876.25" y="526">9</text><text x="957.5" y="526">10</text><text x="1038.75" y="526">11</text><text x="1120" y="526">12</text>
+  </g>
+
+  <!-- survivor mass and cumulative death mass; the steps are the monthly grid -->
+  <path d="M145 205 H226.25 V208.1 H307.5 V211.2 H388.75 V214.3 H470 V217.3 H551.25 V220.3 H632.5 V223.3 H713.75 V226.2 H795 V229.1 H876.25 V232 H957.5 V234.8 H1038.75 V237.6 H1120 V240.4 L1120 500 L145 500 Z" fill="#0f766e" opacity="0.13"/>
+  <path d="M145 205 H226.25 V208.1 H307.5 V211.2 H388.75 V214.3 H470 V217.3 H551.25 V220.3 H632.5 V223.3 H713.75 V226.2 H795 V229.1 H876.25 V232 H957.5 V234.8 H1038.75 V237.6 H1120 V240.4 L1120 205 Z" fill="#d78a22" opacity="0.25"/>
+  <path d="M145 205 H226.25 V208.1 H307.5 V211.2 H388.75 V214.3 H470 V217.3 H551.25 V220.3 H632.5 V223.3 H713.75 V226.2 H795 V229.1 H876.25 V232 H957.5 V234.8 H1038.75 V237.6 H1120 V240.4" fill="none" stroke="#0f766e" stroke-width="4" stroke-linejoin="round"/>
+  <g fill="#173b63">
+    <circle cx="145" cy="205" r="6"/><circle cx="226.25" cy="208.1" r="4"/>
+    <circle cx="307.5" cy="211.2" r="4"/><circle cx="388.75" cy="214.3" r="4"/>
+    <circle cx="470" cy="217.3" r="4"/><circle cx="551.25" cy="220.3" r="4"/>
+    <circle cx="632.5" cy="223.3" r="6"/><circle cx="713.75" cy="226.2" r="4"/>
+    <circle cx="795" cy="229.1" r="4"/><circle cx="876.25" cy="232" r="4"/>
+    <circle cx="957.5" cy="234.8" r="4"/><circle cx="1038.75" cy="237.6" r="4"/>
+    <circle cx="1120" cy="240.4" r="6"/>
+  </g>
+
+  <text x="163" y="198" class="value">1,000</text>
+  <text x="645" y="217" class="value">≈ 938.1</text>
+  <text x="1064" y="266" class="value">880</text>
+  <text x="968" y="191" class="label" style="fill:#9a5a13">cumulative death mass = 120</text>
+  <text x="825" y="465" class="label" style="fill:#0f766e">surviving exposure</text>
+
+  <rect x="265" y="577" width="670" height="30" rx="8" fill="#e8f6f3"/>
+  <text x="600" y="598" text-anchor="middle" class="formula">S₁₂ = 1,000 × (1 − qₘ)¹² = 1,000 × 88% = 880</text>
+</svg>

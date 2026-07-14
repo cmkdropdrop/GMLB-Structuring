@@ -51,7 +51,7 @@ from policy_engine.repository_paths import (  # noqa: E402
     Q_MARKET_PATH_CACHE_ROOT as DEFAULT_MARKET_CACHE_ROOT,
 )
 
-DEFAULT_CAP_GRID = (0.0025, *tuple(np.arange(0.01, 0.201, 0.01)))
+DEFAULT_CAP_GRID = (0.0025, *tuple(np.arange(1, 21, dtype=float) / 100.0))
 MARKET_STRESS_CHOICES = (
     "base", "interest_up", "interest_down", "equity_level_down",
     "equity_volatility_up",

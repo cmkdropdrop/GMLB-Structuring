@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title description">
+  <title id="title">Schematic annual death probability by attained age</title>
+  <desc id="description">An x-y chart shows illustrative male and female Gompertz-Makeham annual conditional death probabilities. Both rise slowly at younger ages and steeply at advanced ages. A hard terminal sentinel forces the annual probability to one at age 115 and is not interpolated into earlier ages.</desc>
+  <defs>
+    <style>
+      .heading { font: 700 28px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .sub { font: 400 15px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .label { font: 600 16px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .tick { font: 400 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .formula { font: 600 17px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="620" rx="18" fill="#fffdf7"/>
+  <text x="55" y="52" class="heading">Illustrative Gompertz–Makeham shape by attained age</text>
+  <text x="55" y="79" class="sub">Schematic shape only — the repository basis is a research proxy, not a calibrated Australian insured-life or annuitant table</text>
+
+  <line x1="125" y1="515" x2="1110" y2="515" stroke="#6f7c88" stroke-width="2"/>
+  <line x1="125" y1="515" x2="125" y2="125" stroke="#6f7c88" stroke-width="2"/>
+  <text x="615" y="565" text-anchor="middle" class="label">Attained age x</text>
+  <text x="35" y="325" text-anchor="middle" class="label" transform="rotate(-90 35 325)">Annual conditional death probability qₓ</text>
+
+  <g stroke="#d7dde3" stroke-width="1">
+    <line x1="125" y1="515" x2="1110" y2="515"/>
+    <line x1="125" y1="417.5" x2="1110" y2="417.5"/>
+    <line x1="125" y1="320" x2="1110" y2="320"/>
+    <line x1="125" y1="222.5" x2="1110" y2="222.5"/>
+    <line x1="125" y1="125" x2="1110" y2="125"/>
+  </g>
+  <g class="tick" text-anchor="end">
+    <text x="112" y="520">0</text><text x="112" y="422">0.25</text><text x="112" y="325">0.50</text>
+    <text x="112" y="227">0.75</text><text x="112" y="130">1.00</text>
+  </g>
+
+  <g class="tick" text-anchor="middle">
+    <text x="125" y="540">0</text><text x="682" y="540">65</text><text x="896" y="540">90</text>
+    <text x="1067" y="540">110</text><text x="1110" y="540">115</text>
+  </g>
+  <g stroke="#aab4bf" stroke-width="1.5">
+    <line x1="125" y1="515" x2="125" y2="522"/><line x1="682" y1="515" x2="682" y2="522"/>
+    <line x1="896" y1="515" x2="896" y2="522"/><line x1="1067" y1="515" x2="1067" y2="522"/>
+    <line x1="1110" y1="515" x2="1110" y2="522"/>
+  </g>
+
+  <path d="M125 514 C570 513 720 505 835 480 C925 460 995 392 1050 286 C1075 260 1093 240 1101 230" fill="none" stroke="#173b63" stroke-width="5"/>
+  <path d="M125 514 C575 514 725 509 842 492 C930 478 1000 429 1056 342 C1080 320 1097 285 1101 270" fill="none" stroke="#0f766e" stroke-width="5" stroke-dasharray="13 7"/>
+
+  <!-- hard terminal override -->
+  <path d="M1101 230 H1110 V125" fill="none" stroke="#173b63" stroke-width="5"/>
+  <path d="M1101 270 H1110 V125" fill="none" stroke="#0f766e" stroke-width="5" stroke-dasharray="13 7"/>
+  <line x1="1110" y1="105" x2="1110" y2="520" stroke="#6b7280" stroke-width="2" stroke-dasharray="6 6"/>
+
+  <rect x="742" y="345" width="165" height="34" rx="8" fill="#edf4fb"/>
+  <line x1="760" y1="362" x2="800" y2="362" stroke="#173b63" stroke-width="5"/>
+  <text x="812" y="368" class="label">Male proxy</text>
+  <rect x="742" y="397" width="175" height="34" rx="8" fill="#e8f6f3"/>
+  <line x1="760" y1="414" x2="800" y2="414" stroke="#0f766e" stroke-width="5" stroke-dasharray="11 6"/>
+  <text x="812" y="420" class="label">Female proxy</text>
+
+  <rect x="155" y="112" width="605" height="72" rx="12" fill="#edf4fb" stroke="#9fb9d1"/>
+  <text x="180" y="140" class="formula">μ(u) = A + Bcᵘ</text>
+  <text x="360" y="140" class="formula">qₓ = 1 − exp(−∫ₓˣ⁺¹ μ(u)du)</text>
+  <text x="180" y="166" class="sub">The chart communicates the shape; exact values come from the parameters and transformations documented below.</text>
+
+  <text x="1095" y="97" text-anchor="end" class="label">q₁₁₅ = 1 sentinel</text>
+  <text x="1095" y="590" text-anchor="end" class="sub">The sentinel is not blended into ages below 115.</text>
+</svg>

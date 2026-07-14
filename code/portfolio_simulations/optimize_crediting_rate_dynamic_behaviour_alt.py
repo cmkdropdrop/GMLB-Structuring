@@ -200,7 +200,10 @@ Array = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 STEPS_PER_YEAR = 12
 
-ACTION_CAPS = np.concatenate((np.array([0.0025]), np.arange(0.01, 0.201, 0.01)))
+ACTION_CAPS = np.concatenate((
+    np.array([0.0025]),
+    np.arange(1, 21, dtype=float) / 100.0,
+))
 MLL_STRESS_IDS = ("mortality", "longevity", "lapse_up", "lapse_down")
 MANAGEMENT_OBJECTIVES = ("csm_to_mll", "csm")
 OTHER_INSURER_FUNDED_BENEFIT_KEYS: tuple[str, ...] = ()
@@ -3422,7 +3425,7 @@ def _mll_metrics_from_payload(
     applied only after those conditional value vectors have been formed.  A
     pathwise or annual mean of ratios is never used.
     """
-    values = np.asarray(payload, dtype=float)
+    values = _reconcile_single_model_point_payload(payload, objective_spec)
     if objective_spec.kind != "csm_to_mll":
         raise ValueError("MLL metrics require the csm_to_mll objective.")
     if values.shape[-1] != objective_spec.payload_width:
@@ -3446,6 +3449,30 @@ def _mll_metrics_from_payload(
         ratio = np.asarray(raw_ratio, dtype=float)
         ratio = np.where(np.isfinite(ratio), ratio, -1.0e100)
     return base_csm, capital, ratio
+
+
+def _reconcile_single_model_point_payload(
+    payload: Array,
+    objective_spec: ManagementObjectiveSpec,
+) -> Array:
+    """Derive the sole model-point CSM from the nine base components.
+
+    This time-zero flexibility study intentionally permits exactly one
+    modelpoint.  Its signed base CSM is therefore an identity, not an
+    independently clipped regression output.  Reconstructing it prevents the
+    mass-lapse term from drifting away from total base CSM.
+    """
+    values = np.asarray(payload, dtype=float)
+    if values.shape[-1] != objective_spec.payload_width:
+        raise ValueError("Management value-vector payload has an invalid width.")
+    if objective_spec.kind != "csm_to_mll" \
+            or objective_spec.model_point_count != 1:
+        return values
+    reconciled = np.array(values, dtype=float, copy=True)
+    reconciled[..., -1] = _csm_from_component_values(
+        reconciled[..., :len(INSURER_COMPONENT_NAMES)]
+    )
+    return reconciled
 
 
 def _objective_from_payload(
@@ -3500,7 +3527,11 @@ def _management_regression_coefficients(
     base_beta = _csm_from_component_values(
         beta[..., :len(INSURER_COMPONENT_NAMES)]
     )
-    return np.concatenate((base_beta[..., None], beta), axis=-1)
+    payload_beta = np.array(beta, copy=True)
+    if objective_spec.kind == "csm_to_mll" \
+            and objective_spec.model_point_count == 1:
+        payload_beta[..., -1] = base_beta
+    return np.concatenate((base_beta[..., None], payload_beta), axis=-1)
 
 
 def _component_prediction_bounds(targets: Array) -> tuple[Array, Array]:
@@ -3564,6 +3595,9 @@ def _management_prediction_bounds(
     padding = 1.0e-10 * np.maximum(1.0, np.max(np.abs(extra), axis=0))
     extra_lower = np.min(extra, axis=0) - 5.0 * spread - padding
     extra_upper = np.max(extra, axis=0) + 5.0 * spread + padding
+    if objective_spec.model_point_count == 1:
+        extra_lower[-1] = base_lower[0]
+        extra_upper[-1] = base_upper[0]
     objective_values = _objective_from_payload(targets, objective_spec)
     finite_objective = objective_values[objective_values > -1.0e99]
     if finite_objective.size:
@@ -3601,6 +3635,11 @@ def _clip_management_predictions(
     bounded[..., 1:] = np.minimum(
         np.maximum(bounded[..., 1:], lower_values[1:]), upper_values[1:]
     )
+    if objective_spec.kind == "csm_to_mll" \
+            and objective_spec.model_point_count == 1:
+        bounded[..., 1:] = _reconcile_single_model_point_payload(
+            bounded[..., 1:], objective_spec
+        )
     clipped = np.abs(bounded[..., 1:] - before) > 0.0
     if objective_spec.kind == "csm_to_mll":
         # A large modelpoint payload must not dilute clipping of one economic
@@ -4151,11 +4190,18 @@ def _policy_action_values(
             raise ValueError("Fitted value bounds are shape-inconsistent.")
         values = np.minimum(np.maximum(values, lower[None, :, :]),
                             upper[None, :, :])
+        if policy.objective_spec.kind == "csm_to_mll":
+            values[:, :, 1:] = _reconcile_single_model_point_payload(
+                values[:, :, 1:], policy.objective_spec
+            )
         if policy.objective_spec.kind == "csm_to_mll" or values.shape[2] == 10:
             values[:, :, 0] = _objective_from_payload(
                 values[:, :, 1:], policy.objective_spec
             )
     elif policy.objective_spec.kind == "csm_to_mll":
+        values[:, :, 1:] = _reconcile_single_model_point_payload(
+            values[:, :, 1:], policy.objective_spec
+        )
         values[:, :, 0] = _objective_from_payload(
             values[:, :, 1:], policy.objective_spec
         )
@@ -7086,6 +7132,34 @@ class _DirectQChain:
     action_mask_reasons: Mapping[int, tuple[tuple[str, ...], ...]]
 
 
+def _validated_activity_exposure(
+    values: Array,
+    *,
+    expected_shape: tuple[int, int],
+    label: str,
+) -> Array:
+    """Return finite non-negative exposure, clipping only round-off noise."""
+    exposure = np.asarray(values, dtype=float)
+    if exposure.shape != expected_shape:
+        raise ValueError(
+            f"{label} activity exposure has shape {exposure.shape}; "
+            f"expected {expected_shape}."
+        )
+    if not np.all(np.isfinite(exposure)):
+        raise ValueError(f"{label} activity exposure is non-finite.")
+    scale = max(1.0, float(np.max(np.abs(exposure))))
+    tolerance = 1.0e-12 * scale
+    minimum = float(np.min(exposure))
+    if minimum < -tolerance:
+        raise ValueError(
+            f"{label} activity exposure is materially negative: "
+            f"minimum={minimum:.12g}, tolerance={tolerance:.12g}."
+        )
+    if minimum < 0.0:
+        exposure = np.maximum(exposure, 0.0)
+    return exposure
+
+
 def _fit_direct_q_chain(
     *,
     data: PortfolioPathData,
@@ -7129,13 +7203,15 @@ def _fit_direct_q_chain(
     feature_names = tuple(data.state_feature_names)
     inventory_index = _inventory_feature_index(feature_names)
     account_value = raw_states[:, :, inventory_index]
-    exposure = (
+    exposure = _validated_activity_exposure(
+        (
         np.asarray(data.inforce_exposure, dtype=float)
         if activity_exposure is None
         else np.asarray(activity_exposure, dtype=float)
+        ),
+        expected_shape=(n_paths, n_years),
+        label="Direct-Q",
     )
-    if exposure.shape != (n_paths, n_years) or np.any(exposure < 0.0):
-        raise ValueError("Direct-Q activity exposure is invalid.")
     if immediate_components is None:
         immediate = _portfolio_continue_component_tensor(data)[:, :, 1:]
     else:
@@ -7620,7 +7696,11 @@ def _backward_induction(
             or advantage_screen_multiplier < 0.0:
         raise ValueError("advantage_screen_multiplier must be finite and non-negative.")
     raw_states = np.asarray(data.raw_states, dtype=float)
-    exposure = np.asarray(data.inforce_exposure, dtype=float)
+    exposure = _validated_activity_exposure(
+        np.asarray(data.inforce_exposure, dtype=float),
+        expected_shape=(n_paths, n_years),
+        label="Base",
+    )
     if objective_spec.kind == "csm_to_mll":
         if stressed_data is None or set(stressed_data) != set(MLL_STRESS_IDS):
             raise ValueError(
@@ -7632,11 +7712,11 @@ def _backward_induction(
                 raise ValueError(
                     f"Stress projection {stress_id!r} lacks in-force exposure."
                 )
-            stressed_values = np.asarray(stressed_exposure, dtype=float)
-            if stressed_values.shape != exposure.shape:
-                raise ValueError(
-                    f"Stress projection {stress_id!r} exposure has invalid shape."
-                )
+            stressed_values = _validated_activity_exposure(
+                np.asarray(stressed_exposure, dtype=float),
+                expected_shape=(n_paths, n_years),
+                label=f"Stress projection {stress_id!r}",
+            )
             exposure = np.maximum(exposure, stressed_values)
     feature_names = tuple(data.state_feature_names)
     _inventory_feature_index(feature_names)
@@ -8196,6 +8276,53 @@ class FrozenCapCSMMLLEvaluation:
     model_point_ids: tuple[str, ...]
 
 
+def _csm_mll_evaluation_from_paths(
+    paths: PolicyCSMPathArrays,
+    *,
+    model_point_ids: Sequence[str],
+    objective_spec: ManagementObjectiveSpec,
+) -> FrozenCapCSMMLLEvaluation:
+    """Rebuild one policy-level CSM/MLL result from aligned path ledgers."""
+    if objective_spec.kind != "csm_to_mll":
+        raise ValueError("Pathwise MLL reconstruction requires csm_to_mll.")
+    identifiers = tuple(str(value) for value in model_point_ids)
+    if len(identifiers) != paths.model_point_count \
+            or paths.model_point_count != objective_spec.model_point_count:
+        raise ValueError("Pathwise MLL model-point metadata is inconsistent.")
+    result = calculate_policy_level_csm_mll(
+        base_csm=float(np.mean(paths.base_csm_paths)),
+        mortality_stressed_csm=float(np.mean(
+            paths.mortality_stressed_csm_paths
+        )),
+        longevity_stressed_csm=float(np.mean(
+            paths.longevity_stressed_csm_paths
+        )),
+        lapse_up_stressed_csm=float(np.mean(
+            paths.lapse_up_stressed_csm_paths
+        )),
+        lapse_down_stressed_csm=float(np.mean(
+            paths.lapse_down_stressed_csm_paths
+        )),
+        model_point_csms=np.mean(
+            np.asarray(paths.model_point_base_csm_paths, dtype=float), axis=0
+        ),
+        model_point_weights=np.ones(objective_spec.model_point_count),
+        capital_materiality=objective_spec.capital_materiality,
+        stresses=_capital_stresses_for_mass_lapse(
+            objective_spec.mass_lapse_fraction
+        ),
+    )
+    if result.csm_to_mll_ratio is None:
+        raise RuntimeError(
+            "CSM/MLL is undefined because MLL capital is below materiality."
+        )
+    return FrozenCapCSMMLLEvaluation(
+        paths=paths,
+        result=result,
+        model_point_ids=identifiers,
+    )
+
+
 def _evaluate_frozen_cap_csm_mll(
     *,
     scenarios: ScenarioSet,
@@ -8270,39 +8397,10 @@ def _evaluate_frozen_cap_csm_mll(
         lapse_down_stressed_csm_paths=stress_paths["lapse_down"],
         model_point_base_csm_paths=np.sum(model_point_values, axis=2).T,
     )
-    stresses = _capital_stresses_for_mass_lapse(
-        objective_spec.mass_lapse_fraction
-    )
-    result = calculate_policy_level_csm_mll(
-        base_csm=float(np.mean(path_values.base_csm_paths)),
-        mortality_stressed_csm=float(np.mean(
-            path_values.mortality_stressed_csm_paths
-        )),
-        longevity_stressed_csm=float(np.mean(
-            path_values.longevity_stressed_csm_paths
-        )),
-        lapse_up_stressed_csm=float(np.mean(
-            path_values.lapse_up_stressed_csm_paths
-        )),
-        lapse_down_stressed_csm=float(np.mean(
-            path_values.lapse_down_stressed_csm_paths
-        )),
-        model_point_csms=np.mean(
-            np.asarray(path_values.model_point_base_csm_paths, dtype=float),
-            axis=0,
-        ),
-        model_point_weights=np.ones(objective_spec.model_point_count),
-        capital_materiality=objective_spec.capital_materiality,
-        stresses=stresses,
-    )
-    if result.csm_to_mll_ratio is None:
-        raise RuntimeError(
-            "CSM/MLL is undefined because MLL capital is below materiality."
-        )
-    return FrozenCapCSMMLLEvaluation(
-        paths=path_values,
-        result=result,
-        model_point_ids=tuple(base_projected.model_point_ids),
+    return _csm_mll_evaluation_from_paths(
+        path_values,
+        model_point_ids=base_projected.model_point_ids,
+        objective_spec=objective_spec,
     )
 
 
@@ -8616,7 +8714,7 @@ def _benchmark_cache_path(
         ).encode("ascii")).hexdigest()
 
     key = hashlib.sha256((
-        f"{projection_fingerprint}"
+        f"benchmark_cache_schema=csm_mll_v2|{projection_fingerprint}"
         f"|sel={sample_fingerprint(selection_scenarios, selection_projection_config)}"
         f"|evl={sample_fingerprint(evaluation_scenarios, evaluation_projection_config)}"
         f"|cap={cap!r}|n_years={int(n_years)}"
@@ -8629,6 +8727,7 @@ def _store_benchmark_cache(
     selection_csm: Array,
     evaluation_csm: Array,
     evaluation_components: Mapping[str, Array],
+    selection_mll: FrozenCapCSMMLLEvaluation | None = None,
 ) -> None:
     arrays = {
         "selection_csm": np.asarray(selection_csm, dtype=float),
@@ -8636,6 +8735,35 @@ def _store_benchmark_cache(
     }
     for name, values in evaluation_components.items():
         arrays[f"component__{name}"] = np.asarray(values, dtype=float)
+    if selection_mll is not None:
+        arrays.update({
+            "selection_mll__base": np.asarray(
+                selection_mll.paths.base_csm_paths, dtype=float
+            ),
+            "selection_mll__mortality": np.asarray(
+                selection_mll.paths.mortality_stressed_csm_paths,
+                dtype=float,
+            ),
+            "selection_mll__longevity": np.asarray(
+                selection_mll.paths.longevity_stressed_csm_paths,
+                dtype=float,
+            ),
+            "selection_mll__lapse_up": np.asarray(
+                selection_mll.paths.lapse_up_stressed_csm_paths,
+                dtype=float,
+            ),
+            "selection_mll__lapse_down": np.asarray(
+                selection_mll.paths.lapse_down_stressed_csm_paths,
+                dtype=float,
+            ),
+            "selection_mll__model_points": np.asarray(
+                selection_mll.paths.model_point_base_csm_paths,
+                dtype=float,
+            ),
+            "selection_mll__model_point_ids": np.asarray(
+                selection_mll.model_point_ids, dtype=str
+            ),
+        })
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with open(temporary, "wb") as handle:
@@ -8645,7 +8773,13 @@ def _store_benchmark_cache(
 
 def _load_benchmark_cache(
     path: Path,
-) -> tuple[Array, Array, dict[str, Array]]:
+) -> tuple[
+    Array,
+    Array,
+    dict[str, Array],
+    PolicyCSMPathArrays | None,
+    tuple[str, ...],
+]:
     with np.load(path) as data:
         selection_csm = np.asarray(data["selection_csm"], dtype=float)
         evaluation_csm = np.asarray(data["evaluation_csm"], dtype=float)
@@ -8654,7 +8788,50 @@ def _load_benchmark_cache(
             for name in data.files
             if name.startswith("component__")
         }
-    return selection_csm, evaluation_csm, components
+        mll_keys = {
+            "base": "selection_mll__base",
+            "mortality": "selection_mll__mortality",
+            "longevity": "selection_mll__longevity",
+            "lapse_up": "selection_mll__lapse_up",
+            "lapse_down": "selection_mll__lapse_down",
+            "model_points": "selection_mll__model_points",
+            "model_point_ids": "selection_mll__model_point_ids",
+        }
+        present = {name for name, key in mll_keys.items() if key in data.files}
+        if present and present != set(mll_keys):
+            raise ValueError("Cached fixed-cap MLL ledger is incomplete.")
+        if present:
+            mll_paths = PolicyCSMPathArrays(
+                base_csm_paths=np.asarray(data[mll_keys["base"]], dtype=float),
+                mortality_stressed_csm_paths=np.asarray(
+                    data[mll_keys["mortality"]], dtype=float
+                ),
+                longevity_stressed_csm_paths=np.asarray(
+                    data[mll_keys["longevity"]], dtype=float
+                ),
+                lapse_up_stressed_csm_paths=np.asarray(
+                    data[mll_keys["lapse_up"]], dtype=float
+                ),
+                lapse_down_stressed_csm_paths=np.asarray(
+                    data[mll_keys["lapse_down"]], dtype=float
+                ),
+                model_point_base_csm_paths=np.asarray(
+                    data[mll_keys["model_points"]], dtype=float
+                ),
+            )
+            model_point_ids = tuple(
+                str(value) for value in data[mll_keys["model_point_ids"]]
+            )
+        else:
+            mll_paths = None
+            model_point_ids = ()
+    return (
+        selection_csm,
+        evaluation_csm,
+        components,
+        mll_paths,
+        model_point_ids,
+    )
 
 
 def _validate_benchmark_cache_arrays(
@@ -8664,6 +8841,8 @@ def _validate_benchmark_cache_arrays(
     components: Mapping[str, Array],
     selection_path_count: int,
     evaluation_path_count: int,
+    selection_mll_paths: PolicyCSMPathArrays | None = None,
+    model_point_ids: Sequence[str] = (),
 ) -> None:
     """Reject incomplete, stale or shape-inconsistent benchmark payloads."""
     if selection_csm.shape != (selection_path_count,):
@@ -8690,6 +8869,19 @@ def _validate_benchmark_cache_arrays(
         raise ValueError("Cached fixed-cap component paths have the wrong shape.")
     if not all(np.all(np.isfinite(array)) for array in arrays):
         raise ValueError("Cached fixed-cap benchmark values are non-finite.")
+    if selection_mll_paths is not None:
+        if selection_mll_paths.n_paths != selection_path_count:
+            raise ValueError("Cached fixed-cap MLL paths have the wrong shape.")
+        if len(tuple(model_point_ids)) != selection_mll_paths.model_point_count:
+            raise ValueError(
+                "Cached fixed-cap MLL model-point metadata is inconsistent."
+            )
+        if not np.array_equal(
+            np.asarray(selection_mll_paths.base_csm_paths), selection_csm
+        ):
+            raise ValueError(
+                "Cached fixed-cap base CSM and MLL ledger do not reconcile."
+            )
 
 
 def _select_best_fixed_label(
@@ -8748,14 +8940,6 @@ def _evaluate_fixed_benchmarks(
     use_csm_to_mll = objective_spec.kind == "csm_to_mll"
     if use_csm_to_mll and base_esg is None:
         raise ValueError("CSM/MLL fixed-cap selection requires the base ESG inputs.")
-    if use_csm_to_mll and cache_dir is not None:
-        # The legacy derived benchmark cache contains only base CSM paths.  It
-        # cannot be used for a capital-aware selection without hiding missing
-        # stress and modelpoint information.
-        LOGGER.info(
-            "Legacy fixed-cap projection cache disabled for CSM/MLL selection."
-        )
-        cache_dir = None
     if selection_scenarios.n_paths <= 0 or evaluation_scenarios.n_paths <= 0:
         raise ValueError("Fixed-cap sample roles must both contain paths.")
     for role, scenarios, config in (
@@ -8803,6 +8987,8 @@ def _evaluate_fixed_benchmarks(
                     selection_path_values[label],
                     evaluation_path_values[label],
                     evaluation_component_paths[label],
+                    cached_mll_paths,
+                    cached_model_point_ids,
                 ) = _load_benchmark_cache(cache_path)
                 _validate_benchmark_cache_arrays(
                     selection_csm=selection_path_values[label],
@@ -8810,7 +8996,21 @@ def _evaluate_fixed_benchmarks(
                     components=evaluation_component_paths[label],
                     selection_path_count=selection_scenarios.n_paths,
                     evaluation_path_count=evaluation_scenarios.n_paths,
+                    selection_mll_paths=cached_mll_paths,
+                    model_point_ids=cached_model_point_ids,
                 )
+                if use_csm_to_mll:
+                    if cached_mll_paths is None:
+                        raise ValueError(
+                            "Cached fixed-cap benchmark lacks its MLL ledger."
+                        )
+                    selection_mll_evaluations[label] = (
+                        _csm_mll_evaluation_from_paths(
+                            cached_mll_paths,
+                            model_point_ids=cached_model_point_ids,
+                            objective_spec=objective_spec,
+                        )
+                    )
                 LOGGER.info(
                     "Benchmark case %d/%d complete | reused cached projection",
                     case_number, len(cases),
@@ -8894,6 +9094,7 @@ def _evaluate_fixed_benchmarks(
                     selection_path_values[label],
                     evaluation_path_values[label],
                     evaluation_component_paths[label],
+                    selection_mll_evaluations.get(label),
                 )
             except Exception as error:  # noqa: BLE001 - cache must never be fatal
                 LOGGER.warning(
@@ -9930,6 +10131,7 @@ def _policy_payload(
                     item.coefficients[..., 1:].tolist()
                 ),
                 "serialized_coefficients_exclude_recomputed_objective": True,
+                "management_objective_recomputed_from_payload": True,
                 "action_value_standard_error": (
                     item.action_value_standard_error.tolist()
                 ),

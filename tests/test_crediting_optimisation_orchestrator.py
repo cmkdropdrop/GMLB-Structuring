@@ -37,9 +37,20 @@ def test_dynamic_orchestrator_derives_four_exact_role_cache_samples():
     cap_grid = tuple(float(value) for value in _option(
         commands[0], "--cap-grid"
     ).split(","))
+    assert cap_grid == tuple(float(value) for value in runner._target(
+        "dynamic"
+    ).ACTION_CAPS)
     assert cap_grid[0] == 0.0025
     assert cap_grid[-1] == 0.20
     assert len(cap_grid) == 21
+    assert all(Path(_option(command, "--equity-allocation")).is_file()
+               for command in commands)
+    assert all(int(_option(command, "--cross-fit-folds")) == 5
+               for command in commands)
+    assert all(int(_option(command, "--cross-fit-seed")) == 9137
+               for command in commands)
+    assert all(float(_option(command, "--ridge")) == 1.0e-6
+               for command in commands)
     assert "--require-market-cache" in reader
     assert "--require-hedge-cache" in reader
     assert Path(reader[1]).name \

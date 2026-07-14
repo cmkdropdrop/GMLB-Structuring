@@ -8,6 +8,7 @@ import numpy as np
 from policy_engine import ProjectionConfig
 from policy_engine.crediting_capital import (
     PairedBootstrapRatioDelta,
+    PolicyCSMPathArrays,
     score_lsmc_value_vectors,
 )
 from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import (
@@ -21,6 +22,7 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _adaptive_policy_passes_validation,
     _backward_induction,
     _constant_first_year_policy,
+    _csm_mll_evaluation_from_paths,
     _direct_transition_target,
     _fit_direct_q_chain,
     _grid_continuation_lookup,
@@ -38,6 +40,10 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _select_best_fixed_label,
     _shell_neutral_argv_display,
     _slim_direct_q_design,
+    _load_benchmark_cache,
+    _store_benchmark_cache,
+    _validate_benchmark_cache_arrays,
+    _validated_activity_exposure,
 )
 
 
@@ -147,6 +153,83 @@ def test_cache_remediation_argv_display_is_shell_neutral_and_lossless():
 
     assert json.loads(display) == argv
     assert not display.lstrip().startswith("&")
+
+
+def test_activity_exposure_clips_only_numerical_negative_noise():
+    values = np.array([[1.0, -1.0e-14], [0.5, 0.0]])
+
+    cleaned = _validated_activity_exposure(
+        values, expected_shape=(2, 2), label="test"
+    )
+
+    np.testing.assert_array_equal(cleaned, [[1.0, 0.0], [0.5, 0.0]])
+    with np.testing.assert_raises_regex(ValueError, "materially negative"):
+        _validated_activity_exposure(
+            np.array([[1.0, -1.0e-6]]),
+            expected_shape=(1, 2),
+            label="test",
+        )
+
+
+def test_capital_aware_benchmark_cache_round_trips_complete_mll_ledger(tmp_path):
+    paths = PolicyCSMPathArrays(
+        base_csm_paths=np.array([10.0, 12.0, 11.0]),
+        mortality_stressed_csm_paths=np.array([9.0, 10.0, 9.0]),
+        longevity_stressed_csm_paths=np.array([8.0, 9.0, 8.0]),
+        lapse_up_stressed_csm_paths=np.array([7.0, 8.0, 7.0]),
+        lapse_down_stressed_csm_paths=np.array([10.0, 11.0, 10.0]),
+        model_point_base_csm_paths=np.array([
+            [6.0, 4.0], [7.0, 5.0], [6.5, 4.5]
+        ]),
+    )
+    objective = ManagementObjectiveSpec(
+        kind="csm_to_mll",
+        model_point_count=2,
+        capital_materiality=1.0e-9,
+        mass_lapse_fraction=0.4,
+    )
+    evaluation = _csm_mll_evaluation_from_paths(
+        paths, model_point_ids=("mp1", "mp2"), objective_spec=objective
+    )
+    component_names = (
+        "fees_product", "fees_lip", "crediting_margin",
+        "money_market_income", "hedge_gain", "mva_retained",
+        "aps_retained", "guarantee_claims",
+        "other_insurer_funded_benefits", "expenses", "hedge_costs",
+        "income_paid", "death_benefits", "surrender_benefits",
+        "partial_withdrawals", "terminal_closeout", "lapse_events",
+    )
+    components = {name: np.zeros(2) for name in component_names}
+    cache_path = tmp_path / "benchmark.npz"
+
+    _store_benchmark_cache(
+        cache_path,
+        np.asarray(paths.base_csm_paths),
+        np.array([13.0, 14.0]),
+        components,
+        evaluation,
+    )
+    selection, final, loaded_components, loaded_paths, loaded_ids = (
+        _load_benchmark_cache(cache_path)
+    )
+
+    _validate_benchmark_cache_arrays(
+        selection_csm=selection,
+        evaluation_csm=final,
+        components=loaded_components,
+        selection_path_count=3,
+        evaluation_path_count=2,
+        selection_mll_paths=loaded_paths,
+        model_point_ids=loaded_ids,
+    )
+    rebuilt = _csm_mll_evaluation_from_paths(
+        loaded_paths,
+        model_point_ids=loaded_ids,
+        objective_spec=objective,
+    )
+    assert loaded_ids == ("mp1", "mp2")
+    assert rebuilt.result.csm_to_mll_ratio \
+        == evaluation.result.csm_to_mll_ratio
 
 
 def test_grid_interpolation_is_pathwise_linear_and_clamps_boundaries():

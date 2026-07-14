@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title description">
+  <title id="title">Schematic primary, spouse and last-survivor survival after income election</title>
+  <desc id="description">An x-y chart starts with both covered lives alive at Income Election. The Primary and Spouse Single-Life survival curves decline over time. Under independent deaths, the last-survivor curve lies above both Single-Life curves and ends when neither covered life survives. Continue income follows last-survivor survival, while Lump sum remains tied to Primary death.</desc>
+  <defs>
+    <style>
+      .heading { font: 700 28px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .sub { font: 400 15px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .label { font: 600 16px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .tick { font: 400 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .formula { font: 600 18px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .boxhead { font: 700 17px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="620" rx="18" fill="#fffdf7"/>
+  <text x="55" y="52" class="heading">Joint-Life continuation is a last-survivor exposure</text>
+  <text x="55" y="79" class="sub">Schematic conditional survival from Income Election; curve heights are illustrative, not calibrated</text>
+
+  <line x1="115" y1="505" x2="830" y2="505" stroke="#6f7c88" stroke-width="2"/>
+  <line x1="115" y1="505" x2="115" y2="125" stroke="#6f7c88" stroke-width="2"/>
+  <text x="473" y="555" text-anchor="middle" class="label">Years since Income Election</text>
+  <text x="34" y="315" text-anchor="middle" class="label" transform="rotate(-90 34 315)">Conditional survival probability</text>
+
+  <g stroke="#d7dde3" stroke-width="1">
+    <line x1="115" y1="505" x2="830" y2="505"/><line x1="115" y1="410" x2="830" y2="410"/>
+    <line x1="115" y1="315" x2="830" y2="315"/><line x1="115" y1="220" x2="830" y2="220"/>
+    <line x1="115" y1="125" x2="830" y2="125"/>
+  </g>
+  <g class="tick" text-anchor="end">
+    <text x="102" y="510">0</text><text x="102" y="415">0.25</text><text x="102" y="320">0.50</text>
+    <text x="102" y="225">0.75</text><text x="102" y="130">1.00</text>
+  </g>
+  <g class="tick" text-anchor="middle">
+    <text x="115" y="530">0</text><text x="258" y="530">10</text><text x="401" y="530">20</text>
+    <text x="544" y="530">30</text><text x="687" y="530">40</text><text x="830" y="530">50</text>
+  </g>
+
+  <!-- approximate Single-Life curves and the independent last-survivor result -->
+  <path d="M115 125 C300 130 520 175 630 300 C660 340 682 400 700 430 C740 470 780 497 805 505" fill="none" stroke="#0f766e" stroke-width="6"/>
+  <path d="M115 125 C275 150 450 255 600 403 C650 452 682 485 700 505" fill="none" stroke="#c56a1a" stroke-width="5" stroke-dasharray="3 8" stroke-linecap="round"/>
+  <path d="M115 125 C290 143 480 225 635 370 C660 395 680 415 700 430 C740 470 780 497 805 505" fill="none" stroke="#173b63" stroke-width="5" stroke-dasharray="13 7"/>
+
+  <rect x="450" y="155" width="260" height="34" rx="8" fill="#e8f6f3"/>
+  <line x1="468" y1="172" x2="510" y2="172" stroke="#0f766e" stroke-width="6"/>
+  <text x="522" y="178" class="label">Last survivor Sᴸˢ</text>
+  <rect x="400" y="325" width="245" height="34" rx="8" fill="#edf4fb"/>
+  <line x1="418" y1="342" x2="460" y2="342" stroke="#173b63" stroke-width="5" stroke-dasharray="11 6"/>
+  <text x="472" y="348" class="label">Spouse Sˢ</text>
+  <rect x="350" y="395" width="245" height="34" rx="8" fill="#fff3dc"/>
+  <line x1="368" y1="412" x2="410" y2="412" stroke="#c56a1a" stroke-width="5" stroke-dasharray="3 8" stroke-linecap="round"/>
+  <text x="422" y="418" class="label">Primary Sᴾ</text>
+
+  <rect x="865" y="126" width="285" height="92" rx="13" fill="#e8f6f3" stroke="#83bcb5"/>
+  <text x="890" y="158" class="boxhead">Independent lives</text>
+  <text x="890" y="190" class="formula">Sᴸˢ = Sᴾ + Sˢ − SᴾSˢ</text>
+
+  <rect x="865" y="244" width="285" height="112" rx="13" fill="#edf4fb" stroke="#9fb9d1"/>
+  <text x="890" y="276" class="boxhead">Continue income</text>
+  <text x="890" y="305" class="sub">The locked income continues while</text>
+  <text x="890" y="328" class="sub">at least one covered life survives.</text>
+
+  <rect x="865" y="382" width="285" height="112" rx="13" fill="#fff3dc" stroke="#d4a43b"/>
+  <text x="890" y="414" class="boxhead">Lump sum</text>
+  <text x="890" y="443" class="sub">The decrement remains Primary-Life;</text>
+  <text x="890" y="466" class="sub">primary death pays post-fee account</text>
+  <text x="890" y="489" class="sub">value and terminates the contract.</text>
+
+  <text x="115" y="592" class="sub">At Election, joint cover is conditional on both lives being alive; the interval ending at Election still uses Primary-Life mortality.</text>
+</svg>

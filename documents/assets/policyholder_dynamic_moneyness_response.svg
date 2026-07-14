@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" role="img" aria-labelledby="title desc">
+  <title id="title">Dynamic action response to decision-specific guarantee moneyness</title>
+  <desc id="desc">A schematic x-y chart in which Income Election rises with its decision-specific guarantee moneyness, while ordinary Full Withdrawal and the expected Excess-Withdrawal rate fall with their respective decision-specific moneyness measures.</desc>
+  <rect width="760" height="500" fill="#ffffff"/>
+  <text x="380" y="34" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#1f2937">Dynamic response to guarantee moneyness</text>
+  <text x="380" y="59" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#4b5563">Each action uses its own decision-specific guarantee value G and comparison value E</text>
+
+  <rect x="105" y="85" width="600" height="315" rx="5" fill="#f8fafc" stroke="#d1d5db"/>
+  <line x1="120" y1="380" x2="690" y2="380" stroke="#374151" stroke-width="2"/>
+  <line x1="120" y1="105" x2="120" y2="380" stroke="#374151" stroke-width="2"/>
+  <line x1="405" y1="105" x2="405" y2="380" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <line x1="120" y1="250" x2="690" y2="250" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="132" y="275" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#6b7280">baseline = 1 at reference covariates</text>
+
+  <path d="M130 348 C230 337 330 309 405 250 C485 183 590 126 680 117" fill="none" stroke="#0072b2" stroke-width="5"/>
+  <path d="M130 117 C230 128 330 185 405 250 C485 312 585 340 680 348" fill="none" stroke="#d55e00" stroke-width="5"/>
+  <path d="M130 211 C235 220 330 236 405 250 C490 267 590 285 680 294" fill="none" stroke="#009e73" stroke-width="4" stroke-dasharray="11 6"/>
+
+  <text x="500" y="120" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#0072b2">Income Election</text>
+  <text x="140" y="108" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#d55e00">Ordinary Full Withdrawal</text>
+  <text x="480" y="319" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#007a5e">Expected Excess-Withdrawal rate</text>
+
+  <text x="120" y="405" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#374151">m min</text>
+  <text x="405" y="405" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#374151">0</text>
+  <text x="690" y="405" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#374151">m max</text>
+  <text x="250" y="426" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#6b7280">account / exit value dominates</text>
+  <text x="560" y="426" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#6b7280">guarantee value dominates</text>
+  <text x="405" y="454" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" fill="#1f2937">Decision-specific m = ln(G / E)</text>
+  <text x="55" y="245" text-anchor="middle" transform="rotate(-90 55 245)" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" fill="#1f2937">Relative action response</text>
+  <text x="380" y="485" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-style="italic" fill="#6b7280">Schematic direction only · uncalibrated · not to scale · other covariates at reference / zero</text>
+</svg>

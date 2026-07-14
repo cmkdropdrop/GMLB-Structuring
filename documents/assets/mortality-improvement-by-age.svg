@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title description">
+  <title id="title">Annual mortality improvement rate by attained age</title>
+  <desc id="description">An x-y chart shows the repository's default annual mortality improvement rate. It is 1.25 percent through age 90, then decreases linearly to zero at age 110 and remains zero through the terminal age 115.</desc>
+  <defs>
+    <style>
+      .heading { font: 700 28px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .sub { font: 400 15px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .label { font: 600 16px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+      .tick { font: 400 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #536273; }
+      .formula { font: 600 18px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #14213d; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="560" rx="18" fill="#fffdf7"/>
+  <text x="55" y="52" class="heading">Default annual mortality improvement by age</text>
+  <text x="55" y="79" class="sub">This is an exact picture of the configured taper, not an experience-study estimate</text>
+
+  <rect x="135" y="120" width="745" height="350" fill="#e8f6f3" opacity="0.48"/>
+  <rect x="880" y="120" width="165" height="350" fill="#fff3dc" opacity="0.62"/>
+  <rect x="1045" y="120" width="45" height="350" fill="#edf0f2" opacity="0.8"/>
+
+  <line x1="135" y1="470" x2="1090" y2="470" stroke="#6f7c88" stroke-width="2"/>
+  <line x1="135" y1="470" x2="135" y2="120" stroke="#6f7c88" stroke-width="2"/>
+  <text x="615" y="520" text-anchor="middle" class="label">Attained age x</text>
+  <text x="36" y="297" text-anchor="middle" class="label" transform="rotate(-90 36 297)">Annual improvement rate i(x)</text>
+
+  <line x1="135" y1="470" x2="1090" y2="470" stroke="#d7dde3"/>
+  <line x1="135" y1="330" x2="1090" y2="330" stroke="#d7dde3"/>
+  <line x1="135" y1="190" x2="1090" y2="190" stroke="#d7dde3"/>
+  <g class="tick" text-anchor="end">
+    <text x="122" y="475">0.00%</text><text x="122" y="335">0.625%</text><text x="122" y="195">1.25%</text>
+  </g>
+
+  <path d="M135 190 L880 190 L1045 470 L1090 470" fill="none" stroke="#0f766e" stroke-width="6" stroke-linejoin="round"/>
+  <circle cx="880" cy="190" r="7" fill="#173b63"/>
+  <circle cx="1045" cy="470" r="7" fill="#173b63"/>
+
+  <g class="tick" text-anchor="middle">
+    <text x="135" y="494">0</text><text x="880" y="494">90</text><text x="1045" y="494">110</text><text x="1090" y="494">115</text>
+  </g>
+  <g stroke="#aab4bf" stroke-width="1.5">
+    <line x1="135" y1="470" x2="135" y2="477"/><line x1="880" y1="470" x2="880" y2="477"/>
+    <line x1="1045" y1="470" x2="1045" y2="477"/><line x1="1090" y1="470" x2="1090" y2="477"/>
+  </g>
+
+  <text x="500" y="225" text-anchor="middle" class="label">1.25% p.a.</text>
+  <text x="962" y="310" text-anchor="middle" class="label" transform="rotate(59 962 310)">linear taper</text>
+  <text x="1068" y="445" text-anchor="middle" class="label">0</text>
+
+  <rect x="215" y="105" width="560" height="48" rx="10" fill="#edf4fb" stroke="#9fb9d1"/>
+  <text x="495" y="136" text-anchor="middle" class="formula">i(x) = 1.25% × clip((110 − x) / 20, 0, 1)</text>
+</svg>

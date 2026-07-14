@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 500" role="img" aria-labelledby="title desc">
+  <title id="title">Schematic contract state over policy duration</title>
+  <desc id="desc">An x-y state chart showing a representative path from Growth to Income and then Terminated, annual wait decisions, an excess withdrawal that leaves the contract in Income, and the alternative contractual age backstop.</desc>
+  <rect width="1100" height="500" fill="#ffffff"/>
+  <text x="550" y="34" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#1f2937">Contract state over policy duration</text>
+  <text x="550" y="59" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#4b5563">Representative voluntary path and contractual backstop</text>
+
+  <rect x="150" y="85" width="870" height="305" rx="4" fill="#f8fafc" stroke="#d1d5db"/>
+  <rect x="150" y="85" width="120" height="305" fill="#e5e7eb" opacity="0.75"/>
+  <text x="225" y="105" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#4b5563">minimum Growth period</text>
+
+  <line x1="150" y1="390" x2="1020" y2="390" stroke="#374151" stroke-width="2"/>
+  <line x1="150" y1="85" x2="150" y2="390" stroke="#374151" stroke-width="2"/>
+  <line x1="150" y1="135" x2="1020" y2="135" stroke="#d1d5db" stroke-width="1"/>
+  <line x1="150" y1="235" x2="1020" y2="235" stroke="#d1d5db" stroke-width="1"/>
+  <line x1="150" y1="340" x2="1020" y2="340" stroke="#d1d5db" stroke-width="1"/>
+
+  <text x="132" y="140" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#1f2937">Terminated</text>
+  <text x="132" y="240" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#1f2937">Income</text>
+  <text x="132" y="345" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#1f2937">Growth</text>
+
+  <path d="M150 340 H630 V235 H850 V135 H1020" fill="none" stroke="#0072b2" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M630 340 H965 V235 H1020" fill="none" stroke="#6b7280" stroke-width="3" stroke-dasharray="9 7" stroke-linejoin="round"/>
+
+  <circle cx="270" cy="340" r="7" fill="#ffffff" stroke="#0072b2" stroke-width="3"/>
+  <circle cx="390" cy="340" r="7" fill="#ffffff" stroke="#0072b2" stroke-width="3"/>
+  <circle cx="510" cy="340" r="7" fill="#ffffff" stroke="#0072b2" stroke-width="3"/>
+  <text x="390" y="318" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#0072b2">WAIT at eligible anniversaries</text>
+
+  <circle cx="630" cy="235" r="8" fill="#0072b2" stroke="#ffffff" stroke-width="2"/>
+  <line x1="630" y1="225" x2="630" y2="177" stroke="#0072b2" stroke-width="1.5"/>
+  <text x="630" y="159" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#0072b2">START_INCOME_NOW</text>
+  <text x="630" y="176" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#4b5563">irreversible election</text>
+
+  <polygon points="750,224 761,235 750,246 739,235" fill="#e69f00" stroke="#ffffff" stroke-width="2"/>
+  <text x="750" y="274" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" fill="#8a5500">Excess withdrawal</text>
+  <text x="750" y="291" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#4b5563">state remains Income</text>
+
+  <circle cx="850" cy="135" r="8" fill="#d55e00" stroke="#ffffff" stroke-width="2"/>
+  <line x1="850" y1="126" x2="850" y2="96" stroke="#d55e00" stroke-width="1.5"/>
+  <text x="850" y="91" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" fill="#d55e00">FULL_WITHDRAWAL_NOW</text>
+
+  <line x1="965" y1="85" x2="965" y2="390" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <circle cx="965" cy="235" r="7" fill="#ffffff" stroke="#6b7280" stroke-width="3"/>
+  <text x="1005" y="300" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" fill="#4b5563">first anniversary after age 100</text>
+  <text x="1005" y="317" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#4b5563">forced start if still in Growth</text>
+
+  <line x1="150" y1="390" x2="150" y2="398" stroke="#374151" stroke-width="2"/>
+  <line x1="270" y1="390" x2="270" y2="398" stroke="#374151" stroke-width="2"/>
+  <line x1="630" y1="390" x2="630" y2="398" stroke="#374151" stroke-width="2"/>
+  <line x1="965" y1="390" x2="965" y2="398" stroke="#374151" stroke-width="2"/>
+  <text x="150" y="419" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#374151">start</text>
+  <text x="270" y="419" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#374151">1 year</text>
+  <text x="630" y="419" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#374151">chosen election date</text>
+  <text x="965" y="419" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#374151">age-100 backstop</text>
+  <text x="585" y="451" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" fill="#1f2937">Policy duration / attained age</text>
+
+  <line x1="156" y1="472" x2="190" y2="472" stroke="#0072b2" stroke-width="4"/>
+  <text x="199" y="477" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#4b5563">representative voluntary path</text>
+  <line x1="400" y1="472" x2="434" y2="472" stroke="#6b7280" stroke-width="3" stroke-dasharray="8 6"/>
+  <text x="443" y="477" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#4b5563">no voluntary election before backstop</text>
+  <text x="1020" y="477" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="12" font-style="italic" fill="#6b7280">Schematic only · timing not to scale</text>
+</svg>

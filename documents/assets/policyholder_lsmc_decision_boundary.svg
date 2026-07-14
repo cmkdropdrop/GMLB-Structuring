@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 520" role="img" aria-labelledby="title desc">
+  <title id="title">Schematic buffered LSMC decision boundary</title>
+  <desc id="desc">An x-y value chart compares the value of acting now, fitted continuation value and continuation value plus an exercise buffer. The policy continues to the left of the crossing and exercises to the right.</desc>
+  <rect width="1100" height="520" fill="#ffffff"/>
+  <text x="550" y="35" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#1f2937">Buffered LSMC value comparison</text>
+  <text x="550" y="60" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#4b5563">Conceptual value view; implementation fits the action advantage directly</text>
+
+  <rect x="130" y="90" width="840" height="330" rx="4" fill="#f8fafc" stroke="#d1d5db"/>
+  <rect x="130" y="90" width="510" height="330" fill="#dbeafe" opacity="0.45"/>
+  <rect x="640" y="90" width="330" height="330" fill="#ffedd5" opacity="0.55"/>
+  <line x1="130" y1="420" x2="970" y2="420" stroke="#374151" stroke-width="2"/>
+  <line x1="130" y1="90" x2="130" y2="420" stroke="#374151" stroke-width="2"/>
+
+  <path d="M145 340 C300 323 455 287 610 250 C755 216 865 202 955 192" fill="none" stroke="#0072b2" stroke-width="4"/>
+  <path d="M145 321 C300 304 455 268 610 231 C755 197 865 183 955 173" fill="none" stroke="#0072b2" stroke-width="2.5" stroke-dasharray="9 6"/>
+  <path d="M145 378 C295 364 435 323 550 266 C685 199 815 176 955 160" fill="none" stroke="#d55e00" stroke-width="4"/>
+
+  <line x1="640" y1="90" x2="640" y2="420" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 5"/>
+  <circle cx="640" cy="218" r="7" fill="#7c3aed" stroke="#ffffff" stroke-width="2"/>
+  <text x="640" y="82" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" fill="#6d28d9">exercise boundary in this state slice</text>
+
+  <text x="350" y="125" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#005f93">WAIT / CONTINUE</text>
+  <text x="805" y="125" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" fill="#a74400">START INCOME / FULL WITHDRAWAL</text>
+  <text x="350" y="150" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#4b5563">act-now value does not clear the buffer</text>
+  <text x="805" y="150" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#4b5563">act-now value exceeds continuation + buffer</text>
+
+  <line x1="185" y1="185" x2="230" y2="185" stroke="#d55e00" stroke-width="4"/>
+  <text x="242" y="190" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#1f2937">act-now value A(t, s)</text>
+  <line x1="185" y1="210" x2="230" y2="210" stroke="#0072b2" stroke-width="4"/>
+  <text x="242" y="215" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#1f2937">fitted continuation value C(t, s)</text>
+  <line x1="185" y1="235" x2="230" y2="235" stroke="#0072b2" stroke-width="2.5" stroke-dasharray="9 6"/>
+  <text x="242" y="240" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#1f2937">C(t, s) + exercise buffer b(t)</text>
+
+  <text x="555" y="457" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" fill="#1f2937">Observable state slice s at decision date t</text>
+  <text x="75" y="255" text-anchor="middle" transform="rotate(-90 75 255)" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" fill="#1f2937">Discounted policyholder value at t</text>
+
+  <text x="550" y="487" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#4b5563">Rule: exercise only when A(t, s) &gt; C(t, s) + b(t); WAIT already includes later modelled Income actions.</text>
+  <text x="550" y="507" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="12" font-style="italic" fill="#6b7280">Schematic only · the fitted state and basis are multi-dimensional · not calibrated and not to scale</text>
+</svg>

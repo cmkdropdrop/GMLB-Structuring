@@ -147,7 +147,7 @@ IntArray = NDArray[np.int64]
 STEPS_PER_YEAR = 12
 
 FULL_ACTION_CAPS = np.concatenate((
-    np.array([0.0025]), np.arange(0.01, 0.201, 0.01)
+    np.array([0.0025]), np.arange(1, 21, dtype=float) / 100.0
 ))
 FAST_ACTION_CAPS = np.asarray(
     (0.0025, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20),

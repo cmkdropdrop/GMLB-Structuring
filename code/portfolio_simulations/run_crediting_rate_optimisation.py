@@ -22,7 +22,11 @@ CODE_ROOT = SCRIPT_DIRECTORY.parent
 if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
-from policy_engine import load_policyholder_model_points  # noqa: E402
+from policy_engine import (  # noqa: E402
+    ValuationSettings,
+    load_equity_allocation,
+    load_policyholder_model_points,
+)
 
 
 def _target(mode: str):
@@ -93,6 +97,8 @@ def _precompute_commands(
         _reader_module(mode)._require_lsmc_mode(tuple(runner_arguments))
     args = module.parse_args(tuple(runner_arguments))
     model_points = load_policyholder_model_points(args.model_points)
+    equity_allocation = load_equity_allocation()
+    hedge_cache_defaults = ValuationSettings()
     horizon_years = module._projection_horizon_years(
         model_points, terminal_age=120.0
     )
@@ -113,6 +119,8 @@ def _precompute_commands(
             str(Path(args.zero_curve).expanduser().resolve()),
             "--model-parameters",
             str(Path(args.model_parameters).expanduser().resolve()),
+            "--equity-allocation",
+            str(Path(equity_allocation.source_path).expanduser().resolve()),
             "--market-cache-root",
             str(Path(args.market_cache_root).expanduser().resolve()),
             "--hedge-cache-root",
@@ -132,6 +140,12 @@ def _precompute_commands(
             command.extend((
                 "--cap-grid",
                 ",".join(f"{cap:.12g}" for cap in caps),
+                "--cross-fit-folds",
+                str(hedge_cache_defaults.hedge_cross_fit_folds),
+                "--cross-fit-seed",
+                str(hedge_cache_defaults.hedge_cross_fit_seed),
+                "--ridge",
+                f"{hedge_cache_defaults.hedge_ridge:.12g}",
             ))
         else:
             command.append("--market-only")
