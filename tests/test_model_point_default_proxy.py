@@ -1,4 +1,4 @@
-"""Default/override contract for the fast four-point portfolio proxy."""
+"""Default/override contracts for general and customer-LSMC model points."""
 
 from pathlib import Path
 
@@ -8,6 +8,9 @@ from policy_engine import (
     DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH,
     load_market_assumptions,
     load_policyholder_model_points,
+)
+from policy_engine.repository_paths import (
+    DEFAULT_FAST_POLICYHOLDER_MODEL_POINTS_PATH,
 )
 from portfolio_simulations.run_portfolio_risk_analysis import (
     DEFAULT_MODEL_POINTS_PATH as RISK_DEFAULT_MODEL_POINTS_PATH,
@@ -25,10 +28,16 @@ SENSITIVITY_MODEL_PARAMETERS_FILENAME = (
 )
 
 
-def test_all_default_entry_points_use_four_point_proxy():
+def test_risk_customer_lsmc_defaults_to_one_point_fast_proxy():
     assert DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH.name == EXPECTED_DEFAULT_FILENAME
-    assert RISK_DEFAULT_MODEL_POINTS_PATH == DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH
+    assert RISK_DEFAULT_MODEL_POINTS_PATH == (
+        DEFAULT_FAST_POLICYHOLDER_MODEL_POINTS_PATH
+    )
+    assert RISK_DEFAULT_MODEL_POINTS_PATH.name == (
+        "model_points_policyholders_1_point_proxy.csv"
+    )
     assert DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH.is_file()
+    assert RISK_DEFAULT_MODEL_POINTS_PATH.is_file()
 
 
 def test_default_proxy_and_explicit_full_grid_remain_available():

@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from policy_engine import ProjectionConfig
 from policy_engine.crediting_capital import (
@@ -29,6 +30,7 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _lower_cap_argmax,
     _masked_lower_cap_argmax,
     _mll_metrics_from_payload,
+    _management_payload_and_activity_exposure,
     _objective_from_payload,
     parse_args,
     _pathwise_outer_fold_ids,
@@ -40,6 +42,8 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _select_best_fixed_label,
     _shell_neutral_argv_display,
     _slim_direct_q_design,
+    _fit_time_zero_chain,
+    _clip_management_predictions,
     _load_benchmark_cache,
     _store_benchmark_cache,
     _validate_benchmark_cache_arrays,
@@ -601,17 +605,106 @@ def test_validation_gate_accepts_significant_uplift_and_rejects_fallback_cases()
         assert not _adaptive_policy_passes_validation(**arguments)
 
 
-def test_ratio_parser_uses_four_full_samples_with_distinct_default_seeds():
+def test_ratio_parser_uses_one_full_sample_and_one_model_point_default():
     args = parse_args(["--n-paths", "882", "--seed", "17"])
 
     assert args.optimisation_objective == "csm_to_mll"
-    assert args.benchmark_paths == args.n_paths == 882
-    assert (
-        args.seed,
-        args.fixed_selection_seed,
-        args.validation_seed,
-        args.evaluation_seed,
-    ) == (17, 18, 19, 20)
+    assert args.n_paths == 882
+    assert args.seed == 17
+    assert args.model_points.name == "model_points_policyholders_1_point_proxy.csv"
+    for removed in (
+        "benchmark_paths", "fixed_selection_seed", "validation_seed",
+        "evaluation_seed", "ratio_bootstrap_replicates",
+    ):
+        assert not hasattr(args, removed)
+    with pytest.raises(SystemExit):
+        parse_args(["--fixed-selection-seed", "18"])
+
+
+def test_single_model_point_payload_is_recomputed_after_clipping():
+    spec = ManagementObjectiveSpec(
+        kind="csm_to_mll",
+        model_point_count=1,
+        capital_materiality=0.01,
+        mass_lapse_fraction=0.40,
+    )
+    payload = np.array([
+        100.0, 5.0, 0.0, 0.0, 0.0,
+        20.0, 0.0, 0.0, 0.0,
+        70.0, 75.0, 80.0, 78.0,
+        999.0,
+    ])
+    with_objective = np.concatenate(([0.0], payload))
+    lower = np.full(15, -200.0)
+    upper = np.full(15, 200.0)
+
+    bounded, _ = _clip_management_predictions(
+        with_objective, lower, upper, spec
+    )
+    implied_csm = (
+        np.sum(bounded[1:6]) - np.sum(bounded[6:10])
+    )
+
+    assert bounded[-1] == implied_csm
+    score = score_lsmc_value_vectors(
+        bounded[1:], capital_materiality=0.01
+    )
+    assert score.mass_lapse_loss == 0.40 * max(implied_csm, 0.0)
+
+
+def test_full_sample_time_zero_chain_never_calls_outer_fold(monkeypatch):
+    from portfolio_simulations import (
+        optimize_crediting_rate_dynamic_behaviour_alt as optimizer,
+    )
+
+    data, actions = _synthetic_direct_q_data(paths_per_action=60)
+    states = data.raw_states.copy()
+    states[:, 0, :] = np.array([0.0, 0.025, 0.04, 1.0])
+    data = replace(data, raw_states=states)
+    base_csm = data.new_business_csm_proxy
+    data = replace(data, model_point_csm=base_csm[None, ...])
+    stressed = {
+        stress_id: replace(
+            data,
+            fees_product=data.fees_product - shift,
+            model_point_csm=None,
+        )
+        for stress_id, shift in zip(
+            ("mortality", "longevity", "lapse_up", "lapse_down"),
+            (0.2, 0.4, 0.3, 0.1),
+        )
+    }
+    spec = ManagementObjectiveSpec(
+        kind="csm_to_mll", model_point_count=1,
+        capital_materiality=0.01, mass_lapse_fraction=0.40,
+    )
+    payload, exposure, active = _management_payload_and_activity_exposure(
+        data, stressed, spec
+    )
+    monkeypatch.setattr(
+        optimizer,
+        "_evaluate_outer_fold_direct_q_chains",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("outer-fold code must not run")
+        ),
+    )
+
+    estimate = _fit_time_zero_chain(
+        data=data,
+        actions=actions,
+        immediate_payload=payload,
+        activity_exposure=exposure,
+        objective_spec=spec,
+        ridge=1.0e-6,
+        inventory_nodes=5,
+        inventory_quantile_clip=0.0,
+        linear_weights=None,
+    )
+
+    assert active == (0, 1)
+    assert payload.shape[-1] == 14
+    assert estimate.first_year_action_payloads.shape == (len(ACTION_CAPS), 14)
+    assert np.all(np.isfinite(estimate.first_year_action_scores))
 
 
 def test_optimizer_mll_score_matches_central_vector_arithmetic():

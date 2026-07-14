@@ -1,4 +1,4 @@
-"""Static CLI contracts for streamlined and replicated LSMC runs."""
+"""Static CLI contracts for the single-sample customer LSMC runner."""
 
 from __future__ import annotations
 
@@ -27,7 +27,21 @@ def test_lsmc_runner_defaults_to_one_seed_and_continue_full_only():
 
     assert args.training_seed_count == 1
     assert args.lsmc_income_action_set == "continue_full"
-    assert len({args.train_seed, args.validation_seed, args.seed}) == 3
+    assert args.exercise_buffer_rmse_multiplier == 0.0
+    assert args.model_points.name == "model_points_policyholders_1_point_proxy.csv"
+    assert args.n_paths == args.n_validation == args.n_train
+    assert args.seed == args.validation_seed == args.train_seed
+    assert (
+        args.take_up_seed
+        == args.validation_take_up_seed
+        == args.train_take_up_seed
+    )
+    assert (
+        args.mortality_seed
+        == args.validation_mortality_seed
+        == args.train_mortality_seed
+    )
+    assert args.legacy_sample_options_ignored == ()
 
 
 def test_fixed_full_withdrawal_benchmark_preserves_complete_action_values():
@@ -121,25 +135,21 @@ def test_election_control_rejects_two_invalid_variants():
         _election_control_policy(fit)
 
 
-@pytest.mark.parametrize(
-    ("option", "collision"),
-    (
-        ("--train-seed-2", "12026"),
-        ("--train-seed-2", "22026"),
-        ("--train-seed-3", "2026"),
-        ("--train-take-up-seed-2", "10097"),
-        ("--train-take-up-seed-3", "20097"),
-        ("--train-mortality-seed-3", "10197"),
-        ("--train-mortality-seed-2", "197"),
-    ),
-)
-def test_lsmc_runner_rejects_training_seed_collisions(option, collision):
-    with pytest.raises(SystemExit):
-        parse_args([option, collision])
-
-
-def test_lsmc_runner_accepts_explicit_second_and_third_seed_triplets():
+def test_lsmc_runner_normalises_legacy_samples_to_the_training_sample():
     args = parse_args([
+        "--n-train", "1234",
+        "--train-seed", "41001",
+        "--train-take-up-seed", "41002",
+        "--train-mortality-seed", "41003",
+        "--n-paths", "999",
+        "--seed", "40001",
+        "--take-up-seed", "40002",
+        "--mortality-seed", "40003",
+        "--n-validation", "888",
+        "--validation-seed", "42001",
+        "--validation-take-up-seed", "42002",
+        "--validation-mortality-seed", "42003",
+        "--training-seed-count", "3",
         "--train-seed-2", "51001",
         "--train-take-up-seed-2", "51002",
         "--train-mortality-seed-2", "51003",
@@ -148,18 +158,24 @@ def test_lsmc_runner_accepts_explicit_second_and_third_seed_triplets():
         "--train-mortality-seed-3", "52003",
     ])
 
+    assert args.training_seed_count == 1
+    assert args.n_paths == args.n_validation == args.n_train == 1234
+    assert args.seed == args.validation_seed == args.train_seed == 41001
     assert (
-        args.train_seed_2,
-        args.train_take_up_seed_2,
-        args.train_mortality_seed_2,
-    ) == (51001, 51002, 51003)
+        args.take_up_seed
+        == args.validation_take_up_seed
+        == args.train_take_up_seed
+        == 41002
+    )
     assert (
-        args.train_seed_3,
-        args.train_take_up_seed_3,
-        args.train_mortality_seed_3,
-    ) == (52001, 52002, 52003)
-    assert args.training_seed_count == 3
-    assert args.lsmc_income_action_set == "continue_full"
+        args.mortality_seed
+        == args.validation_mortality_seed
+        == args.train_mortality_seed
+        == 41003
+    )
+    assert "--training-seed-count" in args.legacy_sample_options_ignored
+    assert "--validation-seed" in args.legacy_sample_options_ignored
+    assert "--train-seed-3" in args.legacy_sample_options_ignored
 
 
 def test_lsmc_runner_rejects_deprecated_partial_action_set():
@@ -167,6 +183,11 @@ def test_lsmc_runner_rejects_deprecated_partial_action_set():
         parse_args([
             "--lsmc-income-action-set", "continue_partial_full",
         ])
+
+
+def test_lsmc_runner_rejects_nonzero_exercise_buffer():
+    with pytest.raises(SystemExit):
+        parse_args(["--exercise-buffer-rmse-multiplier", "0.25"])
 
 
 def test_lsmc_runner_accepts_explicit_streamlined_mode_with_legacy_seed_values():

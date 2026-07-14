@@ -37,104 +37,19 @@ from portfolio_simulations.run_portfolio_risk_analysis import (
     _run_cache_precompute_jobs,
     _validate_dynamic_cache_metadata,
     _validate_lsmc_cache_metadata,
-    _validate_lsmc_gate_set,
     parse_args,
 )
 
 
-def _deployment_row(
-    policy: str,
-    *,
-    candidate_accepted: bool,
-    validated_fallback: bool,
-) -> dict[str, object]:
-    return {
-        "lsmc_primary_deployed_policy": policy,
-        "lsmc_primary_candidate_accepted": candidate_accepted,
-        "lsmc_primary_deployed_validated_fallback": validated_fallback,
-    }
-
-
-def test_lsmc_plot_label_classifies_varied_validated_fallbacks_by_flags():
-    rows = [
-        _deployment_row(
-            "V00_model_point_fixed_continue",
-            candidate_accepted=False,
-            validated_fallback=True,
-        ),
-        _deployment_row(
-            "V10_model_point_fixed_election",
-            candidate_accepted=False,
-            validated_fallback=True,
-        ),
-    ]
+def test_lsmc_plot_label_identifies_direct_single_sample_v11():
+    rows = [{"lsmc_deployed_policy": "V11"} for _ in range(2)]
 
     assert _lsmc_deployment_plot_label(rows) == (
-        "Deployed annual-action LSMC (validated fallback)"
+        "Direct single-sample customer LSMC (direct V11)"
     )
 
 
-def test_lsmc_plot_label_classifies_accepted_v11_candidate():
-    rows = [
-        _deployment_row(
-            "V11_combined_annual_action_policy",
-            candidate_accepted=True,
-            validated_fallback=False,
-        )
-        for _ in range(2)
-    ]
-
-    assert _lsmc_deployment_plot_label(rows) == (
-        "Deployed annual-action LSMC (accepted V11 candidate)"
-    )
-
-
-def test_lsmc_plot_label_reserves_mixed_label_for_candidate_fallback_mix():
-    rows = [
-        _deployment_row(
-            "V11_combined_annual_action_policy",
-            candidate_accepted=True,
-            validated_fallback=False,
-        ),
-        _deployment_row(
-            "V00_model_point_fixed_continue",
-            candidate_accepted=False,
-            validated_fallback=True,
-        ),
-    ]
-
-    assert _lsmc_deployment_plot_label(rows) == (
-        "Deployed annual-action LSMC (mixed candidate/fallback)"
-    )
-
-
-def test_lsmc_plot_label_names_only_one_uniform_unclassified_policy():
-    uniform_rows = [
-        _deployment_row(
-            "fixed_policy",
-            candidate_accepted=False,
-            validated_fallback=False,
-        )
-        for _ in range(2)
-    ]
-    varied_rows = uniform_rows + [
-        _deployment_row(
-            "other_fixed_policy",
-            candidate_accepted=False,
-            validated_fallback=False,
-        )
-    ]
-
-    assert _lsmc_deployment_plot_label(uniform_rows) == (
-        "Deployed annual-action LSMC (fixed_policy)"
-    )
-    assert _lsmc_deployment_plot_label(varied_rows) == (
-        "Deployed annual-action LSMC (mixed deployments)"
-    )
-
-
-def _lsmc_diagnostic_fallback_fixture(
-    *, candidate_fit_valid: bool
+def _lsmc_diagnostic_fixture(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
     action_rows = [
         {
@@ -144,8 +59,6 @@ def _lsmc_diagnostic_fallback_fixture(
             "eligible_path_count": 100,
             "action_path_count": 50,
             "forced_path_count": 0,
-            "training_fallback_used": True,
-            "election_fallback_used": True,
         },
         {
             "training_seed_index": 1,
@@ -154,8 +67,6 @@ def _lsmc_diagnostic_fallback_fixture(
             "eligible_path_count": 80,
             "action_path_count": 0,
             "forced_path_count": 0,
-            "training_fallback_used": True,
-            "surrender_fallback_used": True,
         },
     ]
     diagnostic_rows = [
@@ -165,42 +76,28 @@ def _lsmc_diagnostic_fallback_fixture(
             "oof_rmse_aud": 100.0,
             "condition_number": 10.0,
             "regression_accepted_for_action": True,
-        }
+        },
+        {
+            "action_type": "full_withdrawal",
+            "oof_r_squared": 0.2,
+            "oof_rmse_aud": 80.0,
+            "condition_number": 8.0,
+            "regression_accepted_for_action": True,
+        },
     ]
     manifest = {
         "lsmc_settings": {
             "training_seed_count": 1,
             "allow_partial_withdrawal": False,
             "unique_policy_fits": 1,
-            "training_fallback_policy_count": 1,
-            "accepted_election_regression_count": 1,
-            "accepted_surrender_regression_count": 0,
-            "out_of_sample_policyholder_value_dominates_continue": True,
-            "material_fit_failure_policy": (
-                "reject_v11_candidate_and_deploy_recorded_fixed_validation_benchmark"
-            ),
-        },
-        "validation_settings": {
-            "candidate_fit_valid_by_training_seed": {
-                "training_seed_1": candidate_fit_valid,
-            },
-            "deployed_policy_by_training_seed": {
-                "training_seed_1": "V00_model_point_fixed_continue",
-            },
-            "validation_fallback_reason_by_training_seed": {
-                "training_seed_1": "candidate_fit_invalid",
-            },
-            "deployment_valid": True,
-            "every_seed_passes_or_deploys_validated_fallback": True,
+            "training_fallback_policy_count": 0,
         },
     }
     return action_rows, diagnostic_rows, manifest
 
 
-def test_lsmc_diagnostics_allow_missing_action_for_validated_fit_fallback():
-    action_rows, diagnostic_rows, manifest = _lsmc_diagnostic_fallback_fixture(
-        candidate_fit_valid=False
-    )
+def test_lsmc_diagnostics_cover_both_direct_actions_without_fallback():
+    action_rows, diagnostic_rows, manifest = _lsmc_diagnostic_fixture()
 
     metrics = _lsmc_diagnostic_metrics(
         action_rows,
@@ -208,38 +105,21 @@ def test_lsmc_diagnostics_allow_missing_action_for_validated_fit_fallback():
         manifest,
     )
 
-    assert metrics["surrender_regression_count"] == 0
-    assert metrics["surrender_regression_accepted_count"] == 0
+    assert metrics["surrender_regression_count"] == 1
+    assert metrics["surrender_regression_accepted_count"] == 1
     assert metrics["full_withdrawal_eligible_path_count"] == 80
+    assert metrics["training_fallback_policy_count"] == 0
 
 
-def test_lsmc_diagnostics_require_all_actions_for_valid_candidate():
-    action_rows, diagnostic_rows, manifest = _lsmc_diagnostic_fallback_fixture(
-        candidate_fit_valid=True
-    )
+def test_lsmc_diagnostics_require_all_direct_actions():
+    action_rows, diagnostic_rows, manifest = _lsmc_diagnostic_fixture()
+    diagnostic_rows = diagnostic_rows[:1]
 
     with pytest.raises(
         ValueError,
         match="diagnostics do not cover every enabled optimal action",
     ):
         _lsmc_diagnostic_metrics(action_rows, diagnostic_rows, manifest)
-
-
-def test_lsmc_gate_structure_can_be_checked_when_candidate_falls_back():
-    gates = [
-        {"component": "election_only", "valid": False},
-        {"component": "income_action_only", "valid": True},
-        {"component": "combined_policy", "valid": True},
-    ]
-
-    with pytest.raises(ValueError, match="invalid validation gate"):
-        _validate_lsmc_gate_set(gates, label="candidate")
-
-    _validate_lsmc_gate_set(
-        gates,
-        label="candidate with fixed fallback",
-        require_all_valid=False,
-    )
 
 
 def test_annual_lsmc_action_names_expose_canonical_manifest_actions():
@@ -282,18 +162,13 @@ def test_default_is_four_base_cap_v11_behaviour_analysis_only():
     } == {"interest_rate", "longevity"}
 
 
-def test_default_uses_complete_four_point_proxy():
+def test_default_uses_single_model_point_fast_proxy():
     with DEFAULT_MODEL_POINTS_PATH.open(
         "r", encoding="utf-8-sig", newline=""
     ) as handle:
         rows = list(csv.DictReader(handle))
 
-    assert [row["model_point_id"] for row in rows] == [
-        "ALT4-01",
-        "ALT4-02",
-        "ALT4-03",
-        "ALT4-04",
-    ]
+    assert [row["model_point_id"] for row in rows] == ["ALT4-01"]
     assert sum(float(row["contract_weight"]) for row in rows) == pytest.approx(
         1.0
     )
@@ -402,36 +277,21 @@ def test_default_commands_require_dynamic_functions_and_lsmc():
     assert "--require-hedge-cache" in lsmc
     assert args.training_seed_count == 1
     assert args.lsmc_income_action_set == "continue_full"
-    assert lsmc[lsmc.index("--training-seed-count") + 1] == "1"
+    assert "--training-seed-count" not in lsmc
+    assert "--n-paths" not in lsmc
+    assert "--n-validation" not in lsmc
     assert lsmc[lsmc.index("--lsmc-income-action-set") + 1] == (
         "continue_full"
     )
     assert lsmc[lsmc.index("--model-points") + 1] == str(
         DEFAULT_MODEL_POINTS_PATH.resolve()
     )
-    assert lsmc[lsmc.index("--train-seed-2") + 1] == str(args.train_seed_2)
-    assert lsmc[lsmc.index("--train-seed-3") + 1] == str(args.train_seed_3)
-    assert len({
-        args.train_seed,
-        args.train_seed_2,
-        args.train_seed_3,
-        args.validation_seed,
-        args.seed,
-    }) == 5
-    assert len({
-        args.train_take_up_seed,
-        args.train_take_up_seed_2,
-        args.train_take_up_seed_3,
-        args.validation_take_up_seed,
-        args.take_up_seed,
-    }) == 5
-    assert len({
-        args.train_mortality_seed,
-        args.train_mortality_seed_2,
-        args.train_mortality_seed_3,
-        args.validation_mortality_seed,
-        args.mortality_seed,
-    }) == 5
+    assert "--train-seed-2" not in lsmc
+    assert "--train-seed-3" not in lsmc
+    assert dynamic[dynamic.index("--n-paths") + 1] == str(args.n_train)
+    assert dynamic[dynamic.index("--seed") + 1] == str(args.train_seed)
+    assert lsmc[lsmc.index("--n-train") + 1] == str(args.n_train)
+    assert lsmc[lsmc.index("--train-seed") + 1] == str(args.train_seed)
 
 
 def test_alternate_model_parameters_propagate_to_all_cache_and_valuation_calls(
@@ -513,17 +373,11 @@ def test_cache_precompute_matrix_deduplicates_non_market_stresses(tmp_path):
     assert _cache_market_stress_id("longevity") == "base"
     assert _cache_market_stress_id("expense") == "base"
     assert _cache_market_stress_id("interest_up") == "interest_up"
-    assert len(jobs) == 9
+    assert len(jobs) == 3
     assert [(job.market_stress, job.sample_role) for job in jobs] == [
-        ("base", "evaluation"),
-        ("base", "training_1"),
-        ("base", "validation"),
-        ("interest_up", "evaluation"),
-        ("interest_up", "training_1"),
-        ("interest_up", "validation"),
-        ("interest_down", "evaluation"),
-        ("interest_down", "training_1"),
-        ("interest_down", "validation"),
+        ("base", "training_and_valuation"),
+        ("interest_up", "training_and_valuation"),
+        ("interest_down", "training_and_valuation"),
     ]
     for job in jobs:
         command = list(job.command)
@@ -534,29 +388,9 @@ def test_cache_precompute_matrix_deduplicates_non_market_stresses(tmp_path):
         assert "--market-only" not in command
 
 
-def test_three_training_seeds_are_all_precomputed(tmp_path):
-    args = parse_args(["--training-seed-count", "3"])
-    jobs = _cache_precompute_jobs(
-        args,
-        (_scenario_job(1, "base", 0.06),),
-        horizon_years=53.0,
-        output=tmp_path,
-    )
-
-    assert [job.sample_role for job in jobs] == [
-        "evaluation",
-        "training_1",
-        "training_2",
-        "training_3",
-        "validation",
-    ]
-    assert [job.seed for job in jobs] == [
-        args.seed,
-        args.train_seed,
-        args.train_seed_2,
-        args.train_seed_3,
-        args.validation_seed,
-    ]
+def test_multiple_training_seed_mode_is_rejected():
+    with pytest.raises(SystemExit):
+        parse_args(["--training-seed-count", "3"])
 
 
 def test_moment_matched_precompute_creates_market_cache_only(tmp_path):
@@ -571,7 +405,7 @@ def test_moment_matched_precompute_creates_market_cache_only(tmp_path):
         output=tmp_path,
     )
 
-    assert len(jobs) == 3
+    assert len(jobs) == 1
     assert all("--market-only" in job.command for job in jobs)
     assert all("--cap-grid" not in job.command for job in jobs)
 
@@ -680,15 +514,17 @@ def test_stress_output_uses_canonical_csm_loss_and_deployed_policy_fields():
             "crediting_cap_rate": 0.06,
             "crediting_cap_rate_percent": 6.0,
             "premium_aud": 1_000.0,
-            "evaluation_scenario_fingerprint": fingerprint,
-            "training_scenario_fingerprint": f"training-{fingerprint}",
-            "lsmc_primary_candidate_policy": "V11",
-            "lsmc_primary_deployed_policy": "V00 fixed fallback",
-            "lsmc_primary_candidate_accepted": False,
-            "lsmc_primary_deployed_validated_fallback": True,
-            "lsmc_out_of_sample_policyholder_value_dominates_continue": True,
+            "scenario_fingerprint": fingerprint,
+            "lsmc_deployed_policy": "V11",
+            "lsmc_policy_selection_mode": "direct_single_sample_expected_pv",
+            "lsmc_policyholder_objective_discount_basis": (
+                "time_zero_australian_zero_curve_deterministic_v1"
+            ),
+            "lsmc_oos_validation_used": False,
+            "lsmc_oos_evaluation_used": False,
+            "lsmc_time0_customer_optionality_uplift_aud": 12.0,
             "lsmc_regression_accepted_share": 0.9,
-            "lsmc_training_fallback_policy_share": 0.1,
+            "lsmc_training_fallback_policy_share": 0.0,
             "dynamic_scenario_directory": "dynamic",
             "lsmc_scenario_directory": "lsmc",
         }
@@ -711,8 +547,8 @@ def test_stress_output_uses_canonical_csm_loss_and_deployed_policy_fields():
     assert result[
         "lsmc_minus_dynamic_signed_csm_stress_loss_aud"
     ] == 10.0
-    assert result["lsmc_primary_deployed_policy"] == "V00 fixed fallback"
-    assert result["lsmc_primary_deployed_validated_fallback"] is True
+    assert result["lsmc_deployed_policy"] == "V11"
+    assert result["lsmc_oos_validation_used"] is False
     assert result["lsmc_signed_stress_loss_aud"] == (
         result["lsmc_signed_csm_stress_loss_aud"]
     )
@@ -777,42 +613,23 @@ def test_lsmc_cache_metadata_rejects_path_incongruent_hedge(tmp_path):
         "--hedge-cache-root",
         str(tmp_path / "hedge"),
     ])
-    training = ["training-fingerprint"]
-    validation = "validation-fingerprint"
-    evaluation = "evaluation-fingerprint"
+    fingerprint = "single-sample-fingerprint"
     manifest = {
         "method": {
             "hedge_pricing_method": "mc_conditional",
-            "scenario_fingerprints": {
-                "training": training,
-                "validation": validation,
-                "evaluation": evaluation,
-            },
-            "market_cache_keys": {
-                "training": ["market-training"],
-                "validation": "market-validation",
-                "evaluation": "market-evaluation",
-            },
-            "hedge_cache_keys": {
-                "training": ["hedge-training"],
-                "validation": "hedge-validation",
-                "evaluation": "hedge-evaluation",
-            },
-            "hedge_price_surface_fingerprints": {
-                "training": ["surface-training"],
-                "validation": "surface-validation",
-                "evaluation": "surface-evaluation",
-            },
-            "hedge_training_scenario_fingerprints": ["wrong-training"],
-            "hedge_cap_grid": [0.06],
+            "scenario_fingerprint": fingerprint,
+            "market_cache_key": "market-single",
+            "hedge_cache_key": "hedge-single",
+            "hedge_price_surface_fingerprint": "surface-single",
         },
     }
     summary = {
         "hedge_pricing_method": "mc_conditional",
-        "market_cache_key": "market-evaluation",
-        "hedge_cache_key": "hedge-evaluation",
-        "hedge_price_surface_fingerprint": "surface-evaluation",
-        "hedge_training_scenario_fingerprint": evaluation,
+        "scenario_fingerprint": fingerprint,
+        "market_cache_key": "market-single",
+        "hedge_cache_key": "hedge-single",
+        "hedge_price_surface_fingerprint": "surface-single",
+        "hedge_training_scenario_fingerprint": "wrong-fingerprint",
     }
 
     with pytest.raises(ValueError, match="not path-congruent"):
@@ -821,9 +638,7 @@ def test_lsmc_cache_metadata_rejects_path_incongruent_hedge(tmp_path):
             summary,
             args,
             rate=0.06,
-            training_fingerprints=training,
-            validation_fingerprint=validation,
-            evaluation_fingerprint=evaluation,
+            scenario_fingerprint=fingerprint,
         )
 
 

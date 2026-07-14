@@ -72,8 +72,8 @@ probability:
 
 $$
 q_x^{\mathrm{base}}
-=1-\exp\!\left(-\int_x^{x+1}\mu(u)\,du\right)
-=1-\exp\!\left(
+=1-\exp\left(-\int_x^{x+1}\mu(u)\mathrm{d}u\right)
+=1-\exp\left(
 -A-Bc^x\frac{c-1}{\log c}
 \right).
 $$
@@ -90,7 +90,9 @@ $10^{-6}$. Fractional ages use linear interpolation between annual $q_x$
 values. The hard terminal value at age 115 is treated separately and is not
 interpolated backwards into age 114.x.
 
-![Schematic x-y chart of annual conditional death probability against attained age for the male and female proxy bases; both rise sharply at advanced ages and reach the hard terminal value at age 115.](assets/mortality-base-qx-by-age.svg)
+<p align="center">
+  <img src="assets/mortality-base-qx-by-age.svg" width="900" alt="Schematic x-y chart of annual conditional death probability against attained age for the male and female proxy bases; both rise sharply at advanced ages and reach the hard terminal value at age 115.">
+</p>
 
 *Figure 1 — Schematic shape of the active proxy. The curves explain the
 age pattern and sex ordering; they are not plotted calibration data. The final
@@ -107,11 +109,12 @@ The default annual improvement is 1.25% through age 90, tapers linearly to zero
 at age 110, and is zero thereafter:
 
 $$
-i(x)=0.0125\,
-\operatorname{clip}\!\left(\frac{110-x}{110-90},0,1\right).
+i(x)=0.0125\times\operatorname{clip}\left(\frac{110-x}{110-90},0,1\right).
 $$
 
-![X-y chart of annual mortality improvement rate against attained age: 1.25 percent through age 90, a linear decline to zero at age 110, then zero to age 115.](assets/mortality-improvement-by-age.svg)
+<p align="center">
+  <img src="assets/mortality-improvement-by-age.svg" width="900" alt="X-y chart of annual mortality improvement rate against attained age: 1.25 percent through age 90, a linear decline to zero at age 110, then zero to age 115.">
+</p>
 
 *Figure 2 — Exact shape of the configured improvement taper. It is a fixed
 research assumption, not an estimate from observed deaths.*
@@ -120,10 +123,10 @@ Before the terminal-age override, the annual probability is calculated
 schematically as
 
 $$
-q(x,y,d)=\operatorname{clip}\!\left(
+q(x,y,d)=\operatorname{clip}\left(
 q_x^{\mathrm{base}}
-[1-i(x)]^{\max(y-2022,0)}s
-+a\,\mathbf 1_{\{0\le d<1\}},
+[1-i(x)]^{\max(y-2022,0)}\times s
++a\times\mathbf{1}_{0\le d<1},
 0,1
 \right),
 $$
@@ -160,11 +163,14 @@ $$
 \left(1-q_m\right)^{12}=1-q_x.
 $$
 
-![X-y chart of expected survival exposure by month for a teaching example with annual q equal to 12 percent; exposure decreases from 1,000 at month zero to approximately 938.1 at month six and 880 at month twelve.](assets/mortality-annual-to-monthly.svg)
+<p align="center">
+  <img src="assets/mortality-annual-to-monthly.svg" width="900" alt="X-y chart of expected survival exposure by month for a teaching example with annual q equal to 12 percent; exposure decreases from 1,000 at month zero to approximately 938.1 at month six and 880 at month twelve.">
+</p>
 
 *Figure 3 — Annual-to-monthly reconciliation. Markers and steps are monthly
-model-grid points. The deliberately visible $q_x=12\%$ is a teaching input,
-not a modelpoint result. The monthly rate is about 1.0596%, not 1%.*
+model-grid points. The deliberately visible annual input $q_x=0.12$ (12%) is a
+teaching input, not a modelpoint result. The monthly rate is about 1.0596%, not
+1%.*
 
 On the monthly grid, expected survival and death mass obey
 
@@ -264,7 +270,9 @@ $$
 q_{m+1}^{LS}=1-\frac{S_{m+1}^{LS}}{S_m^{LS}}.
 $$
 
-![X-y chart of conditional survival probability after Income Election for the Primary, the Spouse and the independent last-survivor combination; the last-survivor curve lies above both Single-Life curves.](assets/mortality-joint-survival.svg)
+<p align="center">
+  <img src="assets/mortality-joint-survival.svg" width="900" alt="X-y chart of conditional survival probability after Income Election for the Primary, the Spouse and the independent last-survivor combination; the last-survivor curve lies above both Single-Life curves.">
+</p>
 
 *Figure 4 — Schematic Joint-Life survival. Under `continue_income`, the locked
 amount continues while either covered life survives. Under `lump_sum`, the
@@ -327,7 +335,9 @@ $q_m=1$ override for the interval ending at age 115. Other research sensitivity
 runners may use different explicitly labelled factors; those must not be
 confused with the portfolio/capital stress set above.
 
-![X-y chart of schematic survival probability against attained age for longevity stress, base mortality and mortality stress; longevity lies above base and mortality below, and all end at age 115.](assets/mortality-stress-survival.svg)
+<p align="center">
+  <img src="assets/mortality-stress-survival.svg" width="900" alt="X-y chart of schematic survival probability against attained age for longevity stress, base mortality and mortality stress; longevity lies above base and mortality below, and all end at age 115.">
+</p>
 
 *Figure 5 — Schematic stress direction. Survival exposure moves predictably,
 but the CSM direction remains product-state dependent and requires a complete

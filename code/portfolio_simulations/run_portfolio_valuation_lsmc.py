@@ -74,6 +74,7 @@ from policy_engine import (  # noqa: E402
 from policy_engine.esg import Measure  # noqa: E402
 from policy_engine.optimal_behaviour_lsmc import (  # noqa: E402
     POLICYHOLDER_LSMC_MORTALITY_BASIS,
+    POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS,
     OptimalBehaviourLSMCSettings,
     OptimalBehaviourPolicy,
     OptimalBehaviourPolicyFit,
@@ -125,7 +126,7 @@ else:
 
 
 DEFAULT_OUTPUT_DIRECTORY = run_output_directory("portfolio_valuation_lsmc")
-AVAILABLE_LSMC_TRAINING_SEED_SETS = 3
+AVAILABLE_LSMC_TRAINING_SEED_SETS = 1
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -134,7 +135,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     training_inputs = require_mc_samples(
         mc_inputs,
         "lsmc_training",
-        AVAILABLE_LSMC_TRAINING_SEED_SETS,
+        1,
     )
     primary_training_input = training_inputs[0]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -175,58 +176,65 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=primary_training_input.mortality_seed,
         help="legacy alias; normalised to --train-mortality-seed",
     )
-    parser.add_argument("--n-train", type=int, default=training_inputs[0].n_paths,
-                        help="independent LSMC training paths")
+    parser.add_argument(
+        "--n-train",
+        type=int,
+        default=primary_training_input.n_paths,
+        help="path count for the sole Q sample used by fit and all rollouts",
+    )
     parser.add_argument(
         "--train-seed", type=int, default=training_inputs[0].market_seed
     )
     parser.add_argument(
         "--train-take-up-seed",
         type=int,
-        default=training_inputs[0].take_up_seed,
-        help="independent Election seed recorded for the LSMC training basis",
+        default=primary_training_input.take_up_seed,
+        help="take-up stream for same-sample descriptive rollouts",
     )
     parser.add_argument(
         "--train-mortality-seed",
         type=int,
-        default=training_inputs[0].mortality_seed,
-        help="independent pathwise Joint-Life mortality seed for LSMC training",
+        default=primary_training_input.mortality_seed,
+        help=(
+            "configured pathwise Joint-Life mortality stream for actuarial/"
+            "CSM rollouts; the customer-policy fit remains mortality-free"
+        ),
     )
     parser.add_argument(
         "--train-seed-2",
         type=int,
-        default=training_inputs[1].market_seed,
-        help="market seed for the second independently validated LSMC fit",
+        default=primary_training_input.market_seed + 1,
+        help="ignored legacy second-fit market seed",
     )
     parser.add_argument(
         "--train-take-up-seed-2",
         type=int,
-        default=training_inputs[1].take_up_seed,
-        help="Election stream for the second independently validated LSMC fit",
+        default=primary_training_input.take_up_seed + 1,
+        help="ignored legacy second-fit Election stream",
     )
     parser.add_argument(
         "--train-mortality-seed-2",
         type=int,
-        default=training_inputs[1].mortality_seed,
-        help="mortality stream for the second independently validated LSMC fit",
+        default=primary_training_input.mortality_seed + 1,
+        help="ignored legacy second-fit mortality stream",
     )
     parser.add_argument(
         "--train-seed-3",
         type=int,
-        default=training_inputs[2].market_seed,
-        help="market seed for the third independently validated LSMC fit",
+        default=primary_training_input.market_seed + 2,
+        help="ignored legacy third-fit market seed",
     )
     parser.add_argument(
         "--train-take-up-seed-3",
         type=int,
-        default=training_inputs[2].take_up_seed,
-        help="Election stream for the third independently validated LSMC fit",
+        default=primary_training_input.take_up_seed + 2,
+        help="ignored legacy third-fit Election stream",
     )
     parser.add_argument(
         "--train-mortality-seed-3",
         type=int,
-        default=training_inputs[2].mortality_seed,
-        help="mortality stream for the third independently validated LSMC fit",
+        default=primary_training_input.mortality_seed + 2,
+        help="ignored legacy third-fit mortality stream",
     )
     parser.add_argument(
         "--training-seed-count",
@@ -318,8 +326,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--exercise-buffer-rmse-multiplier",
         type=float,
-        default=0.25,
-        help="conservative buffer for every fitted action advantage",
+        default=0.0,
+        help=(
+            "must be zero: the Swing policy selects the highest fitted "
+            "conditional expected customer PV without a conservative buffer"
+        ),
     )
     parser.add_argument("--crediting-cap-rate", type=float, default=None)
     parser.add_argument("--portfolio-contract-count", type=float, default=None)
@@ -406,9 +417,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--lsmc-ridge must be finite and non-negative")
     if (
         not math.isfinite(args.exercise_buffer_rmse_multiplier)
-        or args.exercise_buffer_rmse_multiplier < 0.0
+        or args.exercise_buffer_rmse_multiplier != 0.0
     ):
-        parser.error("--exercise-buffer-rmse-multiplier must be non-negative")
+        parser.error(
+            "--exercise-buffer-rmse-multiplier must be zero for the "
+            "time-zero Swing objective"
+        )
     if args.crediting_cap_rate is not None and (
         not math.isfinite(args.crediting_cap_rate)
         or not 0.0 <= args.crediting_cap_rate <= 1.0
@@ -964,7 +978,7 @@ def _write_comparison_report(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def _legacy_main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -3707,6 +3721,871 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     allow_nan=False,
                 )
                 handle.write("\n")
+        return 1
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the direct, single-sample time-zero Swing-option workflow."""
+    args = parse_args(argv)
+    output = args.output.expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    logger, log_path = _configure_logging(output, args.log_file, args.log_level)
+    started = time.perf_counter()
+
+    # A failed rerun must not inherit completion or validation evidence from
+    # the retired OOS workflow.
+    stale_files = (
+        "run_manifest.json",
+        "lsmc_failure_manifest.json",
+        "portfolio_summary.csv",
+        "model_point_results.csv",
+        "portfolio_aggregation_reconciliation.csv",
+        "income_election_distribution.csv",
+        "lsmc_regression_diagnostics.csv",
+        "lsmc_action_summary.csv",
+        "lsmc_vs_continue_summary.csv",
+        "lsmc_validation_summary.csv",
+        "lsmc_validation_manifest.json",
+        "lsmc_multi_seed_validation_evaluation.csv",
+        "comparison_summary.csv",
+        "model_point_comparison.csv",
+        "comparison_report.md",
+        "lsmc_behaviour_decomposition.csv",
+    )
+    for artifact_name in stale_files:
+        stale = (output / artifact_name).resolve()
+        if stale.parent != output:
+            raise RuntimeError("Unsafe stale single-sample output path.")
+        if stale.is_file():
+            stale.unlink()
+    for stale_directory_name in ("bench", "dynamic_benchmark", "figures"):
+        stale_directory = (output / stale_directory_name).resolve()
+        if stale_directory.parent != output:
+            raise RuntimeError("Unsafe stale single-sample directory path.")
+        if stale_directory.is_dir():
+            shutil.rmtree(stale_directory)
+
+    try:
+        logger.info(
+            "[1/6] Single-sample time-zero Swing LSMC started | output=%s",
+            output,
+        )
+        if args.legacy_sample_options_ignored:
+            logger.warning(
+                "Ignored legacy OOS/multi-sample options and normalised all "
+                "rollouts to --n-train/--train-seed: %s",
+                ", ".join(args.legacy_sample_options_ignored),
+            )
+
+        stress = get_portfolio_stress(args.stress_scenario)
+        stress_audit = stress.audit_dict(
+            applied_to_training=True,
+            applied_to_evaluation=True,
+        )
+        stress_audit["sample_semantics"] = "single_sample_time0_swing"
+        equity_allocation = load_equity_allocation()
+        market = load_market_assumptions(
+            args.zero_curve, args.model_parameters
+        )
+        base_product = IndexLinkedLifetimeIncomeProduct(
+            reference_fund=ReferenceFundSpec(
+                equity_weight=equity_allocation.equity_weight,
+                scenario_maximum_return=args.crediting_cap_rate,
+            ),
+            fees=FeeSpec(lip_waived_in_income_phase_if_aps=False),
+            dividend_yield={
+                index: parameters.dividend_yield
+                for index, parameters in market.esg.equity.items()
+            },
+        )
+        base_projection = ProjectionConfig(
+            record_paths=False,
+            heston_cos=False,
+            take_up_seed=args.train_take_up_seed,
+            mortality_seed=args.train_mortality_seed,
+            force_pathwise_joint_life=True,
+            hedge_cap_leg_mode=HedgeCapLegMode(args.hedge_cap_leg_mode),
+            hedge_pricing_method=args.hedge_pricing_method,
+        )
+        costs = load_cost_assumptions(
+            args.cost_assumptions,
+            assumption_set_id=args.cost_assumption_set,
+            value_basis="base",
+            product=base_product,
+            projection=base_projection,
+        )
+        behaviour_assumptions = None
+        dynamic_behaviour = None
+        if not args.no_dynamic_benchmark:
+            behaviour_assumptions = load_dynamic_behaviour_assumptions(
+                args.dynamic_behaviour,
+                assumption_set_id=args.behaviour_assumption_set,
+                value_basis="base",
+            )
+            dynamic_behaviour = behaviour_assumptions.behaviour
+        lsmc_behaviour = no_voluntary_action_behaviour(dynamic_behaviour)
+        model_points = load_policyholder_model_points(
+            args.model_points,
+            expected_market_parameter_set_id=market.parameter_set_id,
+            expected_yield_curve_id=market.curve_id,
+        )
+        if len(model_points.model_points) != 1:
+            raise ValueError(
+                "Customer LSMC runs require exactly one model point; got "
+                f"{len(model_points.model_points)} from {args.model_points}."
+            )
+
+        mortality = MortalityTable.gompertz_makeham()
+        stressed_esg, mortality, stressed_expenses = apply_portfolio_input_stress(
+            stress,
+            market.esg,
+            mortality,
+            costs.expenses,
+        )
+        scenario_transform = portfolio_scenario_transform(stress)
+        cache_settings = {
+            "market_cache_root": str(args.market_cache_root),
+            "market_curve_sha256": market.source_sha256["curve"],
+            "market_model_parameters_sha256": (
+                market.source_sha256["model_parameters"]
+            ),
+            "market_variant": (
+                stress.stress_id
+                if stress.stress_id in {
+                    "interest_up",
+                    "interest_down",
+                    "equity_level_down",
+                    "equity_volatility_up",
+                }
+                else "base"
+            ),
+            "require_market_cache": True,
+            "hedge_cache_root": str(args.hedge_cache_root),
+            "hedge_cap_grid": (
+                float(costs.product.reference_fund.effective_maximum_return),
+            ),
+            "hedge_equity_allocation": equity_allocation.equity_weight,
+            "hedge_equity_index": costs.product.reference_fund.equity_index,
+            "hedge_allocation_input_sha256": equity_allocation.source_sha256,
+            "require_hedge_cache": (
+                args.hedge_pricing_method == "mc_conditional"
+            ),
+        }
+        horizon_basis = ValuationSettings(
+            model="heston_hull_white",
+            n_paths=args.n_train,
+            seed=args.train_seed,
+            heston_substeps=args.heston_substeps,
+            horizon_years=None,
+            projection=replace(
+                costs.projection,
+                record_paths=False,
+                heston_cos=False,
+                take_up_seed=args.train_take_up_seed,
+                mortality_seed=args.train_mortality_seed,
+                force_pathwise_joint_life=True,
+            ),
+            real_world_model="hull_white_bs",
+            **cache_settings,
+        )
+        common_horizon = max(
+            resolve_horizon(horizon_basis, point.policy)
+            for point in model_points.model_points
+        )
+        fit_projection = replace(
+            costs.projection,
+            record_paths=True,
+            heston_cos=False,
+            take_up_seed=args.train_take_up_seed,
+            mortality_seed=args.train_mortality_seed,
+            force_pathwise_joint_life=True,
+        )
+        fit_settings = replace(
+            horizon_basis,
+            horizon_years=common_horizon,
+            projection=fit_projection,
+        )
+        rollout_settings = replace(
+            horizon_basis,
+            horizon_years=common_horizon,
+            projection=replace(
+                costs.projection,
+                record_paths=False,
+                heston_cos=False,
+                take_up_seed=args.train_take_up_seed,
+                mortality_seed=args.train_mortality_seed,
+                force_pathwise_joint_life=True,
+            ),
+        )
+
+        logger.info(
+            "[2/6] Load exact Q sample | paths=%d | seed=%d | horizon=%.1f",
+            args.n_train,
+            args.train_seed,
+            common_horizon,
+        )
+        fit_scenarios = build_scenarios(
+            stressed_esg,
+            fit_settings,
+            measure=Measure.RISK_NEUTRAL,
+            horizon_years=common_horizon,
+        )
+        transform_already_cached = (
+            fit_scenarios.market_cache_key is not None
+            and cache_settings["market_variant"] != "base"
+            and fit_scenarios.market_variant == cache_settings["market_variant"]
+        )
+        if scenario_transform is not None and not transform_already_cached:
+            fit_scenarios = scenario_transform(fit_scenarios)
+        fit_scenarios = bind_cached_hedge_prices(
+            fit_scenarios, fit_settings
+        )
+
+        lsmc_settings = OptimalBehaviourLSMCSettings(
+            ridge=args.lsmc_ridge,
+            n_folds=args.lsmc_folds,
+            exercise_buffer_rmse_multiplier=(
+                args.exercise_buffer_rmse_multiplier
+            ),
+            allow_partial_withdrawal=False,
+        )
+        policy_labels: dict[tuple[object, ...], list[str]] = {}
+        for point in model_points.model_points:
+            policy_labels.setdefault(
+                _policy_signature(point.policy), []
+            ).append(point.model_point_id)
+        fits: dict[tuple[object, ...], OptimalBehaviourPolicyFit] = {}
+
+        logger.info("[3/6] Fit mortality-free V11 Swing policy")
+        for point in model_points.model_points:
+            key = _policy_signature(point.policy)
+            if key in fits:
+                continue
+            fits[key] = fit_optimal_behaviour_policy(
+                costs.product,
+                point.policy,
+                fit_scenarios,
+                mortality,
+                expenses=stressed_expenses,
+                projection_config=fit_projection,
+                settings=lsmc_settings,
+                fit_basis_inputs={
+                    "stress_scenario": stress_audit,
+                    "sample_semantics": "single_sample_time0_swing",
+                    "market_seed": int(args.train_seed),
+                    "take_up_seed": int(args.train_take_up_seed),
+                    "policyholder_mortality_basis": (
+                        POLICYHOLDER_LSMC_MORTALITY_BASIS
+                    ),
+                    "policyholder_objective_discount_basis": (
+                        POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS
+                    ),
+                    "crediting_cap_rate": (
+                        costs.product.reference_fund.effective_maximum_return
+                    ),
+                },
+            )
+
+        structural_failures: list[dict[str, object]] = []
+        for key, fit in fits.items():
+            candidate = fit.policy_variants.get("V11")
+            reasons = list(fit.invalid_reasons)
+            if candidate is None:
+                reasons.append("missing_v11_candidate")
+            elif not candidate.valid:
+                reasons.extend(candidate.invalid_reasons or ("invalid_v11",))
+            if not fit.valid and not reasons:
+                reasons.append("invalid_fit")
+            if not fit.valid or candidate is None or not candidate.valid:
+                structural_failures.append({
+                    "policy_signature": repr(key),
+                    "policy_labels": "|".join(
+                        policy_labels.get(key, ["unlabelled"])
+                    ),
+                    "fit_basis_fingerprint": fit.fit_basis_fingerprint,
+                    "reasons": sorted(set(reasons)),
+                })
+        if structural_failures:
+            raise RuntimeError(
+                "Structurally invalid learned V11 candidate; no fixed-policy "
+                "fallback is permitted: "
+                + json.dumps(structural_failures, sort_keys=True)
+            )
+
+        deployed_policies: dict[
+            tuple[object, ...], OptimalBehaviourPolicy
+        ] = {}
+        election_only_policies: dict[tuple[object, ...], _ElectionOnlyPolicy] = {}
+
+        def direct_v11_factory(policy_object: object) -> object:
+            if not isinstance(policy_object, PolicySpec):
+                raise TypeError("LSMC policy factory requires PolicySpec.")
+            key = _policy_signature(policy_object)
+            if key not in fits:
+                raise RuntimeError("No fitted V11 exists for the policy.")
+            if key not in deployed_policies:
+                deployed_policies[key] = _fresh_policy(
+                    fits[key].policy_variants["V11"]
+                )
+            return deployed_policies[key]
+
+        def election_only_factory(policy_object: object) -> object:
+            if not isinstance(policy_object, PolicySpec):
+                raise TypeError("LSMC policy factory requires PolicySpec.")
+            key = _policy_signature(policy_object)
+            if key not in election_only_policies:
+                election_only_policies[key] = _ElectionOnlyPolicy(
+                    _fresh_policy(fits[key].policy_variants["V11"])
+                )
+            return election_only_policies[key]
+
+        logger.info(
+            "[4/6] Roll out V11 and descriptive benchmarks on the same Q sample"
+        )
+        lsmc_result = value_policyholder_portfolio(
+            costs.product,
+            model_points,
+            stressed_esg,
+            mortality,
+            lsmc_behaviour,
+            stressed_expenses,
+            settings=rollout_settings,
+            portfolio_contract_count=args.portfolio_contract_count,
+            profitability_materiality_bp=args.profitability_materiality_bp,
+            progress_callback=_make_progress_callback(logger),
+            combined_policy_factory=direct_v11_factory,
+            scenario_transform=scenario_transform,
+        )
+        election_continue_result = value_policyholder_portfolio(
+            costs.product,
+            model_points,
+            stressed_esg,
+            mortality,
+            lsmc_behaviour,
+            stressed_expenses,
+            settings=rollout_settings,
+            portfolio_contract_count=args.portfolio_contract_count,
+            profitability_materiality_bp=args.profitability_materiality_bp,
+            progress_callback=_make_progress_callback(logger),
+            combined_policy_factory=election_only_factory,
+            scenario_transform=scenario_transform,
+        )
+        dynamic_result = None
+        if dynamic_behaviour is not None:
+            dynamic_result = value_policyholder_portfolio(
+                costs.product,
+                model_points,
+                stressed_esg,
+                mortality,
+                dynamic_behaviour,
+                stressed_expenses,
+                settings=rollout_settings,
+                portfolio_contract_count=args.portfolio_contract_count,
+                profitability_materiality_bp=args.profitability_materiality_bp,
+                progress_callback=_make_progress_callback(logger),
+                scenario_transform=scenario_transform,
+            )
+
+        rollout_fingerprints = {
+            "v11": lsmc_result.scenario_fingerprint,
+            "v10_control": election_continue_result.scenario_fingerprint,
+        }
+        if dynamic_result is not None:
+            rollout_fingerprints["dynamic"] = dynamic_result.scenario_fingerprint
+        expected_fingerprint = fit_scenarios.content_fingerprint
+        if any(
+            fingerprint != expected_fingerprint
+            for fingerprint in rollout_fingerprints.values()
+        ):
+            raise RuntimeError(
+                "Fit and all rollouts must use the same exact Q sample: "
+                f"fit={expected_fingerprint}, rollouts={rollout_fingerprints}."
+            )
+
+        logger.info("[5/6] Write single-sample results")
+        time0_customer_expected_pv = float(
+            sum(
+                fit.training_candidate_policyholder_value_aud
+                for fit in fits.values()
+            ) / len(fits)
+        )
+        time0_customer_no_action_pv = float(
+            sum(
+                fit.training_no_action_policyholder_value_aud
+                for fit in fits.values()
+            ) / len(fits)
+        )
+        lsmc_summary = lsmc_result.summary_dict()
+        lsmc_summary.update({
+            "valuation_as_of_date": market.curve_metadata["as_of_date"],
+            "valuation_currency": market.curve_metadata["currency"],
+            "market_parameter_set_id": market.parameter_set_id,
+            "yield_curve_id": market.curve_id,
+            "cost_assumption_set_id": costs.assumption_set_id,
+            "behaviour_assumption_set_id": None,
+            "lsmc_sample_semantics": "single_sample_time0_swing",
+            "lsmc_policy_selection_mode": "direct_single_sample_expected_pv",
+            "lsmc_policyholder_objective_discount_basis": (
+                POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS
+            ),
+            "lsmc_terminal_condition": (
+                "post_fee_account_value_closeout_at_finite_projection_horizon"
+            ),
+            "lsmc_terminal_closeout_in_customer_objective": True,
+            "lsmc_oos_validation_used": False,
+            "lsmc_oos_evaluation_used": False,
+            "lsmc_training_paths": args.n_train,
+            "lsmc_training_seed": args.train_seed,
+            "lsmc_training_take_up_seed": args.train_take_up_seed,
+            "lsmc_training_mortality_seed": args.train_mortality_seed,
+            "lsmc_training_mortality_seed_used_for_policy_fit": False,
+            "lsmc_policyholder_mortality_basis": (
+                POLICYHOLDER_LSMC_MORTALITY_BASIS
+            ),
+            "lsmc_actuarial_rollout_uses_configured_mortality": True,
+            "lsmc_candidate_policy": "V11",
+            "lsmc_deployed_policy": "V11",
+            "lsmc_structurally_valid": True,
+            "lsmc_time0_customer_expected_pv_aud": (
+                time0_customer_expected_pv
+            ),
+            "lsmc_time0_customer_no_action_pv_aud": (
+                time0_customer_no_action_pv
+            ),
+            "lsmc_time0_customer_optionality_uplift_aud": (
+                time0_customer_expected_pv - time0_customer_no_action_pv
+            ),
+            "lsmc_training_scenario_fingerprint": expected_fingerprint,
+            "scenario_fingerprint": expected_fingerprint,
+            "lsmc_action_set": (
+                "growth:wait_for_one_year|start_income_now;"
+                "income:continue_for_one_year|full_withdrawal_now"
+            ),
+            "income_take_up_mode": "optimal_lsmc",
+            "income_take_up_source": "direct_v11_same_sample_policy",
+            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+            "stress_scenario_id": stress.stress_id,
+        })
+        _validate_hedge_backing_summary(lsmc_summary, args.hedge_cap_leg_mode)
+        lsmc_rows = lsmc_result.model_point_rows()
+        summary_path = output / "portfolio_summary.csv"
+        model_point_path = output / "model_point_results.csv"
+        reconciliation_path = output / "portfolio_aggregation_reconciliation.csv"
+        election_distribution_path = output / "income_election_distribution.csv"
+        _write_csv(summary_path, [lsmc_summary])
+        _write_csv(model_point_path, lsmc_rows)
+        _write_csv(
+            reconciliation_path,
+            _build_aggregation_reconciliation(lsmc_summary, lsmc_rows),
+        )
+        _write_csv(
+            election_distribution_path,
+            _income_election_distribution_rows(lsmc_summary),
+        )
+
+        benchmark_directories = behaviour_benchmark_directories(output)
+        election_continue_summary = election_continue_result.summary_dict()
+        election_continue_summary.update({
+            "stress_scenario_id": stress.stress_id,
+            "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+            "scenario_fingerprint": expected_fingerprint,
+            "benchmark_treatment": (
+                "same_sample_v11_election_with_income_surrender_suppressed"
+            ),
+            "benchmark_is_validation_gate": False,
+        })
+        election_continue_rows = election_continue_result.model_point_rows()
+        election_continue_dir = benchmark_directories["variable_election_continue"]
+        election_continue_summary_path = (
+            election_continue_dir / "portfolio_summary.csv"
+        )
+        election_continue_model_point_path = (
+            election_continue_dir / "model_point_results.csv"
+        )
+        election_continue_reconciliation_path = (
+            election_continue_dir / "portfolio_aggregation_reconciliation.csv"
+        )
+        _write_csv(election_continue_summary_path, [election_continue_summary])
+        _write_csv(election_continue_model_point_path, election_continue_rows)
+        _write_csv(
+            election_continue_reconciliation_path,
+            _build_aggregation_reconciliation(
+                election_continue_summary, election_continue_rows
+            ),
+        )
+        same_sample_comparison = _comparison_rows(
+            election_continue_summary,
+            lsmc_summary,
+            benchmark_column="fitted_election_continue_benchmark",
+        )
+        _write_csv(
+            output / "lsmc_vs_continue_summary.csv", same_sample_comparison
+        )
+
+        dynamic_outputs: dict[str, str] = {}
+        comparison_rows: list[dict[str, object]] = []
+        model_point_comparison_rows: list[dict[str, object]] = []
+        if dynamic_result is not None:
+            dynamic_summary = dynamic_result.summary_dict()
+            dynamic_summary.update({
+                "valuation_as_of_date": market.curve_metadata["as_of_date"],
+                "valuation_currency": market.curve_metadata["currency"],
+                "market_parameter_set_id": market.parameter_set_id,
+                "yield_curve_id": market.curve_id,
+                "cost_assumption_set_id": costs.assumption_set_id,
+                "behaviour_assumption_set_id": (
+                    behaviour_assumptions.assumption_set_id
+                ),
+                "stress_scenario_id": stress.stress_id,
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+                "scenario_fingerprint": expected_fingerprint,
+                "sample_semantics": "same_q_sample_descriptive_benchmark",
+            })
+            dynamic_rows = dynamic_result.model_point_rows()
+            dynamic_dir = output / "dynamic_benchmark"
+            dynamic_summary_path = dynamic_dir / "portfolio_summary.csv"
+            dynamic_model_point_path = dynamic_dir / "model_point_results.csv"
+            dynamic_reconciliation_path = (
+                dynamic_dir / "portfolio_aggregation_reconciliation.csv"
+            )
+            _write_csv(dynamic_summary_path, [dynamic_summary])
+            _write_csv(dynamic_model_point_path, dynamic_rows)
+            _write_csv(
+                dynamic_reconciliation_path,
+                _build_aggregation_reconciliation(dynamic_summary, dynamic_rows),
+            )
+            dynamic_outputs = {
+                "portfolio_summary_csv": str(dynamic_summary_path),
+                "model_point_results_csv": str(dynamic_model_point_path),
+                "aggregation_reconciliation_csv": str(
+                    dynamic_reconciliation_path
+                ),
+            }
+            comparison_rows = _comparison_rows(dynamic_summary, lsmc_summary)
+            model_point_comparison_rows = _model_point_comparison_rows(
+                dynamic_rows, lsmc_rows
+            )
+            _write_csv(output / "comparison_summary.csv", comparison_rows)
+            _write_csv(
+                output / "model_point_comparison.csv",
+                model_point_comparison_rows,
+            )
+
+        diagnostic_rows: list[dict[str, object]] = []
+        action_rows: list[dict[str, object]] = []
+        for key, fit in fits.items():
+            labels = "|".join(policy_labels.get(key, ["unlabelled"]))
+            common = {
+                "sample_semantics": "single_sample_time0_swing",
+                "training_seed_index": 1,
+                "primary_training_seed": True,
+                "training_market_seed": args.train_seed,
+                "training_take_up_seed": args.train_take_up_seed,
+                "training_mortality_seed": args.train_mortality_seed,
+                "training_scenario_fingerprint": expected_fingerprint,
+                "market_seed": args.train_seed,
+                "take_up_seed": args.train_take_up_seed,
+                "policy_labels": labels,
+                "scenario_fingerprint": expected_fingerprint,
+                "fit_basis_fingerprint": fit.fit_basis_fingerprint,
+                "fit_valid": fit.valid,
+                "deployed_policy": "V11",
+                "policyholder_objective_discount_basis": (
+                    POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS
+                ),
+                "training_policyholder_value_aud": (
+                    fit.training_policyholder_value_aud
+                ),
+                "training_no_action_policyholder_value_aud": (
+                    fit.training_no_action_policyholder_value_aud
+                ),
+                "training_candidate_policyholder_value_aud": (
+                    fit.training_candidate_policyholder_value_aud
+                ),
+                "training_optionality_uplift_aud": (
+                    fit.training_optionality_uplift_aud
+                ),
+            }
+            for diagnostic in fit.diagnostics:
+                diagnostic_rows.append({**common, **diagnostic.as_dict()})
+            deployed = deployed_policies.get(key)
+            statistics = (
+                {} if deployed is None else deployed.evaluation_statistics
+            )
+            for (action_type, step), stats in sorted(statistics.items()):
+                eligible = int(stats.get("eligible_path_count", 0))
+                selected = int(stats.get("action_path_count", 0))
+                action_rows.append({
+                    **common,
+                    "action_type": action_type,
+                    "decision_step": step,
+                    "policy_year": step // 12,
+                    **stats,
+                    "action_path_count": selected,
+                    "same_sample_action_rate": (
+                        selected / eligible if eligible else 0.0
+                    ),
+                })
+        if not diagnostic_rows:
+            diagnostic_rows.append({
+                "sample_semantics": "single_sample_time0_swing",
+                "training_seed_index": 1,
+                "primary_training_seed": True,
+                "training_scenario_fingerprint": expected_fingerprint,
+                "fit_valid": True,
+                "deployed_policy": "V11",
+                "scenario_fingerprint": expected_fingerprint,
+            })
+        if not action_rows:
+            action_rows.append({
+                "sample_semantics": "single_sample_time0_swing",
+                "training_seed_index": 1,
+                "primary_training_seed": True,
+                "training_scenario_fingerprint": expected_fingerprint,
+                "deployed_policy": "V11",
+                "scenario_fingerprint": expected_fingerprint,
+                "action_type": None,
+                "eligible_path_count": 0,
+                "action_path_count": 0,
+                "same_sample_action_rate": 0.0,
+            })
+        diagnostics_path = output / "lsmc_regression_diagnostics.csv"
+        actions_path = output / "lsmc_action_summary.csv"
+        _write_csv(diagnostics_path, diagnostic_rows)
+        _write_csv(actions_path, action_rows)
+
+        figure_paths: dict[str, str] = {}
+        matplotlib_version: Optional[str] = None
+        if not args.no_plots:
+            figure_paths, matplotlib_version = _create_plots(
+                lsmc_summary,
+                lsmc_rows,
+                output / "figures",
+                absolute=bool(
+                    lsmc_summary.get("absolute_portfolio_values_available")
+                ),
+                include_fair_fee_plot=False,
+                logger=logger,
+            )
+
+        hedge_surface = fit_scenarios.hedge_price_surface
+        market_cache_key = (
+            hedge_surface.spec.market_cache_key
+            if hedge_surface is not None
+            else fit_scenarios.market_cache_key
+        )
+        hedge_cache_key = (
+            None if hedge_surface is None else hedge_surface.hedge_cache_key
+        )
+        hedge_surface_fingerprint = (
+            None
+            if hedge_surface is None
+            else hedge_surface.price_surface_fingerprint
+        )
+        objective_key = "normalised_average_pv_policyholder_benefits_aud"
+        same_sample_v11_value = float(lsmc_summary[objective_key])
+        same_sample_continue_value = float(
+            election_continue_summary[objective_key]
+        )
+        fit_basis_fingerprints = {
+            repr(key): fit.fit_basis_fingerprint
+            for key, fit in fits.items()
+        }
+
+        logger.info("[6/6] Write single-sample run manifest")
+        manifest_path = output / "run_manifest.json"
+        manifest = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "runtime_seconds": time.perf_counter() - started,
+            "engine_version": ENGINE_VERSION,
+            "stress_scenario": stress_audit,
+            "method": {
+                "sample_semantics": "single_sample_time0_swing",
+                "policy_selection_mode": "direct_single_sample_expected_pv",
+                "policyholder_objective_discount_basis": (
+                    POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS
+                ),
+                "terminal_condition": (
+                    "post_fee_account_value_closeout_at_finite_projection_"
+                    "horizon"
+                ),
+                "terminal_closeout_in_customer_objective": True,
+                "oos_validation_used": False,
+                "oos_evaluation_used": False,
+                "primary_lsmc_deployed_policy": "V11",
+                "fixed_policy_substitution_allowed": False,
+                "noninferiority_gates_used": False,
+                "valuation_measure": "risk_neutral",
+                "market_model": "heston_hull_white",
+                "market_cache_key": market_cache_key,
+                "hedge_cache_key": hedge_cache_key,
+                "hedge_price_surface_fingerprint": hedge_surface_fingerprint,
+                "scenario_fingerprint": expected_fingerprint,
+                "exact_same_q_sample_for_fit_and_rollouts": True,
+                "lsmc_objective": "maximise_time_zero_policyholder_cashflow_pv",
+                "lsmc_action_set": {
+                    "growth": ["wait_for_one_year", "start_income_now"],
+                    "income": [
+                        "continue_for_one_year", "full_withdrawal_now"
+                    ],
+                },
+                "partial_withdrawal_in_optimal_policy": False,
+                "growth_surrender_allowed": False,
+                "factorial_benchmark_outputs_enabled": False,
+                "dynamic_behaviour_used_for_lsmc": False,
+                "dynamic_behaviour_used_for_benchmark": (
+                    dynamic_result is not None
+                ),
+                "hedge_pricing_method": args.hedge_pricing_method,
+                "hedge_cap_leg_mode": args.hedge_cap_leg_mode,
+            },
+            "lsmc_settings": {
+                "n_train": args.n_train,
+                "train_seed": args.train_seed,
+                "train_take_up_seed": args.train_take_up_seed,
+                "train_mortality_seed": args.train_mortality_seed,
+                "training_seed_count": 1,
+                "legacy_sample_options_ignored": list(
+                    args.legacy_sample_options_ignored
+                ),
+                "scenario_fingerprint": expected_fingerprint,
+                "fit_basis_fingerprints": fit_basis_fingerprints,
+                "n_folds": args.lsmc_folds,
+                "ridge": args.lsmc_ridge,
+                "ridge_grid": list(lsmc_settings.ridge_grid),
+                "exercise_buffer_rmse_multiplier": (
+                    args.exercise_buffer_rmse_multiplier
+                ),
+                "policyholder_mortality_basis": (
+                    POLICYHOLDER_LSMC_MORTALITY_BASIS
+                ),
+                "mortality_used_in_policy_fit": False,
+                "all_v11_candidates_structurally_valid": True,
+                "unique_policy_fits": len(fits),
+                "time0_customer_expected_pv_aud": (
+                    time0_customer_expected_pv
+                ),
+                "time0_customer_no_action_pv_aud": (
+                    time0_customer_no_action_pv
+                ),
+                "time0_customer_optionality_uplift_aud": (
+                    time0_customer_expected_pv - time0_customer_no_action_pv
+                ),
+                "same_sample_actuarial_policyholder_value_aud": (
+                    same_sample_v11_value
+                ),
+                "same_sample_actuarial_election_continue_value_aud": (
+                    same_sample_continue_value
+                ),
+                "same_sample_actuarial_minus_election_continue_aud": (
+                    same_sample_v11_value - same_sample_continue_value
+                ),
+                "same_sample_comparison_is_selection_gate": False,
+            },
+            "evaluation_settings": {
+                "sample_role": "same_q_sample_actuarial_rollout",
+                "n_paths": args.n_train,
+                "seed": args.train_seed,
+                "take_up_seed": args.train_take_up_seed,
+                "mortality_seed": args.train_mortality_seed,
+                "actuarial_rollout_uses_configured_mortality": True,
+                "scenario_horizon_years": common_horizon,
+                "scenario_fingerprint": expected_fingerprint,
+                "common_random_numbers_across_behaviour_rollouts": True,
+            },
+            "sources": {
+                "model_points": model_points.source_metadata(),
+                "market": market.source_metadata(),
+                "costs": costs.source_metadata(),
+                "equity_allocation": equity_allocation.source_metadata(),
+                "dynamic_behaviour_benchmark_only": (
+                    None
+                    if behaviour_assumptions is None
+                    else behaviour_assumptions.source_metadata()
+                ),
+            },
+            "model_limitations": [
+                "Research valuation gross of reinsurance.",
+                "Mortality is illustrative and not an approved production basis.",
+                "The learned policy and descriptive rollouts reuse one exact "
+                "Q sample; reported policy values are in-sample and are not "
+                "out-of-sample performance estimates.",
+                "The optimal action set excludes Partial Withdrawal.",
+            ],
+            "outputs": {
+                "portfolio_summary_csv": str(summary_path),
+                "model_point_results_csv": str(model_point_path),
+                "aggregation_reconciliation_csv": str(reconciliation_path),
+                "income_election_distribution_csv": str(
+                    election_distribution_path
+                ),
+                "lsmc_regression_diagnostics_csv": str(diagnostics_path),
+                "lsmc_action_summary_csv": str(actions_path),
+                "lsmc_vs_continue_summary_csv": str(
+                    output / "lsmc_vs_continue_summary.csv"
+                ),
+                "continue_benchmark": {
+                    "semantics": (
+                        "same_sample_v11_election_with_income_surrender_"
+                        "suppressed;descriptive_only"
+                    ),
+                    "portfolio_summary_csv": str(
+                        election_continue_summary_path
+                    ),
+                    "model_point_results_csv": str(
+                        election_continue_model_point_path
+                    ),
+                    "aggregation_reconciliation_csv": str(
+                        election_continue_reconciliation_path
+                    ),
+                },
+                "dynamic_benchmark": dynamic_outputs,
+                "figures": figure_paths,
+                "log": str(log_path),
+            },
+            "reporting": {"matplotlib_version": matplotlib_version},
+            "summary": lsmc_summary,
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                manifest,
+                handle,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+                default=str,
+            )
+            handle.write("\n")
+        logger.info(
+            "Single-sample LSMC completed | fits=%d | runtime=%.1fs | %s",
+            len(fits),
+            time.perf_counter() - started,
+            summary_path,
+        )
+        return 0
+    except Exception as exc:
+        logger.exception("Single-sample LSMC portfolio run failed")
+        failure_path = output / "lsmc_failure_manifest.json"
+        failure = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "status": "single_sample_lsmc_failed",
+            "sample_semantics": "single_sample_time0_swing",
+            "oos_validation_used": False,
+            "oos_evaluation_used": False,
+            "fixed_policy_substitution_allowed": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        with failure_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                failure,
+                handle,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+                default=str,
+            )
+            handle.write("\n")
         return 1
 
 

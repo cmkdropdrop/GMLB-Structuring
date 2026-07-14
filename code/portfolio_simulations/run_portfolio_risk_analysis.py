@@ -3,16 +3,16 @@
 For every requested scenario Maximum Return, this orchestrator calls both
 ``run_portfolio_valuation.py`` (statistical/dynamic policyholder behaviour) and
 ``run_portfolio_valuation_lsmc.py`` (annual fitted Income Election followed by
-annual Continue/Full-Withdrawal lower-bound decisions evaluated out of
-sample).
-Only the complete deployed policies are retained for the risk comparison:
-Dynamic Election plus Dynamic post-Election Behaviour, and either the validated
-LSMC V11 candidate or its recorded fixed validation fallback. Counterfactual
+annual Continue/Full-Withdrawal decisions on one common Q sample).
+Only the complete policies are retained for the risk comparison: Dynamic
+Election plus Dynamic post-Election Behaviour, and the directly fitted LSMC
+V11 policy.  There is no separate validation/evaluation sample, deployment
+gate or fixed-policy fallback. Counterfactual
 V00/V01/V10 Dynamic runs and Behaviour-effect decompositions are deliberately
 omitted.
 
 The default compares 4%, 6%, 12% and 15% Caps on the base market scenario with
-the complete Dynamic and deployed LSMC policies for the four-point proxy, but
+the complete Dynamic and directly fitted LSMC policies for the one-point proxy, but
 without counterfactual Behaviour arms or
 shock-and-revalue stresses.  Aggregate risk-analysis plots are produced by
 default; the more numerous child-scenario plots remain opt-in.  This makes
@@ -89,7 +89,7 @@ from policy_engine.repository_paths import (  # noqa: E402
     DEFAULT_AUSTRALIAN_ZERO_CURVE_PATH as DEFAULT_ZERO_CURVE_PATH,
     DEFAULT_COST_ASSUMPTIONS_PATH,
     DEFAULT_DYNAMIC_BEHAVIOUR_DIRECTORY,
-    DEFAULT_POLICYHOLDER_MODEL_POINTS_PATH as DEFAULT_MODEL_POINTS_PATH,
+    DEFAULT_FAST_POLICYHOLDER_MODEL_POINTS_PATH as DEFAULT_MODEL_POINTS_PATH,
     DEFAULT_MODEL_PARAMETERS_PATH,
     MARKET_DATA_DIRECTORY as DEFAULT_MARKET_DATA_DIRECTORY,
     PROJECT_ROOT as REPOSITORY_ROOT,
@@ -114,7 +114,6 @@ CONTRACTUAL_MINIMUM_CREDITING_CAP_RATE = 0.0025
 MINIMUM_LSMC_TRAINING_PATHS = 60
 AUTO_WORKER_MEMORY_FRACTION = 0.65
 DEFAULT_MAX_WORKERS = 1
-AVAILABLE_LSMC_TRAINING_SEED_SETS = 3
 AUTO_WORKER_MAXIMUM = 16
 AUTO_WORKER_FIXED_BYTES = 1_342_177_280  # 1.25 GiB process/projection overhead
 # Includes the added Election, phase-exposure and cause-specific Behaviour
@@ -380,17 +379,7 @@ def _parse_max_workers(text: str) -> Optional[int]:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     mc_inputs = load_mc_analysis_inputs()
-    evaluation_input = require_mc_samples(
-        mc_inputs, "evaluation", 1
-    )[0]
-    training_inputs = require_mc_samples(
-        mc_inputs,
-        "lsmc_training",
-        AVAILABLE_LSMC_TRAINING_SEED_SETS,
-    )
-    validation_input = require_mc_samples(
-        mc_inputs, "lsmc_validation", 1
-    )[0]
+    training_input = require_mc_samples(mc_inputs, "lsmc_training", 1)[0]
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -412,85 +401,86 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_BASELINE_RATE,
         help="comparison baseline; automatically added to the scenario set",
     )
+    # Retain the old evaluation arguments as parseable compatibility aliases.
+    # They are normalised to the sole training/valuation sample below and are
+    # never used to create an additional cache or OOS rollout.
+    parser.add_argument("--n-paths", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--seed", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--take-up-seed", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--mortality-seed", type=int, default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument(
-        "--n-paths", type=int, default=evaluation_input.n_paths
+        "--n-train", type=int, default=training_input.n_paths,
+        help="paths in the sole LSMC fit/valuation Q sample",
     )
     parser.add_argument(
-        "--seed", type=int, default=evaluation_input.market_seed
-    )
-    parser.add_argument(
-        "--take-up-seed", type=int, default=evaluation_input.take_up_seed
-    )
-    parser.add_argument(
-        "--mortality-seed", type=int, default=evaluation_input.mortality_seed
-    )
-    parser.add_argument(
-        "--n-train", type=int, default=training_inputs[0].n_paths
-    )
-    parser.add_argument(
-        "--train-seed", type=int, default=training_inputs[0].market_seed
+        "--train-seed", type=int, default=training_input.market_seed
     )
     parser.add_argument(
         "--train-take-up-seed",
         type=int,
-        default=training_inputs[0].take_up_seed,
+        default=training_input.take_up_seed,
     )
     parser.add_argument(
         "--train-mortality-seed",
         type=int,
-        default=training_inputs[0].mortality_seed,
+        default=training_input.mortality_seed,
     )
     parser.add_argument(
-        "--train-seed-2", type=int, default=training_inputs[1].market_seed
+        "--train-seed-2", type=int, default=None, help=argparse.SUPPRESS
     )
     parser.add_argument(
         "--train-take-up-seed-2",
         type=int,
-        default=training_inputs[1].take_up_seed,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--train-mortality-seed-2",
         type=int,
-        default=training_inputs[1].mortality_seed,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--train-seed-3", type=int, default=training_inputs[2].market_seed
+        "--train-seed-3", type=int, default=None, help=argparse.SUPPRESS
     )
     parser.add_argument(
         "--train-take-up-seed-3",
         type=int,
-        default=training_inputs[2].take_up_seed,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--train-mortality-seed-3",
         type=int,
-        default=training_inputs[2].mortality_seed,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--training-seed-count",
         type=int,
-        choices=(1, 3),
+        choices=(1,),
         default=1,
-        help=(
-            "number of independently fitted LSMC training policies; the "
-            "default uses one seed for the streamlined baseline"
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--n-validation", type=int, default=validation_input.n_paths
+        "--n-validation", type=int, default=None, help=argparse.SUPPRESS
     )
     parser.add_argument(
-        "--validation-seed", type=int, default=validation_input.market_seed
+        "--validation-seed", type=int, default=None, help=argparse.SUPPRESS
     )
     parser.add_argument(
         "--validation-take-up-seed",
         type=int,
-        default=validation_input.take_up_seed,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--validation-mortality-seed",
         type=int,
-        default=validation_input.mortality_seed,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--heston-substeps", type=int, default=4)
     parser.add_argument(
@@ -548,7 +538,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--exercise-buffer-rmse-multiplier",
         type=float,
-        default=0.25,
+        default=0.0,
     )
     parser.add_argument("--portfolio-contract-count", type=float, default=None)
     parser.add_argument("--profitability-materiality-bp", type=float, default=1.0)
@@ -557,8 +547,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_MODEL_POINTS_PATH,
         help=(
-            "policyholder model-point CSV; the operative default is the "
-            "four-point proxy (use the one-point file only for explicit smoke tests)"
+            "policyholder model-point CSV; customer-LSMC risk runs default "
+            "to the one-point fast proxy"
         ),
     )
     parser.add_argument("--cost-assumptions", type=Path, default=None)
@@ -657,6 +647,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     args.stress_scenarios = list(dict.fromkeys(args.stress_scenarios))
+    # One common sample drives the Swing-policy fit, its direct expected-PV
+    # rollout and the Dynamic CRN comparator.  Normalising legacy attributes
+    # here keeps helper APIs stable without retaining any OOS semantics.
+    args.n_paths = args.n_train
+    args.seed = args.train_seed
+    args.take_up_seed = args.train_take_up_seed
+    args.mortality_seed = args.train_mortality_seed
+    args.n_validation = args.n_train
+    args.validation_seed = args.train_seed
+    args.validation_take_up_seed = args.train_take_up_seed
+    args.validation_mortality_seed = args.train_mortality_seed
+    args.train_seed_2 = args.train_seed
+    args.train_take_up_seed_2 = args.train_take_up_seed
+    args.train_mortality_seed_2 = args.train_mortality_seed
+    args.train_seed_3 = args.train_seed
+    args.train_take_up_seed_3 = args.train_take_up_seed
+    args.train_mortality_seed_3 = args.train_mortality_seed
     # This orchestrator is an operative market-consistent valuation reader.
     # It must never let a child silently simulate replacement Q paths.  The
     # conditional-MC method likewise has no proxy price fallback.
@@ -692,65 +699,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--lsmc-folds must be at least two")
     if args.blas_threads <= 0:
         parser.error("--blas-threads must be positive")
-    seed_names = (
-        "seed",
-        "take_up_seed",
-        "mortality_seed",
-        "train_seed",
-        "train_take_up_seed",
-        "train_mortality_seed",
-        "train_seed_2",
-        "train_take_up_seed_2",
-        "train_mortality_seed_2",
-        "train_seed_3",
-        "train_take_up_seed_3",
-        "train_mortality_seed_3",
-        "validation_seed",
-        "validation_take_up_seed",
-        "validation_mortality_seed",
-    )
+    seed_names = ("train_seed", "train_take_up_seed", "train_mortality_seed")
     if any(getattr(args, name) < 0 for name in seed_names):
         parser.error("seeds must be non-negative")
-    if args.n_validation <= 0:
-        parser.error("--n-validation must be positive")
-    market_seeds = (
-        *(
-            args.train_seed, args.train_seed_2, args.train_seed_3
-        )[:args.training_seed_count],
-        args.validation_seed,
-        args.seed,
-    )
-    take_up_seeds = (
-        *(
-            args.train_take_up_seed,
-            args.train_take_up_seed_2,
-            args.train_take_up_seed_3,
-        )[:args.training_seed_count],
-        args.validation_take_up_seed,
-        args.take_up_seed,
-    )
-    mortality_seeds = (
-        *(
-            args.train_mortality_seed,
-            args.train_mortality_seed_2,
-            args.train_mortality_seed_3,
-        )[:args.training_seed_count],
-        args.validation_mortality_seed,
-        args.mortality_seed,
-    )
-    expected_seed_count = args.training_seed_count + 2
-    if len(set(market_seeds)) != expected_seed_count:
-        parser.error(
-            "all active training, validation and evaluation market seeds must differ"
-        )
-    if len(set(take_up_seeds)) != expected_seed_count:
-        parser.error(
-            "all active training, validation and evaluation take-up seeds must differ"
-        )
-    if len(set(mortality_seeds)) != expected_seed_count:
-        parser.error(
-            "all active training, validation and evaluation mortality seeds must differ"
-        )
     for name in ("lsmc_ridge", "exercise_buffer_rmse_multiplier"):
         value = float(getattr(args, name))
         if not math.isfinite(value) or value < 0.0:
@@ -863,10 +814,10 @@ def _dynamic_command(
         "--stress-scenario", stress_scenario,
         "--income-election-mode", income_election_mode,
         "--post-income-behaviour", post_income_behaviour,
-        "--n-paths", str(args.n_paths),
-        "--seed", str(args.seed),
-        "--take-up-seed", str(args.take_up_seed),
-        "--mortality-seed", str(args.mortality_seed),
+        "--n-paths", str(args.n_train),
+        "--seed", str(args.train_seed),
+        "--take-up-seed", str(args.train_take_up_seed),
+        "--mortality-seed", str(args.train_mortality_seed),
         "--heston-substeps", str(args.heston_substeps),
         "--hedge-cap-leg-mode", args.hedge_cap_leg_mode,
         "--profitability-materiality-bp",
@@ -914,25 +865,10 @@ def _lsmc_command(
         str(LSMC_PORTFOLIO_RUNNER),
         "--crediting-cap-rate", f"{rate:.12g}",
         "--stress-scenario", stress_scenario,
-        "--n-paths", str(args.n_paths),
-        "--seed", str(args.seed),
-        "--take-up-seed", str(args.take_up_seed),
-        "--mortality-seed", str(args.mortality_seed),
         "--n-train", str(args.n_train),
         "--train-seed", str(args.train_seed),
         "--train-take-up-seed", str(args.train_take_up_seed),
         "--train-mortality-seed", str(args.train_mortality_seed),
-        "--train-seed-2", str(args.train_seed_2),
-        "--train-take-up-seed-2", str(args.train_take_up_seed_2),
-        "--train-mortality-seed-2", str(args.train_mortality_seed_2),
-        "--train-seed-3", str(args.train_seed_3),
-        "--train-take-up-seed-3", str(args.train_take_up_seed_3),
-        "--train-mortality-seed-3", str(args.train_mortality_seed_3),
-        "--training-seed-count", str(args.training_seed_count),
-        "--n-validation", str(args.n_validation),
-        "--validation-seed", str(args.validation_seed),
-        "--validation-take-up-seed", str(args.validation_take_up_seed),
-        "--validation-mortality-seed", str(args.validation_mortality_seed),
         "--heston-substeps", str(args.heston_substeps),
         "--hedge-cap-leg-mode", args.hedge_cap_leg_mode,
         "--lsmc-folds", str(args.lsmc_folds),
@@ -946,8 +882,8 @@ def _lsmc_command(
         # in the same ScenarioJob.  Suppress only the duplicate Dynamic run
         # embedded in the standalone LSMC runner.
         "--no-dynamic-benchmark",
-        # The risk analysis reports only V11.  The LSMC runner retains its
-        # internal V10 Continue control solely for fit-quality validation.
+        # The risk analysis reports only direct V11.  V10 remains a purely
+        # descriptive same-sample comparator and can never replace V11.
         "--no-factorial-benchmarks",
         "--log-level", args.log_level,
         "--output", str(output),
@@ -966,20 +902,12 @@ def _cache_market_stress_id(stress_id: str) -> str:
 def _required_cache_samples(
     args: argparse.Namespace,
 ) -> tuple[tuple[str, int, int], ...]:
-    """Return every independent Q sample consumed by Dynamic or LSMC."""
-    training_seeds = (
-        args.train_seed,
-        args.train_seed_2,
-        args.train_seed_3,
-    )[:args.training_seed_count]
-    return (
-        ("evaluation", int(args.n_paths), int(args.seed)),
-        *tuple(
-            (f"training_{index}", int(args.n_train), int(seed))
-            for index, seed in enumerate(training_seeds, start=1)
-        ),
-        ("validation", int(args.n_validation), int(args.validation_seed)),
-    )
+    """Return the sole exact Q sample consumed by Dynamic and LSMC."""
+    return ((
+        "training_and_valuation",
+        int(args.n_train),
+        int(args.train_seed),
+    ),)
 
 
 def _cache_precompute_command(
@@ -1143,9 +1071,6 @@ def _expected_job_artifact_paths(
         directory / RECONCILIATION_FILE_NAME
         for directory in reconciliation_directories
     ]
-    paths.append(
-        job.lsmc_output / "lsmc_multi_seed_validation_evaluation.csv"
-    )
     if include_plots:
         paths.extend(
             directory / LONGEST_SCENARIO_PLOT_RELATIVE_PATH
@@ -2372,8 +2297,10 @@ def _lsmc_diagnostic_metrics(
     if not isinstance(settings, Mapping):
         raise ValueError("LSMC manifest has no lsmc_settings object.")
     training_seed_count = int(_as_float(
-        settings.get("training_seed_count"), "training_seed_count"
+        settings.get("training_seed_count", 1), "training_seed_count"
     ))
+    if training_seed_count != 1:
+        raise ValueError("Direct customer LSMC must use exactly one sample.")
     expected_seed_indices = set(range(1, training_seed_count + 1))
     if _as_bool(settings.get("allow_partial_withdrawal")):
         raise ValueError(
@@ -2463,9 +2390,8 @@ def _lsmc_diagnostic_metrics(
     surrender_count, surrender_eligible, _ = action_totals("full_withdrawal")
     if election_eligible <= 0:
         raise ValueError("LSMC action summary has no eligible Election decisions.")
-    # A documented immaterial-no-fit step may have no numerical regression.
-    # Material missing/unstable steps invalidate the fit and are rejected by
-    # the validation manifest before this aggregation is reached.
+    # Every enabled optimal action must have fit evidence.  There is no
+    # validation fallback that can excuse a structurally invalid V11 fit.
     r_squared = [
         _as_float(row.get("oof_r_squared"), "oof_r_squared")
         for row in diagnostic_rows
@@ -2499,98 +2425,23 @@ def _lsmc_diagnostic_metrics(
         )
     }
 
-    def missing_diagnostic_has_validated_fit_fallback(action_type: str) -> bool:
-        """Allow an absent candidate diagnostic only for its recorded fit failure."""
-
-        validation = manifest.get("validation_settings")
-        if not isinstance(validation, Mapping):
-            return False
-        candidate_fit_by_seed = validation.get(
-            "candidate_fit_valid_by_training_seed"
-        )
-        deployed_by_seed = validation.get("deployed_policy_by_training_seed")
-        fallback_by_seed = validation.get(
-            "validation_fallback_reason_by_training_seed"
-        )
-        if not all(
-            isinstance(item, Mapping)
-            for item in (
-                candidate_fit_by_seed,
-                deployed_by_seed,
-                fallback_by_seed,
-            )
-        ):
-            return False
-        assert isinstance(candidate_fit_by_seed, Mapping)
-        assert isinstance(deployed_by_seed, Mapping)
-        assert isinstance(fallback_by_seed, Mapping)
-        primary_seed = "training_seed_1"
-        if primary_seed not in candidate_fit_by_seed:
-            return False
-        deployed_policy = str(deployed_by_seed.get(primary_seed, "")).strip()
-        fallback_reason = str(fallback_by_seed.get(primary_seed, "")).strip()
-        if (
-            _as_bool(candidate_fit_by_seed.get(primary_seed))
-            or deployed_policy in {"", "V11"}
-            or fallback_reason != "candidate_fit_invalid"
-            or not _as_bool(validation.get("deployment_valid"))
-            or not _as_bool(
-                validation.get(
-                    "every_seed_passes_or_deploys_validated_fallback"
-                )
-            )
-            or settings.get("material_fit_failure_policy")
-            != "reject_v11_candidate_and_deploy_recorded_fixed_validation_benchmark"
-        ):
-            return False
-        accepted_count_field = {
-            "income_election": "accepted_election_regression_count",
-            "full_withdrawal": "accepted_surrender_regression_count",
-        }[action_type]
-        accepted_count = settings.get(accepted_count_field)
-        if accepted_count in (None, "") or int(
-            _as_float(accepted_count, accepted_count_field)
-        ) != 0:
-            return False
-        fallback_field = {
-            "income_election": "election_fallback_used",
-            "full_withdrawal": "surrender_fallback_used",
-        }[action_type]
-        action_group = [
-            row
-            for row in action_rows
-            if str(row.get("action_type", "")).strip().lower() == action_type
-        ]
-        return bool(action_group) and all(
-            _as_bool(row.get("training_fallback_used"))
-            and _as_bool(row.get(fallback_field))
-            for row in action_group
-        )
-
     missing_diagnostics = {
         action_type
         for action_type, rows in diagnostic_groups.items()
         if not rows
     }
-    unjustified_missing_diagnostics = {
-        action_type
-        for action_type in missing_diagnostics
-        if not missing_diagnostic_has_validated_fit_fallback(action_type)
-    }
-    if unjustified_missing_diagnostics:
+    if missing_diagnostics:
         raise ValueError(
             "LSMC diagnostics do not cover every enabled optimal action."
         )
     unique_fits = int(_as_float(
         settings.get("unique_policy_fits"), "unique_policy_fits"))
-    fallback_fits = int(_first_float(
-        settings,
-        (
-            "training_fallback_policy_count",
-            "training_fallback_fit_count",
-        ),
-        label="training fallback policy count",
+    fallback_fits = int(_as_float(
+        settings.get("training_fallback_policy_count", 0),
+        "training fallback policy count",
     ))
+    if fallback_fits:
+        raise ValueError("Direct V11 customer LSMC must not deploy a fit fallback.")
     output: dict[str, object] = {
         # These remain unweighted fit diagnostics.  Portfolio-weighted realised
         # rates come from the valuation summary fields above.
@@ -2630,9 +2481,6 @@ def _lsmc_diagnostic_metrics(
         ),
         "condition_number_max": (
             max(condition_numbers) if condition_numbers else 0.0
-        ),
-        "out_of_sample_policyholder_value_dominates_continue": _as_bool(
-            settings.get("out_of_sample_policyholder_value_dominates_continue")
         ),
     }
     for action_type, rows in diagnostic_groups.items():
@@ -3138,10 +2986,9 @@ def _validate_lsmc_cache_metadata(
     args: argparse.Namespace,
     *,
     rate: float,
-    training_fingerprints: Sequence[str],
-    validation_fingerprint: str,
-    evaluation_fingerprint: str,
+    scenario_fingerprint: str,
 ) -> dict[str, object]:
+    """Validate the one cache-congruent sample used for fit and valuation."""
     method = manifest.get("method")
     if not isinstance(method, Mapping):
         raise ValueError("LSMC manifest has no cache-aware method metadata.")
@@ -3154,148 +3001,64 @@ def _validate_lsmc_cache_metadata(
         label="LSMC",
         require_presence=False,
     )
-    scenario_fingerprints = method.get("scenario_fingerprints")
-    if not isinstance(scenario_fingerprints, Mapping):
-        raise ValueError("LSMC manifest has no cache scenario fingerprints.")
-    if scenario_fingerprints.get("training") != list(training_fingerprints) \
-            or str(scenario_fingerprints.get("validation")) != validation_fingerprint \
-            or str(scenario_fingerprints.get("evaluation")) != evaluation_fingerprint:
-        raise ValueError("LSMC cache scenario fingerprints changed sample roles.")
+    if _required_manifest_text(
+        method.get("scenario_fingerprint"),
+        "LSMC method scenario_fingerprint",
+    ) != scenario_fingerprint or _required_manifest_text(
+        summary.get("scenario_fingerprint"),
+        "LSMC summary scenario_fingerprint",
+    ) != scenario_fingerprint:
+        raise ValueError("LSMC fit and valuation do not use the common Q sample.")
 
-    market_keys = method.get("market_cache_keys")
-    if not isinstance(market_keys, Mapping):
-        raise ValueError("LSMC manifest has no market-cache key mapping.")
-    evaluation_market_key = _required_manifest_text(
-        market_keys.get("evaluation"), "LSMC evaluation market_cache_key"
+    market_key = _required_manifest_text(
+        method.get("market_cache_key"), "LSMC method market_cache_key"
     )
-    if evaluation_market_key != _required_manifest_text(
+    if market_key != _required_manifest_text(
         summary.get("market_cache_key"), "LSMC summary market_cache_key"
     ):
-        raise ValueError("LSMC evaluation market-cache keys differ.")
+        raise ValueError("LSMC summary and manifest market-cache keys differ.")
 
-    training_market_keys = market_keys.get("training")
-    validation_market_key = market_keys.get("validation")
-    hedge_keys = method.get("hedge_cache_keys")
-    price_surface_fingerprints = method.get("hedge_price_surface_fingerprints")
-    hedge_training_fingerprints = method.get(
-        "hedge_training_scenario_fingerprints"
-    )
-    if not isinstance(training_market_keys, list) or len(training_market_keys) != len(
-        training_fingerprints
-    ):
-        raise ValueError("LSMC market-cache training-key count is inconsistent.")
-    if not isinstance(hedge_keys, Mapping) or not isinstance(
-        price_surface_fingerprints, Mapping
-    ) or not isinstance(hedge_training_fingerprints, list):
-        raise ValueError("LSMC hedge-cache metadata is incomplete.")
-
-    evaluation_hedge_key: Optional[str] = None
-    evaluation_surface_fingerprint: Optional[str] = None
+    hedge_key: Optional[str] = None
+    surface_fingerprint: Optional[str] = None
     if args.require_hedge_cache:
-        role_market_keys = [
-            *(
-                _required_manifest_text(value, "LSMC training market_cache_key")
-                for value in training_market_keys
-            ),
-            _required_manifest_text(
-                validation_market_key, "LSMC validation market_cache_key"
-            ),
-            evaluation_market_key,
-        ]
-        if len(set(role_market_keys)) != len(training_fingerprints) + 2:
-            raise ValueError("LSMC sample roles do not use distinct exact market caches.")
-        training_hedge_keys = hedge_keys.get("training")
-        training_surface_fingerprints = price_surface_fingerprints.get("training")
-        if not isinstance(training_hedge_keys, list) or not isinstance(
-            training_surface_fingerprints, list
-        ) or len(training_hedge_keys) != len(training_fingerprints) or len(
-            training_surface_fingerprints
-        ) != len(training_fingerprints):
-            raise ValueError("LSMC training hedge-cache metadata has the wrong size.")
-        role_hedge_keys = [
-            *(
-                _required_manifest_text(value, "LSMC training hedge_cache_key")
-                for value in training_hedge_keys
-            ),
-            _required_manifest_text(
-                hedge_keys.get("validation"), "LSMC validation hedge_cache_key"
-            ),
-            _required_manifest_text(
-                hedge_keys.get("evaluation"), "LSMC evaluation hedge_cache_key"
-            ),
-        ]
-        if len(set(role_hedge_keys)) != len(training_fingerprints) + 2:
-            raise ValueError("LSMC sample roles do not use distinct exact hedge caches.")
-        evaluation_hedge_key = role_hedge_keys[-1]
-        if evaluation_hedge_key != _required_manifest_text(
+        hedge_key = _required_manifest_text(
+            method.get("hedge_cache_key"), "LSMC method hedge_cache_key"
+        )
+        if hedge_key != _required_manifest_text(
             summary.get("hedge_cache_key"), "LSMC summary hedge_cache_key"
         ):
-            raise ValueError("LSMC evaluation hedge-cache keys differ.")
-        role_surface_fingerprints = [
-            *(
-                _required_manifest_text(
-                    value, "LSMC training hedge-price surface fingerprint"
-                )
-                for value in training_surface_fingerprints
-            ),
-            _required_manifest_text(
-                price_surface_fingerprints.get("validation"),
-                "LSMC validation hedge-price surface fingerprint",
-            ),
-            _required_manifest_text(
-                price_surface_fingerprints.get("evaluation"),
-                "LSMC evaluation hedge-price surface fingerprint",
-            ),
-        ]
-        evaluation_surface_fingerprint = role_surface_fingerprints[-1]
-        if evaluation_surface_fingerprint != _required_manifest_text(
+            raise ValueError("LSMC summary and manifest hedge-cache keys differ.")
+        surface_fingerprint = _required_manifest_text(
+            method.get("hedge_price_surface_fingerprint"),
+            "LSMC method hedge-price surface fingerprint",
+        )
+        if surface_fingerprint != _required_manifest_text(
             summary.get("hedge_price_surface_fingerprint"),
             "LSMC summary hedge-price surface fingerprint",
         ):
-            raise ValueError("LSMC evaluation hedge-price surface fingerprints differ.")
-        if hedge_training_fingerprints != list(training_fingerprints):
-            raise ValueError("LSMC training hedge caches are not path-congruent.")
+            raise ValueError("LSMC hedge-price surface fingerprints differ.")
         if _required_manifest_text(
             summary.get("hedge_training_scenario_fingerprint"),
             "LSMC summary hedge training fingerprint",
-        ) != evaluation_fingerprint:
-            raise ValueError("LSMC evaluation hedge cache is not path-congruent.")
-        cap_grid = method.get("hedge_cap_grid")
-        if not isinstance(cap_grid, list) or len(cap_grid) != 1:
-            raise ValueError("LSMC hedge cache does not evidence one exact cap.")
-        _require_close(
-            _as_float(cap_grid[0], "LSMC hedge cap grid"),
-            rate,
-            "LSMC hedge-cache cap",
-        )
+        ) != scenario_fingerprint:
+            raise ValueError("LSMC hedge cache is not path-congruent.")
     else:
-        optional_values = [
-            *training_market_keys,
-            validation_market_key,
-            *(hedge_keys.get("training") or []),
-            hedge_keys.get("validation"),
-            hedge_keys.get("evaluation"),
-            *(price_surface_fingerprints.get("training") or []),
-            price_surface_fingerprints.get("validation"),
-            price_surface_fingerprints.get("evaluation"),
-            *hedge_training_fingerprints,
+        optional_values = (
+            method.get("hedge_cache_key"),
+            method.get("hedge_price_surface_fingerprint"),
             summary.get("hedge_cache_key"),
             summary.get("hedge_price_surface_fingerprint"),
             summary.get("hedge_training_scenario_fingerprint"),
-        ]
+        )
         if any(not _none_like(value) for value in optional_values):
             raise ValueError(
                 "Moment-matched LSMC valuation unexpectedly records a hedge cache."
             )
 
     return {
-        "evaluation_market_cache_key": evaluation_market_key,
-        "training_market_cache_keys": list(training_market_keys),
-        "validation_market_cache_key": validation_market_key,
-        "evaluation_hedge_cache_key": evaluation_hedge_key,
-        "evaluation_hedge_price_surface_fingerprint": (
-            evaluation_surface_fingerprint
-        ),
+        "market_cache_key": market_key,
+        "hedge_cache_key": hedge_key,
+        "hedge_price_surface_fingerprint": surface_fingerprint,
         "pricing_method": pricing_method,
         "require_market_cache_flag_present": market_flag_present,
         "require_hedge_cache_flag_present": hedge_flag_present,
@@ -3323,7 +3086,11 @@ def _normalised_action_tokens(value: object) -> set[str]:
         "wait_for_one_year": "wait",
         "start_income_now": "start_income",
         "continue_for_one_year": "continue",
+        "normal_income_for_one_year": "continue",
+        "normal_income": "continue",
         "full_withdrawal_now": "full_withdrawal",
+        "full_surrender_now": "full_withdrawal",
+        "full_surrender": "full_withdrawal",
     }
     tokens.update(
         action_aliases[token]
@@ -3959,6 +3726,57 @@ def _validate_behaviour_manifest(
     return None
 
 
+def _validate_direct_single_sample_policy(
+    manifest: Mapping[str, object],
+) -> dict[str, object]:
+    """Require direct V11 selection under the time-zero customer objective."""
+    method = manifest.get("method")
+    if not isinstance(method, Mapping):
+        raise ValueError("LSMC manifest has no method object.")
+    selection_mode = str(method.get("policy_selection_mode", "")).strip()
+    sample_semantics = str(method.get("sample_semantics", "")).strip()
+    if selection_mode != "direct_single_sample_expected_pv" or (
+        sample_semantics != "single_sample_time0_swing"
+    ):
+        raise ValueError(
+            "LSMC manifest does not identify direct single-sample expected-PV "
+            "policy selection."
+        )
+    discount_basis = str(
+        method.get("policyholder_objective_discount_basis", "")
+    ).strip()
+    if discount_basis != "time_zero_australian_zero_curve_deterministic_v1":
+        raise ValueError(
+            "LSMC customer objective is not discounted with the time-zero "
+            "Australian zero curve."
+        )
+    for field in ("oos_validation_used", "oos_evaluation_used"):
+        if field not in method or _as_bool(method[field]):
+            raise ValueError(f"LSMC direct policy must record {field}=false.")
+    deployed_policy = str(
+        method.get("primary_lsmc_deployed_policy", "")
+    ).strip()
+    if deployed_policy != "V11":
+        raise ValueError("Direct customer LSMC must deploy V11 without fallback.")
+    if _as_bool(method.get("fixed_policy_substitution_allowed")) or _as_bool(
+        method.get("noninferiority_gates_used")
+    ):
+        raise ValueError("Direct customer LSMC must not use gates or fallback.")
+    settings = manifest.get("lsmc_settings")
+    if not isinstance(settings, Mapping) or not _as_bool(
+        settings.get("all_v11_candidates_structurally_valid")
+    ):
+        raise ValueError("Direct V11 fit is not structurally valid.")
+    return {
+        "policy_selection_mode": selection_mode,
+        "sample_semantics": sample_semantics,
+        "policyholder_objective_discount_basis": discount_basis,
+        "oos_validation_used": False,
+        "oos_evaluation_used": False,
+        "deployed_policy": deployed_policy,
+    }
+
+
 def _load_scenario_result(
     args: argparse.Namespace,
     rate: float,
@@ -3978,9 +3796,6 @@ def _load_scenario_result(
     lsmc_summary = _read_single_csv_row(lsmc_output / "portfolio_summary.csv")
     lsmc_rows = _read_csv(lsmc_output / "model_point_results.csv")
     lsmc_manifest = _read_json(lsmc_output / "run_manifest.json")
-    lsmc_validation_manifest = _read_json(
-        lsmc_output / "lsmc_validation_manifest.json"
-    )
     all_lsmc_benchmark_directories = _lsmc_benchmark_directories(lsmc_output)
     lsmc_benchmark_directories = {
         "variable_election_continue": all_lsmc_benchmark_directories[
@@ -4091,12 +3906,8 @@ def _load_scenario_result(
             float(args.mortality_seed),
             f"{label} mortality seed",
         )
-    lsmc_fit_basis_fingerprint = _validate_behaviour_manifest(
-        lsmc_manifest,
-        label="LSMC full policy",
-        expected_election_mode="optimal",
-        expected_post_income_mode="optimal",
-    )
+    lsmc_fit_basis_fingerprint = _manifest_fit_basis_fingerprint(lsmc_manifest)
+    direct_policy = _validate_direct_single_sample_policy(lsmc_manifest)
     lsmc_method = lsmc_manifest.get("method")
     if not isinstance(lsmc_method, Mapping):
         raise ValueError("LSMC manifest has no method object.")
@@ -4104,25 +3915,21 @@ def _load_scenario_result(
     lsmc_evaluation_settings = lsmc_manifest.get("evaluation_settings")
     if not isinstance(lsmc_training_settings, Mapping) or not isinstance(
         lsmc_evaluation_settings, Mapping
-    ) or not _as_bool(
-        lsmc_training_settings.get("force_pathwise_joint_life")
-    ) or not _as_bool(
-        lsmc_evaluation_settings.get("force_pathwise_joint_life")
     ):
         raise ValueError(
-            "Deployed LSMC policy and its internal validation control do not share the "
-            "pathwise Joint-Life basis."
+            "LSMC manifest has incomplete fit/rollout settings."
         )
-    benchmark_metadata = lsmc_method.get("behaviour_benchmarks")
-    if not isinstance(benchmark_metadata, Mapping):
-        benchmark_metadata = lsmc_manifest.get("behaviour_benchmarks")
-    if not isinstance(benchmark_metadata, Mapping) or not all(
-        benchmark_id in benchmark_metadata
-        for benchmark_id in lsmc_benchmark_summaries
-    ):
+    action_set = lsmc_method.get("lsmc_action_set")
+    if not isinstance(action_set, Mapping):
+        raise ValueError("LSMC manifest has no phase-specific Swing action set.")
+    growth_actions = _normalised_action_tokens(action_set.get("growth"))
+    income_actions = _normalised_action_tokens(action_set.get("income"))
+    if not {"wait", "start_income"}.issubset(growth_actions) or not {
+        "continue", "full_withdrawal"
+    }.issubset(income_actions):
         raise ValueError(
-            "LSMC manifest does not identify the semantics of every retained "
-            "Behaviour benchmark."
+            "LSMC manifest does not expose WAIT/START in Growth and "
+            "NORMAL/FULL in Income."
         )
 
     dynamic_stress_id = _manifest_stress_id(dynamic_manifest)
@@ -4444,7 +4251,6 @@ def _load_scenario_result(
     dynamic_portfolio = dynamic_manifest.get("portfolio")
     lsmc_method = lsmc_manifest.get("method")
     evaluation_settings = lsmc_manifest.get("evaluation_settings")
-    validation_settings = lsmc_manifest.get("validation_settings")
     lsmc_settings = lsmc_manifest.get("lsmc_settings")
     if not isinstance(dynamic_portfolio, Mapping):
         raise ValueError("Dynamic manifest has no portfolio object.")
@@ -4452,59 +4258,38 @@ def _load_scenario_result(
         raise ValueError("LSMC manifest has no method object.")
     if not isinstance(evaluation_settings, Mapping):
         raise ValueError("LSMC manifest has no evaluation_settings object.")
-    if not isinstance(validation_settings, Mapping):
-        raise ValueError("LSMC manifest has no validation_settings object.")
-    if not _as_bool(validation_settings.get("valid")):
-        raise ValueError(
-            "LSMC validation produced neither an accepted V11 candidate nor "
-            "a recorded fixed deployment fallback."
-        )
-    if str(lsmc_validation_manifest.get("scenario_fingerprint")) != str(
-        validation_settings.get("scenario_fingerprint")
-    ):
-        raise ValueError(
-            "LSMC validation manifest and run manifest use different samples."
-        )
     if not isinstance(lsmc_settings, Mapping):
         raise ValueError("LSMC manifest has no lsmc_settings object.")
-    (
-        training_fingerprints,
-        deployed_policies,
-        candidate_acceptance,
-    ) = _validate_lsmc_seed_evidence(
-        lsmc_output,
-        lsmc_manifest,
-        lsmc_validation_manifest,
-        expected_args=args,
-    )
-    expected_deployed_mapping = {
-        f"training_seed_{index}": policy
-        for index, policy in enumerate(deployed_policies, start=1)
-    }
-    if str(lsmc_method.get("lsmc_candidate_policy", "")).strip() != "V11":
-        raise ValueError("LSMC manifest does not identify V11 as the candidate policy.")
-    if str(lsmc_method.get("primary_lsmc_deployed_policy", "")).strip() != (
-        deployed_policies[0]
-    ):
-        raise ValueError("LSMC method metadata mislabels the deployed primary policy.")
-    if lsmc_method.get("lsmc_deployed_policy_by_training_seed") != (
-        expected_deployed_mapping
-    ):
-        raise ValueError("LSMC method metadata changed the deployed policies by seed.")
+    direct_policy = _validate_direct_single_sample_policy(lsmc_manifest)
     if _as_bool(lsmc_method.get("dynamic_behaviour_used_for_benchmark")):
         raise ValueError(
             "LSMC scenario unexpectedly contains a duplicate Dynamic benchmark."
         )
-    if not _as_bool(
-        evaluation_settings.get("continue_benchmark_same_scenarios")
+    if str(evaluation_settings.get("sample_role", "")).strip() != (
+        "same_q_sample_actuarial_rollout"
     ):
-        raise ValueError("Continue and LSMC are not confirmed on the same scenarios.")
-    evaluation_fingerprint = str(dynamic_portfolio.get("scenario_fingerprint"))
-    lsmc_evaluation_fingerprint = str(
-        evaluation_settings.get("scenario_fingerprint"))
-    if evaluation_fingerprint != lsmc_evaluation_fingerprint:
+        raise ValueError("LSMC rollout is not labelled as a same-Q-sample rollout.")
+    scenario_fingerprint = _required_manifest_text(
+        dynamic_portfolio.get("scenario_fingerprint"),
+        "Dynamic portfolio scenario_fingerprint",
+    )
+    lsmc_fingerprints = {
+        _required_manifest_text(
+            lsmc_method.get("scenario_fingerprint"),
+            "LSMC method scenario_fingerprint",
+        ),
+        _required_manifest_text(
+            evaluation_settings.get("scenario_fingerprint"),
+            "LSMC rollout scenario_fingerprint",
+        ),
+        _required_manifest_text(
+            lsmc_settings.get("scenario_fingerprint"),
+            "LSMC fit scenario_fingerprint",
+        ),
+    }
+    if lsmc_fingerprints != {scenario_fingerprint}:
         raise ValueError(
-            "Dynamic and LSMC evaluations do not use the same scenario set."
+            "Dynamic, LSMC fit and LSMC rollout do not use one common Q sample."
         )
     for benchmark_id, benchmark_manifest in dynamic_benchmark_manifests.items():
         benchmark_portfolio = benchmark_manifest.get("portfolio")
@@ -4514,52 +4299,37 @@ def _load_scenario_result(
             )
         if str(
             benchmark_portfolio.get("scenario_fingerprint")
-        ) != evaluation_fingerprint:
+        ) != scenario_fingerprint:
             raise ValueError(
                 f"Dynamic benchmark {benchmark_id} changed evaluation paths."
             )
-    training_fingerprint = training_fingerprints[0]
-    validation_fingerprint = str(
-        validation_settings.get("scenario_fingerprint")
-    )
-    if len({
-        *training_fingerprints,
-        validation_fingerprint,
-        evaluation_fingerprint,
-    }) != args.training_seed_count + 2:
-        raise ValueError(
-            "All active LSMC training, validation and evaluation scenarios "
-            "must differ."
-        )
     dynamic_cache_metadata = _validate_dynamic_cache_metadata(
         dynamic_manifest,
         dynamic_summary,
         args,
         rate=rate,
-        evaluation_fingerprint=evaluation_fingerprint,
+        evaluation_fingerprint=scenario_fingerprint,
     )
     lsmc_cache_metadata = _validate_lsmc_cache_metadata(
         lsmc_manifest,
         lsmc_summary,
         args,
         rate=rate,
-        training_fingerprints=training_fingerprints,
-        validation_fingerprint=validation_fingerprint,
-        evaluation_fingerprint=evaluation_fingerprint,
+        scenario_fingerprint=scenario_fingerprint,
     )
     if dynamic_cache_metadata["market_cache_key"] != (
-        lsmc_cache_metadata["evaluation_market_cache_key"]
+        lsmc_cache_metadata["market_cache_key"]
     ):
-        raise ValueError("Dynamic and LSMC evaluations loaded different market caches.")
+        raise ValueError("Dynamic and LSMC loaded different market caches.")
     if dynamic_cache_metadata["hedge_cache_key"] != (
-        lsmc_cache_metadata["evaluation_hedge_cache_key"]
+        lsmc_cache_metadata["hedge_cache_key"]
     ):
-        raise ValueError("Dynamic and LSMC evaluations loaded different hedge caches.")
+        raise ValueError("Dynamic and LSMC loaded different hedge caches.")
     if dynamic_cache_metadata["hedge_price_surface_fingerprint"] != (
-        lsmc_cache_metadata["evaluation_hedge_price_surface_fingerprint"]
+        lsmc_cache_metadata["hedge_price_surface_fingerprint"]
     ):
         raise ValueError(
-            "Dynamic and LSMC evaluations loaded different hedge-price surfaces."
+            "Dynamic and LSMC loaded different hedge-price surfaces."
         )
     _require_close(
         _as_float(lsmc_settings.get("n_train"), "n_train"),
@@ -4572,20 +4342,14 @@ def _load_scenario_result(
         "LSMC train_seed",
     )
     for container, field, expected, label in (
-        (evaluation_settings, "take_up_seed", args.take_up_seed,
-         "LSMC evaluation take-up seed"),
-        (evaluation_settings, "mortality_seed", args.mortality_seed,
-         "LSMC evaluation mortality seed"),
+        (evaluation_settings, "take_up_seed", args.train_take_up_seed,
+         "LSMC same-sample take-up seed"),
+        (evaluation_settings, "mortality_seed", args.train_mortality_seed,
+         "LSMC same-sample mortality seed"),
         (lsmc_settings, "train_take_up_seed", args.train_take_up_seed,
          "LSMC training take-up seed"),
         (lsmc_settings, "train_mortality_seed", args.train_mortality_seed,
          "LSMC training mortality seed"),
-        (validation_settings, "seed", args.validation_seed,
-         "LSMC validation market seed"),
-        (validation_settings, "take_up_seed", args.validation_take_up_seed,
-         "LSMC validation take-up seed"),
-        (validation_settings, "mortality_seed", args.validation_mortality_seed,
-         "LSMC validation mortality seed"),
     ):
         _require_close(
             _as_float(container.get(field), field),
@@ -4601,9 +4365,14 @@ def _load_scenario_result(
         "LSMC summary training paths",
     )
     _require_close(
-        _as_float(validation_settings.get("n_paths"), "validation n_paths"),
-        float(args.n_validation),
-        "LSMC validation paths",
+        _as_float(evaluation_settings.get("n_paths"), "rollout n_paths"),
+        float(args.n_train),
+        "LSMC same-sample rollout paths",
+    )
+    _require_close(
+        _as_float(evaluation_settings.get("seed"), "rollout seed"),
+        float(args.train_seed),
+        "LSMC same-sample rollout seed",
     )
     _require_close(
         _as_float(
@@ -4615,43 +4384,14 @@ def _load_scenario_result(
     )
     if str(
         lsmc_summary.get("lsmc_training_scenario_fingerprint")
-    ) != training_fingerprint:
-        raise ValueError("LSMC summary and manifest training fingerprints differ.")
-    try:
-        summary_training_fingerprints = tuple(json.loads(str(
-            lsmc_summary.get("lsmc_training_scenario_fingerprints_json", "")
-        )))
-        summary_seed_triplets = json.loads(str(
-            lsmc_summary.get("lsmc_training_seed_triplets_json", "")
-        ))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            "LSMC summary has no valid training-seed JSON evidence."
-        ) from exc
-    if summary_training_fingerprints != training_fingerprints:
-        raise ValueError("LSMC summary changed the training fingerprints.")
-    if summary_seed_triplets != list(
-        _expected_lsmc_training_seed_triplets(args)
-    ):
-        raise ValueError("LSMC summary changed the training seed triplets.")
-    if int(_as_float(
-        lsmc_summary.get("lsmc_training_seed_count"),
-        "lsmc_training_seed_count",
-    )) != args.training_seed_count or not _as_bool(
-        lsmc_summary.get("lsmc_validation_all_active_seeds_valid")
-    ) or not _as_bool(
-        lsmc_summary.get("lsmc_final_evaluation_all_active_seeds_reported")
-    ):
-        raise ValueError("LSMC summary has incomplete training-seed evidence.")
+    ) != scenario_fingerprint:
+        raise ValueError("LSMC summary and manifest sample fingerprints differ.")
     _require_close(
         _as_float(lsmc_settings.get("n_folds"), "n_folds"),
         float(args.lsmc_folds),
         "LSMC n_folds",
     )
-    if str(lsmc_settings.get("income_action_set")) \
-            != args.lsmc_income_action_set:
-        raise ValueError("LSMC Income action set differs from the requested mode.")
-    if _as_bool(lsmc_settings.get("allow_partial_withdrawal")):
+    if _as_bool(lsmc_method.get("partial_withdrawal_in_optimal_policy")):
         raise ValueError("LSMC Partial Withdrawal must be disabled.")
     _require_close(
         _as_float(lsmc_settings.get("ridge"), "ridge"),
@@ -4780,11 +4520,11 @@ def _load_scenario_result(
             diagnostic.get("training_seed_index"),
             "diagnostic training_seed_index",
         ))
-        if seed_index not in set(range(1, args.training_seed_count + 1)):
+        if seed_index != 1:
             raise ValueError("LSMC regression diagnostic has an unknown seed.")
         diagnostic_seed_indices.add(seed_index)
         if str(diagnostic.get("training_scenario_fingerprint")) != (
-            training_fingerprints[seed_index - 1]
+            scenario_fingerprint
         ):
             raise ValueError(
                 "LSMC regression diagnostics changed a training fingerprint."
@@ -4795,8 +4535,8 @@ def _load_scenario_result(
             raise ValueError(
                 "LSMC regression diagnostic has an inconsistent primary flag."
             )
-    if diagnostic_seed_indices != set(range(1, args.training_seed_count + 1)):
-        raise ValueError("LSMC diagnostics do not cover all active training seeds.")
+    if diagnostic_seed_indices != {1}:
+        raise ValueError("LSMC diagnostics do not cover the sole fit sample.")
     lsmc_diagnostics = _lsmc_diagnostic_metrics(
         action_rows,
         diagnostic_rows,
@@ -4813,21 +4553,11 @@ def _load_scenario_result(
         "valuation_basis": dynamic_basis,
         "valuation_currency": dynamic_summary.get("valuation_currency"),
         "premium_aud": dynamic_metrics["premium_aud"],
-        "evaluation_scenario_fingerprint": evaluation_fingerprint,
+        "scenario_fingerprint": scenario_fingerprint,
         "hedge_pricing_method": args.hedge_pricing_method,
-        "evaluation_market_cache_key": dynamic_cache_metadata[
-            "market_cache_key"
-        ],
-        "training_market_cache_keys_json": json.dumps(
-            lsmc_cache_metadata["training_market_cache_keys"]
-        ),
-        "validation_market_cache_key": lsmc_cache_metadata[
-            "validation_market_cache_key"
-        ],
-        "evaluation_hedge_cache_key": dynamic_cache_metadata[
-            "hedge_cache_key"
-        ],
-        "evaluation_hedge_price_surface_fingerprint": (
+        "market_cache_key": dynamic_cache_metadata["market_cache_key"],
+        "hedge_cache_key": dynamic_cache_metadata["hedge_cache_key"],
+        "hedge_price_surface_fingerprint": (
             dynamic_cache_metadata["hedge_price_surface_fingerprint"]
         ),
         "dynamic_manifest_require_market_cache_flag_present": (
@@ -4842,72 +4572,38 @@ def _load_scenario_result(
         "lsmc_manifest_require_hedge_cache_flag_present": (
             lsmc_cache_metadata["require_hedge_cache_flag_present"]
         ),
-        "training_scenario_fingerprint": training_fingerprint,
-        "training_scenario_fingerprints_json": json.dumps(
-            list(training_fingerprints)
-        ),
-        "training_scenario_fingerprint_1": training_fingerprints[0],
-        "training_scenario_fingerprint_2": (
-            training_fingerprints[1] if len(training_fingerprints) > 1 else ""
-        ),
-        "training_scenario_fingerprint_3": (
-            training_fingerprints[2] if len(training_fingerprints) > 2 else ""
-        ),
-        "training_seed_triplets_json": json.dumps(
-            list(_expected_lsmc_training_seed_triplets(args)),
-            sort_keys=True,
-        ),
-        "training_seed_count": args.training_seed_count,
+        "sample_role": "training_and_valuation",
+        "sample_n_paths": args.n_train,
+        "sample_market_seed": args.train_seed,
+        "sample_take_up_seed": args.train_take_up_seed,
+        "sample_mortality_seed": args.train_mortality_seed,
         "lsmc_income_action_set": args.lsmc_income_action_set,
-        "primary_training_seed_index": 1,
-        "lsmc_primary_candidate_policy": "V11",
-        "lsmc_primary_deployed_policy": deployed_policies[0],
-        "lsmc_primary_candidate_accepted": candidate_acceptance[0],
-        "lsmc_primary_deployed_validated_fallback": not candidate_acceptance[0],
-        "lsmc_deployed_policy_by_training_seed_json": json.dumps(
-            expected_deployed_mapping,
-            sort_keys=True,
+        "lsmc_policy_selection_mode": direct_policy["policy_selection_mode"],
+        "lsmc_sample_semantics": direct_policy["sample_semantics"],
+        "lsmc_policyholder_objective_discount_basis": direct_policy[
+            "policyholder_objective_discount_basis"
+        ],
+        "lsmc_oos_validation_used": False,
+        "lsmc_oos_evaluation_used": False,
+        "lsmc_deployed_policy": direct_policy["deployed_policy"],
+        "lsmc_fixed_policy_fallback_used": False,
+        "lsmc_time0_customer_expected_pv_aud": _as_float(
+            lsmc_summary.get("lsmc_time0_customer_expected_pv_aud"),
+            "LSMC time-zero customer expected PV",
         ),
-        "lsmc_candidate_accepted_by_training_seed_json": json.dumps(
-            {
-                f"training_seed_{index}": accepted
-                for index, accepted in enumerate(candidate_acceptance, start=1)
-            },
-            sort_keys=True,
+        "lsmc_time0_customer_no_action_pv_aud": _as_float(
+            lsmc_summary.get("lsmc_time0_customer_no_action_pv_aud"),
+            "LSMC time-zero customer no-action PV",
         ),
-        "all_training_seed_v11_gate_components_valid": (
-            _as_bool(validation_settings.get(
-                "every_seed_passes_election_income_combined"
-            ))
+        "lsmc_time0_customer_optionality_uplift_aud": _as_float(
+            lsmc_summary.get("lsmc_time0_customer_optionality_uplift_aud"),
+            "LSMC time-zero customer optionality uplift",
         ),
-        "all_training_seed_v11_candidates_accepted": all(candidate_acceptance),
-        "all_training_seed_deployments_valid": (
-            _as_bool(validation_settings.get(
-                "every_seed_passes_or_deploys_validated_fallback"
-            ))
-        ),
-        "lsmc_candidate_fit_valid_by_training_seed_json": json.dumps(
-            validation_settings.get(
-                "candidate_fit_valid_by_training_seed", {}
-            ),
-            sort_keys=True,
-        ),
-        "lsmc_validation_fallback_reason_by_training_seed_json": json.dumps(
-            validation_settings.get(
-                "validation_fallback_reason_by_training_seed", {}
-            ),
-            sort_keys=True,
-        ),
-        "evaluation_used_for_training_seed_selection": False,
-        "validation_scenario_fingerprint": validation_fingerprint,
         "lsmc_fit_basis_fingerprint": lsmc_fit_basis_fingerprint,
         "source_metadata_fingerprint": source_metadata_fingerprint,
         "engine_version": dynamic_engine_version,
         "dynamic_scenario_directory": str(dynamic_output),
         "lsmc_scenario_directory": str(lsmc_output),
-        "lsmc_multi_seed_validation_evaluation_csv": str(
-            lsmc_output / "lsmc_multi_seed_validation_evaluation.csv"
-        ),
     }
     for method, metrics in (
         ("dynamic", dynamic_metrics),
@@ -5306,21 +5002,19 @@ def _validate_scenario_grid(
             float(row["premium_aud"]), premium, f"premium within {label}")
     checks = (
         ("hedge_pricing_method", "hedge-pricing method"),
-        ("evaluation_market_cache_key", "evaluation market cache"),
-        ("training_market_cache_keys_json", "LSMC training market caches"),
-        ("validation_market_cache_key", "LSMC validation market cache"),
-        ("evaluation_scenario_fingerprint", "evaluation scenario set"),
-        ("training_scenario_fingerprint", "LSMC training scenario set"),
+        ("market_cache_key", "market cache"),
+        ("scenario_fingerprint", "common fit/valuation scenario set"),
+        ("sample_role", "sample role"),
+        ("sample_n_paths", "sample path count"),
+        ("sample_market_seed", "sample market seed"),
+        ("sample_take_up_seed", "sample take-up seed"),
+        ("sample_mortality_seed", "sample mortality seed"),
+        ("lsmc_policy_selection_mode", "LSMC selection mode"),
         (
-            "training_scenario_fingerprints_json",
-            "all active LSMC training scenario sets",
+            "lsmc_policyholder_objective_discount_basis",
+            "LSMC customer discount basis",
         ),
-        ("training_scenario_fingerprint_1", "LSMC training scenario set 1"),
-        ("training_scenario_fingerprint_2", "LSMC training scenario set 2"),
-        ("training_scenario_fingerprint_3", "LSMC training scenario set 3"),
-        ("training_seed_triplets_json", "active LSMC training seed triplets"),
-        ("training_seed_count", "active LSMC training-seed count"),
-        ("validation_scenario_fingerprint", "LSMC validation scenario set"),
+        ("lsmc_deployed_policy", "direct LSMC policy"),
         ("source_metadata_fingerprint", "source inputs"),
         ("engine_version", "engine version"),
     )
@@ -5336,14 +5030,14 @@ def _validate_scenario_grid(
     if pricing_method == "mc_conditional":
         hedge_keys = {
             _required_manifest_text(
-                row["evaluation_hedge_cache_key"],
-                f"{label} evaluation hedge-cache key",
+                row["hedge_cache_key"],
+                f"{label} hedge-cache key",
             )
             for row in rows
         }
         surface_fingerprints = {
             _required_manifest_text(
-                row["evaluation_hedge_price_surface_fingerprint"],
+                row["hedge_price_surface_fingerprint"],
                 f"{label} hedge-price surface fingerprint",
             )
             for row in rows
@@ -5361,8 +5055,8 @@ def _validate_scenario_grid(
             raise ValueError(f"{label} lacks Dynamic hedge-cache requirement evidence.")
     elif pricing_method == "moment_matched_bs":
         if any(
-            not _none_like(row["evaluation_hedge_cache_key"])
-            or not _none_like(row["evaluation_hedge_price_surface_fingerprint"])
+            not _none_like(row["hedge_cache_key"])
+            or not _none_like(row["hedge_price_surface_fingerprint"])
             for row in rows
         ):
             raise ValueError(f"{label} mixes moment matching with hedge-cache data.")
@@ -5377,44 +5071,16 @@ def _validate_scenario_grid(
             "cap/stress combination must be refitted."
         )
     for row in rows:
-        training_seed_count = int(row["training_seed_count"])
-        scalar_training_fingerprints = (
-            str(row["training_scenario_fingerprint_1"]),
-            str(row["training_scenario_fingerprint_2"]),
-            str(row["training_scenario_fingerprint_3"]),
-        )
-        training_fingerprints = scalar_training_fingerprints[
-            :training_seed_count
-        ]
-        try:
-            encoded_training_fingerprints = tuple(json.loads(str(
-                row["training_scenario_fingerprints_json"]
-            )))
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        if (
+            str(row["sample_role"]) != "training_and_valuation"
+            or str(row["lsmc_deployed_policy"]) != "V11"
+            or _as_bool(row["lsmc_oos_validation_used"])
+            or _as_bool(row["lsmc_oos_evaluation_used"])
+            or _as_bool(row["lsmc_fixed_policy_fallback_used"])
+        ):
             raise ValueError(
-                f"{label} has malformed training-seed fingerprint evidence."
-            ) from exc
-        if encoded_training_fingerprints != training_fingerprints:
-            raise ValueError(
-                f"{label} scalar and encoded training fingerprints differ."
+                f"{label} violates direct single-sample V11 semantics."
             )
-        if str(row["training_scenario_fingerprint"]) != training_fingerprints[0]:
-            raise ValueError(
-                f"{label} primary fingerprint is not predeclared seed 1."
-            )
-        if len({
-            str(row["evaluation_scenario_fingerprint"]),
-            *training_fingerprints,
-            str(row["validation_scenario_fingerprint"]),
-        }) != training_seed_count + 2:
-            raise ValueError(
-                f"{label} all active LSMC training, validation and evaluation "
-                "samples must differ."
-            )
-        if int(row["primary_training_seed_index"]) != 1 or not _as_bool(
-            row["all_training_seed_deployments_valid"]
-        ) or _as_bool(row["evaluation_used_for_training_seed_selection"]):
-            raise ValueError(f"{label} violates the seed-acceptance rule.")
 
 
 STRESS_DELTA_METRICS = (
@@ -5474,26 +5140,20 @@ def _build_stress_loss_rows(
                 "crediting_cap_rate_percent"],
             "baseline_crediting_cap_rate": baseline_rate,
             "premium_aud": premium,
-            "base_evaluation_scenario_fingerprint": base[
-                "evaluation_scenario_fingerprint"],
-            "stress_evaluation_scenario_fingerprint": stressed[
-                "evaluation_scenario_fingerprint"],
-            "stress_training_scenario_fingerprint": stressed[
-                "training_scenario_fingerprint"],
-            "lsmc_primary_candidate_policy": stressed[
-                "lsmc_primary_candidate_policy"
+            "base_scenario_fingerprint": base["scenario_fingerprint"],
+            "stress_scenario_fingerprint": stressed["scenario_fingerprint"],
+            "lsmc_deployed_policy": stressed["lsmc_deployed_policy"],
+            "lsmc_policy_selection_mode": stressed[
+                "lsmc_policy_selection_mode"
             ],
-            "lsmc_primary_deployed_policy": stressed[
-                "lsmc_primary_deployed_policy"
+            "lsmc_policyholder_objective_discount_basis": stressed[
+                "lsmc_policyholder_objective_discount_basis"
             ],
-            "lsmc_primary_candidate_accepted": stressed[
-                "lsmc_primary_candidate_accepted"
+            "lsmc_oos_validation_used": stressed["lsmc_oos_validation_used"],
+            "lsmc_oos_evaluation_used": stressed["lsmc_oos_evaluation_used"],
+            "lsmc_time0_customer_optionality_uplift_aud": stressed[
+                "lsmc_time0_customer_optionality_uplift_aud"
             ],
-            "lsmc_primary_deployed_validated_fallback": stressed[
-                "lsmc_primary_deployed_validated_fallback"
-            ],
-            "lsmc_out_of_sample_policyholder_value_dominates_continue": stressed[
-                "lsmc_out_of_sample_policyholder_value_dominates_continue"],
             "lsmc_regression_accepted_share": stressed[
                 "lsmc_regression_accepted_share"],
             "lsmc_training_fallback_policy_share": stressed[
@@ -5617,39 +5277,17 @@ def _aud_axis(value: float, _position: object = None) -> str:
 
 
 def _lsmc_deployment_plot_label(rows: list[dict[str, object]]) -> str:
-    """Describe the deployment class represented by a set of plot rows."""
-    base = "Deployed annual-action LSMC"
+    """Describe the directly fitted single-sample Swing policy."""
+    base = "Direct single-sample customer LSMC"
     if not rows:
         return base
-
-    fallback_flags = [
-        _as_bool(row.get("lsmc_primary_deployed_validated_fallback"))
-        for row in rows
-    ]
-    accepted_flags = [
-        _as_bool(row.get("lsmc_primary_candidate_accepted"))
-        for row in rows
-    ]
-    if all(fallback_flags):
-        return f"{base} (validated fallback)"
-    if all(
-        accepted and not fallback
-        for accepted, fallback in zip(accepted_flags, fallback_flags)
-    ):
-        return f"{base} (accepted V11 candidate)"
-    if any(fallback_flags) and any(
-        accepted and not fallback
-        for accepted, fallback in zip(accepted_flags, fallback_flags)
-    ):
-        return f"{base} (mixed candidate/fallback)"
-
     deployed_policies = {
-        str(row.get("lsmc_primary_deployed_policy", "unknown"))
+        str(row.get("lsmc_deployed_policy", "unknown"))
         for row in rows
     }
-    if len(deployed_policies) == 1:
-        return f"{base} ({next(iter(deployed_policies))})"
-    return f"{base} (mixed deployments)"
+    if deployed_policies == {"V11"}:
+        return f"{base} (direct V11)"
+    return f"{base} ({', '.join(sorted(deployed_policies))})"
 
 
 def _create_plots(
@@ -6189,7 +5827,8 @@ def _write_report(
         "",
         (
             "The analysis compares a path-dependent statistical Dynamic policy "
-            "with an out-of-sample evaluated LSMC policy. Income Election remains "
+            "with the directly fitted LSMC V11 policy on the same Q sample. "
+            "There is no separate OOS test. Income Election remains "
             "annual under both approaches. Voluntary Income actions are decided "
             "monthly under the Dynamic policy, but only on crediting anniversaries "
             "under the LSMC policy. Both approaches model Income Election "
@@ -6204,8 +5843,8 @@ def _write_report(
         ),
         (
             "A symmetric one-factor shock-and-revalue grid is also evaluated for "
-            "Dynamic and LSMC; the LSMC policy is refitted on independent training "
-            "paths for each stress-and-cap combination."
+            "Dynamic and LSMC; the LSMC policy is refitted and valued on the same "
+            "exact Q sample for each stress-and-cap combination."
             if stress_rows
             else "The explicit shock-and-revalue grid was skipped by option."
         ),
@@ -6268,8 +5907,8 @@ def _write_report(
         "",
         (
             "| Cap | Guarantee Claims Dynamic | Guarantee Claims LSMC | "
-            "CSM Dynamic | CSM LSMC | Deployed LSMC policy | "
-            "Behaviour-Model Gap | OOS PH ≥ Continue |"
+            "CSM Dynamic | CSM LSMC | Direct LSMC policy | "
+            "Behaviour-Model Gap | Time-zero customer optionality uplift |"
         ),
         "|---:|---:|---:|---:|---:|:---|---:|:---:|",
     ]
@@ -6280,10 +5919,9 @@ def _write_report(
             f"{_format_money(float(row['lsmc_pv_guarantee_claims_aud']))} | "
             f"{_format_money(float(row['dynamic_csm_aud']))} | "
             f"{_format_money(float(row['lsmc_csm_aud']))} | "
-            f"{row['lsmc_primary_deployed_policy']}"
-            f"{' (validated fallback)' if row['lsmc_primary_deployed_validated_fallback'] else ''} | "
+            f"{row['lsmc_deployed_policy']} | "
             f"{_format_money(float(row['behaviour_model_csm_gap_aud']))} | "
-            f"{'yes' if row['lsmc_out_of_sample_policyholder_value_dominates_continue'] else 'NO'} |"
+            f"{_format_money(float(row['lsmc_time0_customer_optionality_uplift_aud']))} |"
         )
 
     lines.extend([
@@ -6392,25 +6030,6 @@ def _write_report(
             f"{100.0 * float(row['lsmc_surrender_regression_accepted_share']):.3f}% |"
         )
 
-    failed_oos_caps = [
-        float(row["crediting_cap_rate_percent"])
-        for row in rows
-        if not bool(row[
-            "lsmc_out_of_sample_policyholder_value_dominates_continue"
-        ])
-    ]
-    if failed_oos_caps:
-        lines.extend([
-            "",
-            (
-                "> **LSMC evaluation note:** The previously independently "
-                "validated and frozen policy falls below the Continue benchmark "
-                "on the untouched final sample at: "
-                + ", ".join(f"{cap:.2f}%" for cap in failed_oos_caps)
-                + ". This is a reported evaluation fluctuation; the final sample "
-                "changes neither the policy nor its validation status."
-            ),
-        ])
     below_minimum_caps = [
         float(row["crediting_cap_rate_percent"])
         for row in rows
@@ -6546,8 +6165,8 @@ def _write_report(
             ),
             "",
             "| One-factor stress | Dynamic signed | LSMC signed | LSMC adverse | "
-            "LSMC − Dynamic | Deployed LSMC policy | OOS PH ≥ Continue |",
-            "|---|---:|---:|---:|---:|:---|:---:|",
+            "LSMC − Dynamic | Direct LSMC policy | Time-zero optionality uplift |",
+            "|---|---:|---:|---:|---:|:---|---:|",
         ])
         for stress in baseline_stresses:
             lines.append(
@@ -6556,16 +6175,9 @@ def _write_report(
                 f"{float(stress['lsmc_signed_csm_stress_loss_bp_of_premium']):.3f} bp | "
                 f"{float(stress['lsmc_adverse_csm_stress_loss_bp_of_premium']):.3f} bp | "
                 f"{float(stress['lsmc_minus_dynamic_signed_csm_stress_loss_bp_of_premium']):.3f} bp | "
-                f"{stress['lsmc_primary_deployed_policy']}"
-                f"{' (validated fallback)' if stress['lsmc_primary_deployed_validated_fallback'] else ''} | "
-                f"{'yes' if stress['lsmc_out_of_sample_policyholder_value_dominates_continue'] else 'NO'} |"
+                f"{stress['lsmc_deployed_policy']} | "
+                f"{_format_money(float(stress['lsmc_time0_customer_optionality_uplift_aud']))} |"
             )
-        failed_stress_oos = [
-            row for row in stress_rows
-            if not bool(row[
-                "lsmc_out_of_sample_policyholder_value_dominates_continue"
-            ])
-        ]
         lines.extend([
             "",
             (
@@ -6575,22 +6187,6 @@ def _write_report(
                 "the cap on each stress loss is available in the stress CSV."
             ),
         ])
-        if failed_stress_oos:
-            lines.extend([
-                "",
-                (
-                    "> **LSMC stress-evaluation note:** The independently validated "
-                    "stress policy falls below the Continue benchmark on the final "
-                    "sample at "
-                    + ", ".join(
-                        f"{row['stress_scenario_id']} / "
-                        f"{float(row['crediting_cap_rate_percent']):.2f}%"
-                        for row in failed_stress_oos
-                    )
-                    + ". The final sample changes neither the policy nor its "
-                    "validation status."
-                ),
-            ])
 
     lines.extend([
         "",
@@ -6642,31 +6238,35 @@ def _write_report(
         (
             "`Behaviour-Model Gap = Dynamic CSM − LSMC CSM`. A positive value "
             "means that the fitted LSMC approach is more adverse for the insurer. "
-            "The LSMC policy maximises the present value of policyholder cashflows "
-            "under Q; it optimises neither insurer profit nor risk capital."
+            "The LSMC policy maximises the time-zero-curve-discounted expected "
+            "present value of customer cashflows under Q; it optimises neither "
+            "insurer profit nor risk capital."
         ),
         "",
         (
             "The delta compares two complete behaviour approaches: path-dependent "
             "statistical Income Election plus monthly post-Election lapse/withdrawal "
             "assumptions on one side, and a jointly fitted LSMC policy on the other. "
-            "In the Growth phase, LSMC chooses between WAIT and START_INCOME; in "
-            "the Income phase, it chooses between CONTINUE and FULL_WITHDRAWAL "
-            "(lapse) on crediting anniversaries. It should therefore not be read as "
+            "In the Growth phase, LSMC chooses between WAIT and "
+            "START_NORMAL_INCOME; in the Income phase, it chooses between receiving "
+            "NORMAL_INCOME and FULL_SURRENDER on crediting anniversaries. It "
+            "should therefore not be read as "
             "the isolated effect of a single rate."
         ),
         "",
         (
-            "Income-Election decisions occur on policy anniversaries; voluntary "
-            "Income actions occur at month ends. Surviving contracts that have not "
+            "Income-Election decisions occur on policy anniversaries. Dynamic "
+            "voluntary Income actions occur monthly, whereas LSMC chooses only on "
+            "crediting anniversaries. Surviving contracts that have not "
             "yet elected start no later than the first policy anniversary after age "
             "100 is reached. Joint-Life contracts use pathwise separate Primary and "
             "Spouse life states."
         ),
         "",
         (
-            "Only the complete Dynamic V11 policy and the actually deployed LSMC "
-            "policy (V11 candidate or validated fixed fallback) are reported; "
+            "Only the complete Dynamic V11 policy and the directly fitted LSMC "
+            "V11 policy are reported; no validation gate or fixed-policy fallback "
+            "is used. "
             "V00/V01/V10 and the decomposition into Election, post-Election and "
             "interaction effects are omitted. Raw Election and Full-Withdrawal "
             "action rates are unweighted across model-point/path/decision events "
@@ -6705,16 +6305,15 @@ def _write_report(
         ),
         (
             "- Common random numbers reduce comparison noise but do not replace "
-            "Monte Carlo standard errors or repetitions across evaluation and "
-            "training seeds. Small deltas should not be treated as statistically "
-            "significant without such confidence analyses."
+            "Monte Carlo standard errors or repetitions across seeds. The same "
+            "sample is intentionally used for fit and reported customer value; "
+            "there is no OOS performance claim."
         ),
         (
-            "- The LSMC policy is a conservative lower bound with annual "
-            "WAIT/START_INCOME in Growth and annual CONTINUE/FULL_WITHDRAWAL in "
-            "Income; Partial Withdrawal is excluded from the optimal action set. "
-            "The lower bound applies to policyholder value and is not a conservative "
-            "upper bound on insurer costs."
+            "- The LSMC policy is fitted on one Q sample with annual "
+            "WAIT/START_NORMAL_INCOME in Growth and annual "
+            "NORMAL_INCOME/FULL_SURRENDER in Income; Partial Withdrawal is "
+            "excluded from the optimal action set."
         ),
         (
             "- The valuation is before Risk Margin and gross of reinsurance. "
@@ -6738,6 +6337,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_started = time.perf_counter()
     model_points_path = args.model_points.expanduser().resolve()
     model_point_ids = _model_point_ids(model_points_path)
+    if len(model_point_ids) != 1:
+        raise ValueError(
+            "Customer-LSMC risk analyses require exactly one model point; "
+            f"received {len(model_point_ids)} from {model_points_path}."
+        )
     output_root, output, run_id, run_created_at_utc = (
         _create_timestamped_run_directory(args.output)
     )
@@ -6755,8 +6359,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         + f" | comparison basis {100.0 * args.baseline_rate:.2f}%"
     )
     log_to_console(
-        "BEHAVIOUR | Per scenario, retain only Dynamic V11 and the validated "
-        "LSMC deployment; no V00/V01/V10 effect decomposition."
+        "BEHAVIOUR | Per scenario, retain Dynamic V11 and direct single-sample "
+        "LSMC V11; no OOS gate, fixed fallback or V00/V01/V10 decomposition."
     )
     log_to_console(
         f"MODEL POINTS | {len(model_point_ids)} used | "
@@ -6764,10 +6368,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     log_to_console(
         "COMPUTATION SCOPE | "
-        f"Dynamic: {args.n_paths} evaluation paths; "
-        f"LSMC: {args.training_seed_count} × {args.n_train} training paths, "
-        f"{args.n_validation} validation paths and "
-        f"{args.n_paths} evaluation paths."
+        f"one shared sample with {args.n_train} paths and market seed "
+        f"{args.train_seed} for Dynamic comparison, LSMC fit and LSMC rollout."
     )
 
     all_jobs: list[ScenarioJob] = []
@@ -7037,33 +6639,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _validate_scenario_grid(rows, label="base crediting-cap grid")
     bases = {str(row["valuation_basis"]) for row in rows}
-    evaluation_fingerprints = {
-        str(row["evaluation_scenario_fingerprint"]) for row in rows
+    scenario_fingerprints = {
+        str(row["scenario_fingerprint"]) for row in rows
     }
-    evaluation_market_cache_keys = {
-        str(row["evaluation_market_cache_key"]) for row in rows
+    market_cache_keys = {
+        str(row["market_cache_key"]) for row in rows
     }
-    evaluation_hedge_cache_keys_by_rate = {
-        _rate_key(float(row["crediting_cap_rate"])): row[
-            "evaluation_hedge_cache_key"
-        ]
+    hedge_cache_keys_by_rate = {
+        _rate_key(float(row["crediting_cap_rate"])): row["hedge_cache_key"]
         for row in rows
-    }
-    training_fingerprints = {
-        str(row["training_scenario_fingerprint"]) for row in rows
-    }
-    training_fingerprint_triplets = {
-        str(row["training_scenario_fingerprints_json"]) for row in rows
-    }
-    if len(training_fingerprint_triplets) != 1:
-        raise ValueError(
-            "Base scenarios do not share the same active training samples."
-        )
-    common_training_fingerprints = tuple(json.loads(
-        next(iter(training_fingerprint_triplets))
-    ))
-    validation_fingerprints = {
-        str(row["validation_scenario_fingerprint"]) for row in rows
     }
     source_fingerprints = {
         str(row["source_metadata_fingerprint"]) for row in rows
@@ -7112,12 +6696,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f"{stress_id!r} for cap "
                         f"{float(stress_row['crediting_cap_rate_percent']):.2f}%."
                     )
-            stress_evaluation_fingerprints = {
-                str(row["evaluation_scenario_fingerprint"])
+            stress_scenario_fingerprints = {
+                str(row["scenario_fingerprint"])
                 for row in stress_group
             }
-            stress_evaluation_market_cache_keys = {
-                str(row["evaluation_market_cache_key"])
+            stress_market_cache_keys = {
+                str(row["market_cache_key"])
                 for row in stress_group
             }
             stress_source_fingerprints = {
@@ -7136,27 +6720,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"Engine version changed between base and stress {stress_id!r}."
                 )
             if stress_id in market_path_stresses:
-                if stress_evaluation_fingerprints == evaluation_fingerprints:
+                if stress_scenario_fingerprints == scenario_fingerprints:
                     raise ValueError(
                         f"Market stress {stress_id!r} did not change scenarios."
                     )
-                if stress_evaluation_market_cache_keys == evaluation_market_cache_keys:
+                if stress_market_cache_keys == market_cache_keys:
                     raise ValueError(
                         f"Market stress {stress_id!r} reused the base market cache."
                     )
-            elif stress_evaluation_fingerprints != evaluation_fingerprints:
+            elif stress_scenario_fingerprints != scenario_fingerprints:
                 raise ValueError(
                     f"Non-market stress {stress_id!r} unexpectedly changed scenarios."
                 )
-            elif stress_evaluation_market_cache_keys != evaluation_market_cache_keys:
+            elif stress_market_cache_keys != market_cache_keys:
                 raise ValueError(
                     f"Non-market stress {stress_id!r} changed the market cache."
                 )
             if args.require_hedge_cache:
                 for stress_row in stress_group:
                     rate_key = _rate_key(float(stress_row["crediting_cap_rate"]))
-                    base_hedge_key = evaluation_hedge_cache_keys_by_rate[rate_key]
-                    stress_hedge_key = stress_row["evaluation_hedge_cache_key"]
+                    base_hedge_key = hedge_cache_keys_by_rate[rate_key]
+                    stress_hedge_key = stress_row["hedge_cache_key"]
                     if stress_id in market_path_stresses:
                         if stress_hedge_key == base_hedge_key:
                             raise ValueError(
@@ -7256,11 +6840,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "post_election_lapse_and_withdrawal"
             ),
             "lsmc_behaviour": (
-                "annual_election_and_annual_continue_full_lapse_"
-                "cross_fitted_lower_bound"
+                "direct_single_sample_time0_expected_pv_swing_policy"
             ),
-            "income_election_action_set": ["WAIT", "START_INCOME"],
-            "post_income_action_set": ["CONTINUE", "FULL_WITHDRAWAL"],
+            "policy_selection_mode": "direct_single_sample_expected_pv",
+            "sample_semantics": "single_sample_time0_swing",
+            "policyholder_objective_discount_basis": (
+                "time_zero_australian_zero_curve_deterministic_v1"
+            ),
+            "oos_validation_used": False,
+            "oos_evaluation_used": False,
+            "income_election_action_set": ["WAIT", "START_NORMAL_INCOME"],
+            "post_income_action_set": ["NORMAL_INCOME", "FULL_SURRENDER"],
             "behaviour_decision_grid": {
                 "dynamic": {
                     "income_election": "policy_anniversaries",
@@ -7298,24 +6888,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "dynamic Election; dynamic post-Election behaviour"
                 ),
                 "lsmc_deployed_policy": (
-                    "actual per-cell deployment: validated V11 candidate or "
-                    "recorded fixed validation fallback"
+                    "direct V11 fit; no validation gate or fixed fallback"
                 ),
             },
-            "lsmc_primary_deployment_by_cell": {
+            "lsmc_direct_policy_by_cell": {
                 (
                     f"{row['stress_scenario_id']}|"
                     f"{float(row['crediting_cap_rate_percent']):.8f}%"
-                ): {
-                    "candidate_policy": row["lsmc_primary_candidate_policy"],
-                    "deployed_policy": row["lsmc_primary_deployed_policy"],
-                    "candidate_accepted": row[
-                        "lsmc_primary_candidate_accepted"
-                    ],
-                    "validated_fallback_deployed": row[
-                        "lsmc_primary_deployed_validated_fallback"
-                    ],
-                }
+                ): row["lsmc_deployed_policy"]
                 for row in all_fit_rows
             },
             "counterfactual_v00_v01_v10_dynamic_runs": False,
@@ -7332,45 +6912,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "behaviour_models_compared": list(DEFAULT_BEHAVIOUR_MODELS),
             "separate_dynamic_full_policy_run_required": True,
             "lsmc_internal_dynamic_benchmark_disabled_to_avoid_duplicate": True,
-            "lsmc_internal_v10_continue_validation_control_retained": True,
+            "lsmc_internal_v10_continue_descriptive_comparator_retained": True,
             "lsmc_v00_v01_factorial_outputs_disabled": True,
             "parallel_schedule_changes_random_seeds": False,
             "one_factor_shock_and_revalue": not args.no_stress_analysis,
             "default_risk_scope": list(DEFAULT_RISK_SCOPE),
             "effective_risk_scope": effective_risk_scope,
             "lapse_risk_assessment": (
-                "full_policy_dynamic_v11_vs_full_policy_lsmc_deployed_policy"
+                "full_policy_dynamic_v11_vs_direct_single_sample_lsmc_v11"
             ),
             "stress_losses_are_not_regulatory_capital_aggregation": True,
             "portfolio_tail_distribution_calculated": False,
         },
         "settings": {
-            "n_paths": args.n_paths,
-            "seed": args.seed,
-            "take_up_seed": args.take_up_seed,
-            "mortality_seed": args.mortality_seed,
-            "n_train": args.n_train,
-            "train_seed": args.train_seed,
-            "train_take_up_seed": args.train_take_up_seed,
-            "train_mortality_seed": args.train_mortality_seed,
-            "train_seed_2": args.train_seed_2,
-            "train_take_up_seed_2": args.train_take_up_seed_2,
-            "train_mortality_seed_2": args.train_mortality_seed_2,
-            "train_seed_3": args.train_seed_3,
-            "train_take_up_seed_3": args.train_take_up_seed_3,
-            "train_mortality_seed_3": args.train_mortality_seed_3,
-            "training_seed_count": args.training_seed_count,
-            "training_seed_triplets": list(
-                _expected_lsmc_training_seed_triplets(args)
-            ),
-            "primary_training_seed_index": 1,
-            "training_seed_selection_rule": (
-                "predeclared_seed_1_not_evaluation_based"
-            ),
-            "n_validation": args.n_validation,
-            "validation_seed": args.validation_seed,
-            "validation_take_up_seed": args.validation_take_up_seed,
-            "validation_mortality_seed": args.validation_mortality_seed,
+            "sample_role": "training_and_valuation",
+            "n_paths": args.n_train,
+            "market_seed": args.train_seed,
+            "take_up_seed": args.train_take_up_seed,
+            "mortality_seed": args.train_mortality_seed,
             "heston_substeps": args.heston_substeps,
             "hedge_pricing_method": args.hedge_pricing_method,
             "market_cache_root": str(
@@ -7421,48 +6980,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "lsmc_runner": str(LSMC_PORTFOLIO_RUNNER),
             "q_cache_precompute_runner": str(Q_CACHE_PRECOMPUTE_RUNNER),
             "q_cache_precompute_commands": cache_precompute_commands,
-            "common_evaluation_scenario_fingerprint": next(
-                iter(evaluation_fingerprints)),
-            "common_training_scenario_fingerprint": next(
-                iter(training_fingerprints)),
-            "common_training_scenario_fingerprints": list(
-                common_training_fingerprints
-            ),
-            "common_validation_scenario_fingerprint": next(
-                iter(validation_fingerprints)),
+            "common_fit_and_valuation_scenario_fingerprint": next(
+                iter(scenario_fingerprints)),
             "common_source_metadata_fingerprint": next(
                 iter(source_fingerprints)),
             "common_engine_version": next(iter(engine_versions)),
-            "training_validation_evaluation_are_distinct": True,
-            "all_active_training_validation_evaluation_are_distinct": True,
-            "all_training_seed_v11_gate_components_valid": all(
-                _as_bool(row[
-                    "all_training_seed_v11_gate_components_valid"
-                ])
+            "one_common_sample_per_cell": True,
+            "oos_validation_used": False,
+            "oos_evaluation_used": False,
+            "validation_gate_used": False,
+            "fixed_policy_fallback_used": False,
+            "all_cells_deploy_direct_v11": all(
+                str(row["lsmc_deployed_policy"]) == "V11"
                 for row in all_fit_rows
             ),
-            "all_training_seed_v11_candidates_accepted": all(
-                _as_bool(row[
-                    "all_training_seed_v11_candidates_accepted"
-                ])
-                for row in all_fit_rows
-            ),
-            "all_training_seed_deployments_valid": all(
-                _as_bool(row[
-                    "all_training_seed_deployments_valid"
-                ])
-                for row in all_fit_rows
-            ),
-            "primary_training_seed_index": 1,
-            "evaluation_used_for_training_seed_selection": False,
-            "multi_seed_validation_evaluation_csv_required_per_cell": True,
             "aggregation_reconciliations_checked": True,
             "csm_component_reconciliation_checked": True,
             "csm_model_point_to_portfolio_aggregation_checked": True,
             "model_point_alignment_checked": True,
             "source_identifiers_checked": True,
             "child_hedge_pricing_method_checked": True,
-            "child_scenario_fingerprints_checked_by_sample_role": True,
+            "child_common_sample_fingerprints_checked": True,
             "child_market_cache_keys_checked_where_emitted": True,
             "child_hedge_cache_keys_and_surface_fingerprints_checked": (
                 args.require_hedge_cache
@@ -7518,6 +7056,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "ordinary_performance_and_total_income_lapse_rates",
                 "unweighted_lsmc_income_election_action_rate",
                 "unweighted_lsmc_full_withdrawal_action_rate",
+                "lsmc_time0_customer_expected_pv",
+                "lsmc_time0_customer_optionality_uplift",
                 "policy_year_income_election_and_growth_phase_buckets",
             ],
             "model_point_concentration": [
@@ -7555,13 +7095,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else "Hedge prices use the explicitly selected moment-matched Black-Scholes fallback proxy, not Conditional MC."
             ),
             "No pathwise portfolio loss distribution; no VaR, TVaR or CTE.",
-            "No Monte Carlo standard errors or repeated-seed confidence intervals; common random numbers reduce but do not remove simulation and LSMC training uncertainty.",
+            "One common Q sample is used for LSMC fit and reported customer value; there is no OOS validation claim or repeated-seed confidence interval.",
             (
                 "One-factor research stresses are not an APRA/LAGIC or Solvency-II capital aggregation."
                 if stress_loss_rows
                 else "The explicit shock-and-revalue grid was skipped for this run."
             ),
-            "Lapse risk is assessed through the complete Dynamic V11 versus the deployed LSMC policy (validated V11 candidate or recorded fixed validation fallback); no V00/V01/V10 Behaviour-effect decomposition or symmetric statistical lapse/take-up/withdrawal shock is reported.",
+            "Lapse risk is assessed through complete Dynamic V11 versus direct single-sample LSMC V11; no validation gate, fixed-policy fallback, V00/V01/V10 effect decomposition or symmetric statistical lapse/take-up/withdrawal shock is reported.",
             "No catastrophe, FX, credit-spread or correlation stress.",
             "Results are before Risk Margin and gross of reinsurance.",
             "Mortality is illustrative and not an approved production basis.",

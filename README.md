@@ -35,7 +35,7 @@ different policyholder models:
 The customer receives the annual simple credit
 
 $$
-g_y = \min\!\left(\max\!\left(R_y^{\mathrm{fund}},0\right),C_y\right),
+g_y = \min\left(\max\left(R_y^{\mathrm{fund}},0\right),C_y\right),
 $$
 
 where $R_y^{\mathrm{fund}}$ is the complete annual reference-fund return and $C_y$
@@ -115,7 +115,7 @@ insurer. Customer index participation is manufactured separately with a
 capital-market bull call spread:
 
 $$
-\min\!\left(\max(R,0),C\right)=\max(R,0)-\max(R-C,0).
+\min\left(\max(R,0),C\right)=\max(R,0)-\max(R-C,0).
 $$
 
 The insurer buys the lower call and sells the cap call **to the capital
@@ -336,7 +336,7 @@ No Policyholder LSMC was fitted or called. Every valuation manifest records
 path-congruent hedge caches. For each revalued module the adverse amount is
 
 $$
-K_i=\max\!\left(0,\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{base}}
+K_i=\max\left(0,\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{base}}
 -\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{stress},i}\right).
 $$
 
@@ -350,7 +350,7 @@ The primary ranking is no longer mean CSM alone. It uses the robust AUD measure
 
 $$
 \mathrm{CSM}^{\text{capital-adjusted}}(C)
-=\mathrm{CSM}^{\mathrm{proxy}}(C)-6\%\,K_{\mathrm{MLL}}(C),
+=\mathrm{CSM}^{\mathrm{proxy}}(C)-0.06\times K_{\mathrm{MLL}}(C),
 $$
 
 with $\mathrm{CSM}/K_{\mathrm{MLL}}$ reported only as a secondary lifetime
@@ -468,3 +468,132 @@ Portable default paths are resolved by
 repository does not require editing machine-specific paths. The architectural
 dependency direction and provenance rules are documented in
 [engine architecture](documents/engine_architecture.md).
+
+## Selected literature
+
+The references below were selected for their direct connection to this
+repository rather than as a comprehensive survey. RILAs, variable annuities
+and GMWB/GLWB contracts are the closest published analogues, but none is
+identical to the generic case-study product. The accounting and prudential
+standards define reporting boundaries; they do not validate the repository's
+CSM or capital proxies.
+
+### Index-linked lifetime income and policyholder behaviour
+
+- Moenig, T. (2022). [*It's RILA Time: An Introduction to Registered
+  Index-Linked Annuities*](https://doi.org/10.1111/jori.12357). *Journal of
+  Risk and Insurance*, 89(2), 339–369. Closest reference for annually reset
+  index-linked crediting, short-dated option replication and insurer hedging.
+- Moenig, T., & Xu, C. (2023). [*Valuing Lifetime Withdrawal Guarantees in
+  RILAs*](https://doi.org/10.1080/10920277.2023.2167835). *North American
+  Actuarial Journal*, 27(4), 771–786. Connects an index-linked account to a
+  lifetime withdrawal guarantee and its long-dated insurer risk.
+- Huang, H., Milevsky, M. A., & Salisbury, T. S. (2014). [*Optimal Initiation
+  of a GLWB in a Variable Annuity: No-Arbitrage
+  Approach*](https://doi.org/10.1016/j.insmatheco.2014.04.002). *Insurance:
+  Mathematics and Economics*, 56, 102–111. Direct treatment of the decision
+  when to move from accumulation into lifetime income as a function of age,
+  moneyness and product terms.
+- Bauer, D., Kling, A., & Russ, J. (2008). [*A Universal Pricing Framework for
+  Guaranteed Minimum Benefits in Variable
+  Annuities*](https://doi.org/10.2143/AST.38.2.2033356). *ASTIN Bulletin*,
+  38(2), 621–651. General valuation framework for living benefits with fixed
+  or value-maximising policyholder actions.
+- Milevsky, M. A., & Salisbury, T. S. (2006). [*Financial Valuation of
+  Guaranteed Minimum Withdrawal
+  Benefits*](https://doi.org/10.1016/j.insmatheco.2005.06.012). *Insurance:
+  Mathematics and Economics*, 38(1), 21–38. Foundational treatment of the
+  insurer cost and exercise value of withdrawal guarantees.
+- Dai, M., Kwok, Y. K., & Zong, J. (2008). [*Guaranteed Minimum Withdrawal
+  Benefit in Variable
+  Annuities*](https://doi.org/10.1111/j.1467-9965.2008.00349.x).
+  *Mathematical Finance*, 18(4), 595–611. Formulates excess withdrawal and
+  surrender as an optimal stochastic-control problem.
+- Chen, Z., Vetzal, K., & Forsyth, P. A. (2008). [*The Effect of Modelling
+  Parameters on the Value of GMWB
+  Guarantees*](https://doi.org/10.1016/j.insmatheco.2008.04.003). *Insurance:
+  Mathematics and Economics*, 43(1), 165–173. Shows how valuation and optimal
+  actions depend on assumptions and quantifies the effect of suboptimal
+  policyholder behaviour.
+- Moenig, T., & Bauer, D. (2016). [*Revisiting the Risk-Neutral Approach to
+  Optimal Policyholder Behavior: A Study of Withdrawal Guarantees in Variable
+  Annuities*](https://doi.org/10.1093/rof/rfv018). *Review of Finance*, 20(2),
+  759–794. Explains why option-value-maximising behaviour can differ from
+  observed behaviour and motivates practical moneyness-sensitive rules.
+- Bauer, D., Gao, J., Moenig, T., Ulm, E. R., & Zhu, N. (2017).
+  [*Policyholder Exercise Behavior in Life Insurance: The State of
+  Affairs*](https://doi.org/10.1080/10920277.2017.1314816). *North American
+  Actuarial Journal*, 21(4), 485–501. Survey and classification of structural,
+  reduced-form and empirical exercise models.
+
+### Valuation, market dynamics and hedging
+
+- Longstaff, F. A., & Schwartz, E. S. (2001). [*Valuing American Options by
+  Simulation: A Simple Least-Squares
+  Approach*](https://doi.org/10.1093/rfs/14.1.113). *Review of Financial
+  Studies*, 14(1), 113–147. Methodological basis for the repository's fitted
+  continuation values and LSMC action policy.
+- Huang, Y. T., & Kwok, Y. K. (2016). [*Regression-Based Monte Carlo Methods
+  for Stochastic Control Models: Variable Annuities with Lifelong
+  Guarantees*](https://doi.org/10.1080/14697688.2015.1088962). *Quantitative
+  Finance*, 16(6), 905–928. Direct bridge from regression Monte Carlo to
+  optimal stochastic control of lifelong withdrawal guarantees.
+- Black, F., & Scholes, M. (1973). [*The Pricing of Options and Corporate
+  Liabilities*](https://doi.org/10.1086/260062). *Journal of Political
+  Economy*, 81(3), 637–654. Foundation for European-call replication, the
+  annual bull call spread and the explicitly labelled Black–Scholes proxy.
+- Heston, S. L. (1993). [*A Closed-Form Solution for Options with Stochastic
+  Volatility with Applications to Bond and Currency
+  Options*](https://doi.org/10.1093/rfs/6.2.327). *Review of Financial
+  Studies*, 6(2), 327–343. Stochastic-volatility foundation for the equity
+  component of the risk-neutral market model.
+- Hull, J., & White, A. (1990). [*Pricing Interest-Rate-Derivative
+  Securities*](https://doi.org/10.1093/rfs/3.4.573). *Review of Financial
+  Studies*, 3(4), 573–592. Curve-consistent mean-reverting short-rate model
+  underlying the rate and discount-factor component.
+- Grzelak, L. A., & Oosterlee, C. W. (2011). [*On the Heston Model with
+  Stochastic Interest Rates*](https://doi.org/10.1137/090756119). *SIAM
+  Journal on Financial Mathematics*, 2, 255–286. Direct reference for hybrid
+  Heston–Hull–White modelling with correlated equity and interest-rate risk.
+- Kling, A., Ruez, F., & Russ, J. (2011). [*The Impact of Stochastic
+  Volatility on Pricing, Hedging, and Hedge Efficiency of Withdrawal Benefit
+  Guarantees in Variable
+  Annuities*](https://doi.org/10.2143/AST.41.2.2136987). *ASTIN Bulletin*,
+  41(2), 511–545. Links stochastic volatility and model risk specifically to
+  the pricing and hedge performance of lifetime withdrawal guarantees.
+
+### Mortality, longevity and reporting boundaries
+
+- Gompertz, B. (1825). [*On the Nature of the Function Expressive of the Law
+  of Human Mortality, and on a New Mode of Determining the Value of Life
+  Contingencies*](https://doi.org/10.1098/rstl.1825.0026). *Philosophical
+  Transactions of the Royal Society of London*, 115, 513–583. Origin of the
+  exponential age pattern used in the illustrative mortality basis.
+- Makeham, W. M. (1860). [*On the Law of Mortality and the Construction of
+  Annuity Tables*](https://doi.org/10.1017/S204616580000126X). *Journal of the
+  Institute of Actuaries*, 8(6), 301–310. Adds the age-independent component
+  used by the Gompertz–Makeham proxy.
+- Lee, R. D., & Carter, L. R. (1992). [*Modeling and Forecasting U.S.
+  Mortality*](https://doi.org/10.1080/01621459.1992.10475265). *Journal of the
+  American Statistical Association*, 87(419), 659–671. Classical reference
+  for empirically estimated age and period effects; the repository's fixed
+  improvement taper is deliberately simpler and is not a Lee–Carter fit.
+- Frees, E. W., Carriere, J. F., & Valdez, E. A. (1996). [*Annuity Valuation
+  with Dependent Mortality*](https://doi.org/10.2307/253744). *Journal of Risk
+  and Insurance*, 63(2), 229–261. Reference for Joint-Life and last-survivor
+  annuities and for the dependence omitted by the current independent-lives
+  proxy.
+- Cairns, A. J. G., Blake, D., & Dowd, K. (2006). [*A Two-Factor Model for
+  Stochastic Mortality with Parameter Uncertainty: Theory and
+  Calibration*](https://doi.org/10.1111/j.1539-6975.2006.00195.x). *Journal
+  of Risk and Insurance*, 73(4), 687–718. Benchmark for longevity and
+  parameter risk beyond the repository's deterministic improvement baseline.
+- IFRS Foundation. [*IFRS 17 Insurance
+  Contracts*](https://www.ifrs.org/issued-standards/list-of-standards/ifrs-17-insurance-contracts/).
+  Authoritative reporting boundary for insurance-contract measurement and the
+  contractual service margin; the repository's signed four-leg CSM remains a
+  research proxy.
+- Australian Prudential Regulation Authority. [*Prudential Standard LPS 110
+  Capital Adequacy*](https://www.apra.gov.au/standards/lps-110). Australian
+  life-insurance capital boundary, including specific treatment of variable
+  annuity business; the repository's MLL measure is not APRA capital.

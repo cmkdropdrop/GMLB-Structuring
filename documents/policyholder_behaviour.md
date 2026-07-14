@@ -472,29 +472,3 @@ deployed fallback.
   is not a real-world behavioural prediction.
 - Tax, financial advice, liquidity needs and other customer-specific utility
   effects are omitted.
-
-## Run-specific diagnostic illustrations
-
-The following completed-run plots are retained as audit examples. They are not
-the response functions above: the crediting cap is an insurer design variable
-that affects behaviour only through realised customer state.
-
-![Ordinary, performance-sensitive and total Income Full-Withdrawal mass by crediting cap in one completed Dynamic run](../results/document_figures/capital_dynamic_lapse_by_cap.png)
-
-*Illustrative cause decomposition from completed Dynamic-only run
-`20260714T054131.308036Z`. The performance-sensitive component falls as the cap
-rises, while the ordinary component rises modestly; total event mass falls on
-this four-point grid. The dashed line is the contractual 6% cap. This is a
-four-model-point proxy with 1,000 common Q paths and uncalibrated behaviour
-assumptions, not an experience study. See the
-[figure provenance](../results/document_figures/capital_run_20260714T054131.308036Z.provenance.json).*
-
-![Income-Election timing and post-Election behaviour by crediting cap for Dynamic assumptions and a deployed LSMC fallback](../results/document_figures/risk_behaviour_comparison_by_cap.png)
-
-*Dynamic statistical behaviour versus the actually deployed annual-action LSMC
-fallback in completed run `20260714T002637.233689Z`. Every LSMC cell is a
-validated fallback; no accepted candidate is shown, and the fallback has no
-voluntary Full-Withdrawal rate in these cells. The plot is evidence about the
-deployed model policies, not proof of optimal behaviour. The dashed line marks
-the contractual 6% cap. See the
-[figure provenance](../results/document_figures/risk_run_20260714T002637.233689Z.provenance.json).*

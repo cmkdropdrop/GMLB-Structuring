@@ -100,7 +100,7 @@ class _MortalityFreeLSMCBasis(MortalityTable):
 def mortality_free_policyholder_basis(
     mortality: MortalityTable,
 ) -> _MortalityFreeLSMCBasis:
-    """Return the zero-decrement basis used for LSMC fit and validation."""
+    """Return the zero-decrement basis used for the customer LSMC fit."""
     if not isinstance(mortality, MortalityTable):
         raise TypeError("mortality must be MortalityTable.")
     return _MortalityFreeLSMCBasis(
@@ -1549,24 +1549,30 @@ def fit_optimal_surrender_policy(
 ) -> OptimalBehaviourLSMCFit:
     """Fit an annual, adapted LSMC Full-Withdrawal rule.
 
-    Cross-fitted predictions drive the backward training recursion.  The final
-    regression at each anniversary is then frozen and evaluated only on a
-    separate scenario set by the portfolio runner.
+    Cross-fitted predictions drive the backward training recursion.  This
+    compatibility API now shares the productive conditional-survival and
+    time-zero-curve customer objective.
     """
     policy.validate_against(product)
     if policy.age_pension_plus:
         raise NotImplementedError("Generic optimal behaviour does not support APS.")
     if product.allows_growth_surrender or product.allows_growth_withdrawals:
         raise ValueError("The generic LSMC implementation requires Growth action gates.")
-    config = replace(projection_config, record_paths=True, heston_cos=False)
+    config = replace(
+        projection_config,
+        record_paths=True,
+        heston_cos=False,
+        mortality_seed=0,
+    )
     behaviour = no_voluntary_action_behaviour()
+    training_mortality = mortality_free_policyholder_basis(mortality)
     context_recorder = _SurrenderContextRecorder()
     projection = project(
         product,
         policy,
         training_scenarios,
         behaviour,
-        mortality,
+        training_mortality,
         expenses=expenses,
         config=config,
         surrender_policy=context_recorder,
@@ -2284,7 +2290,7 @@ class _ElectionRegressionPair:
 
 @dataclass
 class OptimalBehaviourPolicy:
-    """Frozen annual phase-aware Policyholder rule used only out of sample."""
+    """Frozen annual phase-aware Policyholder rule produced by the Swing fit."""
 
     election_regressions: Mapping[int, _ElectionRegressionPair]
     surrender_policy: OptimalSurrenderPolicy
@@ -3032,8 +3038,11 @@ class OptimalBehaviourPolicyFit:
     selected_income_action_mode: str
     valid: bool = True
     invalid_reasons: tuple[str, ...] = ()
-    fit_version: str = "ordered_annual_multiple_stopping_lsmc_v5"
+    fit_version: str = "time_zero_curve_swing_lsmc_v6"
     policyholder_mortality_basis: str = POLICYHOLDER_LSMC_MORTALITY_BASIS
+    policyholder_objective_discount_basis: str = (
+        POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS
+    )
     income_action_exposure_coverage: float = 1.0
     policy_iteration_count: int = 0
     policy_iteration_converged: bool = True
@@ -4496,6 +4505,12 @@ def _fit_monthly_income_action_phase(
                     scenario_slice,
                 )
                 next_state = month_transition.next_state
+                objective_discount_ratio = float(
+                    scenarios.config.curve.forward_df(
+                        float(scenarios.times[step]),
+                        float(scenarios.times[int(next_state.step)]),
+                    )
+                )
                 next_active = (
                     (next_state.phase == Phase.INCOME.value)
                     & (
@@ -4532,7 +4547,7 @@ def _fit_monthly_income_action_phase(
                         )
                 return np.asarray(
                     action_transition.policyholder_cashflow
-                    + month_transition.discount_ratio
+                    + objective_discount_ratio
                     * (
                         month_transition.mandatory_policyholder_cashflow
                         + next_value
@@ -5285,6 +5300,9 @@ def _fit_monthly_optimal_behaviour_policy_legacy(
     growth_discounted_cashflow = _discounted_policyholder_cashflows(
         branch_projection, training_scenarios
     )
+    objective_discount = _time_zero_curve_discount_factors(
+        training_scenarios, len(branch_projection.times)
+    )
     if branch_projection.phase_cashflows is None:
         raise RuntimeError(
             "Income-Election Bellman fit requires phase cashflow ledgers."
@@ -5293,7 +5311,7 @@ def _fit_monthly_optimal_behaviour_policy_legacy(
         branch_projection.phase_cashflows[
             "policyholder_benefits_pre_election"
         ]
-        * training_scenarios.discount[
+        * objective_discount[
             :, :branch_projection.phase_cashflows[
                 "policyholder_benefits_pre_election"
             ].shape[1]
@@ -5303,7 +5321,7 @@ def _fit_monthly_optimal_behaviour_policy_legacy(
         branch_projection.phase_cashflows[
             "policyholder_benefits_post_election"
         ][:, forced_step]
-        * training_scenarios.discount[:, forced_step]
+        * objective_discount[:, forced_step]
     )
     forced_start_value_0 = (
         forced_post_election_current_0
@@ -5345,7 +5363,7 @@ def _fit_monthly_optimal_behaviour_policy_legacy(
             raise ValueError(
                 f"Projector did not expose Election context at step {step}."
             )
-        scale_0 = training_scenarios.discount[:, step] * context.inforce_weight
+        scale_0 = objective_discount[:, step] * context.inforce_weight
         eligible = (
             context.voluntary_election_eligible
             & (context.phase == Phase.GROWTH.value)
@@ -5972,6 +5990,15 @@ def fit_optimal_behaviour_policy(
             "Annual optimal-behaviour LSMC requires the fixed Ridge grid "
             f"{RIDGE_GRID_DEFAULT}; got {tuple(settings.ridge_grid)}."
         )
+    if settings.exercise_buffer_rmse_multiplier != 0.0:
+        raise ValueError(
+            "Time-zero Swing LSMC requires a zero RMSE exercise buffer."
+        )
+    if settings.fallback_to_no_action_if_training_underperforms:
+        raise ValueError(
+            "Time-zero Swing LSMC does not permit a statistical policy "
+            "fallback."
+        )
     policy.validate_against(product)
     if policy.age_pension_plus:
         raise NotImplementedError("Generic optimal behaviour does not support APS.")
@@ -6040,47 +6067,43 @@ def fit_optimal_behaviour_policy(
         )
     )
     income_fit_failure: Optional[str] = None
-    try:
-        income_fit = _fit_surrender_phase_from_projection(
-            projection=assigned_continue_projection,
-            contexts=assigned_recorder.surrender_contexts,
-            scenarios=training_scenarios,
-            premium=premium,
-            settings=settings,
-            base_fold_ids=complete_path_ids,
+    income_fit = _fit_surrender_phase_from_projection(
+        projection=assigned_continue_projection,
+        contexts=assigned_recorder.surrender_contexts,
+        scenarios=training_scenarios,
+        premium=premium,
+        settings=settings,
+        base_fold_ids=complete_path_ids,
+    )
+    if income_fit.fallback_used:
+        raise RuntimeError(
+            "Time-zero Swing LSMC may not replace the fitted Income rule "
+            "with a Continue fallback."
         )
-    except (ValueError, np.linalg.LinAlgError) as exc:
-        income_fit_failure = f"annual_income_fit_failed:{exc}"
-        continue_value = float(np.mean(np.sum(
-            _discounted_policyholder_cashflows(
-                assigned_continue_projection, training_scenarios
-            ),
-            axis=1,
-        )))
-        income_fit = _SurrenderPhaseFit(
-            policy=OptimalSurrenderPolicy(regressions={}, settings=settings),
-            cross_fitted_policy=CrossFittedOptimalSurrenderPolicy(
-                regressions_by_step={}, fold_ids_by_step={}, settings=settings
-            ),
-            diagnostics=(),
-            training_policyholder_value_aud=continue_value,
-            training_continue_value_aud=continue_value,
-            training_candidate_value_aud=continue_value,
-            fallback_used=True,
-        )
-
     cross_income_policy: Optional[CrossFittedOptimalSurrenderPolicy] = (
-        None if income_fit.fallback_used else income_fit.cross_fitted_policy
+        income_fit.cross_fitted_policy
     )
 
     # The forced-START rollout is both the Growth Bellman branch and a check
     # that the cross-fitted Income policy covers states used outside its
     # randomized assigned-START panel.  Perform it before fitting the START
-    # surface so any material coverage failure can consistently rebuild every
-    # downstream target from the explicit Continue-only policy.
-    try:
-        branch_projection, election_recorder = _project_fixed_election_branch(
-            start_step=forced_step,
+    # surface so any material coverage failure aborts the fit instead of
+    # changing the customer's behavioural policy.
+    branch_projection, election_recorder = _project_fixed_election_branch(
+        start_step=forced_step,
+        product=product,
+        policy=policy,
+        scenarios=training_scenarios,
+        behaviour=behaviour,
+        mortality=training_mortality,
+        expenses=expenses,
+        config=config,
+        surrender_policy=cross_income_policy,
+    )
+
+    assigned_policy_projection, assigned_policy_recorder = (
+        _project_assigned_election_annual_branch(
+            assigned_start_steps=assigned_start_steps,
             product=product,
             policy=policy,
             scenarios=training_scenarios,
@@ -6090,69 +6113,7 @@ def fit_optimal_behaviour_policy(
             config=config,
             surrender_policy=cross_income_policy,
         )
-    except _MaterialCrossFitCoverageError as exc:
-        income_fit_failure = (
-            "annual_income_cross_fit_coverage_failed:" + str(exc)
-        )
-        income_fit = _continue_only_surrender_phase_fallback(
-            income_fit, settings
-        )
-        cross_income_policy = None
-        branch_projection, election_recorder = _project_fixed_election_branch(
-            start_step=forced_step,
-            product=product,
-            policy=policy,
-            scenarios=training_scenarios,
-            behaviour=behaviour,
-            mortality=training_mortality,
-            expenses=expenses,
-            config=config,
-        )
-
-    try:
-        assigned_policy_projection, assigned_policy_recorder = (
-            _project_assigned_election_annual_branch(
-                assigned_start_steps=assigned_start_steps,
-                product=product,
-                policy=policy,
-                scenarios=training_scenarios,
-                behaviour=behaviour,
-                mortality=training_mortality,
-                expenses=expenses,
-                config=config,
-                surrender_policy=cross_income_policy,
-            )
-        )
-    except _MaterialCrossFitCoverageError as exc:
-        income_fit_failure = (
-            "annual_income_cross_fit_coverage_failed:" + str(exc)
-        )
-        income_fit = _continue_only_surrender_phase_fallback(
-            income_fit, settings
-        )
-        cross_income_policy = None
-        branch_projection, election_recorder = _project_fixed_election_branch(
-            start_step=forced_step,
-            product=product,
-            policy=policy,
-            scenarios=training_scenarios,
-            behaviour=behaviour,
-            mortality=training_mortality,
-            expenses=expenses,
-            config=config,
-        )
-        assigned_policy_projection, assigned_policy_recorder = (
-            _project_assigned_election_annual_branch(
-                assigned_start_steps=assigned_start_steps,
-                product=product,
-                policy=policy,
-                scenarios=training_scenarios,
-                behaviour=behaviour,
-                mortality=training_mortality,
-                expenses=expenses,
-                config=config,
-            )
-        )
+    )
 
     # The pooled START surface uses realised cashflows from the fold-pure annual
     # Income rollout.  Every counterfactual row retains its complete-path fold.
@@ -6210,15 +6171,18 @@ def fit_optimal_behaviour_policy(
     )
     if branch_projection.phase_cashflows is None:
         raise RuntimeError("Annual Election fit requires phase cashflow ledgers.")
+    objective_discount = _time_zero_curve_discount_factors(
+        training_scenarios, len(branch_projection.times)
+    )
     growth_pre_election_benefit_0 = (
         branch_projection.phase_cashflows["policyholder_benefits_pre_election"]
-        * training_scenarios.discount[:, :len(branch_projection.times)]
+        * objective_discount[:, :len(branch_projection.times)]
     )
     forced_post_election_current_0 = (
         branch_projection.phase_cashflows[
             "policyholder_benefits_post_election"
         ][:, forced_step]
-        * training_scenarios.discount[:, forced_step]
+        * objective_discount[:, forced_step]
     )
     forced_start_value_0 = (
         forced_post_election_current_0
@@ -6260,7 +6224,7 @@ def fit_optimal_behaviour_policy(
                 raise ValueError(
                     f"Projector did not expose Election context at step {step}."
                 )
-            scale_0 = training_scenarios.discount[:, step] * context.inforce_weight
+            scale_0 = objective_discount[:, step] * context.inforce_weight
             eligible = (
                 context.voluntary_election_eligible
                 & (context.phase == Phase.GROWTH.value)
@@ -6536,10 +6500,9 @@ def fit_optimal_behaviour_policy(
         )
     candidate_value = float(np.mean(candidate_path_value))
 
-    # Predeclared fixed library.  Each anchor is valued both with CONTINUE only
-    # and with the already-fitted annual Lapse policy.  Selection uses paired
-    # complete-path differences on training paths; evaluation paths never feed
-    # back into this choice.
+    # Retain fixed policies only as transparent in-sample comparators.  They do
+    # not participate in deployment: the productive customer rule is the
+    # direct Bellman argmax and a structurally incomplete fit is an error.
     def fixed_step(year: int) -> int:
         return min(forced_step, max(minimum_step, int(year) * STEPS_PER_YEAR))
 
@@ -6600,78 +6563,21 @@ def fit_optimal_behaviour_policy(
         if mode == "continue"
     )
 
-    def paired_lower_bound(selected: Array, benchmark: Array) -> float:
-        difference = np.asarray(selected) - np.asarray(benchmark)
-        if difference.size < 2:
-            return float(np.mean(difference))
-        return float(
-            np.mean(difference)
-            - 1.96 * np.std(difference, ddof=1) / np.sqrt(difference.size)
+    if not dynamic_complete or not candidate_policy.valid:
+        reasons = candidate_policy.invalid_reasons or (
+            "unknown_structural_fit_failure",
         )
-
-    training_margin = premium / 10_000.0
-    use_fixed_fallback = bool(
-        not dynamic_complete
-        or (
-            settings.fallback_to_no_action_if_training_underperforms
-            and paired_lower_bound(candidate_path_value, best_fixed_paths)
-            < training_margin
+        raise RuntimeError(
+            "Time-zero Swing LSMC could not fit every material decision "
+            "surface; no behavioural fallback is permitted: "
+            + "|".join(reasons)
         )
-    )
-    selected_surrender = (
-        income_fit.policy
-        if best_fixed_mode == "annual_lapse" else empty_surrender
-    )
-    selected_policy = (
-        OptimalBehaviourPolicy(
-            election_regressions=MappingProxyType({}),
-            surrender_policy=selected_surrender,
-            premium=premium,
-            issue_age=float(policy.age),
-            settings=settings,
-            automatic_income_start_age=float(
-                product.automatic_income_start_age
-            ),
-            fixed_election_step=int(best_fixed_step),
-            monthly_income_actions_required=False,
-        )
-        if use_fixed_fallback else candidate_policy
-    )
-    selected_cross_policy = (
-        CrossFittedOptimalBehaviourPolicy(
-            election_regressions_by_step=MappingProxyType({}),
-            election_fold_ids_by_step=MappingProxyType({}),
-            surrender_policy=(
-                income_fit.cross_fitted_policy
-                if best_fixed_mode == "annual_lapse"
-                else empty_cross_surrender
-            ),
-            premium=premium,
-            issue_age=float(policy.age),
-            settings=settings,
-            automatic_income_start_age=float(
-                product.automatic_income_start_age
-            ),
-            fixed_election_step=int(best_fixed_step),
-            monthly_income_actions_required=False,
-        )
-        if use_fixed_fallback else cross_candidate
-    )
-    selected_value = best_fixed_value if use_fixed_fallback else candidate_value
-    selected_name = (
-        f"fixed_year_{best_fixed_step // STEPS_PER_YEAR}_{best_fixed_mode}"
-        if use_fixed_fallback else "V11"
-    )
-    fallback_reason = (
-        None
-        if not use_fixed_fallback
-        else (
-            "candidate_fit_incomplete:"
-            + "|".join(candidate_policy.invalid_reasons)
-        )
-        if not dynamic_complete
-        else "candidate_failed_paired_training_lower_bound"
-    )
+    use_fixed_fallback = False
+    selected_policy = candidate_policy
+    selected_cross_policy = cross_candidate
+    selected_value = candidate_value
+    selected_name = "V11"
+    fallback_reason = None
 
     modelpoint_step = fixed_step(policy.effective_income_start_year(product))
     variants = {
@@ -6708,11 +6614,12 @@ def fit_optimal_behaviour_policy(
     }
 
     fit_basis_fingerprint = assumption_fingerprint(
-        "ordered_annual_multiple_stopping_lsmc_v5",
+        "time_zero_curve_swing_lsmc_v6",
         training_scenarios.content_fingerprint,
         product,
         policy,
         POLICYHOLDER_LSMC_MORTALITY_BASIS,
+        POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS,
         expenses,
         config,
         settings,
@@ -6818,6 +6725,7 @@ __all__ = [
     "INCOME_ACTION_FEATURE_NAMES",
     "PARTIAL_ACTION_FEATURE_NAMES",
     "POLICYHOLDER_LSMC_MORTALITY_BASIS",
+    "POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS",
     "IncomeActionAdvantagePolicyFit",
     "IncomeActionRegressionSet",
     "LSMCRegressionDiagnostic",

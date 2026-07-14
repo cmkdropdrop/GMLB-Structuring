@@ -130,6 +130,61 @@ def _setup(n_paths=96, seed=11, horizon=8.0):
     return esg, scenarios
 
 
+def test_customer_objective_uses_only_today_curve_discount_schedule():
+    _, scenarios = _setup(n_paths=8, seed=811, horizon=2.0)
+    product = IndexLinkedLifetimeIncomeProduct(
+        automatic_income_start_age=66.0
+    )
+    policy = PolicySpec(age=65, income_start_year=1)
+    conditional = optimal_behaviour_module.mortality_free_policyholder_basis(
+        MortalityTable.gompertz_makeham()
+    )
+    projection = project(
+        product,
+        policy,
+        scenarios,
+        no_voluntary_action_behaviour(),
+        conditional,
+        config=ProjectionConfig(record_paths=False, max_age=67.0),
+    )
+    deliberately_different_pathwise_discount = np.broadcast_to(
+        np.exp(-0.20 * scenarios.times),
+        scenarios.discount.shape,
+    ).copy()
+    altered_scenarios = replace(
+        scenarios,
+        discount=deliberately_different_pathwise_discount,
+    )
+
+    actual = optimal_behaviour_module._discounted_policyholder_cashflows(
+        projection, altered_scenarios
+    )
+    original = optimal_behaviour_module._discounted_policyholder_cashflows(
+        projection, scenarios
+    )
+    np.testing.assert_allclose(actual, original, rtol=0.0, atol=1.0e-12)
+
+    customer_cashflow = sum(
+        projection.cashflows[name]
+        for name in (
+            "income_paid",
+            "surrender_benefits",
+            "terminal_closeout",
+        )
+    )
+    expected = customer_cashflow * np.asarray(
+        scenarios.config.curve.df(scenarios.times), dtype=float
+    )[None, :]
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-12)
+    assert np.any(projection.cashflows["terminal_closeout"][:, -1] > 0.0)
+
+
+def test_productive_swing_defaults_apply_literal_expected_pv_argmax():
+    settings = OptimalBehaviourLSMCSettings()
+    assert settings.exercise_buffer_rmse_multiplier == 0.0
+    assert not settings.fallback_to_no_action_if_training_underperforms
+
+
 def _synthetic_surrender_context(
     n_paths=128,
     *,
@@ -593,7 +648,12 @@ def test_policyholder_lsmc_fit_is_mortality_and_mortality_seed_invariant():
     policy = PolicySpec(age=65, income_start_year=1)
     mortality = MortalityTable.gompertz_makeham()
     extreme_mortality = mortality.stressed(1.0e6)
-    settings = OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=37)
+    settings = OptimalBehaviourLSMCSettings(
+        n_folds=3,
+        fold_seed=37,
+        minimum_regression_observations=20,
+        observations_per_coefficient=2,
+    )
 
     base = fit_optimal_behaviour_policy(
         product,
@@ -625,7 +685,10 @@ def test_policyholder_lsmc_fit_is_mortality_and_mortality_seed_invariant():
     assert base.policyholder_mortality_basis == (
         optimal_behaviour_module.POLICYHOLDER_LSMC_MORTALITY_BASIS
     )
-    assert base.fit_version == "ordered_annual_multiple_stopping_lsmc_v5"
+    assert base.fit_version == "time_zero_curve_swing_lsmc_v6"
+    assert base.policyholder_objective_discount_basis == (
+        optimal_behaviour_module.POLICYHOLDER_LSMC_OBJECTIVE_DISCOUNT_BASIS
+    )
     assert base.fit_basis_fingerprint == stressed.fit_basis_fingerprint
     assert base.selected_policy_name == stressed.selected_policy_name
     assert base.training_policyholder_value_aud == pytest.approx(
@@ -681,10 +744,10 @@ def test_mortality_free_policyholder_basis_does_not_leak_into_valuation():
     assert np.all(policyholder_conditional.cashflows["death_benefits"] == 0.0)
 
 
-def test_material_cross_fit_coverage_gap_selects_explicit_continue_fallback(
+def test_material_cross_fit_coverage_gap_aborts_without_behaviour_fallback(
     monkeypatch,
 ):
-    """A deployment-state coverage gap invalidates V11 without a crash."""
+    """A material coverage gap is an error, never a fixed-policy substitute."""
 
     def fit_with_missing_material_cross_fit(
         *, projection, scenarios, settings, **_kwargs
@@ -732,54 +795,25 @@ def test_material_cross_fit_coverage_gap_selects_explicit_continue_fallback(
     )
     policy = PolicySpec(age=65, income_start_year=1)
 
-    fit = fit_optimal_behaviour_policy(
-        product,
-        policy,
-        training,
-        MortalityTable.gompertz_makeham(),
-        projection_config=ProjectionConfig(
-            record_paths=False,
-            max_age=69.0,
-            mortality_seed=1191,
-        ),
-        settings=OptimalBehaviourLSMCSettings(
-            n_folds=3,
-            fold_seed=23,
-        ),
-    )
-
-    assert fit.valid
-    assert fit.candidate_policy is not None
-    assert not fit.candidate_policy.valid
-    coverage_reasons = [
-        reason for reason in fit.candidate_policy.invalid_reasons
-        if reason.startswith("annual_income_cross_fit_coverage_failed:")
-    ]
-    assert len(coverage_reasons) == 1
-    assert (
-        "Material cross-fitted Full regression is missing"
-        in coverage_reasons[0]
-    )
-    assert fit.training_fallback_reason is not None
-    assert coverage_reasons[0] in fit.training_fallback_reason
-    assert fit.selected_policy_name.endswith("_continue")
-    assert fit.selected_income_action_mode == "continue"
-    assert fit.surrender_fallback_used
-    assert not fit.policy.surrender_policy.regressions
-    assert not fit.policy.surrender_policy.strict_missing_material_regression
-    assert not (
-        fit.cross_fitted_training_policy.surrender_policy.regressions_by_step
-    )
-    assert not (
-        fit.cross_fitted_training_policy.surrender_policy
-        .strict_missing_material_regression
-    )
-    assert fit.policy.provenance_fingerprint
-    assert fit.candidate_policy.provenance_fingerprint
-    assert (
-        fit.policy.provenance_fingerprint
-        != fit.candidate_policy.provenance_fingerprint
-    )
+    with pytest.raises(
+        RuntimeError,
+        match="Material cross-fitted Full regression is missing",
+    ):
+        fit_optimal_behaviour_policy(
+            product,
+            policy,
+            training,
+            MortalityTable.gompertz_makeham(),
+            projection_config=ProjectionConfig(
+                record_paths=False,
+                max_age=69.0,
+                mortality_seed=1191,
+            ),
+            settings=OptimalBehaviourLSMCSettings(
+                n_folds=3,
+                fold_seed=23,
+            ),
+        )
 
 
 def test_fixed_training_anchor_is_a_valid_frozen_election_policy():
@@ -832,7 +866,12 @@ def test_combined_fit_identity_changes_for_each_cap_and_stress_basis():
     policy = PolicySpec(age=65, income_start_year=1)
     mortality = MortalityTable.gompertz_makeham()
     config = ProjectionConfig(record_paths=False, max_age=68.0)
-    settings = OptimalBehaviourLSMCSettings(n_folds=3, fold_seed=29)
+    settings = OptimalBehaviourLSMCSettings(
+        n_folds=3,
+        fold_seed=29,
+        minimum_regression_observations=20,
+        observations_per_coefficient=2,
+    )
 
     base = fit_optimal_behaviour_policy(
         product,
