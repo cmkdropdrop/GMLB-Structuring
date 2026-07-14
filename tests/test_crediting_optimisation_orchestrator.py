@@ -55,6 +55,19 @@ def test_dynamic_orchestrator_derives_one_exact_time_zero_cache_sample():
     assert "lsmc" not in " ".join(reader).lower()
 
 
+def test_dynamic_orchestrator_rejects_multiple_modelpoints_before_precompute(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        runner,
+        "load_policyholder_model_points",
+        lambda _path: SimpleNamespace(model_points=(object(),) * 4),
+    )
+
+    with pytest.raises(ValueError, match="exactly one modelpoint before cache"):
+        runner._precompute_commands("dynamic", ("--n-paths", "882"))
+
+
 def test_proxy_pricing_prepares_market_cache_only():
     commands, reader = runner._precompute_commands(
         "lsmc", ("--hedge-pricing-method", "moment_matched_bs")

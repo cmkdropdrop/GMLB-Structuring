@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -34,6 +35,7 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _management_payload_and_activity_exposure,
     _objective_from_payload,
     _time_zero_policy_class_weights,
+    _time_zero_fixed_output_rows,
     parse_args,
     _pathwise_outer_fold_ids,
     _policy_action_values,
@@ -42,6 +44,8 @@ from portfolio_simulations.optimize_crediting_rate_dynamic_behaviour_alt import 
     _screened_policy_component_values,
     _screened_policy_actions,
     _select_best_fixed_label,
+    _select_best_time_zero_capital_adjusted_candidate,
+    _time_zero_capital_adjusted_csm,
     _shell_neutral_argv_display,
     _slim_direct_q_design,
     _fit_time_zero_chain,
@@ -630,10 +634,11 @@ def test_validation_gate_accepts_significant_uplift_and_rejects_fallback_cases()
         assert not _adaptive_policy_passes_validation(**arguments)
 
 
-def test_ratio_parser_uses_one_full_sample_and_one_model_point_default():
+def test_capital_adjusted_parser_uses_one_full_sample_and_one_model_point_default():
     args = parse_args(["--n-paths", "882", "--seed", "17"])
 
-    assert args.optimisation_objective == "csm_to_mll"
+    assert args.optimisation_objective == "csm_minus_lambda_mll"
+    assert args.mll_capital_charge_rate == pytest.approx(0.06)
     assert args.n_paths == 882
     assert args.seed == 17
     assert args.model_points.name == "model_points_policyholders_1_point_proxy.csv"
@@ -665,6 +670,25 @@ def test_time_zero_policy_class_grid_is_predeclared_and_additive():
     )
     assert longevity_half[10] == 0.5
     assert np.count_nonzero(longevity_half[9:]) == 1
+
+
+def test_time_zero_fixed_output_removes_legacy_sample_role_names():
+    rows = _time_zero_fixed_output_rows(({
+        "case": "fixed_cap_0.25pct",
+        "fixed_cap_selection_sample_csm_aud": 12.0,
+        "fixed_cap_selection_sample_mll_capital_aud": 5.0,
+        "n_fixed_cap_selection_paths": 100,
+        "n_final_evaluation_paths": 100,
+        "sample_role": "common_time_zero_q_sample",
+    },))
+
+    assert rows == [{
+        "case": "fixed_cap_0.25pct",
+        "time_zero_path_count": 100,
+        "sample_basis": "common_time_zero_q_sample",
+        "time_zero_csm_aud": 12.0,
+        "time_zero_mll_capital_aud": 5.0,
+    }]
 
 
 def test_single_model_point_payload_is_recomputed_after_clipping():
@@ -819,6 +843,64 @@ def test_ratio_objective_can_prefer_lower_csm_with_better_risk_profile():
     assert _objective_from_payload(lower_csm_low_risk, spec) > (
         _objective_from_payload(high_csm_high_risk, spec)
     )
+
+
+def test_time_zero_final_selection_maximises_capital_adjusted_csm():
+    higher_adjusted_lower_ratio = SimpleNamespace(
+        anchored_result=SimpleNamespace(
+            csm=120.0,
+            mll=SimpleNamespace(capital=100.0),
+            csm_to_mll_ratio=1.2,
+        ),
+        estimate=SimpleNamespace(chosen_action=0),
+        policy_class_index=1,
+    )
+    lower_adjusted_higher_ratio = SimpleNamespace(
+        anchored_result=SimpleNamespace(
+            csm=110.0,
+            mll=SimpleNamespace(capital=10.0),
+            csm_to_mll_ratio=11.0,
+        ),
+        estimate=SimpleNamespace(chosen_action=1),
+        policy_class_index=2,
+    )
+
+    selected = _select_best_time_zero_capital_adjusted_candidate(
+        (higher_adjusted_lower_ratio, lower_adjusted_higher_ratio),
+        capital_charge_rate=0.06,
+    )
+
+    assert _time_zero_capital_adjusted_csm(
+        higher_adjusted_lower_ratio.anchored_result, 0.06
+    ) == pytest.approx(114.0)
+    assert selected is higher_adjusted_lower_ratio
+
+
+def test_capital_adjusted_selection_allows_undefined_secondary_ratio():
+    zero_mll = SimpleNamespace(
+        anchored_result=SimpleNamespace(
+            csm=115.0,
+            mll=SimpleNamespace(capital=0.0),
+            csm_to_mll_ratio=None,
+        ),
+        estimate=SimpleNamespace(chosen_action=0),
+        policy_class_index=1,
+    )
+    material_mll = SimpleNamespace(
+        anchored_result=SimpleNamespace(
+            csm=120.0,
+            mll=SimpleNamespace(capital=100.0),
+            csm_to_mll_ratio=1.2,
+        ),
+        estimate=SimpleNamespace(chosen_action=1),
+        policy_class_index=2,
+    )
+
+    selected = _select_best_time_zero_capital_adjusted_candidate(
+        (zero_mll, material_mll), capital_charge_rate=0.06
+    )
+
+    assert selected is zero_mll
 
 
 def test_ratio_is_formed_after_value_vector_aggregation():

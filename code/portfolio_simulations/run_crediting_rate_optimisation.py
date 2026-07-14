@@ -93,6 +93,12 @@ def _precompute_commands(
         _reader_module(mode)._require_lsmc_mode(tuple(runner_arguments))
     args = module.parse_args(tuple(runner_arguments))
     model_points = load_policyholder_model_points(args.model_points)
+    if mode == "dynamic" and len(model_points.model_points) != 1:
+        raise ValueError(
+            "The Dynamic Time-0 capital-adjusted workflow requires exactly one "
+            f"modelpoint before cache preparation; loaded "
+            f"{len(model_points.model_points)} from {args.model_points}."
+        )
     equity_allocation = load_equity_allocation()
     hedge_cache_defaults = ValuationSettings()
     horizon_years = module._projection_horizon_years(

@@ -386,13 +386,14 @@ The directly fitted V11 policy is the deployed customer policy. It is not
 replaced by a fixed-behaviour rule on the basis of a confidence bound or an
 in-sample comparison. Structural controls remain hard requirements: a
 non-finite, incomplete, materially unsupported or otherwise invalid regression
-fit aborts the run instead of silently deploying a behavioural fallback.
+fit aborts the run instead of silently deploying a substitute behavioural
+rule.
 
 The advantage basis is reduced from full to core features when necessary for a
 stable estimator. For a materially sparse far-tail decision boundary, its final
 documented basis may be an intercept-only, cross-fitted constant advantage.
 That remains the expected-advantage argmax on a coarser information set; it is
-not a `CONTINUE` rule or another behavioural fallback.
+not a prescribed `CONTINUE` rule or another substitute policy.
 
 Customer-LSMC runs use exactly one modelpoint. The mortality-free fit and the
 actual-mortality actuarial/CSM rollout share one exact market-path sample and

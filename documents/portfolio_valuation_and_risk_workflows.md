@@ -82,7 +82,7 @@ nearby horizon, different seed or partial cap grid is not a substitute.
 
 With annual `mc_conditional` pricing, `--require-market-cache` and
 `--require-hedge-cache` are effective requirements. `moment_matched_bs` must be
-chosen explicitly and labelled as a proxy; it is never an automatic fallback.
+chosen explicitly and labelled as a proxy; it is never selected automatically.
 
 ## Orchestrated cache preparation
 
@@ -102,17 +102,18 @@ Only after successful preflight does the orchestrator launch the Dynamic and
 LSMC read-only valuation children.
 
 [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py)
-provides the equivalent boundary for adaptive-cap research. The installed
+provides the equivalent boundary for cap-management research. The installed
 `optimise-crediting-dynamic` and `optimise-crediting-lsmc` commands first parse
 the selected optimiser configuration, derive the exact portfolio horizon and
-enumerate its training and independent benchmark path-count/seed pairs. The
-orchestrator invokes the sole authorised precompute runner for each exact
-sample. With `mc_conditional`, it supplies the complete optimiser cap grid and
-prepares the congruent hedge cache; with explicitly selected
-`moment_matched_bs`, it prepares the market cache only. It then launches the
-strict optimiser reader in a separate process with the cache requirements
-enforced; the LSMC route uses the Bellman wrapper that enforces LSMC
-policyholder behaviour.
+enumerate the required path-count/seed identities. The Dynamic route
+hard-requires exactly one modelpoint before any cache job and prepares one
+complete Time-0 Q sample. The orchestrator invokes the sole authorised
+precompute runner for each exact sample. With `mc_conditional`, it supplies the
+complete optimiser cap grid and prepares the congruent hedge cache; with
+explicitly selected `moment_matched_bs`, it prepares the market cache only. It
+then launches the strict optimiser reader in a separate process with the cache
+requirements enforced; the Customer-LSMC route uses the Bellman wrapper that
+enforces LSMC Policyholder behaviour.
 
 Standalone valuation scripts and the direct optimiser implementation files
 remain strict readers. If one reports a cache miss, prepare exactly the
@@ -229,6 +230,38 @@ annually adaptive discretionary cap rule has value. Outputs include the full
 stress revaluation table, capital table, run manifest and three diagnostic
 figures under `results/runs/crediting_rate_capital_analysis/`.
 
+## Time-zero capital-adjusted value of annual cap flexibility
+
+[`optimize_crediting_rate_dynamic_behaviour_alt.py`](../code/portfolio_simulations/optimize_crediting_rate_dynamic_behaviour_alt.py)
+is the strict reader for the current annual-flexibility question. It uses
+exactly one modelpoint, statistical Dynamic customers and Management LSMC. It
+does not invoke Customer LSMC.
+
+The fixed caps, Management-LSMC regressions and finished-candidate ranking use
+one complete exact Q sample. Cashflows are discounted to Time 0 with the current
+curve. There is no path reservation, OOS seed, forward roll, deployment gate or
+strategy replay. The primary final score is
+$\mathrm{CSM}-0.06\,\mathrm{MLL}$; CSM/MLL is a secondary reported efficiency
+measure and does not select the policy. Twenty-one additive Base/Stress
+objectives plus one conditional-ratio heuristic generate the finite fitted
+policy class, while a forced best-fixed chain supplies the regression anchor.
+Best fixed is the explicit comparator under the same 6% score and there is no
+additional CSM constraint.
+
+For the documented one-modelpoint run with 4,200 Q paths and market seed 2026,
+the selector chooses `base_csm`: CSM AUD 103,840.3807, MLL AUD 45,213.1339,
+capital-adjusted CSM AUD 101,127.5926 and secondary CSM/MLL 2.2966862. The best
+fixed comparator is 0.25%, with CSM AUD 52,151.2701, MLL AUD 25,057.4801,
+capital-adjusted CSM AUD 50,647.8213 and CSM/MLL 2.0812656. Both use the current
+curve and the same complete sample.
+
+The output is a present-value estimate of the contractual annual reset right,
+not an operating policy. It includes the fixed grid, policy-class candidates,
+primary capital-adjusted and secondary ratio metrics, Time-0 action-cell and
+regression diagnostics, comparison table, manifest and plot. The current
+one-modelpoint result and limitations are documented in
+[`crediting_rate_profitability_and_capital.md`](crediting_rate_profitability_and_capital.md).
+
 ## Run directories and provenance
 
 Generated outputs belong under `results/runs/<workflow>/`. Workflows that may
@@ -242,23 +275,27 @@ Every documented run should retain:
 - path counts, active seed namespaces and horizon;
 - cap grid, behaviour mode, action set and stress definition;
 - sample semantics and whether any OOS validation/evaluation was used;
-- the fitted and deployed policy label;
+- the fitted candidate label and, only where the workflow deploys a policy, the
+  deployed-policy label;
 - aggregation basis and CSM reconciliation;
 - runtime status and logs.
 
 `results/document_figures/` is reserved for a small set of reviewed figures
 promoted from completed runs. A promoted figure should have a nearby documented
 provenance link to its completed run manifest and must not be copied from a
-smoke, interrupted, rejected or source-mismatched run. The curated
-Dynamic-behaviour cap study records a completed current-source optimisation run.
-Completed base-only portfolio-risk run `20260714T082548.845487Z` is the current
-customer-LSMC diagnostic. It uses one model point (`ALT4-01`), 20,000 paths,
-market seed 12026 and Caps 0.25%, 1%, 6% and 12%. Every cell directly deploys a
-structurally valid V11 rule; no OOS test or fixed fallback is used. Time-zero
+smoke, interrupted, rejected or source-mismatched run. The current curated
+Dynamic Time-0 study preserves the completed fit manifest and documents the
+final $\lambda=6\%$ capital-adjusted re-ranking separately; it is not labelled
+as a deployment run.
+The current base-only customer-LSMC diagnostic uses one model point (`ALT4-01`),
+20,000 common paths, market seed 12026 and Caps 0.25%, 0.5%, 1%, 2%, 4%, 6%, 8%
+and 12%. Every displayed cell directly deploys a structurally valid V11 rule;
+no separate policy-selection test or fixed-rule substitution is used. Time-zero
 customer optionality relative to the best fixed START-plus-CONTINUE reference
-is AUD 0, 0, 3,684.45 and 66,949.93 respectively. Because the run contains one
-example insured person, it is method evidence and a design sensitivity, not
-portfolio evidence or regulatory capital.
+is zero through 2%, AUD 34.06 at 4%, AUD 3,684.45 at 6%, AUD 13,426.51 at 8%
+and AUD 66,949.93 at 12%. Because the analysis contains one example insured
+person, it is method evidence and a design sensitivity, not portfolio evidence
+or regulatory capital.
 
 ## Quick workflows
 
@@ -272,27 +309,27 @@ Run the customer-LSMC base cap/behaviour comparison; exact missing
 caches are prepared first:
 
 ```powershell
-portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --crediting-rates 0.25% 1% 6% 12% --n-train 20000 --no-stress-analysis --require-market-cache --require-hedge-cache
+portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --crediting-rates 0.25% 0.5% 1% 2% 4% 6% 8% 12% --n-train 20000 --market-cache-root AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths --hedge-cache-root AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices --no-stress-analysis --require-market-cache --require-hedge-cache
 ```
 
 Add the standard market/longevity shock set explicitly:
 
 ```powershell
-portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --crediting-rates 0.25% 1% 6% 12% --stress-analysis --stress-scenarios interest_up interest_down longevity --require-market-cache --require-hedge-cache
+portfolio-risk-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --crediting-rates 0.25% 0.5% 1% 2% 4% 6% 8% 12% --market-cache-root AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths --hedge-cache-root AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices --stress-analysis --stress-scenarios interest_up interest_down longevity --require-market-cache --require-hedge-cache
 ```
 
 Run the Dynamic-only mortality/longevity/lapse capital comparison without
 triggering Policyholder LSMC:
 
 ```powershell
-crediting-capital-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv --cap-grid 0.0025,0.01,0.06,0.12 --baseline-cap 0.06
+crediting-capital-analysis --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --cap-grid 0.0025,0.01,0.06,0.12 --baseline-cap 0.06
 ```
 
-Run either adaptive-cap family through its prepare-then-read console command:
+Run either cap-management family through its prepare-then-read console command:
 
 ```powershell
-optimise-crediting-dynamic --model-points input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv
-optimise-crediting-lsmc --model-points input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv
+optimise-crediting-dynamic --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --n-paths 4200 --seed 2026 --require-market-cache --require-hedge-cache
+optimise-crediting-lsmc --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv
 ```
 
 Those commands derive every required cache identity from the forwarded
@@ -321,10 +358,11 @@ Before interpreting or promoting a result, confirm that:
 3. the four CSM legs reconcile to the reported signed objective;
 4. the portfolio aggregation reconciliation is within tolerance;
 5. the Dynamic and customer-LSMC comparison uses the recorded common sample;
-6. direct V11 deployment, structural validity and the absence of OOS/fallback
-   selection are recorded;
-7. any separate adaptive-cap selection workflow preserves its own declared
-   training/validation/final-sample controls;
+6. direct V11 deployment, structural validity and the absence of external
+   policy selection or fixed-rule substitution are recorded;
+7. the Dynamic Management-LSMC output records one modelpoint, one complete
+   Time-0 Q sample, primary $\mathrm{CSM}-0.06\,\mathrm{MLL}$ selection,
+   secondary CSM/MLL reporting and no OOS, forward roll or deployment output;
 8. Monte Carlo uncertainty and the proxy/non-regulatory boundaries are stated;
 9. any promoted chart carries the run and cache provenance needed to reproduce
    it.

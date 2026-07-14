@@ -10,7 +10,7 @@ An editable install from the repository root exposes five commands through
 | `precompute-q-cache` | [`precompute_q_market_and_hedge_cache.py`](../code/portfolio_simulations/precompute_q_market_and_hedge_cache.py) | Create or validate exact Q-market and conditional-MC hedge caches |
 | `portfolio-risk-analysis` | [`run_portfolio_risk_analysis.py`](../code/portfolio_simulations/run_portfolio_risk_analysis.py) | Recommended end-to-end cap, behaviour and optional stress workflow |
 | `crediting-capital-analysis` | [`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py) | Dynamic-only fixed-cap MLL capital and capital-adjusted profitability study |
-| `optimise-crediting-dynamic` | [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py) | Prepare exact caches, then run the strict Dynamic-policyholder optimiser |
+| `optimise-crediting-dynamic` | [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py) | Prepare exact caches, then run the strict one-modelpoint Dynamic Time-0 capital-adjusted reader |
 | `optimise-crediting-lsmc` | [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py) | Prepare exact caches, then run the strict combined LSMC-policyholder optimiser |
 
 Use `python -m pip install -e ".[test]"` once from the repository root. Direct
@@ -40,8 +40,10 @@ is the appropriate cache boundary when a reader explicitly selects the labelled
 
 This is the prepare-then-read orchestrator behind both installed optimisation
 commands. It parses the selected optimiser's arguments, resolves the model-point
-horizon and enumerates the exact training and independent benchmark samples.
-For every distinct path-count/market-seed pair it invokes
+horizon and enumerates the exact samples required by that family. The Dynamic
+Time-0 route hard-requires one modelpoint and one complete Q sample; the
+Customer-LSMC route retains its separately declared sample roles. For every
+distinct path-count/market-seed pair it invokes
 `precompute_q_market_and_hedge_cache.py` with the same market inputs, substeps,
 cache roots and horizon. With `mc_conditional`, it also supplies the optimiser's
 complete cap grid so that the path-congruent hedge surface has the exact
@@ -110,8 +112,9 @@ terminal-closeout cashflows discounted by today's Australian zero curve. The
 fit contains no mortality or death benefit; configured mortality is restored
 for actuarial and CSM rollout. Whole-path cross-fitting estimates continuation
 values inside one exact Q sample. The V11 rule is deployed directly on that
-same sample: there is no separate validation/evaluation sample, OOS gate, RMSE
-exercise buffer or fixed-policy fallback. Legacy sample flags remain parseable
+same sample: there is no separate validation/evaluation sample, policy-selection
+gate, RMSE exercise buffer or fixed-policy substitution. Legacy sample flags
+remain parseable
 but are normalised to `--n-train` and the active training seeds.
 
 The runner writes regression/action diagnostics, same-sample comparisons and
@@ -146,26 +149,26 @@ loss distribution or regulatory capital calculation.
 ### `optimize_crediting_rate_dynamic_behaviour_alt.py`
 
 This is the strict cache-reader implementation used by the canonical
-Dynamic-behaviour cap command. It uses a gas-storage LSMC formulation with
-account value per initial premium as an endogenous inventory grid. Node
-continuation fits use an intercept, ATM one-year call value, reference-fund
-level and overnight rate. Each action-Q target is the realised annual CSM
-components plus the next value interpolated at that same path's realised next
-account value; no separate conditional-mean reward or transition regression is
-used.
+Dynamic-behaviour cap command. It values today the insurer's right to reset the
+annual cap under statistical Dynamic Policyholder behaviour. It hard-requires
+exactly one modelpoint and never calls Customer LSMC. Future cashflows are
+risk-neutral expected values discounted to Time 0 with the current curve.
 
-Action-Q fitting and frozen deployment use the identical compact six-column
-basis: intercept, standardised ATM call, fund level, short rate, account value
-and squared account value. There is no surrogate projection to a larger basis.
-Complete market paths retain one immutable outer-fold assignment through the
-full backward recursion, including scaling, inventory grids, continuation and
-Q fits.
+The gas-storage formulation uses account value per initial premium as an
+endogenous inventory grid. Node continuation fits use an intercept, ATM
+one-year call value, reference-fund level and overnight rate. Each action-Q
+target is the realised annual 14-value Base/Stress CSM payload plus the next
+value interpolated at that same path's realised next account value. The
+six-column action basis adds account value and squared account value.
 
-The workflow separates control-randomisation training, fixed-cap selection,
-adaptive validation and final evaluation. The adaptive policy is deployed only
-when its validation uplift is greater than 1.96 paired standard errors and all
-operational diagnostics pass. Otherwise the fixed fallback is deployed and the
-deployed flexibility value is zero.
+Because MLL is non-additive, the runner fits 21 predeclared additive Base/Stress
+support policies plus one conditional-ratio heuristic, then ranks the finished
+fixed-anchored payloads on the primary Time-0 score
+$\mathrm{CSM}-0.06\,\mathrm{MLL}$. CSM/MLL is a secondary reported efficiency
+measure and does not select the policy. There is no additional CSM constraint;
+best fixed is the explicit comparator under the same 6% score. One complete Q
+sample is shared by fitting, candidate ranking and fixed caps; no OOS sample,
+forward roll, deployment gate or future policy schedule is produced.
 
 The standard hedge is the sold bull call spread. The current cap affects
 statistical behaviour through account value, guarantee moneyness and realised
@@ -212,7 +215,7 @@ Files beginning with `_` are implementation helpers, not public commands:
 | One fixed cap with direct optimal-policyholder diagnostics | `run_portfolio_valuation_lsmc.py` |
 | Dynamic versus direct LSMC V11 across caps and optional stresses | `portfolio-risk-analysis` |
 | Fixed caps under Dynamic mortality/longevity/lapse capital | `crediting-capital-analysis` |
-| Adaptive cap under statistical Dynamic behaviour | `optimise-crediting-dynamic` |
+| Time-0 $\mathrm{CSM}-0.06\,\mathrm{MLL}$ value of annual cap flexibility under statistical Dynamic behaviour, with CSM/MLL reported secondarily | `optimise-crediting-dynamic` |
 | LSMC-follower cap research | `optimise-crediting-lsmc` |
 | Prepare one known exact cache specification | `precompute-q-cache` |
 | Debug an optimiser against already prepared exact caches | Direct optimiser implementation file |
@@ -226,11 +229,11 @@ Files beginning with `_` are implementation helpers, not public commands:
 3. For Q valuation, never bypass exact market-cache validation.
 4. For `mc_conditional`, never omit the congruent hedge cache or replace it with
    an implicit Black–Scholes estimate.
-5. For adaptive cap optimisation, keep training, fixed selection, validation
-   and final evaluation seeds distinct; customer LSMC deliberately uses one
-   sample and records that fact.
-6. Read the deployed-policy and sample-semantics fields, not only a fitted
-   candidate/Bellman field.
+5. For Dynamic-customer Management LSMC, use exactly one modelpoint and the one
+   complete Time-0 sample recorded in the manifest; do not reinterpret its
+   action-cell diagnostics as a deployment rule.
+6. For the separate Customer-LSMC/Stackelberg route, follow its own declared
+   sample and deployment restrictions.
 7. Check the CSM and portfolio aggregation reconciliations before interpreting
    a result.
 8. Treat one-point customer-LSMC runs as method/design sensitivities, not

@@ -55,10 +55,14 @@ dependent:
 | Growth | A higher cap increases the potential value of waiting and can raise the income base at election | More fees and later election may help, but the hedge is more expensive |
 | Income | A higher account value does not raise locked income without a ratchet; withdrawal can become the only way to realise gains | Claims may fall, while lapse, longevity exposure, fee duration and hedge cost can move in opposing directions |
 
-There is therefore no universally optimal high or low cap. The objective is to
-choose $C_y$ from a predeclared admissible grid using information available at
-the decision time, then compare the deployed adaptive policy with a separately
-selected best fixed cap out of sample.
+There is therefore no universally optimal high or low cap. For the current
+management question, $C_y$ is chosen from a predeclared admissible grid using
+information available at each decision time. The contractual flexibility is
+valued today with the primary capital-adjusted objective
+$\mathrm{CSM}^{\mathrm{proxy}}-0.06K_{\mathrm{MLL}}$ and compared with the best
+fixed cap on the same complete risk-neutral sample. CSM/MLL remains a
+supplementary capital-efficiency diagnostic. This is not a deployment or OOS
+exercise.
 
 Management discretion may also matter to fulfilment-cashflow and service
 assessments where it is substantive and recognised by the applicable accounting
@@ -156,8 +160,10 @@ hedge nor the return credited to the policyholder.
 
 The full illustrative portfolio contains 48 model points. A four-point proxy is
 provided for faster development. Customer-LSMC runs deliberately require the
-one-point proxy; it is also used for smoke and orchestration checks. A
-one-modelpoint output is a method/design sensitivity, not portfolio evidence.
+one-point proxy. The Time-0 Management-LSMC calculation in Section 7 also hard-
+requires that same single modelpoint; no 4- or 48-point aggregation is used in
+that calculation. A one-modelpoint output is a method/design sensitivity, not
+portfolio evidence.
 A model point represents an insured person; scalar portfolio results use
 `contract_weight`, not an implicit count of CSV rows.
 The [input reference](documents/input_data_reference.md) documents the portable
@@ -186,9 +192,9 @@ those directories. The risk orchestrator and the installed crediting-cap
 optimisation commands validate existing entries and ask that runner to create
 only missing exact entries before their read-only children begin. A changed cap
 grid or equity allocation creates a distinct hedge-cache identity but can reuse
-the same exact market cache. An approximate cache match and a silent
-Black–Scholes fallback are prohibited; `moment_matched_bs` is available only as
-an explicit, labelled proxy choice.
+the same exact market cache. An approximate cache match and an implicit
+Black–Scholes substitution are prohibited; `moment_matched_bs` is available
+only as an explicit, labelled proxy choice.
 
 Simplified real-world projections use Black–Scholes–Hull–White under the
 physical measure with the supplied equity risk premia, no bond term premium and
@@ -215,26 +221,26 @@ $$
 
 using the deterministic discount factors implied by today's Australian zero
 curve. The mortality-free fit uses one exact Q-market sample and deploys the
-fitted V11 policy directly: there is no independent out-of-sample gate and no
-statistical fixed-policy fallback. Complete-path fold cross-fitting remains
-inside the continuation-value estimator; it is not a separate OOS test. At
+fitted V11 policy directly, without an independent policy-selection sample or
+replacement by a fixed rule. Complete-path fold cross-fitting remains inside
+the continuation-value estimator; it estimates conditional expectations. At
 annual Growth decisions the customer chooses `WAIT` or
 `START_NORMAL_INCOME`; at annual Income decisions the choice is normal income
 for the next period or `FULL_SURRENDER`. Partial withdrawal and mortality are
 absent from the customer objective. At the finite projection horizon the
-terminal payoff is the post-fee account-value closeout. Actual mortality is
-restored only when the fitted actions are rolled into the actuarial and CSM
-valuation. Customer-LSMC runs require exactly one model point. See
+terminal payoff is the post-fee account-value closeout. Customer-LSMC runs
+require exactly one model point. See
 [policyholder behaviour](documents/policyholder_behaviour.md).
 
 ### Crediting-cap control and core scripts
 
 The insurer chooses the next cap after old-year crediting, fees, mortality and
 eligible Income election, but before the new hedge is purchased. Optimisation
-uses only pre-action state. Separate samples are used for fitting, fixed-cap
-selection, adaptive validation and final evaluation. A failed adaptive
-candidate is replaced by the selected fixed cap; its deployed flexibility value
-is then exactly zero.
+uses only pre-action state. The Dynamic-customer management valuation uses one
+complete Q sample both to fit conditional expectations and to determine today's
+risk-neutral capital-adjusted CSM; it has no OOS test, forward roll or deployment
+gate. CSM/MLL is reported alongside the primary AUD objective. This is distinct
+from the separate Policyholder-LSMC/Stackelberg research route.
 
 The small set of scripts that defines the operative research workflow is:
 
@@ -243,11 +249,11 @@ The small set of scripts that defines the operative research workflow is:
 | [`run_portfolio_risk_analysis.py`](code/portfolio_simulations/run_portfolio_risk_analysis.py) | Recommended end-to-end fixed-cap, behaviour and optional shock-and-revalue orchestrator; it prepares exact caches before invoking readers |
 | [`run_crediting_rate_capital_analysis.py`](code/portfolio_simulations/run_crediting_rate_capital_analysis.py) | Dynamic-only fixed-cap mortality/longevity/lapse capital and capital-adjusted profitability orchestrator; Policyholder LSMC is hard-blocked |
 | [`run_crediting_rate_optimisation.py`](code/portfolio_simulations/run_crediting_rate_optimisation.py) | Console-command orchestrator for both optimisation families; prepares only missing exact caches, then starts a strict reader |
-| [`optimize_crediting_rate_dynamic_behaviour_alt.py`](code/portfolio_simulations/optimize_crediting_rate_dynamic_behaviour_alt.py) | Strict cache-reader implementation of gas-storage-style annual cap optimisation with statistical dynamic policyholder behaviour |
+| [`optimize_crediting_rate_dynamic_behaviour_alt.py`](code/portfolio_simulations/optimize_crediting_rate_dynamic_behaviour_alt.py) | Strict cache-reader for the one-modelpoint, same-sample Time-0 capital-adjusted CSM value of annual cap flexibility under statistical Dynamic Policyholder behaviour; CSM/MLL is a secondary diagnostic |
 | [`optimize_crediting_rate_bellman.py`](code/portfolio_simulations/optimize_crediting_rate_bellman.py) | Strict cache-reader LSMC-policyholder entry point; delegates to the combined Stackelberg implementation |
 | [`precompute_q_market_and_hedge_cache.py`](code/portfolio_simulations/precompute_q_market_and_hedge_cache.py) | Sole authorised writer of exact Q-market and conditional-MC hedge caches |
 | [`run_portfolio_valuation.py`](code/portfolio_simulations/run_portfolio_valuation.py) | Read-only dynamic-behaviour portfolio valuation |
-| [`run_portfolio_valuation_lsmc.py`](code/portfolio_simulations/run_portfolio_valuation_lsmc.py) | Read-only one-modelpoint customer-LSMC valuation on one exact Q sample, with direct V11 deployment and no OOS gate or fallback |
+| [`run_portfolio_valuation_lsmc.py`](code/portfolio_simulations/run_portfolio_valuation_lsmc.py) | Read-only one-modelpoint customer-LSMC valuation on one exact Q sample with direct V11 deployment |
 
 The optimisation details are in
 [crediting-rate optimisation](documents/crediting_rate_optimisation.md); the
@@ -264,26 +270,54 @@ Q sample:
 1. statistical dynamic Income election plus dynamic Income lapse/withdrawal;
 2. the directly deployed V11 customer-LSMC policy.
 
-The comparison should report CSM and its components, guarantee claims, election
-timing, surrender diagnostics and risk sensitivities. V11 is no longer screened
-by an independent OOS test: it is the direct single-sample policy, provided the
-structural regression checks succeed. Its internal complete-path fold estimates
-are continuation-value cross-fitting, not a held-out validation gate.
+The comparison reports CSM and its components, guarantee claims, election
+timing, surrender diagnostics and risk sensitivities. V11 is the direct
+single-sample policy once the structural regression checks succeed. Its
+internal complete-path folds estimate continuation values.
 
-**Current one-modelpoint diagnostic.** Completed base Heston–Hull–White run
-[`20260714T082548.845487Z`](results/runs/portfolio_risk_analysis/20260714T082548.845487Z/portfolio_risk_report.md)
-used 20,000 paths for the single model point `ALT4-01` and caps of 0.25%, 1%,
-6% and 12%. V11 was valid and deployed directly in every cell. Its
-mortality-free customer fit and the Dynamic arm used the common exact market
-sample; actual mortality was then restored for the actuarial and CSM rollout.
-Mean V11 Income start was 1.0000, 1.0000, 1.0171 and 4.0146 years across the
-four caps. Full surrender was absent except for one path at policy year 32 in
-the 12% cell. Because the base Heston–Hull–White run succeeded, no fixed-equity-
-volatility/lower-rate-volatility sensitivity was needed.
+The one-modelpoint diagnostic uses 20,000 common Heston–Hull–White paths for
+`ALT4-01` and the discrete cap grid 0.25%, 0.5%, 1%, 2%, 4%, 6%, 8% and 12%.
+V11 is valid and deployed directly in every displayed cell. Its customer fit
+and the Dynamic arm use the same exact market sample. The base market model
+provides the complete grid, so no alternative fixed-equity-volatility or
+lower-rate-volatility sensitivity is used.
 
 This is an illustrative result for one representative contract, not evidence
 about a diversified portfolio. The full sample identities, method flags and
-outputs are in the [source table](results/runs/portfolio_risk_analysis/20260714T082548.845487Z/portfolio_risk_by_crediting_cap.csv).
+outputs are in the [curated source table](results/document_figures/source_data/customer_lsmc_crediting_cap_grid/portfolio_risk_by_crediting_cap.csv).
+
+The optimal decisions change in annual steps rather than along a smooth cap
+response. Mean V11 Income Election occurs in year 1 for caps from 0.25% through
+2%, around year 3 at 4%, again around year 1 at 6%, and around year 4 at 8% and
+12%. This non-monotone pattern reflects the pathwise trade-off between waiting
+in Growth and starting normal Income at the permitted annual decision dates; it
+must not be interpolated between cap scenarios. Full Surrender is zero to
+displayed precision apart from negligible path mass at 12%. For this model
+point, the value difference is therefore driven mainly by Income-Election
+timing and the resulting normal-income cashflows rather than by surrender.
+
+The customer-value comparison below puts both behaviour models on the same
+pathwise Q valuation basis and uses the same contractual benefit definition.
+The difference is therefore the paired increase in Policyholder-benefit PV from
+the V11 customer rule relative to Dynamic behaviour.
+
+| Cap | Dynamic customer benefit PV (AUD) | V11 customer benefit PV (AUD) | V11 increase (AUD) | V11 increase |
+|---:|---:|---:|---:|---:|
+| 0.25% | 246,411.57 | 301,761.23 | 55,349.65 | 22.46% |
+| 0.5% | 248,964.57 | 302,608.32 | 53,643.75 | 21.55% |
+| 1% | 254,137.13 | 304,296.09 | 50,158.96 | 19.74% |
+| 2% | 264,492.22 | 307,636.96 | 43,144.75 | 16.31% |
+| 4% | 284,955.98 | 306,866.85 | 21,910.87 | 7.69% |
+| 6% | 303,121.48 | 319,908.63 | 16,787.15 | 5.54% |
+| 8% | 317,300.20 | 326,555.95 | 9,255.76 | 2.92% |
+| 12% | 332,245.38 | 337,256.46 | 5,011.08 | 1.51% |
+
+The V11 customer rule increases the customer-benefit PV at every displayed cap.
+The uplift is largest at low caps, where earlier Income Election avoids much of
+the value loss under Dynamic behaviour, and narrows from 22.46% at 0.25% to
+1.51% at 12% as the two realised benefit profiles converge. This is a
+customer-benefit comparison, not the insurer CSM effect or the separate
+optimisation objective used to fit V11.
 
 ## 6. Effect of the crediting rate
 
@@ -297,108 +331,141 @@ revalues both behaviour models. The key outputs are:
 
 A higher cap is expected to increase hedge cost, but the net CSM and risk
 effects need not be monotone because account value, fee duration, claims and
-behaviour all respond. In the completed one-modelpoint study the observed
-values were:
+behaviour all respond. Across the displayed one-modelpoint cap grid, the
+observed values are:
 
 | Cap | Dynamic CSM (AUD) | Direct V11 CSM (AUD) | Customer optionality uplift (AUD) | Mean V11 Income-start year |
 |---:|---:|---:|---:|---:|
 | 0.25% | 52,128.84 | -2,225.25 | 0.00 | 1.0000 |
+| 0.5% | 49,350.86 | -3,274.68 | 0.00 | 1.0000 |
 | 1% | 43,713.58 | -5,316.92 | 0.00 | 1.0000 |
+| 2% | 32,394.84 | -9,412.17 | 0.00 | 1.0000 |
+| 4% | 9,926.33 | -11,222.41 | 34.06 | 2.9819 |
 | 6% | -10,170.40 | -24,811.80 | 3,684.45 | 1.0171 |
+| 8% | -25,942.61 | -34,606.39 | 13,426.51 | 4.0001 |
 | 12% | -42,571.89 | -46,840.27 | 66,949.93 | 4.0146 |
 
-The optionality uplift is the increase in the mortality-free, deterministic-
-time-zero-curve customer objective relative to the best fixed
-START-plus-CONTINUE reference.
-It is neither an insurer CSM increment nor an OOS performance estimate. These
-are discrete, base-only scenarios for `ALT4-01`, not interpolated break-even
-estimates or portfolio-level evidence.
+![CSM and reconciled value drivers by cap](results/document_figures/customer_lsmc_csm_value_drivers_by_cap.png)
 
-## 7. Capital-aware crediting-rate choice
+*Guarantee claims generally decline as the cap rises, while call-spread cost
+grows from AUD 10,137 at 0.25% to AUD 198,614 at 12%; V11 CSM consequently falls
+from AUD -2,225 to AUD -46,840.*
 
-The crediting cap does change the risk profile under statistical Dynamic
-Policyholder Behaviour. Completed Dynamic-only run
-`20260714T054131.308036Z` revalued the four caps from Section 6 under the same
-1,000 Q paths and the following non-market stresses:
+The optionality uplift is the increase in the deterministic-time-zero-curve
+customer objective relative to the best fixed START-plus-CONTINUE reference.
+It is neither an insurer CSM increment nor a separate-sample performance
+estimate. These are discrete, base-only scenarios for `ALT4-01`, not
+interpolated break-even estimates or portfolio-level evidence.
 
-- mortality rates $q_x$ permanently increased by 15%;
-- mortality rates $q_x$ permanently reduced by 20% (longevity);
-- ordinary lapse baselines and the performance-sensitive excess-hazard cap
-  permanently multiplied by 1.5 and 0.5; and
-- a separately disclosed 40% mass-lapse proxy applied to positive CSM by model
-  point before aggregation.
+![Phase-specific cashflows and exposure by cap](results/document_figures/customer_lsmc_phase_values_by_cap.png)
 
-No Policyholder LSMC was fitted or called. Every valuation manifest records
-`lsmc_used=false`; all five revaluations per cap use the same exact market and
-path-congruent hedge caches. For each revalued module the adverse amount is
+*The discrete V11 start-year changes at 4%, 6% and 8% shift value and exposure
+between Growth and Income.*
+
+The two figures in this section were rendered data-only from the unified,
+validated result table. Figure hashes, cap-cell identities and exact source
+hashes are recorded in the
+[current figure provenance](results/document_figures/customer_lsmc_crediting_cap_grid.provenance.json).
+
+Sections 5 and 6 are a separate Customer-LSMC diagnostic and are not inputs to
+the Management-LSMC valuation below, which uses statistical Dynamic customers
+and current-curve Time-0 cashflows.
+
+## 7. Value of Optimal Management Decisions for the Crediting Rate
+
+The question here is not how to deploy a cap strategy. It is the value today of
+the insurer's contractual right to reset the annual crediting cap in future,
+given the information available at each future anniversary. Future cashflows
+are risk-neutral expected values discounted back to Time 0 using the current
+Australian curve.
+
+The illustrative Time-0 valuation uses exactly one modelpoint (`ALT4-01`),
+4,200 common Heston-Hull-White Q paths with market seed 2026, and exact
+path-congruent market and hedge caches. Policyholders follow the statistical
+Dynamic behaviour model, including its moneyness-sensitive lapse and election
+response. No Customer LSMC is fitted or called.
+
+The fixed caps and the management LSMC are evaluated on the same complete Q
+sample. There is deliberately no reserved path subset, different OOS seed,
+forward roll, strategy replay, bootstrap acceptance test or deployment rule.
+The output is a Time-0 valuation, not an estimate of live strategy performance.
+
+For each complete management candidate $\pi$, the primary objective is the AUD
+capital-adjusted value
 
 $$
-K_i=\max\left(0,\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{base}}
--\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{stress},i}\right).
+J_{\mathrm{adj}}(\pi)
+=\mathrm{CSM}^{\mathrm{proxy}}(\pi)-0.06K_{\mathrm{MLL}}(\pi).
 $$
 
-Lapse capital is the largest of lapse-up, lapse-down and the disclosed
-mass-lapse proxy. Mortality, longevity and lapse are then combined with the
-repository's existing research correlation submatrix. The result is an **MLL
-life-risk capital proxy**, not total SCR, APRA capital or an IFRS 17 Risk
-Adjustment.
+Here $K_{\mathrm{MLL}}$ combines mortality, longevity and the largest adverse
+lapse amount, including the separately disclosed 40% positive-CSM mass-lapse
+proxy. It remains a partial research life-risk capital measure, not total SCR,
+APRA capital or an IFRS 17 Risk Adjustment. The 6% factor is a one-year research
+capital hurdle, not a projected Risk Margin. The lifetime efficiency ratio
+$\mathrm{CSM}/K_{\mathrm{MLL}}$ is reported as a secondary diagnostic.
 
-The primary ranking is no longer mean CSM alone. It uses the robust AUD measure
+MLL and its stress maxima are not additive annual Bellman rewards. Management
+LSMC therefore fits a predeclared class of 21 additive Base/Stress support
+objectives,
 
 $$
-\mathrm{CSM}^{\mathrm{capital-adjusted}}(C)
-=\mathrm{CSM}^{\mathrm{proxy}}(C)-0.06\times K_{\mathrm{MLL}}(C),
+J_{\alpha,q}=(1-\alpha)\,\mathrm{CSM}_{\mathrm{base}}
++\alpha\sum_s q_s\,\mathrm{CSM}_{s},
+\qquad \alpha\in\{0,0.25,0.50,0.75,1\},
 $$
 
-with $\mathrm{CSM}/K_{\mathrm{MLL}}$ reported only as a secondary lifetime
-efficiency ratio.
-The 6% deduction is a one-year capital hurdle, not a full projected Risk Margin.
+plus one conditional-ratio heuristic. The exact aggregate
+$J_{\mathrm{adj}}$—not a support objective—ranks the candidate set. Each
+fitted payload difference is anchored to the directly projected best fixed cap,
+and best fixed remains an explicit zero-flexibility-value comparator.
 
-| Cap | CSM proxy (AUD) | MLL capital proxy (AUD) | Capital-adjusted CSM (AUD) | CSM / capital | Cumulative Dynamic Income lapse |
-|---:|---:|---:|---:|---:|---:|
-| 0.25% | 57,630 | 28,399 | 55,927 | 2.03 | 12.30% |
-| 1% | 48,944 | 25,158 | 47,435 | 1.95 | 11.77% |
-| 6% | -6,697 | 10,772 | -7,343 | -0.62 | 7.75% |
-| 12% | -39,517 | 9,020 | -40,058 | -4.38 | 5.09% |
+The stored candidate table contains all 22 fitted candidates. Earlier
+ratio-only reporting selected the balanced four-stress candidate with
+$\alpha=0.50$; that result is retained only as a historical objective
+sensitivity. Applying the current capital-adjusted objective to the complete
+candidate table selects the pure `base_csm` candidate. This deterministic
+re-ranking required neither a new market projection nor a regression refit.
 
-![CSM and MLL capital by crediting cap](results/document_figures/capital_csm_and_mll_by_cap.png)
+| Time-0 alternative | CSM (AUD) | MLL (AUD) | CSM − 6% MLL (AUD) | CSM / MLL |
+|---|---:|---:|---:|---:|
+| Best fixed cap: 0.25% | 52,151.27 | 25,057.48 | 50,647.82 | 2.08127 |
+| Annual adjustment right: `base_csm` | 103,840.38 | 45,213.13 | 101,127.59 | 2.29669 |
+| Flexible minus fixed | +51,689.11 | +20,155.65 | **+50,479.77** | **+0.21542** |
 
-The risk trade-off is material. Higher caps reduce the MLL proxy from AUD
-28,399 at 0.25% to AUD 9,020 at 12% and materially reduce performance-sensitive
-lapse. Mortality-up is favourable to the insurer in every cell and therefore
-has zero stand-alone capital; longevity remains adverse but its loss falls from
-AUD 11,795 to AUD 8,655. At 0.25% and 1% the approximate mass-lapse component
-binds; at 6% and 12% lapse-down binds. Without the mass proxy, the 0.25% MLL
-amount is AUD 13,237, so the limitation is visible rather than hidden.
+The fitted candidate's first Time-0 action is also 0.25%. Its additional value
+comes from the right to make later state-dependent resets, not from choosing a
+different initial cap. No future deployment schedule is exported.
 
-![Mortality, longevity and lapse capital modules](results/document_figures/capital_mll_modules_by_cap.png)
+![Direct comparison of the Section 7 table values for best fixed and annual management](results/document_figures/time0_crediting_flexibility_csm_mll.png)
 
-![Dynamic lapse response by crediting cap](results/document_figures/capital_dynamic_lapse_by_cap.png)
+This single graphic is a direct visualisation of the table above; no additional
+fixed-cap curves or risk-module charts are included. It shows that the primary
+capital-adjusted value rises by AUD 50,479.77 and the supplementary CSM/MLL
+ratio by 0.21542. Absolute MLL increases by AUD 20,155.65 because CSM increases
+by AUD 51,689.11, but MLL per unit of CSM falls from 48.05% to 43.54%. The
+observed benefit is therefore higher capital-adjusted value together with
+better partial life-risk efficiency, not a reduction in absolute capital.
 
-On this discrete grid, capital adjustment does **not** reverse the CSM ranking:
-0.25% remains selected. Relative to the contractual 6% cap it adds AUD 64,327
-of CSM but also requires AUD 17,626 more MLL capital. After the one-year 6%
-capital charge, the estimated value of fixed-design cap choice is therefore
-AUD 63,269 per representative contract. This is value from choosing a different
-fixed product cap, not evidence that annual state-contingent cap management has
-positive value. The result is also a lower-grid-boundary result, not proof of a
-continuous optimum below 0.25%.
+This evidence has important boundaries. It uses exactly one illustrative
+modelpoint, and MLL covers mortality, longevity and lapse only. The 40%
+positive-CSM mass-lapse proxy can materially shape both the AUD objective and
+the ratio. The result is the best member of the declared fitted policy class,
+not a global optimum over all management rules. It is in-sample by design, and
+regression fitting, anchoring, path count and stress calibration remain model
+risk. These limitations are consistent with a Time-0 valuation claim but rule
+out interpreting the result as tested strategy performance.
 
-### Annual adaptive cap remains unproven
+All calculations in this section currently use statistical Dynamic
+Policyholder behaviour only. Policyholder behaviour optimised by a separate
+Customer LSMC has not been included in the Section 7 values. Repeating the
+Time-0 management-flexibility analysis with an LSMC Policyholder response is an
+interesting extension for future research, because optimal customer decisions
+could change both CSM and the mortality, longevity and lapse capital profile.
 
-The earlier independent adaptive-policy run `20260713T233802.157326Z` still
-matters for the narrower question of annual discretion. Its candidate failed
-held-out validation by AUD 4,934.47 and the untouched final sample by AUD
-5,079.89, so deployment remained the fixed 0.25% comparator and recognised
-annual flexibility value remained zero. That candidate was trained on CSM, not
-the new non-additive capital measure; a future capital-aware adaptive study must
-freeze each candidate, stress-revalue it on separate selection/validation
-samples and only then evaluate it once out of sample.
-
-Exact settings and limitations are in the
-[capital-run provenance record](results/document_figures/capital_run_20260714T054131.308036Z.provenance.json),
-with compact source tables under
-[`source_data/capital_run_20260714T054131.308036Z`](results/document_figures/source_data/capital_run_20260714T054131.308036Z/).
+Machine-readable settings, the full fixed-cap grid, the complete fitted
+candidate table and regression diagnostics are stored with the
+[supporting figure data](results/document_figures/).
 
 ## Quickstart
 
@@ -430,12 +497,14 @@ portfolio-risk-analysis --model-points input_data/model_points_policyholders/mod
 ```
 
 The two installed optimisation commands provide the same prepare-then-read
-boundary. They derive the horizon, sample roles, path counts, seeds and complete
-cap grid from the optimiser arguments, invoke the sole authorised cache writer
-for missing exact entries, and only then start the strict reader:
+boundary. They derive the horizon, required path counts, seeds and complete cap
+grid from the optimiser arguments, invoke the sole authorised cache writer for
+missing exact entries, and only then start the strict reader. The Dynamic route
+prepares one complete Time-0 Q sample and rejects anything other than one
+modelpoint before cache preparation:
 
 ```powershell
-optimise-crediting-dynamic --model-points input_data/model_points_policyholders/model_points_policyholders_4_point_proxy.csv
+optimise-crediting-dynamic --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv --n-paths 4200 --seed 2026 --require-market-cache --require-hedge-cache
 optimise-crediting-lsmc --model-points input_data/model_points_policyholders/model_points_policyholders_1_point_proxy.csv
 ```
 

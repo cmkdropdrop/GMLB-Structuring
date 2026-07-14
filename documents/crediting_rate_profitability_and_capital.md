@@ -86,7 +86,10 @@ shock-and-revalue sensitivities, including:
 - fee and backing-income duration;
 - lapse and income-election outcomes;
 - interest-rate, longevity and selected research stresses;
-- differences between statistical dynamic and deployed LSMC behaviour.
+- differences between statistical Dynamic and Customer-LSMC behaviour in the
+  separate behaviour workflow; and
+- Management-LSMC cap flexibility under statistical Dynamic customer
+  behaviour in the Time-0 management workflow.
 
 The current outputs are not pathwise shareholder-loss VaR/CTE, APRA LAGIC
 capital or a complete IFRS 17 risk adjustment. Any research capital or
@@ -102,7 +105,19 @@ gates require dynamic Income Election, dynamic post-Election behaviour,
 path-congruent hedge-price cache. Missing entries are prepared only by the
 authorised precompute runner.
 
-For each fixed cap, common-random-number revaluations apply:
+That runner is the separate fixed-design capital workflow. Its earlier
+four-modelpoint and 1,000-path documentation results remain historical
+sensitivities; they are not inputs or evidence for the one-modelpoint Time-0
+annual-flexibility value below.
+
+The current annual-flexibility valuation is implemented in
+[`optimize_crediting_rate_dynamic_behaviour_alt.py`](../code/portfolio_simulations/optimize_crediting_rate_dynamic_behaviour_alt.py).
+It applies the same MLL definitions to fixed caps and fitted management-policy
+candidates. It also hard-requires exactly one modelpoint and never calls the
+Customer-LSMC runner. Its LSMC is solely the insurer's Management LSMC.
+
+For each fixed cap and each fitted management-policy candidate,
+common-random-number revaluations apply:
 
 | Module | Revaluation |
 |---|---|
@@ -138,6 +153,13 @@ lost on profitable cells. It is **not** an immediate-surrender revaluation and
 does not reproduce surrender cashflows, MVA or event expenses. Both the result
 with this proxy and the permanent-lapse-only amount must be disclosed.
 
+The Time-0 flexibility calculation uses exactly one modelpoint. In that special
+case the mass-lapse amount is simply 40% of positive total CSM. If mortality and
+longevity are non-adverse and mass lapse is the only binding module, the ratio
+therefore has the mechanical ceiling
+$\mathrm{CSM}/K_{\mathrm{MLL}}=1/0.40=2.5$. This is a property of the proxy, not
+a universal actuarial optimum.
+
 The Mortality/Longevity/Lapse submodules use the existing correlation submatrix
 
 $$
@@ -154,78 +176,131 @@ concentration and tax-absorption effects. Its correct label is **MLL life-risk
 capital proxy**, never total SCR, prescribed capital amount or APRA/LAGIC
 capital.
 
-## Capital-adjusted objective
+## Time-zero capital-adjusted management objective
 
-A raw ratio is a poor primary optimiser: it is unstable when capital is small,
-is not additive across projection years and can be mechanically distorted when
-the mass-lapse proxy binds. The primary fixed-cap ranking therefore uses the AUD
-economic-value-added proxy
+The current question is the value today of the contractual right to reset the
+crediting cap annually, not the construction or validation of a deployment
+strategy. All candidate cashflows are risk-neutral expected values discounted
+to Time 0 with the current Australian zero curve. The fixed-cap comparator and
+Management LSMC use the same complete cached Q sample. There is no held-out
+sample, different OOS seed, forward roll, policy replay or bootstrap gate.
 
-$$
-J_{\mathrm{adj}}(C)=J(C)-hK_{\mathrm{MLL}}(C),
-$$
-
-where the current research hurdle is $h=0.06$ (6%). This is a one-year capital
-charge, not a full projected Risk Margin. The lifetime efficiency diagnostic
-$J/K_{\mathrm{MLL}}$ is reported only when capital exceeds a premium-relative
-materiality threshold; no epsilon denominator is introduced.
-
-For product-design discretion relative to the contractual 6% cap,
+The primary ranking measure is the AUD capital-adjusted value
 
 $$
-\Delta^{\mathrm{design}}_{\mathrm{capital}}
-=J_{\mathrm{adj}}(C_{\mathrm{selected}})
--J_{\mathrm{adj}}(0.06).
+J_{\mathrm{adj}}(\pi)=J(\pi)-hK_{\mathrm{MLL}}(\pi),
+\qquad h=0.06,
 $$
 
-For annual adaptive discretion, the comparison remains adaptive versus best
-fixed. Because capital and ratios are non-additive, they cannot simply replace
-annual CSM in the existing Bellman reward. Each frozen candidate must instead be
-stress-revalued and selected on separate validation data before one untouched
-final evaluation.
+where $J$ is the complete CSM proxy and $\pi$ is either a fixed cap or a fitted
+annual-management candidate. The 6% factor is a one-year research capital
+hurdle, not a full projected Risk Margin, regulatory cost of capital or APRA
+requirement. The lifetime efficiency diagnostic $J/K_{\mathrm{MLL}}$ is
+reported alongside the primary AUD objective. A candidate with immaterial
+capital has no ratio; the implementation does not manufacture a denominator
+with an epsilon.
 
-## Constant-cap analysis
-
-A controlled constant-cap comparison uses common random numbers, exact cache
-keys and the same product/behaviour settings for every cap. Recommended views
-are:
-
-1. CSM and component waterfall by cap;
-2. hedge cost, guarantee claims and money-market income by cap;
-3. election, lapse and withdrawal rates by cap;
-4. market and longevity shock changes relative to the base cap;
-5. dynamic-function versus deployed-LSMC results on the same evaluation paths.
-
-A cap should not be declared superior from the mean CSM alone if paired Monte
-Carlo uncertainty or material risk sensitivities reverse the conclusion.
-
-Completed Dynamic-only run `20260714T054131.308036Z` provides the first MLL
-capital screen on the four-point proxy. Between 0.25% and 12%, the MLL proxy
-falls from AUD 28,399 to AUD 9,020 and cumulative Dynamic Income lapse falls from
-12.30% to 5.09%, while CSM falls from AUD 57,630 to AUD -39,517. The 0.25% cap
-still maximises capital-adjusted CSM. Versus 6%, its CSM uplift is AUD 64,327,
-its additional MLL capital is AUD 17,626 and its value after the one-year 6%
-capital charge is AUD 63,269 per representative contract.
-
-## Flexible-cap value
-
-The economic value of flexibility is the paired OOS difference
+MLL is nonlinear because stand-alone losses contain positive parts, the lapse
+module contains a maximum and MLL contains a correlation norm. The complete
+capital-adjusted objective therefore cannot be inserted directly as an additive
+one-year Bellman reward. Management LSMC fits a finite, predeclared policy class
+using additive support objectives
 
 $$
-\Delta^{\mathrm{flex}}=\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{adaptive}}
--\mathrm{CSM}^{\mathrm{proxy}}_{\mathrm{best}}.
+J_{\alpha,q}
+=(1-\alpha)J_{\mathrm{base}}+\alpha\sum_s q_sJ_s,
+\qquad \alpha\in\{0,0.25,0.50,0.75,1\}.
 $$
 
-The best fixed cap is selected on its own sample. The adaptive candidate is
-accepted on a separate validation sample and evaluated once on a final sample.
-If it fails validation, the deployed policy is the fixed fallback and deployed
-flexibility value is zero. A negative rejected candidate is useful model-risk
-evidence but is not a deployed loss or a positive value claim.
+The stress directions are mortality, longevity, lapse up, lapse down and an
+equal-weighted basket of all four. This gives 21 Base/Stress objectives,
+including pure Base CSM, plus one conditional-ratio heuristic. Each complete
+fitted 14-value Time-0 payload is then evaluated with the actual nonlinear
+MLL formula. Thus $J_{\mathrm{adj}}$, not a support objective, selects the
+result; CSM/MLL remains supplementary.
 
-Do not conflate this annual adaptive value with the positive fixed-design value
-above. The completed capital run establishes that the cap changes risk and that
-choosing a different fixed cap can add capital-adjusted value relative to 6%.
-It does not validate annual state-contingent management discretion.
+To control the regression level error, candidate $j$ is anchored to the direct
+best-fixed projection:
+
+$$
+\mathbf p_j^{\mathrm{anchored}}
+=\mathbf p_{\mathrm{fixed,direct}}
++\left(\mathbf p_{j,\mathrm{LSMC}}
+-\mathbf p_{\mathrm{fixed,LSMC}}\right).
+$$
+
+There is no additional minimum-CSM constraint. Best fixed remains an explicit
+zero-flexibility-value comparator and is replaced only by a strictly higher
+actual capital-adjusted value. Ties are resolved deterministically; no epsilon
+denominator is introduced to manufacture a ratio.
+
+## Same-sample fixed-cap comparator
+
+The fixed comparison uses common random numbers, the same statistical Dynamic
+customer model, exact cache keys and the complete admissible grid 0.25%, then
+1% through 20%. Customer LSMC is absent. The same base and mortality,
+longevity, lapse-up and lapse-down projections feed both the fixed-cap and
+management comparisons.
+
+In completed run `20260714T084838.270769Z`, the best fixed cell is the lower
+grid boundary of 0.25%:
+
+| Fixed cap | CSM (AUD) | MLL (AUD) | CSM − 6% MLL (AUD) | CSM / MLL |
+|---:|---:|---:|---:|---:|
+| 0.25% | 52,151.27 | 25,057.48 | 50,647.82 | 2.08127 |
+| 1% | 43,684.60 | 21,872.82 | 42,372.23 | 1.99721 |
+| 6% | -9,798.78 | 9,231.86 | -10,352.69 | -1.06141 |
+| 12% | -42,096.49 | 7,308.65 | -42,535.01 | -5.75982 |
+
+The fixed-cap result alone confirms that the crediting choice changes both
+profitability and the partial life-risk capital profile. The 0.25% cell also
+maximises the primary capital-adjusted measure on the fixed grid. It does not
+yet value the annual reset right; that requires the Management-LSMC comparison
+below.
+
+## Time-zero value of annual reset flexibility
+
+The completed primary run uses exactly one modelpoint (`ALT4-01`), 4,200 common
+Heston-Hull-White Q paths, market seed 2026, current-curve discounting and exact
+path-congruent hedge prices. Statistical Dynamic customer behaviour is active;
+Customer LSMC is false. The fitted policy class is complete and contains 23
+Bellman chains: one forced fixed anchor, 21 Base/Stress objectives and one
+conditional-ratio heuristic.
+
+The completed fit stored every candidate. Its earlier ratio-only presentation
+selected `base_stress_mix_alpha_0.50::balanced_four_stress_csm`; that result is
+retained only as a historical objective sensitivity. Applying the current
+$J_{\mathrm{adj}}=\mathrm{CSM}-0.06K_{\mathrm{MLL}}$ ranking to the complete
+stored table selects `base_csm`. This deterministic selection-layer change does
+not require a new projection or regression fit.
+
+The selected candidate's first Time-0 action is 0.25%, the same as best fixed.
+Its additional value comes from the right to make later state-dependent annual
+choices; no future operating schedule is exported or tested.
+
+| Time-0 alternative | CSM (AUD) | MLL (AUD) | CSM − 6% MLL (AUD) | CSM / MLL | MLL / CSM |
+|---|---:|---:|---:|---:|---:|
+| Best fixed 0.25% | 52,151.27 | 25,057.48 | 50,647.82 | 2.08127 | 48.05% |
+| Annual adjustment right: `base_csm` | 103,840.38 | 45,213.13 | 101,127.59 | 2.29669 | 43.54% |
+| Difference | +51,689.11 | +20,155.65 | **+50,479.77** | **+0.21542** | **-4.51 pp** |
+
+The primary Time-0 value of flexibility is therefore AUD 50,479.77 under the
+one-year 6% research capital charge. The supplementary efficiency measure also
+improves: CSM/MLL rises by 0.21542 and MLL/CSM falls by 4.51 percentage points.
+Absolute MLL nevertheless rises by AUD 20,155.65 because CSM rises by AUD
+51,689.11. The result demonstrates higher capital-adjusted value and improved
+partial life-risk efficiency, not lower absolute capital.
+
+This is an in-sample Time-0 estimate by design. It is the maximum within the
+declared fitted policy class, not a global optimum over every possible
+management rule. Exactly one illustrative modelpoint is used, so the 40%
+positive-CSM mass-lapse proxy can materially influence both measures. Regression
+fit, anchoring, path count, stress calibration and the partial scope of MLL are
+model limitations. Sensitivities are required before treating the uplift as a
+robust product-value estimate.
+
+The plot and compact source tables are documented under
+[`results/document_figures`](../results/document_figures/README.md).
 
 ## Accounting interpretation
 

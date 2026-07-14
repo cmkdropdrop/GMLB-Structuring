@@ -1,0 +1,173 @@
+@page {
+  size: A4;
+  margin: 17mm 15mm 19mm;
+}
+
+html {
+  color-scheme: light;
+  background: #ffffff;
+}
+
+body {
+  max-width: none;
+  margin: 0;
+  color: #1f2937;
+  background: #ffffff;
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 9.5pt;
+  line-height: 1.42;
+  hyphens: auto;
+}
+
+h1,
+h2,
+h3 {
+  color: #0f2742;
+  break-after: avoid-page;
+  page-break-after: avoid;
+}
+
+h1 {
+  margin: 0 0 8mm;
+  padding-bottom: 3mm;
+  border-bottom: 2px solid #2b6f9f;
+  font-size: 23pt;
+  line-height: 1.15;
+}
+
+h2 {
+  margin: 8mm 0 3mm;
+  padding-bottom: 1.5mm;
+  border-bottom: 1px solid #b8c7d3;
+  font-size: 16pt;
+}
+
+h3 {
+  margin: 5mm 0 2mm;
+  font-size: 12pt;
+}
+
+p,
+ul,
+ol,
+blockquote {
+  orphans: 3;
+  widows: 3;
+}
+
+a {
+  color: #1f5f8b;
+  text-decoration: none;
+}
+
+strong {
+  color: #102f4c;
+}
+
+code {
+  padding: 0.05em 0.25em;
+  border-radius: 2px;
+  background: #eef3f7;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.88em;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  padding: 3mm;
+  border: 1px solid #ccd7df;
+  border-radius: 3px;
+  background: #f6f8fa;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+pre code {
+  padding: 0;
+  background: transparent;
+}
+
+blockquote {
+  margin: 3mm 0;
+  padding: 1mm 0 1mm 4mm;
+  border-left: 3px solid #7ba4bf;
+  color: #435466;
+}
+
+table {
+  width: 100%;
+  margin: 3mm 0 5mm;
+  border-collapse: collapse;
+  font-size: 7.7pt;
+}
+
+thead {
+  display: table-header-group;
+}
+
+tr {
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+th,
+td {
+  padding: 1.5mm 1.7mm;
+  border: 1px solid #b9c6cf;
+  vertical-align: top;
+}
+
+th {
+  color: #102f4c;
+  background: #e7eef3;
+  font-weight: 600;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+  max-height: 225mm;
+  margin: 4mm auto;
+  object-fit: contain;
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+figcaption,
+p > em:only-child {
+  color: #556575;
+  font-size: 8.5pt;
+}
+
+nav#TOC {
+  margin: 0 0 8mm;
+  padding: 4mm 5mm;
+  border: 1px solid #c5d1da;
+  background: #f4f7f9;
+  break-after: page;
+  page-break-after: always;
+}
+
+nav#TOC > ul {
+  columns: 2;
+  column-gap: 8mm;
+  padding-left: 5mm;
+}
+
+.math.display {
+  margin: 3mm 0;
+  overflow: hidden;
+  text-align: center;
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+@media print {
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

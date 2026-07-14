@@ -18,10 +18,11 @@ also offers a predeclared coarse screening grid for faster research runs. The
 counterfactual management-action studies and do not reprice all other product
 terms to be budget neutral.
 
-There are two distinct optimisation questions:
+There are three distinct research questions:
 
-1. What cap policy maximises insurer CSM proxy when policyholders follow the
-   statistical dynamic behaviour model?
+1. What is today's capital-adjusted CSM value of the insurer's right to reset
+   the cap each year when Policyholders follow the statistical Dynamic
+   behaviour model, with CSM/MLL reported as a secondary efficiency measure?
 2. What cap policy is attractive when policyholders themselves respond through
    a policyholder-value-maximising LSMC follower?
 3. Does the fixed cap selected from a design grid remain attractive after its
@@ -31,7 +32,7 @@ The insurer and policyholder objectives are never blended.
 
 ## Insurer objective
 
-At time zero the optimiser maximises
+The complete signed CSM proxy is
 
 $$
 J(\pi)=\mathbb{E}^{\mathbb{Q}}\left[
@@ -55,32 +56,55 @@ the capital market. Consequently a higher cap normally costs more. Customer
 benefits paid from the account value are not counted again as insurer claims.
 
 The code labels $J$ as a market-consistent new-business CSM proxy before Risk
-Margin. It is not a complete IFRS 17 CSM.
-
-### Capital-aware fixed-design selector
-
-The third question is handled by the Dynamic-only
-[`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py),
-not by inserting a non-additive ratio into the annual Bellman recursion. It
-revalues each fixed cap under mortality, longevity and permanent lapse-up/down
-stresses, adds the explicitly labelled model-point mass-lapse proxy, aggregates
-the MLL research capital amount and ranks the supplied grid by
+Margin. It is not a complete IFRS 17 CSM. In the current Dynamic-customer
+Management-LSMC workflow, the primary finished-candidate objective is
 
 $$
-J_{\mathrm{adj}}(C)=J(C)-hK_{\mathrm{MLL}}(C).
+A_{\lambda}(\pi)=J(\pi)-\lambda K_{\mathrm{MLL}}(\pi),
+\qquad \lambda=0.06.
 $$
 
-The current hurdle $h=0.06$ (6%) is a one-year capital charge. $J/K_{\mathrm{MLL}}$ is a
-secondary lifetime value-to-capital diagnostic and is not annualised RAROC. The
-runner hard-blocks Policyholder LSMC, auto-prepares missing exact cache entries
-through the sole authorised precompute runner, and then launches only strict
-Dynamic readers.
+$K_{\mathrm{MLL}}$ is the partial mortality/longevity/lapse research capital
+proxy. The 6% coefficient is a one-year research capital charge, not a complete
+Risk Margin or regulatory calibration. CSM/MLL is reported as the secondary
+capital-efficiency measure
 
-This is a candidate-set selector over fixed product designs. A genuinely
-capital-aware adaptive policy requires each frozen adaptive candidate and all
-fixed comparators to be stress-revalued on separate selection/validation
-samples. The annual regression cannot be called globally capital-optimal merely
-because a CSM-trained candidate later has an attractive capital ratio.
+$$
+R(\pi)=\frac{J(\pi)}{K_{\mathrm{MLL}}(\pi)},
+$$
+
+but it does not select the policy. The calculation uses exactly one modelpoint.
+
+### Time-zero capital-adjusted selector
+
+MLL is formed only after complete Time-0 aggregation. Positive-part stress
+losses, the maximum of the lapse stresses and the MLL correlation norm make the
+capital charge non-additive. The implementation therefore does not pretend that
+$A_{\lambda}$ is a one-year Bellman reward. It fits a predeclared finite class
+of additive Base/Stress objectives and ranks each finished 14-value payload on
+its actual $J-0.06K_{\mathrm{MLL}}$. CSM/MLL is calculated from the same
+payload and reported secondarily.
+
+$$
+J_{\alpha,q}=(1-\alpha)J_{\mathrm{base}}
++\alpha\sum_s q_sJ_s,
+\qquad \alpha\in\{0,0.25,0.50,0.75,1\}.
+$$
+
+The directions are mortality, longevity, lapse up, lapse down and a balanced
+four-stress basket. One pure-Base objective plus four positive alpha levels for
+each of the five directions gives 21 fitted support policies; one
+conditional-ratio heuristic is added. A forced best-fixed chain supplies a
+common regression anchor. There is no additional minimum-CSM constraint. Best
+fixed is the explicit capital-adjusted comparator and is replaced only by a
+strictly higher actual $J-0.06K_{\mathrm{MLL}}$. The ratio is not an additional
+selection gate.
+
+The separate Dynamic-only
+[`run_crediting_rate_capital_analysis.py`](../code/portfolio_simulations/run_crediting_rate_capital_analysis.py)
+remains available for a fixed-design CSM-minus-capital-charge screen. It is an
+auxiliary fixed-design workflow using the same 6% research charge; it does not
+value the annual reset right.
 
 ## Decision timing and information
 
@@ -157,7 +181,7 @@ or account-value transition. This avoids evaluating a nonlinear continuation
 surface at a conditional-mean inventory, which would introduce a Jensen-type
 approximation.
 
-Both fit and frozen deployment use the same six-column direct-Q basis, where
+The Time-0 action-Q fits use the six-column direct-Q basis, where
 $z_H$, $z_S$, $z_r$ and $z_A$ are the standardised call, fund, rate and
 inventory features:
 
@@ -165,18 +189,25 @@ $$
 \left(1,z_H,z_S,z_r,z_A,z_A^2\right).
 $$
 
-There is no second projection onto a larger rollout basis and no second argmax.
+There is no second projection onto a larger rollout basis and no rollout
+argmax.
 Values are interpolated between inventory nodes; the inter-node difference is
 the discrete shadow value of one additional unit of account value. Component
 envelopes and local action masks prevent an unstable regression from
 manufacturing negative claims/costs or forcing every state to use one globally
 failed action.
 
-Each complete market path receives one immutable outer-fold identity for the
-entire backward chain. A held-out path is excluded from every scaling, grid,
-continuation and action-Q fit at every policy year; it cannot leave and later
-re-enter the training set through the recursion. Final policy value comes from
-a causal forward rollout, not from the in-sample Bellman estimate.
+The public Dynamic workflow uses one complete cached Q sample for the
+Management-LSMC regressions, the finished-candidate capital-adjusted ranking and
+all fixed caps. It does not allocate outer folds, reserve paths or run a causal
+forward rollout. All future cashflows are discounted to Time 0 with the current
+curve. The result is today's risk-neutral expected value within the declared
+fitted policy class, not an OOS or deployment-performance estimate.
+
+Every annual projection uses statistical Dynamic Policyholder behaviour.
+Customer LSMC is never called. The reader and its cache-preparation orchestrator
+both reject anything other than exactly one modelpoint; the orchestrator checks
+this before starting any precompute job.
 
 ## LSMC-policyholder Stackelberg optimiser
 
@@ -218,50 +249,29 @@ iteration and the complete three-seed Election/Income/combined validation
 contract have been implemented. The deployable result is therefore the
 prevalidated best fixed cap when the primary behaviour mode is LSMC.
 
-## Sample separation and deployment
+## Sample semantics
 
-Both optimisation families distinguish four roles:
+The two optimiser families now have deliberately different sample semantics.
 
-| Sample | Permitted use | Prohibited use |
+| Workflow | Samples | Interpretation |
 |---|---|---|
-| Control-randomisation training | Fit reward, transition, continuation and policy regressions | Publish its fitted value as OOS performance |
-| Fixed-cap selection | Select the fixed comparator from the declared grid | Tune the adaptive validation gate |
-| Adaptive validation | Decide whether the fitted adaptive policy can replace the fixed comparator | Repair the policy using final-evaluation outcomes |
-| Final evaluation | Estimate the performance of the policy already selected on validation | Select caps, features, regularisation or fallback |
+| Dynamic customers / Time-0 Management LSMC | One complete Q sample shared by fitting, candidate ranking and fixed caps | Today's risk-neutral $\mathrm{CSM}-0.06\,\mathrm{MLL}$ valuation, with CSM/MLL reported secondarily; no OOS, forward roll or deployment claim |
+| Customer-LSMC Stackelberg research | Its separately documented training and benchmark roles | Follower/leader research subject to that workflow's deployment restrictions |
 
-Within a sample, common random numbers make the adaptive-minus-fixed difference
-paired. Let $\Delta_i$ be that pathwise/paired portfolio difference. The
-validation rule requires operational diagnostics to pass and
-
-$$
-\overline{\Delta}_{\mathrm{val}}>
-1.96\times\mathrm{SE}(\Delta_{\mathrm{val}}).
-$$
-
-The dynamic optimiser also requires an executable locally masked policy and a
-converged causal rollout. The LSMC-family gate additionally requires stable
-insurer regressions and a policyholder validation result that is not inferior
-to the declared Continue control. Structural deployment restrictions override
-an otherwise positive statistical gate.
-
-If any required gate fails, the selected fixed cap is deployed on the final
-sample. In that case:
-
-$$
-\Delta^{\mathrm{flex}}_{\mathrm{deployed}}=0.
-$$
-
-The rejected adaptive candidate may still be reported as a diagnostic, but it
-must be labelled rejected and cannot support a claim that flexibility created
-value.
+For the current Dynamic workflow, using the same sample is the requested
+estimand rather than a validation shortcut. Its output records `oos_used=false`,
+`forward_roll_used=false`, `deployment_strategy_output=false` and
+`model_point_count=1`. The first Time-0 action-cell diagnostics explain the
+valuation but are not an operating schedule or recommendation.
 
 ## Exact Q-cache contract
 
 Optimisation is market-consistent and read-only with respect to Q caches.
-Training, fixed-cap selection, validation and evaluation require their own exact
-market entries whenever path count, market seed, horizon, substeps, market
-stress or market inputs differ. Conditional-MC hedge pricing additionally
-requires the exact market-path fingerprint, allocation and complete cap grid.
+The Dynamic Time-0 workflow requires one exact market entry for its one complete
+sample. Other workflows require a separate exact entry whenever their path
+count, market seed, horizon, substeps, market stress or market inputs differ.
+Conditional-MC hedge pricing additionally requires the exact market-path
+fingerprint, allocation and complete cap grid.
 
 Only
 [`precompute_q_market_and_hedge_cache.py`](../code/portfolio_simulations/precompute_q_market_and_hedge_cache.py)
@@ -278,68 +288,72 @@ cache even when the market cache can be reused.
 The installed `optimise-crediting-dynamic` and `optimise-crediting-lsmc`
 commands route through
 [`run_crediting_rate_optimisation.py`](../code/portfolio_simulations/run_crediting_rate_optimisation.py).
-That orchestrator derives the exact horizon, sample path counts, seeds and cap
-grid from the forwarded optimiser arguments. It invokes the sole authorised
-precompute runner for each exact sample and starts the strict reader only after
-all required entries validate successfully. For `mc_conditional` it enforces
-both cache requirements; for explicitly selected `moment_matched_bs` it
-prepares and requires only the market cache. Direct execution of either
-optimiser implementation file never creates or repairs a cache. The LSMC
-console route enters through the Bellman wrapper and therefore cannot silently
-switch to statistical dynamic policyholder behaviour.
+That orchestrator derives the exact horizon, required path counts, seeds and cap
+grid from the forwarded optimiser arguments. For the Dynamic route it first
+hard-checks exactly one modelpoint and then prepares only the single
+`(n_paths, seed)` Time-0 sample. It invokes the sole authorised precompute runner
+for each required exact sample and starts the strict reader only after all
+entries validate successfully. For `mc_conditional` it enforces both cache
+requirements; for explicitly selected `moment_matched_bs` it prepares only the
+market cache and labels pricing as a proxy. Direct execution of either optimiser
+implementation file never creates or repairs a cache. The Customer-LSMC console
+route enters through the Bellman wrapper and therefore cannot silently switch
+to statistical Dynamic Policyholder behaviour.
 
 ## Outputs and interpretation
 
-Each optimiser writes a run manifest, `optimization_summary.json`, fixed-cap
-checks, policy-by-year files, regression/validation diagnostics, a detailed
-`run.log` and plots under its generated `results/runs/` directory. The summary
-distinguishes at least:
+The Dynamic Time-0 reader writes:
 
-- raw Bellman or response-surface estimates;
-- the adaptive candidate and its validation result;
-- the policy actually deployed on final evaluation;
-- the best fixed comparator and paired standard error;
-- CSM legs and reconciliation gaps;
-- cache and sample fingerprints.
+- `fixed_cap_time_zero_results.csv` for the complete fixed grid;
+- `management_lsmc_time_zero_policy_class_candidates.csv` for every finished
+  support policy, its primary capital-adjusted score and its secondary aggregate
+  ratio;
+- `management_lsmc_time_zero_action_cell_diagnostics.csv` for the first Time-0
+  action cells, explicitly as diagnostics rather than a deployment schedule;
+- `management_lsmc_time_zero_regression_diagnostics.csv` for support and
+  clipping checks;
+- `time_zero_flexibility_comparison.csv`, the value vector, run manifest,
+  summary, log and plot.
 
-The first-year cap should be quoted only from the deployed-policy field. The
-primary flexibility result is the paired deployed-minus-best-fixed final
-evaluation result, not the highest in-sample action value.
+The summary records one modelpoint, one Q sample, current-curve Time-0
+discounting, dynamic customers, no Customer LSMC, no OOS and no forward roll.
+It reports absolute CSM and MLL changes, the primary capital-adjusted uplift and
+the secondary ratio change. The first action is explanatory state, not an
+instruction to deploy that cap.
 
-Model simplifications, feature sets, regularisation and validation gates must
-be predeclared or justified independently of final-sample outcomes. A simpler
-ESG may be studied as model risk, but neither model choice nor cache identity may
-be changed after inspecting final performance to manufacture a desired sign for
-the flexibility result.
+The Customer-LSMC Stackelberg implementation retains its own policy and
+validation outputs. They must not be used to reinterpret the Dynamic Time-0
+result.
 
-## Current validation status
+## Current Time-zero result
 
-Dynamic-only capital run `20260714T054131.308036Z` is the current fixed-design
-MLL screen. It used 1,000 common evaluation paths, the four-model-point proxy,
-the cap grid 0.25%, 1%, 6% and 12%, exact base market/hedge caches and no
-Policyholder LSMC. MLL capital was AUD 28,398.52, 25,157.55, 10,772.47 and
-9,020.14 respectively. Capital-adjusted CSM retained 0.25% as the selected
-grid point: AUD 55,926.55 versus AUD -7,342.90 at the contractual 6% cap.
+Completed run `20260714T084838.270769Z` uses exactly one modelpoint (`ALT4-01`),
+4,200 Heston-Hull-White Q paths with market seed 2026, the current Australian
+curve and exact path-congruent market and hedge caches. Statistical Dynamic
+customer behaviour is active and Customer LSMC is false. The fixed caps and all
+23 Management-LSMC chains use the same complete sample.
 
-Relative to 6%, the selected fixed design gains AUD 64,327.01 of CSM while
-requiring AUD 17,626.04 more MLL capital. After the one-year 6% charge, the
-fixed-design choice value is AUD 63,269.45 per representative contract. The
-0.25% and 1% lapse modules are driven by the non-revalued mass-lapse proxy; the
-permanent-lapse-only MLL amounts are separately reported. This result therefore
-supports a risk/profit trade-off and a positive value of fixed design choice,
-not a positive value of annual adaptive discretion.
+The completed fit was produced before the final selection-layer correction and
+its manifest therefore records the earlier best-fixed CSM floor. All 22 fitted
+candidate payloads were nevertheless stored before that screen. The current
+$\lambda=6\%$ rule re-ranks those complete payloads by
+$J-0.06K_{\mathrm{MLL}}$ without refitting or rerunning a projection. It selects
+the pure `base_csm` support policy; the old CSM floor is not part of this final
+selection.
 
-Dynamic-optimisation run `20260713T233802.157326Z` is a completed current-source
-four-model-point proxy study with disjoint training, fixed-selection,
-adaptive-validation and final-evaluation samples. The best admissible fixed cap
-was the 0.25% lower grid boundary, with a final-evaluation CSM proxy of
-AUD 60,125.16 (MC SE AUD 2,481.71). The adaptive candidate failed the held-out
-validation gate: its paired delta was AUD -4,934.47 (SE AUD 304.80). On the
-untouched final sample its research-only delta was AUD -5,079.89 (SE
-AUD 264.76). The deployed policy is therefore the fixed 0.25% fallback and the
-validated flexibility value is exactly zero. The figures and compact source
-tables are promoted under `results/document_figures/` with hashes and sample
-provenance; they do not support a positive flexibility-value claim.
+The best fixed cap is 0.25%, with CSM AUD 52,151.2701, MLL AUD 25,057.4801,
+primary capital-adjusted CSM AUD 50,647.8213 and secondary CSM/MLL 2.0812656.
+The selected `base_csm` policy has CSM AUD 103,840.3807, MLL AUD 45,213.1339,
+capital-adjusted CSM AUD 101,127.5926 and CSM/MLL 2.2966862. Relative to best
+fixed, the primary uplift is AUD 50,479.7713; CSM increases by AUD 51,689.1106,
+MLL increases by AUD 20,155.6539 and the secondary ratio improves by 0.2154206.
+
+This is evidence of a possible capital-adjusted and risk-efficiency benefit from
+the annual reset right, not a deployment result. The result is the maximum of
+the primary $J-0.06K_{\mathrm{MLL}}$ score within the fitted policy class, not a
+global optimum, and is in-sample by design. The 6% charge and partial MLL scope
+are research assumptions; material regression clipping requires path-count,
+basis and capital-proxy sensitivity before a stronger economic conclusion.
 
 For the LSMC-policyholder optimiser, adaptive leader deployment is intentionally
 blocked by code pending the additional on-policy and multi-seed validation work
@@ -347,6 +361,6 @@ described above. Accordingly, this repository does not currently publish an
 optimal first-year adaptive cap or a positive adaptive-cap value claim.
 
 Changing the ESG—for example removing stochastic volatility or stochastic
-rates—can be a useful predeclared model-risk experiment if LSMC support remains
-poor. It creates new exact cache identities and must not be chosen after looking
-at final-evaluation performance merely to rescue a failed policy.
+rates—can be a useful predeclared model-risk experiment if regression support
+remains poor. It creates new exact cache identities and must be reported as a
+separate sensitivity rather than blended into the base Time-0 result.

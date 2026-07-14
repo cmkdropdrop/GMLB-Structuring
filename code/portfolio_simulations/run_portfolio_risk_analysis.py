@@ -7,7 +7,7 @@ annual Continue/Full-Withdrawal decisions on one common Q sample).
 Only the complete policies are retained for the risk comparison: Dynamic
 Election plus Dynamic post-Election Behaviour, and the directly fitted LSMC
 V11 policy.  There is no separate validation/evaluation sample, deployment
-gate or fixed-policy fallback. Counterfactual
+gate or fixed-policy substitution. Counterfactual
 V00/V01/V10 Dynamic runs and Behaviour-effect decompositions are deliberately
 omitted.
 
@@ -5278,7 +5278,7 @@ def _aud_axis(value: float, _position: object = None) -> str:
 
 def _lsmc_deployment_plot_label(rows: list[dict[str, object]]) -> str:
     """Describe the directly fitted single-sample Swing policy."""
-    base = "Direct single-sample customer LSMC"
+    base = "Customer LSMC"
     if not rows:
         return base
     deployed_policies = {
@@ -5286,7 +5286,7 @@ def _lsmc_deployment_plot_label(rows: list[dict[str, object]]) -> str:
         for row in rows
     }
     if deployed_policies == {"V11"}:
-        return f"{base} (direct V11)"
+        return f"{base} (V11)"
     return f"{base} ({', '.join(sorted(deployed_policies))})"
 
 
@@ -6265,8 +6265,8 @@ def _write_report(
         "",
         (
             "Only the complete Dynamic V11 policy and the directly fitted LSMC "
-            "V11 policy are reported; no validation gate or fixed-policy fallback "
-            "is used. "
+            "V11 policy are reported; no external policy-selection gate or "
+            "fixed-policy substitution is used. "
             "V00/V01/V10 and the decomposition into Election, post-Election and "
             "interaction effects are omitted. Raw Election and Full-Withdrawal "
             "action rates are unweighted across model-point/path/decision events "
@@ -6360,7 +6360,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     log_to_console(
         "BEHAVIOUR | Per scenario, retain Dynamic V11 and direct single-sample "
-        "LSMC V11; no OOS gate, fixed fallback or V00/V01/V10 decomposition."
+        "LSMC V11 without external policy selection or V00/V01/V10 "
+        "decomposition."
     )
     log_to_console(
         f"MODEL POINTS | {len(model_point_ids)} used | "
@@ -6888,7 +6889,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "dynamic Election; dynamic post-Election behaviour"
                 ),
                 "lsmc_deployed_policy": (
-                    "direct V11 fit; no validation gate or fixed fallback"
+                    "direct V11 fit on the common Q sample"
                 ),
             },
             "lsmc_direct_policy_by_cell": {
@@ -7101,7 +7102,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if stress_loss_rows
                 else "The explicit shock-and-revalue grid was skipped for this run."
             ),
-            "Lapse risk is assessed through complete Dynamic V11 versus direct single-sample LSMC V11; no validation gate, fixed-policy fallback, V00/V01/V10 effect decomposition or symmetric statistical lapse/take-up/withdrawal shock is reported.",
+            "Lapse risk is assessed through complete Dynamic V11 versus direct single-sample LSMC V11; no external policy selection, V00/V01/V10 effect decomposition or symmetric statistical lapse/take-up/withdrawal shock is reported.",
             "No catastrophe, FX, credit-spread or correlation stress.",
             "Results are before Risk Margin and gross of reinsurance.",
             "Mortality is illustrative and not an approved production basis.",

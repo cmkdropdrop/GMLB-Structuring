@@ -4,7 +4,73 @@ Only small figures reviewed against a completed run manifest belong here.
 Large run directories and Q caches remain generated local artefacts under
 `results/runs/` and `results/cache/`.
 
-## Dynamic-behaviour cap study
+## Current Time-0 capital-adjusted flexibility study
+
+`time0_crediting_flexibility_csm_mll.png` and `.svg` document completed run
+`20260714T084838.270769Z`. It uses exactly one modelpoint (`ALT4-01`), 4,200
+common Heston-Hull-White Q paths with market seed 2026, the current Australian
+curve and exact path-congruent market and hedge caches. Customers follow the
+statistical Dynamic behaviour model. Customer LSMC was not fitted or called.
+
+This is today's risk-neutral valuation of the annual cap-reset right, not a
+deployment study. The complete Q sample is shared by the Management-LSMC fit,
+the finished-candidate ranking and every fixed-cap comparator. There is no OOS
+sample, different validation seed, forward roll, strategy replay or bootstrap
+gate. Exactly one modelpoint is used throughout.
+
+The completed fit stored all 22 candidate payloads before its original final
+screen. The documented selection now maximises the stable, additive-capital
+criterion `CSM - lambda * MLL` with `lambda = 6%`; CSM/MLL is reported as the
+second success criterion. This post-fit ranking needs neither a new projection
+nor a regression refit. Its exact inputs and result are recorded in
+`capital_adjusted_reranking_audit.csv`; the earlier pure-ratio audit remains a
+secondary diagnostic only.
+
+The best fixed cap is 0.25%, with CSM AUD 52,151.27, MLL AUD 25,057.48,
+CSM/MLL 2.08127 and capital-adjusted CSM AUD 50,647.82. The selected fitted
+class is `base_csm`. Its Time-0 values are CSM AUD 103,840.38, MLL AUD
+45,213.13, CSM/MLL 2.29669 and capital-adjusted CSM AUD 101,127.59. Thus the
+ratio rises by 0.21542 and the primary criterion by AUD 50,479.77. Absolute MLL
+rises, but more slowly than CSM: MLL/CSM falls from 48.05% to 43.54%.
+
+This is the maximum only within the predeclared 21 Base/Stress fitted policies
+plus one conditional-ratio heuristic, not a global management optimum. It is
+in-sample by design. MLL covers mortality, longevity and lapse only and is not
+total regulatory capital. The 6% lambda is the existing one-year cost-of-
+capital rate and remains an explicit modelling choice.
+
+The plot was regenerated after the completed valuation as one direct
+visualisation of the Section 7 table. It compares best fixed and annual
+management for CSM, MLL, `CSM - 6% * MLL` and CSM/MLL; no full fixed-cap curve
+or separate risk-module graphic is included. This changed neither stored paths
+nor fitted payloads. The original run manifest and numerical outputs are
+preserved under
+`source_data/time0_crediting_flexibility_20260714T084838.270769Z/`.
+
+Promoted files and SHA-256 digests are:
+
+- `time0_crediting_flexibility_csm_mll.png`:
+  `ee894e010d2e92188157e9aa7b408b99e3eb3d34396a8c590c67f289d0596c7f`;
+- `time0_crediting_flexibility_csm_mll.svg`:
+  `7dab8e240185393a3ba58a27582f3137e7978e87961dd2befaf6572ed751e0df`;
+- `fixed_cap_time_zero_results.csv`:
+  `552261bf5a741e0c9daa937f17818b28adeb6dfa9a8edd5dca40c2aacd3d9eb4`;
+- `time_zero_capital_adjusted_flexibility_comparison.csv`:
+  `8e68741c5b98a0ee23f02d02250411b135ccb903452367b3aa657b56cfee6009`;
+- `management_lsmc_policy_class_candidates.csv`:
+  `353527b05dfb2c89f542a902f40830737dfdbe449451a1d8a645bfbef333b015`;
+- `capital_adjusted_reranking_audit.csv`:
+  `fbd4debb3fe8c4c7016205e2f248e85aac5553fce5fb1377985e068611f0cb5a`.
+
+The adjacent record
+`time0_crediting_flexibility_20260714T084838.270769Z.provenance.json` contains
+the full input, cache, method and curation metadata.
+
+## Historical dynamic-behaviour OOS cap study
+
+This earlier four-modelpoint study is retained for historical comparison. It is
+superseded for README Section 7 and is not an input to the current one-modelpoint
+same-sample Time-0 capital-adjusted valuation.
 
 The three `dynamic_*.png` figures are byte-for-byte copies from completed run
 `20260713T233802.157326Z`. This is a four-model-point proxy study, not the full
@@ -14,13 +80,13 @@ selection, adaptive-validation and final-evaluation samples. Market seeds were
 2026 for training and 2027 for the benchmark parent; take-up and mortality
 seeds for every subsample are recorded in the provenance file.
 
-The adaptive research candidate failed the predeclared validation gate. Its
-validation CSM delta versus the selected fixed cap was AUD -4,934.469384680989
-with paired SE AUD 304.797851917518. On the untouched final-evaluation sample,
-the candidate delta was AUD -5,079.886300697593 with paired SE
-AUD 264.76277974853014. The deployed policy is therefore the fixed 0.25% cap,
-whose paired delta against itself is zero. These figures are not evidence of a
-positive value from annual cap flexibility.
+The adaptive research candidate was below the selected fixed cap by
+AUD 4,934.469384680989 on the declared validation sample, with paired SE
+AUD 304.797851917518. On the untouched final-evaluation sample, the difference
+was AUD 5,079.886300697593, with paired SE AUD 264.76277974853014. The selected
+policy therefore remains the fixed 0.25% cap, whose paired delta against itself
+is zero. These figures are not evidence of positive value from annual cap
+flexibility.
 
 The curated set is deliberately limited to:
 
@@ -36,46 +102,43 @@ Exact sample definitions, hashes and numerical claims are in
 the completed run metadata are copied under
 `source_data/dynamic_run_20260713T233802.157326Z/`.
 
-## Portfolio risk and behaviour study
+## Customer-LSMC crediting-cap study
 
-The three `risk_*.png` figures come from completed run
-`20260714T002637.233689Z`. They compare Dynamic V11 with the validated deployed
-annual-action LSMC fallback. All four cap cells used a fallback: 0.25%, 1% and
-6% used `earliest|continue_only`, while 12% used
-`V00_model_point_fixed_continue`. No accepted LSMC candidate is shown.
+This study concerns optimal customer behaviour. Customer LSMC is not used in
+the current Time-0 Management-LSMC flexibility calculation above.
 
-This is a four-model-point, base-only development study. It used 1,000
-evaluation paths, 4,000 training paths, 1,000 validation paths and one
-predeclared training seed. The explicit stress grid was not run. Results must
-not be interpreted as a full-portfolio calibration, a stress study or a
-pathwise VaR/TVaR/CTE analysis.
-
-At the contractual 6% cap, CSM was AUD -6,696.55357557183 under Dynamic V11
-and AUD -22,010.838525358064 under the validated LSMC fallback. Across the cap
-grid, call-spread costs increased materially: for Dynamic V11 from
-AUD 12,755.273071925712 at 0.25% to AUD 208,453.77757959758 at 12%, and for the
-LSMC fallback from AUD 10,466.440847954998 to AUD 206,192.9929005082.
+The two retained `customer_lsmc_*.png` figures use one validated result grid with
+20,000 common Q paths and the single model point `ALT4-01` for caps 0.25%, 0.5%,
+1%, 2%, 4%, 6%, 8% and 12%. All cells share the same market-cache key, scenario
+fingerprint, inputs and seeds. The explicit stress grid was not run.
 
 The curated set is deliberately limited to:
 
-- `risk_behaviour_comparison_by_cap.png`: Income-Election timing and
-  post-Election behaviour;
-- `risk_csm_value_drivers_by_cap.png`: reconciled CSM and selected value
-  drivers; and
-- `risk_valuation_exposures_by_cap.png`: premium-normalised guarantee, BEL,
-  CSM, fee-coverage and hedge-cost exposures.
+- `customer_lsmc_phase_values_by_cap.png`: benefits before and after Election,
+  phase exposure, fees, margins and guarantee claims; and
+- `customer_lsmc_csm_value_drivers_by_cap.png`: reconciled CSM, income, claims,
+  call-spread costs and the Dynamic/V11 difference.
 
-All seven run figures were visually reviewed. The selected PNGs were
-regenerated deterministically from the validated root CSV after a plot-only
-legend-classification fix; numerical tables, manifests and valuation artifacts
-were unchanged. Exact hashes, seeds, fallback mappings and limitations are in
-`risk_run_20260714T002637.233689Z.provenance.json`. Compact source data are in
-`source_data/risk_run_20260714T002637.233689Z/`.
+The PNGs were rendered from the unified, numerically sorted
+`portfolio_risk_by_crediting_cap.csv`. Both use the existing plot function;
+the sensitivity table was recalculated on the denser neighbour grid rather than
+concatenated. Plot rendering did not change numerical tables, caches or action
+rules. Both images were visually reviewed. On the common Policyholder-
+benefit PV basis, V11 exceeds Dynamic behaviour at every displayed cap; the
+increase narrows from AUD 55,349.65 at 0.25% to AUD 5,011.08 at 12%.
+
+Exact hashes, seeds, method flags and interpretation limits are in
+`customer_lsmc_crediting_cap_grid.provenance.json`. Compact unified source data
+are in `source_data/customer_lsmc_crediting_cap_grid/`.
 
 When a figure is replaced, update its SHA-256 digest and all numerical claims
 in the adjacent provenance file.
 
-## Dynamic-only MLL capital study
+## Historical fixed-cap Dynamic-only MLL capital study
+
+This earlier four-modelpoint fixed-cap screen is retained as background. Its
+CSM-minus-6%-of-MLL ranking is superseded for the current annual-flexibility
+question by the one-modelpoint Time-0 CSM/MLL study above.
 
 The three `capital_*.png` figures are byte-for-byte copies from completed run
 `20260714T054131.308036Z`. The run used the four-model-point proxy, 1,000 common

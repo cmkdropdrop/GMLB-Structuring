@@ -1,0 +1,119 @@
+{
+  "provenance_schema_version": "1.0",
+  "analysis_id": "customer_lsmc_crediting_cap_grid_20260714",
+  "status": "completed",
+  "generated_at_utc": "2026-07-14T09:55:34.319810+00:00",
+  "presentation": {
+    "label": "one-model-point customer-LSMC crediting-cap sensitivity",
+    "crediting_cap_percent_grid": [
+      0.25,
+      0.5,
+      1.0,
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      12.0
+    ],
+    "model_point_ids": [
+      "ALT4-01"
+    ],
+    "path_count": 20000,
+    "discrete_scenarios_not_interpolation": true
+  },
+  "common_method_profile": {
+    "valuation_measure": "risk_neutral",
+    "market_model": "heston_hull_white",
+    "market_cache_key": "571c369e050621d99e4072f6f88fb913f7799548acc4334da30ad4378f5e704b",
+    "scenario_fingerprint": "b5de8a85e61c261470eec317de9b8443cadcd7be36896e91f1f51e4b7b14da43",
+    "source_metadata_fingerprint": "e7212a41800f395673fce15d7aeae2cd286f8dee357595bc68ecd82e6bb357dc",
+    "market_seed": 12026,
+    "take_up_seed": 10097,
+    "mortality_seed": 10197,
+    "hedge_pricing_method": "mc_conditional",
+    "hedge_cap_leg_mode": "sold",
+    "lsmc_deployed_policy": "V11",
+    "lsmc_policy_fit_mortality_free": true,
+    "policyholder_objective_discount_basis": "time_zero_australian_zero_curve_deterministic_v1",
+    "market_cache_root_used_for_additional_cells": "AGILE_Modelling_Engine/portfolio_simulations/cache/q_market_paths",
+    "hedge_cache_root_used_for_additional_cells": "AGILE_Modelling_Engine/portfolio_simulations/cache/q_hedge_prices"
+  },
+  "source_artifacts": {
+    "existing_grid_csv": "results/runs/portfolio_risk_analysis/20260714T082548.845487Z/portfolio_risk_by_crediting_cap.csv",
+    "existing_grid_csv_sha256": "917b334bb280d9a2b09126e78465a476b50505fa921d072690b936c1dcbdaa1e",
+    "additional_completed_cells": {
+      "0.5%": {
+        "dynamic_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_0p5pct/dynamic_behaviour/run_manifest.json",
+        "dynamic_manifest_sha256": "8b75d95344b4da0932b89c089e4c79bbd2988445030adb62bc1860a9b66c165c",
+        "lsmc_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_0p5pct/lsmc_fitted_lower_bound/run_manifest.json",
+        "lsmc_manifest_sha256": "94b05b0306341ea2aff8aeca01692ef19c723e1f102c76d708024b757a10c1ea"
+      },
+      "2%": {
+        "dynamic_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_2pct/dynamic_behaviour/run_manifest.json",
+        "dynamic_manifest_sha256": "83bc2a8f5c969b5c9d44fad4ec7a4d94016d353321a1f791742456f1194bfbb3",
+        "lsmc_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_2pct/lsmc_fitted_lower_bound/run_manifest.json",
+        "lsmc_manifest_sha256": "831ae3c2c2b19130bb1835eebfa010a487d3e8b55dd380e3e2954060c44beda7"
+      },
+      "4%": {
+        "dynamic_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_4pct/dynamic_behaviour/run_manifest.json",
+        "dynamic_manifest_sha256": "1fa08ed4a30f8e23895fa629f3b174e2e5bd24ec3572b5bd4d2c65efe131b526",
+        "lsmc_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_4pct/lsmc_fitted_lower_bound/run_manifest.json",
+        "lsmc_manifest_sha256": "9f0e441cf5ef915f0dfd8ac7fda3ba963d7a207925807f59141bc390c7e08eb8"
+      },
+      "6%": {
+        "dynamic_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_6pct/dynamic_behaviour/run_manifest.json",
+        "dynamic_manifest_sha256": "4e91b11275869f14feefa6dfe022faef47e3b0f032a9aaf750cbfce4414a76ab",
+        "lsmc_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_6pct/lsmc_fitted_lower_bound/run_manifest.json",
+        "lsmc_manifest_sha256": "294471bbf164d0195a1763bb08ae3ba560e4f51e7bcf1c83ba6e6d57870a1151"
+      },
+      "8%": {
+        "dynamic_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_8pct/dynamic_behaviour/run_manifest.json",
+        "dynamic_manifest_sha256": "255f792ac26325ca4f525ce3a988c03a305803d966bfdabaaf334f5fd9d21964",
+        "lsmc_manifest": "results/runs/portfolio_risk_analysis/20260714T092202.603923Z/scenarios/crediting_cap_8pct/lsmc_fitted_lower_bound/run_manifest.json",
+        "lsmc_manifest_sha256": "ea05edfbc991cc16f29c91de96d281151573837019e3805e78e9c74d7fd12eb3"
+      }
+    },
+    "included_cap_source_map": {
+      "0.25%": "existing_grid_csv",
+      "0.5%": "additional_completed_cells",
+      "1%": "existing_grid_csv",
+      "2%": "additional_completed_cells",
+      "4%": "additional_completed_cells",
+      "6%": "existing_grid_csv",
+      "8%": "additional_completed_cells",
+      "12%": "existing_grid_csv"
+    }
+  },
+  "compatibility_validation": {
+    "overlap_cap_percent": 6.0,
+    "checked_fields": 603,
+    "mismatch_count": 0,
+    "ignored_path_fields": [
+      "dynamic_scenario_directory",
+      "lsmc_scenario_directory"
+    ],
+    "baseline_deltas_recomputed_on_unified_grid": true,
+    "sensitivity_rows_recomputed_on_unified_sorted_grid": true,
+    "unified_grid_validation_passed": true
+  },
+  "outputs": {
+    "combined_csv": "results/document_figures/source_data/customer_lsmc_crediting_cap_grid/portfolio_risk_by_crediting_cap.csv",
+    "combined_csv_sha256": "520cb9aa862ec7fa5fbd40be768f9a2f500bb0f459b5701a00d1dbebcb7ade69",
+    "sensitivity_csv": "results/document_figures/source_data/customer_lsmc_crediting_cap_grid/crediting_cap_risk_sensitivities.csv",
+    "sensitivity_csv_sha256": "2d0bed60125ad499df2f5f8b426cb0f956f2563ff1a3d56651af93921874d1b7",
+    "figures": {
+      "customer_lsmc_phase_values_by_cap.png": "5aac7afd9a4cc533b961e067230274af2c53c892231b041c1e0ac73343677b67",
+      "customer_lsmc_csm_value_drivers_by_cap.png": "8e9f2a1330672cccd9c5762d56d0cad7964b2b0a1ff1bbbb7a42613a61e53a61"
+    }
+  },
+  "generation_scope": {
+    "new_market_paths_simulated": false,
+    "additional_hedge_cache_entries_created_by_authorised_precompute": true,
+    "figure_rendering_performed_from_stored_aggregates": true,
+    "test_suite_run": false
+  },
+  "interpretation_limits": [
+    "The grid contains discrete cap scenarios and is not an interpolated curve.",
+    "This is a one-model-point design sensitivity, not portfolio evidence."
+  ]
+}
