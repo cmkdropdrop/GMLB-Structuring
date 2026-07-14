@@ -34,11 +34,11 @@ life of the portfolio.
 
 The standard objective is
 
-\[
+$$
 \mathrm{CSM}^{proxy}=PV(F)+PV(O)-PV(K)-PV(C),
-\]
+$$
 
-where \(F\) is Fee Income, \(O\) Other Income, \(K\) Claims and \(C\) Costs.
+where $F$ is Fee Income, $O$ Other Income, $K$ Claims and $C$ Costs.
 
 | Leg | Main contents | Typical cap channel |
 |---|---|---|
@@ -52,14 +52,14 @@ margin such as fees less guarantee claims and call it CSM.
 
 ## Option-spread economics
 
-For annual return \(R\) and cap \(C\), the customer payoff is
+For annual return $R$ and cap $C$, the customer payoff is
 
-\[
+$$
 \min(\max(R,0),C)=\max(R,0)-\max(R-C,0).
-\]
+$$
 
 The insurer buys the lower call and sells the cap call in the capital market.
-Increasing \(C\) makes the short call less valuable, so the net spread becomes
+Increasing $C$ makes the short call less valuable, so the net spread becomes
 more expensive. The base cost also includes the configured fair-value markup
 and hedge-reference management fee.
 
@@ -105,10 +105,10 @@ For each fixed cap, common-random-number revaluations apply:
 
 | Module | Revaluation |
 |---|---|
-| Mortality | permanent \(+15\%\) multiplier to annual \(q_x\) |
-| Longevity | permanent \(-20\%\) multiplier to annual \(q_x\) |
-| Lapse up | permanent \(+50\%\) multiplier to ordinary lapse baselines and the performance-sensitive excess-hazard cap |
-| Lapse down | permanent \(-50\%\) multiplier to ordinary lapse baselines and the performance-sensitive excess-hazard cap |
+| Mortality | permanent $+15\%$ multiplier to annual $q_x$ |
+| Longevity | permanent $-20\%$ multiplier to annual $q_x$ |
+| Lapse up | permanent $+50\%$ multiplier to ordinary lapse baselines and the performance-sensitive excess-hazard cap |
+| Lapse down | permanent $-50\%$ multiplier to ordinary lapse baselines and the performance-sensitive excess-hazard cap |
 
 The first two factors and the lapse up/down factors mirror the repository's
 existing Solvency-II-style research defaults. The corresponding European
@@ -124,11 +124,11 @@ at a 99.5% one-year sufficiency level for its own liabilities. The fixed researc
 factors in this repository therefore must not be described as APRA capital:
 [APRA LPS 115](https://www.apra.gov.au/standards/lps-115).
 
-For signed CSM proxy \(J\), each stand-alone amount is
+For signed CSM proxy $J$, each stand-alone amount is
 
-\[
+$$
 K_i=[J_{base}-J_{stress,i}]_+.
-\]
+$$
 
 The lapse module is the maximum of lapse up, lapse down and a 40% mass-lapse
 proxy. The latter is calculated model point by model point from positive CSM
@@ -139,14 +139,14 @@ with this proxy and the permanent-lapse-only amount must be disclosed.
 
 The Mortality/Longevity/Lapse submodules use the existing correlation submatrix
 
-\[
+$$
 \rho_{MLL}=\begin{pmatrix}
 1&-0.25&0\\
 -0.25&1&0.25\\
 0&0.25&1
 \end{pmatrix},\qquad
 K_{MLL}=\sqrt{\mathbf K^\top\rho_{MLL}\mathbf K}.
-\]
+$$
 
 This partial result excludes market, expense, catastrophe, operational,
 concentration and tax-absorption effects. Its correct label is **MLL life-risk
@@ -160,22 +160,22 @@ is not additive across projection years and can be mechanically distorted when
 the mass-lapse proxy binds. The primary fixed-cap ranking therefore uses the AUD
 economic-value-added proxy
 
-\[
+$$
 J^{capital\ adjusted}(C)=J(C)-hK_{MLL}(C),
-\]
+$$
 
-where the current research hurdle is \(h=6\%\). This is a one-year capital
+where the current research hurdle is $h=6\%$. This is a one-year capital
 charge, not a full projected Risk Margin. The lifetime efficiency diagnostic
-\(J/K_{MLL}\) is reported only when capital exceeds a premium-relative
+$J/K_{MLL}$ is reported only when capital exceeds a premium-relative
 materiality threshold; no epsilon denominator is introduced.
 
 For product-design discretion relative to the contractual 6% cap,
 
-\[
+$$
 \Delta^{design}_{capital}
 =J^{capital\ adjusted}_{selected\ fixed}
 -J^{capital\ adjusted}_{6\%}.
-\]
+$$
 
 For annual adaptive discretion, the comparison remains adaptive versus best
 fixed. Because capital and ratios are non-additive, they cannot simply replace
@@ -210,10 +210,10 @@ capital charge is AUD 63,269 per representative contract.
 
 The economic value of flexibility is the paired OOS difference
 
-\[
+$$
 \Delta^{flex}=\mathrm{CSM}^{proxy}_{adaptive}
 -\mathrm{CSM}^{proxy}_{best\ fixed}.
-\]
+$$
 
 The best fixed cap is selected on its own sample. The adaptive candidate is
 accepted on a separate validation sample and evaluated once on a final sample.

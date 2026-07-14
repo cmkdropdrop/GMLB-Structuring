@@ -47,9 +47,9 @@ not drive the generic reference fund.
 The equity and bond sleeves are combined before protection is applied. For one
 month,
 
-\[
+$$
 R^{fund}_{m}=0.30R^{equity}_{m}+0.70R^{bond}_{m}.
-\]
+$$
 
 The sleeves are reset to their targets after each monthly return. The annual
 point-to-point reference return is compounded from the twelve monthly fund
@@ -61,15 +61,15 @@ inflation-linkage or transaction-cost model.
 
 ## Annual crediting
 
-For crediting year \(y\), let \(R_y^{fund}\) be the full annual reference-fund
-return and \(C_y\) the cap announced by the insurer. The contractual simple
+For crediting year $y$, let $R_y^{fund}$ be the full annual reference-fund
+return and $C_y$ the cap announced by the insurer. The contractual simple
 credit is
 
-\[
+$$
 g_y=\min\left(\max(R_y^{fund},0), C_y\right).
-\]
+$$
 
-A 0.25% guaranteed minimum cap means \(C_y\ge 0.25\%\). It does not prevent a
+A 0.25% guaranteed minimum cap means $C_y\ge 0.25\%$. It does not prevent a
 0% credit when the reference fund falls. The active base case uses a 6% cap;
 the optimisation studies allow the insurer to reset the cap annually on the
 predeclared admissible grid.

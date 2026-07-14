@@ -25,13 +25,13 @@ insured-life, annuitant or company experience.
 
 ## Monthly conversion
 
-One annual conditional probability \(q_x\) applies to a policy year. The monthly
+One annual conditional probability $q_x$ applies to a policy year. The monthly
 conditional probability is chosen so that twelve equal monthly exposures
 reconcile to the annual probability:
 
-\[
+$$
 q_x^{(m)}=1-(1-q_x)^{1/12}.
-\]
+$$
 
 Where age changes within a monthly interval, the projector follows the policy-
 year anchoring and terminal-age convention implemented by the table. Survival

@@ -3593,7 +3593,14 @@ def _clip_management_predictions(
     bounded[..., 1:] = np.minimum(
         np.maximum(bounded[..., 1:], lower_values[1:]), upper_values[1:]
     )
-    fraction = float(np.mean(np.abs(bounded[..., 1:] - before) > 0.0))
+    clipped = np.abs(bounded[..., 1:] - before) > 0.0
+    if objective_spec.kind == "csm_to_mll":
+        # A large modelpoint payload must not dilute clipping of one economic
+        # core/stress output.  Gate on the worst output-specific path fraction.
+        reduction_axes = tuple(range(clipped.ndim - 1))
+        fraction = float(np.max(np.mean(clipped, axis=reduction_axes)))
+    else:
+        fraction = float(np.mean(clipped))
     bounded[..., 0] = _objective_from_payload(
         bounded[..., 1:], objective_spec
     )
@@ -7087,6 +7094,7 @@ def _fit_direct_q_chain(
     minimum_training_count: int | None = None,
     immediate_components: Array | None = None,
     objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
+    activity_exposure: Array | None = None,
 ) -> _DirectQChain:
     """Fit a full direct-Q recursion without touching excluded paths in fits."""
     if data.raw_states is None or data.inforce_exposure is None:
@@ -7113,7 +7121,13 @@ def _fit_direct_q_chain(
     feature_names = tuple(data.state_feature_names)
     inventory_index = _inventory_feature_index(feature_names)
     account_value = raw_states[:, :, inventory_index]
-    exposure = np.asarray(data.inforce_exposure, dtype=float)
+    exposure = (
+        np.asarray(data.inforce_exposure, dtype=float)
+        if activity_exposure is None
+        else np.asarray(activity_exposure, dtype=float)
+    )
+    if exposure.shape != (n_paths, n_years) or np.any(exposure < 0.0):
+        raise ValueError("Direct-Q activity exposure is invalid.")
     if immediate_components is None:
         immediate = _portfolio_continue_component_tensor(data)[:, :, 1:]
     else:
@@ -7445,6 +7459,7 @@ def _evaluate_outer_fold_direct_q_chains(
     fallback_action: int | None = None,
     advantage_screen_multiplier: float = 0.0,
     objective_spec: ManagementObjectiveSpec = ManagementObjectiveSpec(),
+    activity_exposure: Array | None = None,
 ) -> _OuterFoldDirectQEvaluation:
     """Evaluate complete held-out paths under one identical future policy."""
     if data.raw_states is None:
@@ -7491,6 +7506,7 @@ def _evaluate_outer_fold_direct_q_chains(
             minimum_training_count=minimum_training_count,
             immediate_components=immediate_components,
             objective_spec=objective_spec,
+            activity_exposure=activity_exposure,
         )
         for year in active_years:
             policy = chain.policies[year]
@@ -7919,6 +7935,16 @@ def _backward_induction(
                 ),
                 "out_of_fold_r_squared_new_business_csm_proxy": float(
                     oof_r_squared[year][action]
+                ),
+                "out_of_fold_rmse_management_objective": float(
+                    oof_rmse[year][action]
+                ),
+                "out_of_fold_r_squared_management_objective": float(
+                    oof_r_squared[year][action]
+                ),
+                "management_objective_diagnostic_metric": objective_spec.kind,
+                "legacy_csm_named_diagnostic_fields_are_compatibility_aliases": (
+                    objective_spec.kind != "csm"
                 ),
                 "in_sample_component_clip_fraction": float(
                     full_chain.action_clip_fractions[year][action]
@@ -9614,6 +9640,8 @@ def _policy_payload(
     adaptive_policy_selected: bool,
     validation_delta_aud: float,
     validation_paired_standard_error_aud: float,
+    validation_ratio_bootstrap: PairedBootstrapRatioDelta | None = None,
+    model_point_ids: Sequence[str] = (),
     advantage_screen_multiplier: float = 1.96,
 ) -> dict[str, object]:
     basis_names = (
@@ -9624,14 +9652,62 @@ def _policy_payload(
         "z:account_value_per_initial_premium",
         "square:z:account_value_per_initial_premium",
     )
-    deployed_rule = (
-        "Apply the year-specific fitted-Q coefficients, exclude locally "
-        "masked actions, and deviate from the fixed cap only when the fitted "
-        "Q advantage exceeds the documented conservative uncertainty screen."
-        if adaptive_policy_selected
-        else "Ignore the fitted-Q coefficients for deployment and apply the "
-        "fixed fallback cap in every policy year."
+    objective_spec = (
+        result.policy_years[0].objective_spec
+        if result.policy_years else ManagementObjectiveSpec(
+            kind=result.management_objective
+        )
     )
+    supplied_model_point_ids = tuple(str(value) for value in model_point_ids)
+    if objective_spec.kind == "csm_to_mll" and len(supplied_model_point_ids) != (
+        objective_spec.model_point_count
+    ):
+        raise ValueError(
+            "Frozen policy serialization requires one id per modelpoint output."
+        )
+    payload_output_layout = [*INSURER_COMPONENT_NAMES]
+    if objective_spec.kind == "csm_to_mll":
+        payload_output_layout.extend(
+            f"{stress_id}_stressed_csm" for stress_id in MLL_STRESS_IDS
+        )
+        payload_output_layout.extend(
+            f"model_point_base_csm::{model_point_id}"
+            for model_point_id in supplied_model_point_ids
+        )
+    predicted_output_layout = [
+        (
+            "csm_to_mll_ratio_recomputed_from_payload"
+            if objective_spec.kind == "csm_to_mll"
+            else "new_business_csm_proxy_recomputed_from_payload"
+        ),
+        *payload_output_layout,
+    ]
+    expected_output_count = objective_spec.payload_width + 1
+    if len(predicted_output_layout) != expected_output_count:
+        raise RuntimeError("Frozen policy output layout has an invalid width.")
+    for item in result.policy_years:
+        if item.objective_spec != objective_spec:
+            raise RuntimeError("Frozen policy years use different objectives.")
+        if item.coefficients.shape[-1] != expected_output_count:
+            raise RuntimeError(
+                "Frozen policy coefficient tensor and output layout disagree."
+            )
+    if adaptive_policy_selected:
+        deployed_rule = (
+            "Apply the frozen year-specific conditional-value coefficients, "
+            "exclude locally masked actions and maximise conditional CSM/MLL; "
+            "the complete rule was admitted only because the paired validation "
+            "bootstrap interval for its ratio improvement was wholly positive."
+            if objective_spec.kind == "csm_to_mll"
+            else "Apply the year-specific fitted-Q coefficients, exclude locally "
+            "masked actions, and deviate from the fixed cap only when the fitted "
+            "Q advantage exceeds the documented conservative uncertainty screen."
+        )
+    else:
+        deployed_rule = (
+            "Ignore the fitted-Q coefficients for deployment and apply the "
+            "fixed fallback cap in every policy year."
+        )
     return {
         "engine_version": ENGINE_VERSION,
         "method": "pathwise_outer_fold_direct_q_gas_storage_lsmc",
@@ -9648,20 +9724,32 @@ def _policy_payload(
             result.numerical_fallback_reasons
         ),
         "projection_semantics": dict(projection_semantics),
-        "objective_outputs": [
-            "new_business_csm_proxy",
-            "product_fees",
-            "lip_fees",
-            "crediting_margin",
-            "money_market_income",
-            "hedge_gain",
-            "mva_retained",
-            "aps_retained",
-            "guarantee_claims",
-            "other_insurer_funded_benefits",
-            "expenses",
-            "hedge_costs",
-        ],
+        "management_objective": {
+            "kind": objective_spec.kind,
+            "value": result.management_objective_value,
+            "mll_capital_proxy": result.mll_capital_proxy,
+            "csm_to_mll_ratio": result.csm_to_mll_ratio,
+            "capital_materiality_unscaled_aud": (
+                objective_spec.capital_materiality
+            ),
+            "mass_lapse_fraction": objective_spec.mass_lapse_fraction,
+            "mll_framework": (
+                MLL_FRAMEWORK
+                if objective_spec.kind == "csm_to_mll" else None
+            ),
+            "stress_management_action_treatment": (
+                "same frozen realised cap matrix under every nonmarket stress"
+                if objective_spec.kind == "csm_to_mll" else None
+            ),
+            "nonlinear_score_timing": (
+                "ratio formed only after conditional value-vector aggregation"
+                if objective_spec.kind == "csm_to_mll" else None
+            ),
+        },
+        "coefficient_output_layout": payload_output_layout,
+        "predicted_output_layout": predicted_output_layout,
+        "management_objective_recomputed_from_payload": True,
+        "objective_outputs": predicted_output_layout,
         "other_insurer_funded_benefit_cashflow_keys": list(
             OTHER_INSURER_FUNDED_BENEFIT_KEYS
         ),
@@ -9695,12 +9783,32 @@ def _policy_payload(
             "adaptive_validation_paired_standard_error_aud": float(
                 validation_paired_standard_error_aud
             ),
+            "adaptive_validation_csm_to_mll_ratio_delta": (
+                None
+                if validation_ratio_bootstrap is None
+                else validation_ratio_bootstrap.estimate
+            ),
+            "adaptive_validation_csm_to_mll_interval_95pct_lower": (
+                None
+                if validation_ratio_bootstrap is None
+                else validation_ratio_bootstrap.ci_lower
+            ),
+            "adaptive_validation_csm_to_mll_interval_95pct_upper": (
+                None
+                if validation_ratio_bootstrap is None
+                else validation_ratio_bootstrap.ci_upper
+            ),
             "adaptive_validation_rule": (
-                "Select the adaptive candidate only when its paired direct-"
+                "Select the adaptive candidate only when the complete paired "
+                "bootstrap 95% interval for candidate-minus-fixed CSM/MLL is "
+                "strictly positive."
+                if objective_spec.kind == "csm_to_mll"
+                else "Select the adaptive candidate only when its paired direct-"
                 "projection validation delta exceeds 1.96 standard errors."
             ),
             "local_action_advantage_screen_applied": bool(
                 advantage_screen_multiplier > 0.0
+                and objective_spec.kind == "csm"
             ),
             "local_action_advantage_screen_multiplier": float(
                 advantage_screen_multiplier
@@ -9724,7 +9832,11 @@ def _policy_payload(
             "interaction_raw_feature_indices": [],
         },
         "action_value_standard_error_semantics": (
-            "policy year 1 uses the direct outer-fold action-cell target "
+            "zero in CSM/MLL mode because a CSM residual standard error is not "
+            "commensurate with a ratio; uncertainty is handled by the paired "
+            "policy-level OOS ratio bootstrap"
+            if objective_spec.kind == "csm_to_mll"
+            else "policy year 1 uses the direct outer-fold action-cell target "
             "standard error at the deterministic start state; later years use "
             "the gate-pass outer-fold residual RMSE/sqrt(n), frozen before the "
             "screened-policy recursion"
@@ -9735,20 +9847,24 @@ def _policy_payload(
                 "economically_active": True,
                 "raw_mean": item.raw_mean.tolist(),
                 "raw_scale": item.raw_scale.tolist(),
-                "coefficients_by_action_basis_output": item.coefficients.tolist(),
+                "coefficients_by_action_basis_output": (
+                    item.coefficients[..., 1:].tolist()
+                ),
+                "serialized_coefficients_exclude_recomputed_objective": True,
                 "action_value_standard_error": (
                     item.action_value_standard_error.tolist()
                 ),
                 "value_lower_bounds_by_action_output": (
                     None
                     if item.value_lower_bounds is None
-                    else item.value_lower_bounds.tolist()
+                    else item.value_lower_bounds[..., 1:].tolist()
                 ),
                 "value_upper_bounds_by_action_output": (
                     None
                     if item.value_upper_bounds is None
-                    else item.value_upper_bounds.tolist()
+                    else item.value_upper_bounds[..., 1:].tolist()
                 ),
+                "serialized_bounds_exclude_recomputed_objective": True,
                 "numerically_stable": bool(item.numerically_stable),
                 "action_deployable_mask": (
                     np.ones(len(item.action_caps), dtype=bool).tolist()
@@ -9757,18 +9873,35 @@ def _policy_payload(
                         item.action_deployable_mask, dtype=bool
                     ).tolist()
                 ),
+                "objective_spec": {
+                    "kind": item.objective_spec.kind,
+                    "model_point_count": item.objective_spec.model_point_count,
+                    "capital_materiality": (
+                        item.objective_spec.capital_materiality
+                    ),
+                    "mass_lapse_fraction": (
+                        item.objective_spec.mass_lapse_fraction
+                    ),
+                    "coefficient_output_layout": payload_output_layout,
+                    "management_objective_recomputed_from_payload": True,
+                },
             }
             for item in result.policy_years
         ],
         "application_rule": deployed_rule,
         "fitted_candidate_rule": (
-            "At each economically active anniversary form only the listed "
-            "pre-action state, apply that year's scaling and basis, predict "
-            "all deployable action values, and use the fixed comparator unless "
-            "the best alternative clears the local uncertainty screen. The "
-            "complete masked adaptive rule is selected or rejected only on the "
-            "separate paired validation sample. No policy is fitted after all covered "
-            "lives have zero in-force exposure."
+            "At each economically active anniversary form the listed pre-action "
+            "state, predict every payload, recompute conditional CSM/MLL and "
+            "choose the best deployable action. No local CSM uncertainty screen "
+            "is applied to the ratio; the complete rule is admitted only by the "
+            "separate paired policy-level OOS ratio bootstrap."
+            if objective_spec.kind == "csm_to_mll"
+            else "At each economically active anniversary form only the listed "
+            "pre-action state, apply that year's scaling and basis, predict all "
+            "deployable action values, and use the fixed comparator unless the "
+            "best alternative clears the local uncertainty screen. The complete "
+            "masked adaptive rule is selected or rejected only on the separate "
+            "paired validation sample."
         ),
     }
 
@@ -9797,6 +9930,10 @@ def _scaled_first_year_rows(
         row = dict(source)
         for key in monetary:
             row[f"{key}_aud"] = scale * float(row.pop(key))
+        mll = row.pop("selection_mll_capital_proxy", None)
+        row["selection_mll_capital_proxy_aud"] = (
+            None if mll is None else scale * float(mll)
+        )
         output.append(row)
     return output
 
@@ -10030,11 +10167,19 @@ def _plot_first_year_choice(
 ) -> list[Path]:
     ordered = sorted(rows, key=lambda row: float(row["cap_percent"]))
     caps = np.asarray([float(row["cap_percent"]) for row in ordered])
+    ratio_mode = all(
+        row.get("selection_management_objective") == "csm_to_mll"
+        for row in ordered
+    )
     selection = np.asarray([
-        float(row["selection_estimated_q_new_business_csm_proxy_aud"])
+        float(row[
+            "selection_csm_to_mll_ratio"
+            if ratio_mode
+            else "selection_estimated_q_new_business_csm_proxy_aud"
+        ])
         for row in ordered
     ])
-    selection_se = np.asarray([
+    selection_se = np.zeros_like(selection) if ratio_mode else np.asarray([
         float(row["selection_standard_error_new_business_csm_proxy_aud"])
         for row in ordered
     ])
@@ -10063,32 +10208,38 @@ def _plot_first_year_choice(
     )
 
     figure, axis = pyplot.subplots(figsize=(10.5, 6.2))
-    axis.errorbar(
-        caps, selection, yerr=1.96 * selection_se,
-        marker="o", markersize=4, linewidth=1.5, capsize=2,
-        label=(
-            "Selection pool: direct realised-action Q"
-            if has_honest_fold_zero
-            else "Pathwise outer-fold OOS Q prediction"
-            if outer_fold_pure
-            else "Complete-path OOF coupled Q"
-            if single_oof_series
-            else "Selection folds: estimated Q"
-        ),
-    )
-    if outer_fold_pure:
+    if ratio_mode:
+        axis.plot(
+            caps, selection, marker="o", markersize=4, linewidth=1.5,
+            label="Conditional CSM/MLL from aggregated value vectors",
+        )
+    else:
+        axis.errorbar(
+            caps, selection, yerr=1.96 * selection_se,
+            marker="o", markersize=4, linewidth=1.5, capsize=2,
+            label=(
+                "Selection pool: direct realised-action Q"
+                if has_honest_fold_zero
+                else "Pathwise outer-fold OOS Q prediction"
+                if outer_fold_pure
+                else "Complete-path OOF coupled Q"
+                if single_oof_series
+                else "Selection folds: estimated Q"
+            ),
+        )
+    if outer_fold_pure and not ratio_mode:
         axis.errorbar(
             caps, holdout, yerr=1.96 * holdout_se,
             marker="s", markersize=3.5, linewidth=1.2, capsize=2,
             linestyle="--", label="OOS direct target at realised next state",
         )
-    elif has_honest_fold_zero:
+    elif has_honest_fold_zero and not ratio_mode:
         axis.errorbar(
             caps, holdout, yerr=1.96 * holdout_se,
             marker="s", markersize=3.5, linewidth=1.2, capsize=2,
             linestyle="--", label="Honest fold zero: direct Q",
         )
-    elif not single_oof_series:
+    elif not single_oof_series and not ratio_mode:
         axis.errorbar(
             caps, holdout, yerr=1.96 * holdout_se,
             marker="s", markersize=3.5, linewidth=1.2, capsize=2,
@@ -10104,17 +10255,29 @@ def _plot_first_year_choice(
     )
     axis.axhline(0.0, color="grey", linewidth=0.8)
     axis.set_xlabel("First-year cap (%)")
-    axis.set_ylabel("Approximate New Business CSM (AUD; higher is better)")
+    axis.set_ylabel(
+        "Conditional CSM / MLL (higher is better)"
+        if ratio_mode
+        else "Approximate New Business CSM (AUD; higher is better)"
+    )
     axis.set_title(
         "First-year pathwise outer-fold diagnostic and validated deployed cap"
     )
-    axis.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
+    if not ratio_mode:
+        axis.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
     axis.grid(alpha=0.25)
     axis.legend(loc="best")
     figure.text(
         0.01, 0.01,
-        "Error bars show ±1.96 × conditional Monte-Carlo SE. They exclude "
-        "regression and model-selection uncertainty.",
+        (
+            "The nonlinear ratio is formed after conditional aggregation of "
+            "base and stressed values; local CSM error bars are intentionally "
+            "not reused. Policy-level uncertainty is assessed on the separate "
+            "paired OOS bootstrap."
+            if ratio_mode
+            else "Error bars show +/-1.96 times conditional Monte-Carlo SE. "
+            "They exclude regression and model-selection uncertainty."
+        ),
         fontsize=8,
     )
     figure.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
@@ -10474,7 +10637,10 @@ def _plot_regression_diagnostics(
         action = int(np.argmin(np.abs(ACTION_CAPS - float(row["cap"]))))
         column = year_index[int(row["policy_year"])]
         r_squared[action, column] = float(
-            row["out_of_fold_r_squared_new_business_csm_proxy"]
+            row.get(
+                "out_of_fold_r_squared_management_objective",
+                row["out_of_fold_r_squared_new_business_csm_proxy"],
+            )
         )
         condition = max(float(row["design_condition_number"]), 1.0)
         log_condition[action, column] = min(np.log10(condition), 16.0)
@@ -10507,14 +10673,125 @@ def _plot_regression_diagnostics(
         axis.set_title(title)
         figure.colorbar(image, ax=axis, pad=0.01)
     axes[-1].set_xlabel("Policy year (year 1 is a direct mean, not a regression)")
+    metric = str(rows[0].get(
+        "management_objective_diagnostic_metric", "csm"
+    ))
     figure.suptitle(
-        "New Business CSM Fitted-Q diagnostics (active years only)",
+        f"Management {metric} Fitted-Q diagnostics (active years only)",
         y=1.01,
     )
     figure.tight_layout()
     return _save_figure(
         figure=figure, pyplot=pyplot, directory=directory,
         stem="05_regression_diagnostics", plot_format=plot_format, dpi=dpi,
+    )
+
+
+def _plot_csm_mll_risk_profile(
+    *,
+    pyplot,
+    ticker,
+    benchmark_rows: Sequence[Mapping[str, object]],
+    directory: Path,
+    plot_format: str,
+    dpi: int,
+) -> list[Path]:
+    """Show fixed-cap efficiency and adaptive-versus-fixed MLL modules."""
+    fixed = sorted(
+        (
+            row for row in benchmark_rows
+            if str(row.get("case", "")).startswith("fixed_cap_")
+            and row.get("fixed_cap_selection_sample_csm_to_mll_ratio")
+            is not None
+        ),
+        key=lambda row: float(row["cap_percent"]),
+    )
+    if not fixed:
+        return []
+    best = next(
+        row for row in fixed if row["is_best_fixed_cap_admissible_grid"]
+    )
+    candidate = next(
+        (
+            row for row in benchmark_rows
+            if row.get("case") == "flexible_dynamic_behaviour_policy"
+            and row.get("mll_capital_aud") is not None
+        ),
+        None,
+    )
+    if candidate is None or best.get("mll_capital_aud") is None:
+        return []
+
+    caps = np.asarray([float(row["cap_percent"]) for row in fixed])
+    ratios = np.asarray([
+        float(row["fixed_cap_selection_sample_csm_to_mll_ratio"])
+        for row in fixed
+    ])
+    figure, (ratio_axis, risk_axis) = pyplot.subplots(
+        2, 1, figsize=(11.0, 8.5),
+        gridspec_kw={"height_ratios": (1.2, 1.0)},
+    )
+    ratio_axis.plot(caps, ratios, marker="o", linewidth=1.6)
+    ratio_axis.scatter(
+        [float(best["cap_percent"])],
+        [float(best["fixed_cap_selection_sample_csm_to_mll_ratio"])],
+        color="#2F6B9A", s=70, zorder=3,
+        label=(
+            "Selection-sample best fixed cap: "
+            f"{float(best['cap_percent']):g}%"
+        ),
+    )
+    ratio_axis.set_xlabel("Constant annual cap (%)")
+    ratio_axis.set_ylabel("Selection CSM / MLL")
+    ratio_axis.set_title(
+        "Capital efficiency of constant caps on the full independent selection sample"
+    )
+    ratio_axis.grid(alpha=0.25)
+    ratio_axis.legend(loc="best")
+
+    modules = ("Mortality", "Longevity", "Lapse", "Correlated MLL")
+    fields = (
+        "mortality_loss_aud",
+        "longevity_loss_aud",
+        "lapse_loss_aud",
+        "mll_capital_aud",
+    )
+    fixed_values = np.asarray([float(best[field]) for field in fields])
+    adaptive_values = np.asarray([float(candidate[field]) for field in fields])
+    positions = np.arange(len(fields))
+    width = 0.36
+    risk_axis.bar(
+        positions - width / 2.0, fixed_values, width,
+        label=f"Best fixed ({float(best['cap_percent']):g}%)", color="#2F6B9A",
+    )
+    risk_axis.bar(
+        positions + width / 2.0, adaptive_values, width,
+        label="Adaptive candidate", color="#D4882A",
+    )
+    risk_axis.set_xticks(positions, modules)
+    risk_axis.set_ylabel("CSM loss / capital (AUD)")
+    risk_axis.yaxis.set_major_formatter(ticker.FuncFormatter(_aud_formatter))
+    risk_axis.set_title(
+        "Final-sample life-risk profile under the same frozen cap schedules"
+    )
+    risk_axis.grid(axis="y", alpha=0.25)
+    risk_axis.legend(loc="best")
+    fixed_ratio = float(best["csm_to_mll_ratio"])
+    adaptive_ratio = float(candidate["csm_to_mll_ratio"])
+    figure.suptitle(
+        "Crediting-rate flexibility: CSM/MLL "
+        f"{fixed_ratio:.3f} -> {adaptive_ratio:.3f}; "
+        f"delta {adaptive_ratio - fixed_ratio:+.3f}",
+        fontsize=12,
+    )
+    figure.tight_layout()
+    return _save_figure(
+        figure=figure,
+        pyplot=pyplot,
+        directory=directory,
+        stem="07_csm_mll_risk_profile",
+        plot_format=plot_format,
+        dpi=dpi,
     )
 
 
@@ -10541,6 +10818,7 @@ def _generate_plots(
         "04_dynamic_cap_policy",
         "05_regression_diagnostics",
         "06_lapse_behaviour_by_cap",
+        "07_csm_mll_risk_profile",
     )
     for stem in stems:
         for extension in ("png", "svg"):
@@ -10583,6 +10861,14 @@ def _generate_plots(
         pyplot=pyplot,
         benchmark_rows=benchmark_rows,
         summary=summary,
+        directory=plot_directory,
+        plot_format=plot_format,
+        dpi=dpi,
+    ))
+    paths.extend(_plot_csm_mll_risk_profile(
+        pyplot=pyplot,
+        ticker=ticker,
+        benchmark_rows=benchmark_rows,
         directory=plot_directory,
         plot_format=plot_format,
         dpi=dpi,
@@ -10958,11 +11244,12 @@ def main() -> None:
         MORTALITY_TERMINAL_AGE,
     )
     LOGGER.info(
-        "Objective | MAX CSM = PV(Fee Income) + PV(Other Income) - "
+        "Objective | MAX %s; base CSM = PV(Fee Income) + PV(Other Income) - "
         "PV(Claims) - PV(Costs) | Other Income includes Money-Market backing "
         "and zero retained above-cap gain | DVA=%s | hedge vol spread=%.6f | "
         "hedge pricing=%s | hedge cap leg=%s "
         "(no retained above-cap performance)",
+        args.optimisation_objective.upper(),
         projection_config.dva_enabled,
         projection_config.hedge_vol_spread,
         projection_config.hedge_pricing_method,
@@ -11182,6 +11469,7 @@ def main() -> None:
                     model_point_log_interval=args.model_point_log_interval,
                     surrender_policy_factory=None,
                     collect_stackelberg_primitives=False,
+                    collect_pre_action_states=True,
                 )
     with _logged_stage("Merge adapted market history and rich portfolio states"):
         training_control_inputs = _control_state_inputs(
@@ -11460,7 +11748,10 @@ def main() -> None:
         )
     if backward.regression_rows:
         oof_r2 = np.asarray([
-            float(row["out_of_fold_r_squared_new_business_csm_proxy"])
+            float(row.get(
+                "out_of_fold_r_squared_management_objective",
+                row["out_of_fold_r_squared_new_business_csm_proxy"],
+            ))
             for row in backward.regression_rows
         ])
         LOGGER.debug(
@@ -12278,6 +12569,37 @@ def main() -> None:
     scaled_initial_premium = portfolio_scale * (
         training_data.representative_initial_premium
     )
+    ratio_mode = objective_spec.kind == "csm_to_mll"
+    adaptive_candidate_ratio = (
+        None
+        if evaluation_adaptive_mll is None
+        else evaluation_adaptive_mll.result.csm_to_mll_ratio
+    )
+    best_fixed_ratio = (
+        None
+        if evaluation_fixed_mll is None
+        else evaluation_fixed_mll.result.csm_to_mll_ratio
+    )
+    deployed_ratio = (
+        None
+        if deployed_row.get("csm_to_mll_ratio") is None
+        else float(deployed_row["csm_to_mll_ratio"])
+    )
+    deployed_mll_capital_aud = (
+        None
+        if deployed_row.get("mll_capital_aud") is None
+        else float(deployed_row["mll_capital_aud"])
+    )
+    deployed_ratio_delta = (
+        None
+        if deployed_ratio is None or best_fixed_ratio is None
+        else deployed_ratio - best_fixed_ratio
+    )
+    candidate_ratio_delta = (
+        None
+        if adaptive_candidate_ratio is None or best_fixed_ratio is None
+        else adaptive_candidate_ratio - best_fixed_ratio
+    )
 
     summary = {
         "status": "completed",
@@ -12285,10 +12607,10 @@ def main() -> None:
         "created_utc": run_created_utc,
         "engine_version": ENGINE_VERSION,
         "valuation_label": (
-            "market-consistent approximate New Business CSM cap-management "
+            "market-consistent approximate New Business CSM/MLL cap-management "
             "study under fixed proxy product and behaviour assumptions"
             if args.hedge_pricing_method == "mc_conditional"
-            else "moment-matched-BS fallback/proxy New Business CSM cap-"
+            else "moment-matched-BS fallback/proxy New Business CSM/MLL cap-"
             "management study; not the primary market-consistent result"
         ),
         "method": (
@@ -12316,8 +12638,16 @@ def main() -> None:
             "not a proof of the global control optimum"
         ),
         "primary_research_question": (
-            "incremental insurer CSM value of annual crediting-cap flexibility "
-            "relative to the best constant admissible cap"
+            "incremental insurer CSM per unit of mortality, longevity and lapse "
+            "capital from annual crediting-cap flexibility relative to the best "
+            "constant admissible cap"
+        ),
+        "management_optimisation_objective": objective_spec.kind,
+        "management_objective_is_global_time_zero_ratio_optimum": False,
+        "management_objective_methodology": (
+            "rolling conditional remaining-lifetime CSM/MLL heuristic; the "
+            "non-additive ratio is recomputed from the conditional value vector"
+            if ratio_mode else "additive remaining-lifetime CSM Bellman objective"
         ),
         "primary_output_sample_role": "final_evaluation",
         "primary_policy_role": "validated_deployed_policy",
@@ -12336,6 +12666,37 @@ def main() -> None:
         "primary_paired_csm_delta_interval_95pct_upper_aud": (
             deployed_flexibility_delta
             + 1.96 * deployed_flexibility_delta_se
+        ),
+        "primary_metric": (
+            "validated_deployed_csm_to_mll_ratio_difference_vs_best_fixed"
+            if ratio_mode else "paired_csm_delta_aud"
+        ),
+        "primary_validated_deployed_csm_to_mll_ratio": deployed_ratio,
+        "primary_best_fixed_csm_to_mll_ratio": best_fixed_ratio,
+        "primary_validated_deployed_minus_best_fixed_csm_to_mll_ratio": (
+            deployed_ratio_delta
+        ),
+        "primary_validated_deployed_mll_capital_aud": (
+            deployed_mll_capital_aud
+        ),
+        "adaptive_candidate_csm_to_mll_ratio": adaptive_candidate_ratio,
+        "adaptive_candidate_minus_best_fixed_csm_to_mll_ratio": (
+            candidate_ratio_delta
+        ),
+        "adaptive_candidate_minus_best_fixed_csm_to_mll_bootstrap_se": (
+            None
+            if evaluation_ratio_bootstrap is None
+            else evaluation_ratio_bootstrap.standard_error
+        ),
+        "adaptive_candidate_minus_best_fixed_csm_to_mll_interval_95pct_lower": (
+            None
+            if evaluation_ratio_bootstrap is None
+            else evaluation_ratio_bootstrap.ci_lower
+        ),
+        "adaptive_candidate_minus_best_fixed_csm_to_mll_interval_95pct_upper": (
+            None
+            if evaluation_ratio_bootstrap is None
+            else evaluation_ratio_bootstrap.ci_upper
         ),
         "primary_flexibility_value_decomposition_aud": {
             "change_in_fee_income": deployed_fee_income_change,
@@ -12382,7 +12743,11 @@ def main() -> None:
         ),
         "objective_direction": "maximize",
         "objective": (
-            "maximise PV(Fee Income) + PV(Other Income) - PV(Claims) - "
+            "maximise rolling conditional remaining-lifetime CSM divided by "
+            "correlated mortality/longevity/lapse capital; CSM retains the "
+            "documented fee + other income - claims - costs definition"
+            if ratio_mode
+            else "maximise PV(Fee Income) + PV(Other Income) - PV(Claims) - "
             "PV(Costs), where Other Income includes pathwise Money-Market "
             "Income and Costs include the complete option spread cost"
         ),
@@ -12542,9 +12907,14 @@ def main() -> None:
             ])
         ),
         "flexible_policy_fixed_fallback_cap_percent": 100.0 * best_fixed_cap,
-        "fitted_policy_local_action_advantage_screen_applied": True,
+        "fitted_policy_local_action_advantage_screen_applied": not ratio_mode,
         "fitted_policy_local_action_advantage_screen_multiplier": 1.96,
-        "adaptive_policy_validation_confidence_multiplier": 1.96,
+        "adaptive_policy_validation_confidence_multiplier": (
+            None if ratio_mode else 1.96
+        ),
+        "adaptive_policy_validation_bootstrap_confidence_level": (
+            0.95 if ratio_mode else None
+        ),
         "adaptive_policy_selected_on_validation_sample": (
             validation_adaptive_policy_selected
         ),
@@ -12565,17 +12935,58 @@ def main() -> None:
         "adaptive_policy_validation_paired_standard_error_aud": (
             validation_delta_se
         ),
+        "adaptive_policy_validation_csm_to_mll_ratio_difference_vs_fixed": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.estimate
+        ),
+        "adaptive_policy_validation_csm_to_mll_bootstrap_standard_error": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.standard_error
+        ),
+        "adaptive_policy_validation_csm_to_mll_interval_95pct_lower": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.ci_lower
+        ),
+        "adaptive_policy_validation_csm_to_mll_interval_95pct_upper": (
+            None
+            if validation_ratio_bootstrap is None
+            else validation_ratio_bootstrap.ci_upper
+        ),
         "adaptive_policy_validation_selection_rule": (
-            "deploy adaptive rule only if validation delta exceeds 1.96 paired SE; "
-            "otherwise deploy the admissible fixed fallback"
+            "deploy the adaptive rule only if the paired-bootstrap 95% interval "
+            "for its CSM/MLL improvement is wholly positive; otherwise deploy "
+            "the admissible fixed fallback"
+            if ratio_mode
+            else "deploy adaptive rule only if validation delta exceeds 1.96 "
+            "paired SE; otherwise deploy the admissible fixed fallback"
         ),
         "flexible_policy_deviation_rule": (
-            "mask unreliable action regressions locally and deviate from the "
-            "best fixed cap only when the fitted Q advantage exceeds 1.96 times "
-            "the combined action standard errors; deploy this complete candidate "
-            "only if its paired validation delta also clears 1.96 standard errors"
+            "mask unreliable action regressions locally, recompute conditional "
+            "CSM/MLL from each predicted value vector and choose the highest "
+            "deployable ratio; the complete candidate is admitted only by the "
+            "paired policy-level validation bootstrap"
+            if ratio_mode
+            else "mask unreliable action regressions locally and deviate from "
+            "the best fixed cap only when the fitted Q advantage exceeds 1.96 "
+            "times the combined action standard errors; deploy this complete "
+            "candidate only if its paired validation delta also clears 1.96 "
+            "standard errors"
         ),
         "best_fixed_cap_new_business_csm_proxy_aud": best_fixed_csm,
+        "best_fixed_cap_mll_capital_aud": (
+            None
+            if evaluation_fixed_mll is None
+            else portfolio_scale * evaluation_fixed_mll.result.mll.capital
+        ),
+        "best_fixed_cap_csm_to_mll_ratio": best_fixed_ratio,
+        "best_fixed_selection_sample_csm_to_mll_ratio": (
+            fixed_selection_metadata.get(
+                "best_fixed_selection_csm_to_mll_ratio"
+            )
+        ),
         "best_fixed_cap_new_business_csm_proxy_standard_error_aud": (
             best_fixed_se
         ),
@@ -12795,6 +13206,8 @@ def main() -> None:
         adaptive_policy_selected=adaptive_policy_selected,
         validation_delta_aud=validation_delta,
         validation_paired_standard_error_aud=validation_delta_se,
+        validation_ratio_bootstrap=validation_ratio_bootstrap,
+        model_point_ids=training_data.model_point_ids,
     )
     policy_payload["flexibility_value_evaluation"] = {
         "sample_role": "final_evaluation",

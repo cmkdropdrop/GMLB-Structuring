@@ -4,15 +4,15 @@
 
 The optimisation studies annual management discretion over the customer's
 Maximum Return. Workflow names call this quantity the **crediting rate**, but
-the contractual payoff is a floor-at-zero, cap-at-\(C_y\) annual index credit:
+the contractual payoff is a floor-at-zero, cap-at-$C_y$ annual index credit:
 
-\[
+$$
 g_y=\min\!\left(\max(R_y^{fund},0),C_y\right),
 \qquad C_y\in\mathcal C.
-\]
+$$
 
 The standard full action grid is
-\(\mathcal C=\{0.25\%,1\%,2\%,\ldots,20\%\}\). The LSMC-policyholder runner
+$\mathcal C=\{0.25\%,1\%,2\%,\ldots,20\%\}$. The LSMC-policyholder runner
 also offers a predeclared coarse screening grid for faster research runs. The
 6% case-study cap remains the contractual base; optimisation grids are
 counterfactual management-action studies and do not reprice all other product
@@ -33,20 +33,20 @@ The insurer and policyholder objectives are never blended.
 
 At time zero the optimiser maximises
 
-\[
+$$
 J(\pi)=\mathbb E^{\mathbb Q}\!\left[
 PV(F)+PV(O)-PV(K)-PV(C)\mid \pi
 \right],
-\]
+$$
 
-where \(\pi\) maps observable pre-action state to an annual cap and:
+where $\pi$ maps observable pre-action state to an annual cap and:
 
 | Symbol | CSM leg | Main contents |
 |---|---|---|
-| \(F\) | Fee Income | Product and lifetime-income fees |
-| \(O\) | Other Income | Money-market backing income, MVA/other retained margins and explicitly retained hedge gain where applicable |
-| \(K\) | Claims | Guarantee shortfalls and other identified insurer-funded benefits |
-| \(C\) | Costs | Acquisition/maintenance expense and the complete option package |
+| $F$ | Fee Income | Product and lifetime-income fees |
+| $O$ | Other Income | Money-market backing income, MVA/other retained margins and explicitly retained hedge gain where applicable |
+| $K$ | Claims | Guarantee shortfalls and other identified insurer-funded benefits |
+| $C$ | Costs | Acquisition/maintenance expense and the complete option package |
 
 The option package includes fair value, the configured percentage markup on
 fair option value and the annual hedge-reference management fee. The standard
@@ -54,7 +54,7 @@ hedge buys the zero-strike return call and sells the call at the customer cap in
 the capital market. Consequently a higher cap normally costs more. Customer
 benefits paid from the account value are not counted again as insurer claims.
 
-The code labels \(J\) as a market-consistent new-business CSM proxy before Risk
+The code labels $J$ as a market-consistent new-business CSM proxy before Risk
 Margin. It is not a complete IFRS 17 CSM.
 
 ### Capital-aware fixed-design selector
@@ -66,11 +66,11 @@ revalues each fixed cap under mortality, longevity and permanent lapse-up/down
 stresses, adds the explicitly labelled model-point mass-lapse proxy, aggregates
 the MLL research capital amount and ranks the supplied grid by
 
-\[
+$$
 J^{capital\ adjusted}(C)=J(C)-hK_{MLL}(C).
-\]
+$$
 
-The current hurdle \(h=6\%\) is a one-year capital charge. `J / K_MLL` is a
+The current hurdle $h=6\%$ is a one-year capital charge. `J / K_MLL` is a
 secondary lifetime value-to-capital diagnostic and is not annualised RAROC. The
 runner hard-blocks Policyholder LSMC, auto-prepares missing exact cache entries
 through the sole authorised precompute runner, and then launches only strict
@@ -84,14 +84,14 @@ because a CSM-trained candidate later has an attractive capital ratio.
 
 ## Decision timing and information
 
-The management action is annual. At anniversary \(y\), the projector applies
+The management action is annual. At anniversary $y$, the projector applies
 events in this economic order:
 
 1. finish the previous crediting year and apply its protected return;
 2. post accrued product and lifetime-income fees;
 3. process mortality and contractual survivor treatment;
 4. permit an eligible Growth-to-Income election;
-5. choose and announce \(C_y\), then purchase the new annual hedge;
+5. choose and announce $C_y$, then purchase the new annual hedge;
 6. process eligible same-anniversary Income actions;
 7. continue the monthly projection.
 
@@ -119,36 +119,36 @@ policyholder value-function regression in this workflow.
 
 The insurer problem has an endogenous state: today's cap changes the account
 value and behaviour states used by later decisions. The implementation treats
-account value per initial premium as a storage inventory \(A_y\) and writes the
+account value per initial premium as a storage inventory $A_y$ and writes the
 recursion schematically as
 
-\[
+$$
 V_y(A_y,X_y)=\max_{c\in\mathcal C}
 \left\{r_y(A_y,X_y,c)+
 \mathbb E^{\mathbb Q}\!\left[
 V_{y+1}(A_{y+1},X_{y+1})\mid A_y,X_y,c
 \right]\right\}.
-\]
+$$
 
-Here \(X_y\) is exogenous market/portfolio state and the monthly projector
-generates both the realised one-year insurer reward \(r_y\) and realised next
-inventory \(A_{y+1}\). Control-randomised cap histories, including a
+Here $X_y$ is exogenous market/portfolio state and the monthly projector
+generates both the realised one-year insurer reward $r_y$ and realised next
+inventory $A_{y+1}$. Control-randomised cap histories, including a
 persistent-exploration subset, provide state/action support.
 
 Account value is placed on an adaptive quantile grid. At each node the
 continuation regression uses the compact economic basis
 
-\[
+$$
 \phi(X_y)=\{1,\ \text{ATM one-year call},\
 \text{reference-fund level},\ \text{overnight rate}\}.
-\]
+$$
 
 The action-Q regression is fitted directly to the pathwise Bellman target
 
-\[
+$$
 Y_{i,y}^{c}=r_{i,y}^{c}
 +\widehat V_{y+1}\!\left(A_{i,y+1}^{c},X_{i,y+1}\right),
-\]
+$$
 
 where the next-year grid value is interpolated at that path's **realised** next
 account value. There is no separate regression for the conditional mean reward
@@ -158,9 +158,9 @@ approximation.
 
 Both fit and frozen deployment use the same six-column direct-Q basis
 
-\[
+$$
 \{1,\ z(\text{ATM call}),\ z(\text{fund level}),\ z(r),\ z(A),\ z(A)^2\}.
-\]
+$$
 
 There is no second projection onto a larger rollout basis and no second argmax.
 Values are interpolated between inventory nodes; the inter-node difference is
@@ -227,13 +227,13 @@ Both optimisation families distinguish four roles:
 | Final evaluation | Estimate the performance of the policy already selected on validation | Select caps, features, regularisation or fallback |
 
 Within a sample, common random numbers make the adaptive-minus-fixed difference
-paired. Let \(\Delta_i\) be that pathwise/paired portfolio difference. The
+paired. Let $\Delta_i$ be that pathwise/paired portfolio difference. The
 validation rule requires operational diagnostics to pass and
 
-\[
+$$
 \overline{\Delta}_{val}>1.96\,
 SE(\Delta_{val}).
-\]
+$$
 
 The dynamic optimiser also requires an executable locally masked policy and a
 converged causal rollout. The LSMC-family gate additionally requires stable
@@ -244,9 +244,9 @@ an otherwise positive statistical gate.
 If any required gate fails, the selected fixed cap is deployed on the final
 sample. In that case:
 
-\[
+$$
 \Delta^{flex}_{deployed}=0.
-\]
+$$
 
 The rejected adaptive candidate may still be reported as a diagnostic, but it
 must be labelled rejected and cannot support a claim that flexibility created

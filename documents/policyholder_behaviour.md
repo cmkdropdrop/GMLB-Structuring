@@ -33,16 +33,16 @@ funds, particularly because the fixed income has no ratchet.
 
 ### Proportional-hazard response
 
-For a baseline annual probability \(p_0\), the model first converts the
+For a baseline annual probability $p_0$, the model first converts the
 probability to an integrated hazard and applies a multiplicative predictor:
 
-\[
+$$
 h=h_0\exp(\beta_m m+\beta_p z+\beta_{mp}mz+\beta_{MVA}s),
 \qquad p=1-e^{-h}.
-\]
+$$
 
-Here \(m\) is clipped log moneyness, \(z\) is clipped log premium relative to a
-reference premium, and \(s\) is an optional MVA signal. Floors and caps limit the
+Here $m$ is clipped log moneyness, $z$ is clipped log premium relative to a
+reference premium, and $s$ is an optional MVA signal. Floors and caps limit the
 response. Annual probabilities are converted to coherent monthly conditional
 probabilities by the projector.
 

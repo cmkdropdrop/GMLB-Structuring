@@ -34,11 +34,11 @@ different policyholder models:
 
 The customer receives the annual simple credit
 
-\[
+$$
 g_y=\min\!\left(\max(R_y^{fund},0),C_y\right),
-\]
+$$
 
-where \(R_y^{fund}\) is the complete annual reference-fund return and \(C_y\)
+where $R_y^{fund}$ is the complete annual reference-fund return and $C_y$
 is the Maximum Return announced by the insurer. In this repository, “crediting
 rate” in workflow names normally means this annual cap, not a guaranteed flat
 interest rate. The contractual case-study cap is 6%, with a guaranteed minimum
@@ -56,7 +56,7 @@ dependent:
 | Income | A higher account value does not raise locked income without a ratchet; withdrawal can become the only way to realise gains | Claims may fall, while lapse, longevity exposure, fee duration and hedge cost can move in opposing directions |
 
 There is therefore no universally optimal high or low cap. The objective is to
-choose \(C_y\) from a predeclared admissible grid using information available at
+choose $C_y$ from a predeclared admissible grid using information available at
 the decision time, then compare the deployed adaptive policy with a separately
 selected best fixed cap out of sample.
 
@@ -85,9 +85,9 @@ current insurer offer.
 
 The combined monthly fund return is
 
-\[
+$$
 R_m^{fund}=0.30R_m^{global\ equity}+0.70R_m^{5y\ government\ bond}.
-\]
+$$
 
 Equity and bond returns are combined first; only then is the annual floor/cap
 payoff applied. A higher cap during Growth can benefit the policyholder through
@@ -113,9 +113,9 @@ in a money-market backing account and its pathwise return belongs to the
 insurer. Customer index participation is manufactured separately with a
 capital-market bull call spread:
 
-\[
+$$
 \min(\max(R,0),C)=\max(R,0)-\max(R-C,0).
-\]
+$$
 
 The insurer buys the lower call and sells the cap call **to the capital
 market**, not to the customer. Raising the cap reduces the value received for
@@ -126,11 +126,11 @@ the customer cap become retained hedge income.
 
 The standard profitability objective is the signed new-business CSM proxy
 
-\[
+$$
 \mathrm{CSM}^{proxy}
 =PV(\text{Fee Income})+PV(\text{Other Income})
 -PV(\text{Claims})-PV(\text{Costs}).
-\]
+$$
 
 | Leg | Main modelled components |
 |---|---|
@@ -280,7 +280,7 @@ Hashes, cache/sample controls and the compact source tables are listed in the
 
 ## 6. Effect of the crediting rate
 
-A controlled cap study varies only \(C\), keeps common random numbers and
+A controlled cap study varies only $C$, keeps common random numbers and
 revalues both behaviour models. The key outputs are:
 
 - CSM proxy and the four-leg reconciliation by cap;
@@ -323,8 +323,8 @@ Policyholder Behaviour. Completed Dynamic-only run
 `20260714T054131.308036Z` revalued the four caps from Section 6 under the same
 1,000 Q paths and the following non-market stresses:
 
-- mortality rates \(q_x\) permanently increased by 15%;
-- mortality rates \(q_x\) permanently reduced by 20% (longevity);
+- mortality rates $q_x$ permanently increased by 15%;
+- mortality rates $q_x$ permanently reduced by 20% (longevity);
 - ordinary lapse baselines and the performance-sensitive excess-hazard cap
   permanently multiplied by 1.5 and 0.5; and
 - a separately disclosed 40% mass-lapse proxy applied to positive CSM by model
@@ -334,10 +334,10 @@ No Policyholder LSMC was fitted or called. Every valuation manifest records
 `lsmc_used=false`; all five revaluations per cap use the same exact market and
 path-congruent hedge caches. For each revalued module the adverse amount is
 
-\[
+$$
 K_i=\max(0,\mathrm{CSM}^{proxy}_{base}
 -\mathrm{CSM}^{proxy}_{stress,i}).
-\]
+$$
 
 Lapse capital is the largest of lapse-up, lapse-down and the disclosed
 mass-lapse proxy. Mortality, longevity and lapse are then combined with the
@@ -347,10 +347,10 @@ Adjustment.
 
 The primary ranking is no longer mean CSM alone. It uses the robust AUD measure
 
-\[
+$$
 \mathrm{CSM}^{capital\ adjusted}(C)
 =\mathrm{CSM}^{proxy}(C)-6\%\,K_{MLL}(C),
-\]
+$$
 
 with `CSM / MLL capital` reported only as a secondary lifetime efficiency ratio.
 The 6% deduction is a one-year capital hurdle, not a full projected Risk Margin.
